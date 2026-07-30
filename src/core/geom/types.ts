@@ -27,6 +27,20 @@ export function rectRing(r: Rect): Ring {
   ];
 }
 
+/** Positive width and height, so a rect dragged up or left still describes its area. */
+export function normalizeRect(r: Rect): Rect {
+  return {
+    x: r.width < 0 ? r.x + r.width : r.x,
+    y: r.height < 0 ? r.y + r.height : r.y,
+    width: Math.abs(r.width),
+    height: Math.abs(r.height)
+  };
+}
+
+export function rectContains(r: Rect, p: Vec2): boolean {
+  return p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height;
+}
+
 export function ringBounds(ring: Ring): Rect {
   let minX = Infinity;
   let minY = Infinity;

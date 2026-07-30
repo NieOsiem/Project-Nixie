@@ -19,6 +19,8 @@ export interface RoadEdge {
   a: string;
   b: string;
   classId: string;
+  /** Per-road override of the class pavement. Absent means "use the class". */
+  sidewalks?: boolean;
 }
 
 export interface RoadGraph {

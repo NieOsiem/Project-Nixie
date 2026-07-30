@@ -1,10 +1,20 @@
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import type { BuildingSpec } from "../geom/extrude.js";
-import { rectRing, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Polygon } from "../geom/types.js";
+import {
+  rectRing,
+  ringArea,
+  ringBounds,
+  ringCentroid,
+  type MultiPolygon,
+  type Polygon,
+  type Vec2
+} from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import { hash2, hashPick } from "./hash.js";
 
 export interface LotOptions {
+  /** Anchor for the lot grid. Blocks sharing an anchor share a rhythm. */
+  originPx: Vec2;
   /** Target lot edge length in world pixels. */
   lotSizePx: number;
   /** Alley gap between neighbouring lots, in world pixels. */
@@ -15,36 +25,44 @@ export interface LotOptions {
   maxHeightM: number;
 }
 
+/** A slice of the city generated from one seed with one set of lot params. */
+export interface LotRegion {
+  seed: number;
+  options: LotOptions;
+  /** Area this region governs, or null for "wherever no other region reaches". */
+  clip: MultiPolygon | null;
+}
+
 const WALL_MATERIALS = [MATERIAL.WALL_VIOLET, MATERIAL.WALL_MAGENTA, MATERIAL.WALL_TEAL] as const;
 const ROOF_MATERIALS = [MATERIAL.ROOF_DARK, MATERIAL.ROOF_WARM, MATERIAL.ROOF_ACCENT] as const;
 
 /**
  * Cut a block into buildable lots.
  *
- * The lot grid is anchored to absolute world coordinates rather than the block's own
- * bounds, so neighbouring blocks line up instead of each starting its own rhythm.
- * Buildings end up flush with the pavement, which is the correct urban form and avoids
- * needing a general polygon offset for setbacks.
+ * The lot grid is anchored to `originPx` rather than to the block's own bounds, so
+ * neighbouring blocks line up instead of each starting its own rhythm. Buildings end up
+ * flush with the pavement, which is the correct urban form and avoids needing a general
+ * polygon offset for setbacks.
  */
 export function subdivideBlock(block: Polygon, options: LotOptions): Polygon[] {
   const outer = block[0];
   if (!outer || outer.length < 3) return [];
 
   const bounds = ringBounds(outer);
-  const { lotSizePx, gapPx } = options;
+  const { lotSizePx, gapPx, originPx } = options;
   const inset = gapPx / 2;
 
-  const firstCol = Math.floor(bounds.x / lotSizePx);
-  const lastCol = Math.ceil((bounds.x + bounds.width) / lotSizePx);
-  const firstRow = Math.floor(bounds.y / lotSizePx);
-  const lastRow = Math.ceil((bounds.y + bounds.height) / lotSizePx);
+  const firstCol = Math.floor((bounds.x - originPx.x) / lotSizePx);
+  const lastCol = Math.ceil((bounds.x + bounds.width - originPx.x) / lotSizePx);
+  const firstRow = Math.floor((bounds.y - originPx.y) / lotSizePx);
+  const lastRow = Math.ceil((bounds.y + bounds.height - originPx.y) / lotSizePx);
 
   const lots: Polygon[] = [];
   for (let col = firstCol; col < lastCol; col++) {
     for (let row = firstRow; row < lastRow; row++) {
       const cell = rectRing({
-        x: col * lotSizePx + inset,
-        y: row * lotSizePx + inset,
+        x: originPx.x + col * lotSizePx + inset,
+        y: originPx.y + row * lotSizePx + inset,
         width: lotSizePx - gapPx,
         height: lotSizePx - gapPx
       });
@@ -62,22 +80,27 @@ export function subdivideBlock(block: Polygon, options: LotOptions): Polygon[] {
   return lots;
 }
 
-export function buildingsForBlocks(blocks: MultiPolygon, options: LotOptions): BuildingSpec[] {
+export function buildingsForBlocks(blocks: MultiPolygon, regions: LotRegion[]): BuildingSpec[] {
   const specs: BuildingSpec[] = [];
-  for (const block of blocks) {
-    for (const lot of subdivideBlock(block, options)) {
-      const ring = lot[0]!;
-      const centre = ringCentroid(ring);
-      const cx = Math.round(centre.x);
-      const cy = Math.round(centre.y);
-      const t = hash2(cx, cy);
+  for (const region of regions) {
+    const area = region.clip === null ? blocks : intersection(blocks, region.clip);
+    const { seed, options } = region;
 
-      specs.push({
-        footprint: ring,
-        height: options.minHeightM + t * t * (options.maxHeightM - options.minHeightM),
-        roofMaterial: hashPick(ROOF_MATERIALS, cx, cy, 1),
-        wallMaterial: hashPick(WALL_MATERIALS, cx, cy, 2)
-      });
+    for (const block of area) {
+      for (const lot of subdivideBlock(block, options)) {
+        const ring = lot[0]!;
+        const centre = ringCentroid(ring);
+        const cx = Math.round(centre.x);
+        const cy = Math.round(centre.y);
+        const t = hash2(cx, cy, seed);
+
+        specs.push({
+          footprint: ring,
+          height: options.minHeightM + t * t * (options.maxHeightM - options.minHeightM),
+          roofMaterial: hashPick(ROOF_MATERIALS, cx, cy, 1, seed),
+          wallMaterial: hashPick(WALL_MATERIALS, cx, cy, 2, seed)
+        });
+      }
     }
   }
   return specs;

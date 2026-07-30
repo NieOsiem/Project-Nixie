@@ -6,13 +6,13 @@ import {
   GENERATOR_VERSION,
   MODULE_ID
 } from "../constants.js";
+import { withRoadClasses, type CityParams } from "../core/gen/demo-city.js";
 import type { WallSegment } from "../core/gen/walls.js";
-import type { RoadGraph } from "../core/graph/road-graph.js";
+import { DEFAULT_ZONE_PARAMS } from "../core/gen/zones.js";
 
-export interface CityState {
+export interface CityState extends CityParams {
   formatVersion: number;
   generatorVersion: number;
-  graph: RoadGraph;
 }
 
 function requireScene(): any {
@@ -43,17 +43,25 @@ export function loadCityState(): CityState | null {
     );
     return null;
   }
-  return raw as CityState;
+  return {
+    ...raw,
+    // Road classes are module presets, so a stored city adopts the current list instead
+    // of keeping its own — otherwise adding a class strands old cities without it.
+    graph: withRoadClasses(raw.graph),
+    base: { ...DEFAULT_ZONE_PARAMS, ...raw.base },
+    zones: Array.isArray(raw.zones) ? raw.zones : []
+  } as CityState;
 }
 
-export async function saveCityState(graph: RoadGraph): Promise<CityState> {
+export async function saveCityState(params: CityParams): Promise<CityState> {
   requireGM();
   const state: CityState = {
     formatVersion: CITY_FORMAT_VERSION,
     generatorVersion: GENERATOR_VERSION,
-    graph
+    ...params
   };
-  // Foundry replaces arrays wholesale on merge, so removing an edge persists correctly.
+  // Foundry replaces arrays wholesale on merge, so deleting a road or a zone persists
+  // correctly rather than leaving the removed entry behind.
   await requireScene().setFlag(MODULE_ID, FLAG_CITY, state);
   return state;
 }

@@ -168,3 +168,31 @@ describe("buildRoadSurfaces", () => {
     expect(area(s.blocks)).toBeCloseTo(bounds.width * bounds.height, 3);
   });
 });
+
+describe("per-road walkways", () => {
+  const straight = (sidewalks?: boolean): RoadGraph => ({
+    nodes: [
+      { id: "w", x: -100, y: 0 },
+      { id: "e", x: 100, y: 0 }
+    ],
+    edges: [{ id: "we", a: "w", b: "e", classId: "street", ...(sidewalks === undefined ? {} : { sidewalks }) }],
+    classes: [STREET]
+  });
+
+  it("uses the class pavement by default", () => {
+    expect(area(buildRoadSurfaces(straight(), bounds, 1).sidewalk)).toBeGreaterThan(0);
+  });
+
+  it("drops the pavement when the road turns it off", () => {
+    const off = buildRoadSurfaces(straight(false), bounds, 1);
+    expect(area(off.sidewalk)).toBeCloseTo(0, 6);
+    // The carriageway is untouched — only the pavement either side goes away.
+    expect(area(off.road)).toBeCloseTo(area(buildRoadSurfaces(straight(), bounds, 1).road), 6);
+  });
+
+  it("gives the land back to the blocks", () => {
+    const on = buildRoadSurfaces(straight(true), bounds, 1);
+    const off = buildRoadSurfaces(straight(false), bounds, 1);
+    expect(area(off.blocks)).toBeGreaterThan(area(on.blocks));
+  });
+});

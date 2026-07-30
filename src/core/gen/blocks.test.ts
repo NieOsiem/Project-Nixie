@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, type Polygon } from "../geom/types.js";
-import { buildingsForBlocks, subdivideBlock, type LotOptions } from "./blocks.js";
+import { buildingsForBlocks, subdivideBlock, type LotOptions, type LotRegion } from "./blocks.js";
 
 const options = (over: Partial<LotOptions> = {}): LotOptions => ({
+  originPx: { x: 0, y: 0 },
   lotSizePx: 100,
   gapPx: 20,
   minAreaPx2: 400,
@@ -11,6 +12,10 @@ const options = (over: Partial<LotOptions> = {}): LotOptions => ({
   maxHeightM: 100,
   ...over
 });
+
+const region = (over: Partial<LotOptions> = {}, seed = 0): LotRegion[] => [
+  { seed, options: options(over), clip: null }
+];
 
 const block = (x: number, y: number, w: number, h: number): Polygon => [
   rectRing({ x, y, width: w, height: h })
@@ -91,11 +96,11 @@ describe("subdivideBlock", () => {
 describe("buildingsForBlocks", () => {
   it("produces one spec per lot", () => {
     const blocks = [block(0, 0, 300, 300)];
-    expect(buildingsForBlocks(blocks, options())).toHaveLength(9);
+    expect(buildingsForBlocks(blocks, region())).toHaveLength(9);
   });
 
   it("keeps heights inside the configured range", () => {
-    const specs = buildingsForBlocks([block(0, 0, 900, 900)], options());
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region());
     expect(specs.length).toBeGreaterThan(20);
     for (const s of specs) {
       expect(s.height).toBeGreaterThanOrEqual(10);
@@ -104,25 +109,48 @@ describe("buildingsForBlocks", () => {
   });
 
   it("varies height across lots", () => {
-    const specs = buildingsForBlocks([block(0, 0, 900, 900)], options());
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region());
     const distinct = new Set(specs.map((s) => Math.round(s.height)));
     expect(distinct.size).toBeGreaterThan(5);
   });
 
   it("is deterministic", () => {
-    const a = buildingsForBlocks([block(0, 0, 600, 600)], options());
-    const b = buildingsForBlocks([block(0, 0, 600, 600)], options());
+    const a = buildingsForBlocks([block(0, 0, 600, 600)], region());
+    const b = buildingsForBlocks([block(0, 0, 600, 600)], region());
     expect(b.map((s) => s.height)).toEqual(a.map((s) => s.height));
     expect(b.map((s) => s.wallMaterial)).toEqual(a.map((s) => s.wallMaterial));
   });
 
   it("assigns more than one material", () => {
-    const specs = buildingsForBlocks([block(0, 0, 900, 900)], options());
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region());
     expect(new Set(specs.map((s) => s.wallMaterial)).size).toBeGreaterThan(1);
     expect(new Set(specs.map((s) => s.roofMaterial)).size).toBeGreaterThan(1);
   });
 
   it("returns nothing for no blocks", () => {
-    expect(buildingsForBlocks([], options())).toEqual([]);
+    expect(buildingsForBlocks([], region())).toEqual([]);
+  });
+
+  it("reshuffles on a new seed without moving a lot", () => {
+    const a = buildingsForBlocks([block(0, 0, 900, 900)], region({}, 0));
+    const b = buildingsForBlocks([block(0, 0, 900, 900)], region({}, 987654));
+    expect(b.map((s) => s.footprint)).toEqual(a.map((s) => s.footprint));
+    expect(b.map((s) => s.height)).not.toEqual(a.map((s) => s.height));
+  });
+
+  it("keeps one region's reseed out of its neighbour", () => {
+    const blocks = [block(0, 0, 900, 300)];
+    const half = (x: number, seed: number): LotRegion => ({
+      seed,
+      options: options(),
+      clip: [[rectRing({ x, y: 0, width: 450, height: 300 })]]
+    });
+    const before = buildingsForBlocks(blocks, [half(0, 1), half(450, 2)]);
+    const after = buildingsForBlocks(blocks, [half(0, 1), half(450, 3)]);
+
+    const west = (specs: typeof before) => specs.filter((s) => ringBounds(s.footprint).x < 450);
+    expect(after).toHaveLength(before.length);
+    expect(west(after)).toEqual(west(before));
+    expect(after.map((s) => s.height)).not.toEqual(before.map((s) => s.height));
   });
 });

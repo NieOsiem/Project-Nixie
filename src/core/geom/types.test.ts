@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rectRing, ringArea, ringBounds, ringCentroid, type Ring } from "./types.js";
+import { normalizeRect, rectContains, rectRing, ringArea, ringBounds, ringCentroid, type Ring } from "./types.js";
 
 const square = (size = 10): Ring => [
   { x: 0, y: 0 },
@@ -59,5 +59,35 @@ describe("rectRing", () => {
     expect(ring).toHaveLength(4);
     expect(ringArea(ring)).toBe(50);
     expect(ringBounds(ring)).toEqual({ x: 3, y: 4, width: 10, height: 5 });
+  });
+});
+
+describe("normalizeRect", () => {
+  it("leaves a positive rect alone", () => {
+    const r = { x: 1, y: 2, width: 3, height: 4 };
+    expect(normalizeRect(r)).toEqual(r);
+  });
+
+  it("flips a rect dragged up and left", () => {
+    expect(normalizeRect({ x: 10, y: 10, width: -4, height: -6 })).toEqual({
+      x: 6,
+      y: 4,
+      width: 4,
+      height: 6
+    });
+  });
+});
+
+describe("rectContains", () => {
+  const r = { x: 0, y: 0, width: 10, height: 10 };
+
+  it("accepts interior and edge points", () => {
+    expect(rectContains(r, { x: 5, y: 5 })).toBe(true);
+    expect(rectContains(r, { x: 0, y: 10 })).toBe(true);
+  });
+
+  it("rejects points outside", () => {
+    expect(rectContains(r, { x: -0.1, y: 5 })).toBe(false);
+    expect(rectContains(r, { x: 5, y: 10.1 })).toBe(false);
   });
 });

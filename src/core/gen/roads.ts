@@ -60,8 +60,9 @@ export function buildRoadSurfaces(
     const roadClass = classes.get(edge.classId);
     if (!a || !b || !roadClass || edgeLength(a, b) === 0) continue;
 
+    const sidewalkM = edge.sidewalks === false ? 0 : roadClass.sidewalkM;
     const roadHalf = (roadClass.widthM / 2) * pixelsPerMetre;
-    const pavedHalf = (roadClass.widthM / 2 + roadClass.sidewalkM) * pixelsPerMetre;
+    const pavedHalf = (roadClass.widthM / 2 + sidewalkM) * pixelsPerMetre;
 
     roadParts.push(ringAsMulti(edgeQuad(a, b, roadHalf)));
     pavedParts.push(ringAsMulti(edgeQuad(a, b, pavedHalf)));

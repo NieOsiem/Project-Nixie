@@ -15,3 +15,5 @@ declare const Hooks: any;
 declare const CONFIG: any;
 declare const CONST: any;
 declare const foundry: any;
+/** v12 only, and only as a bare identifier — see `interactionLayerBase`. */
+declare const InteractionLayer: any;
