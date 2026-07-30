@@ -1,0 +1,12 @@
+{
+  "id": "project-nixie",
+  "title": "Project Nixie",
+  "description": "Project Nixie is a top down city map builder and generator.",
+  "version": "0.0.1",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "14"
+  },
+  "esmodules": ["project-nixie.mjs"],
+  "authors": [{ "name": "Vira" }]
+}
