@@ -1,4 +1,11 @@
-import { cameraEquals, cloneCamera, visibleWorldRect, type CameraState, type Rect } from "../core/camera.js";
+import {
+  cameraEquals,
+  cloneCamera,
+  offscreenTransform,
+  visibleWorldRect,
+  type CameraState,
+  type Rect
+} from "../core/camera.js";
 import { createDemoBlock } from "./demo-block.js";
 
 /**
@@ -52,10 +59,9 @@ export class CityRenderer {
     const resized = this.#ensureTarget(camera);
     if (!resized && !this.#contentDirty && cameraEquals(this.#lastCamera, camera)) return;
 
-    // Mirroring the stage transform maps world coordinates onto target pixels 1:1,
-    // so the presented quad lands back on screen without resampling.
-    this.#content.position.set(camera.x, camera.y);
-    this.#content.scale.set(camera.scale);
+    const t = offscreenTransform(camera, this.#renderScale);
+    this.#content.position.set(t.x, t.y);
+    this.#content.scale.set(t.scale);
     this.#renderer.render(this.#content, { renderTexture: this.#target, clear: true });
 
     const view = visibleWorldRect(camera);

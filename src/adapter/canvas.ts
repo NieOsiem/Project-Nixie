@@ -9,8 +9,10 @@ let tickerCallback: (() => void) | null = null;
 
 function readCamera(): CameraState {
   return {
-    x: canvas.stage.position.x,
-    y: canvas.stage.position.y,
+    stageX: canvas.stage.position.x,
+    stageY: canvas.stage.position.y,
+    pivotX: canvas.stage.pivot.x,
+    pivotY: canvas.stage.pivot.y,
     scale: canvas.stage.scale.x,
     screenWidth: canvas.app.renderer.screen.width,
     screenHeight: canvas.app.renderer.screen.height
