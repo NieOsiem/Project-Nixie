@@ -6,11 +6,26 @@ import {
   type CameraState
 } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
+import type { Rect } from "../core/geom/types.js";
+import {
+  UNCULLED_BOUNDS,
+  WHOLE_CITY_CHUNK_ID,
+  visibleChunkIds,
+  type ChunkGeometry
+} from "./chunk-culling.js";
 import { CityMesh } from "./city-mesh.js";
+
+export type { ChunkGeometry } from "./chunk-culling.js";
 
 export interface CityRendererOptions {
   pixelsPerMetre: number;
   cameraHeightMetres: number;
+}
+
+interface LiveChunk {
+  id: string;
+  boundsPx: Rect;
+  mesh: CityMesh;
 }
 
 /**
@@ -19,6 +34,9 @@ export interface CityRendererOptions {
  * The indirection buys three things the direct-to-stage approach cannot: we own the
  * depth buffer, the post chain is isolated from whatever filters other modules hang
  * on the shared groups, and render resolution becomes an independent dial.
+ *
+ * Geometry is held as a map of chunks; each update draws only those whose bounds meet
+ * the visible world rect.
  */
 export class CityRenderer {
   readonly display: any;
@@ -26,11 +44,13 @@ export class CityRenderer {
   #renderer: any;
   #target: any = null;
   #content: any;
-  #mesh: CityMesh;
+  #chunks = new Map<string, LiveChunk>();
   #palette: Uint8Array;
   #lastCamera: CameraState | null = null;
   #contentDirty = true;
   #renderCount = 0;
+  #chunksDrawn = 0;
+  #visibleTriangles = 0;
   #renderScale = 1;
   #pixelsPerMetre: number;
   #cameraHeightMetres: number;
@@ -46,9 +66,8 @@ export class CityRenderer {
     this.#cameraHeightMetres = options.cameraHeightMetres;
     this.#palette = palette;
 
-    this.#mesh = new CityMesh(buffers, palette);
     this.#content = new PIXI.Container();
-    this.#content.addChild(this.#mesh.display);
+    this.setGeometry(buffers);
 
     this.display = new PIXI.Sprite(PIXI.Texture.EMPTY);
     this.display.eventMode = "none";
@@ -83,17 +102,49 @@ export class CityRenderer {
     this.#contentDirty = true;
   }
 
-  /** Swap in regenerated geometry without tearing down the render target. */
+  /**
+   * Swap in regenerated whole-city geometry without tearing down the render target.
+   *
+   * Mixing rule: this is an ordinary chunk under a reserved id with bounds that never
+   * cull, so `setChunks`/`clearChunks`/`removeChunk` drop it exactly like any other.
+   */
   setGeometry(buffers: MeshBuffers): void {
-    this.#content.removeChild(this.#mesh.display);
-    this.#mesh.destroy();
-    this.#mesh = new CityMesh(buffers, this.#palette);
-    this.#content.addChild(this.#mesh.display);
+    this.setChunk({ id: WHOLE_CITY_CHUNK_ID, mesh: buffers, boundsPx: UNCULLED_BOUNDS });
+  }
+
+  /** Replace the whole chunk set. Every displaced mesh is destroyed. */
+  setChunks(chunks: ChunkGeometry[]): void {
+    this.clearChunks();
+    for (const chunk of chunks) this.setChunk(chunk);
+  }
+
+  /** Add a chunk, or replace the one already under that id. */
+  setChunk(chunk: ChunkGeometry): void {
+    this.removeChunk(chunk.id);
+    this.#chunks.set(chunk.id, {
+      id: chunk.id,
+      boundsPx: chunk.boundsPx,
+      mesh: this.#addMesh(chunk.mesh)
+    });
     this.#contentDirty = true;
   }
 
+  removeChunk(id: string): void {
+    const chunk = this.#chunks.get(id);
+    if (chunk === undefined) return;
+    this.#chunks.delete(id);
+    this.#content.removeChild(chunk.mesh.display);
+    chunk.mesh.destroy();
+    this.#contentDirty = true;
+  }
+
+  clearChunks(): void {
+    for (const id of [...this.#chunks.keys()]) this.removeChunk(id);
+  }
+
   updatePalette(palette: Uint8Array): void {
-    this.#mesh.updatePalette(palette);
+    this.#palette = palette;
+    for (const chunk of this.#chunks.values()) chunk.mesh.updatePalette(palette);
     this.#contentDirty = true;
   }
 
@@ -104,7 +155,7 @@ export class CityRenderer {
 
     const view = visibleWorldRect(camera);
     const cameraHeightPx = this.#cameraHeightMetres * this.#pixelsPerMetre;
-    this.#mesh.setCamera({
+    const uniforms = {
       pivotX: camera.pivotX,
       pivotY: camera.pivotY,
       pixelsPerMetre: this.#pixelsPerMetre,
@@ -112,7 +163,18 @@ export class CityRenderer {
       // Generous, because geometry outside the view still leans into it. Depth is
       // 24-bit, so the slack costs no meaningful precision.
       depthFar: 2 * Math.hypot(0.5 * Math.hypot(view.width, view.height), cameraHeightPx)
-    });
+    };
+
+    const drawn = new Set(visibleChunkIds(this.#chunks.values(), view));
+    this.#chunksDrawn = drawn.size;
+    this.#visibleTriangles = 0;
+    for (const chunk of this.#chunks.values()) {
+      const draw = drawn.has(chunk.id);
+      chunk.mesh.display.visible = draw;
+      if (!draw) continue;
+      chunk.mesh.setCamera(uniforms);
+      this.#visibleTriangles += chunk.mesh.triangleCount;
+    }
 
     const t = offscreenTransform(camera, this.#renderScale);
     this.#content.position.set(t.x, t.y);
@@ -129,23 +191,33 @@ export class CityRenderer {
   }
 
   stats(): Record<string, unknown> {
+    let trianglesTotal = 0;
+    for (const chunk of this.#chunks.values()) trianglesTotal += chunk.mesh.triangleCount;
     return {
       renderCount: this.#renderCount,
       renderScale: this.#renderScale,
       cameraHeightMetres: this.#cameraHeightMetres,
       pixelsPerMetre: this.#pixelsPerMetre,
-      triangles: this.#mesh.triangleCount,
+      chunks: this.#chunks.size,
+      chunksDrawn: this.#chunksDrawn,
+      triangles: this.#visibleTriangles,
+      trianglesTotal,
       targetSize: this.#target ? [this.#target.width, this.#target.height] : null
     };
   }
 
   destroy(): void {
     this.#releaseTarget();
-    this.#content.removeChildren();
-    this.#mesh.destroy();
+    this.clearChunks();
     this.#content.destroy({ children: true });
     this.display.destroy();
     this.#lastCamera = null;
+  }
+
+  #addMesh(buffers: MeshBuffers): CityMesh {
+    const mesh = new CityMesh(buffers, this.#palette);
+    this.#content.addChild(mesh.display);
+    return mesh;
   }
 
   #ensureTarget(camera: CameraState): boolean {

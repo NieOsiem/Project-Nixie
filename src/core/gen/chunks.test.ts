@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Rect } from "../geom/types.js";
+import { rectsIntersect, unionRect } from "../geom/types.js";
 import {
   CHUNK_SIZE_M,
   chunkId,
@@ -8,8 +9,6 @@ import {
   chunkRect,
   chunksCovering,
   parseChunkId,
-  rectsIntersect,
-  unionRect,
   type ChunkKey
 } from "./chunks.js";
 

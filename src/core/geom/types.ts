@@ -82,3 +82,25 @@ export function ringCentroid(ring: Ring): Vec2 {
   }
   return { x: cx / (6 * area), y: cy / (6 * area) };
 }
+
+/** True when two rects overlap at all, edge-touching included. Used for frustum culling. */
+export function rectsIntersect(a: Rect, b: Rect): boolean {
+  return (
+    a.x <= b.x + b.width &&
+    b.x <= a.x + a.width &&
+    a.y <= b.y + b.height &&
+    b.y <= a.y + a.height
+  );
+}
+
+/** Smallest rect containing both. Used to accumulate a chunk's real geometry bounds. */
+export function unionRect(a: Rect, b: Rect): Rect {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    width: Math.max(a.x + a.width, b.x + b.width) - x,
+    height: Math.max(a.y + a.height, b.y + b.height) - y
+  };
+}
