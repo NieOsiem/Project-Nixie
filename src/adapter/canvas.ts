@@ -1,3 +1,4 @@
+import { MODULE_ID } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
 import {
   buildCity,
@@ -6,18 +7,33 @@ import {
   lotOptionsFromMetres,
   type CityBuild
 } from "../core/gen/demo-city.js";
+import { totalWallLength, wallSegmentsFromBlocks } from "../core/gen/walls.js";
+import type { Rect } from "../core/geom/types.js";
+import type { RoadGraph } from "../core/graph/road-graph.js";
 import { DEFAULT_MATERIALS, packPalette } from "../core/palette.js";
 import { CityRenderer } from "../render/city-renderer.js";
+import {
+  isSceneEnabled,
+  loadCityState,
+  replaceGeneratedWalls,
+  saveCityState,
+  setSceneEnabledFlag,
+  deleteGeneratedWalls,
+  generatedWallIds
+} from "./documents.js";
 
-export const MODULE_ID = "project-nixie";
-const FLAG_ENABLED = "enabled";
 // Screen-space lean is height/(camHeight-height) times the on-screen distance from the
 // pivot, independent of zoom. 900 m puts a 130 m tower at ~0.18, which matches the
 // reference art; drop it toward 400 for a much harder lean.
 const DEFAULT_CAMERA_HEIGHT_M = 900;
+/** One metre of slack collapses junction-disc arcs without visibly moving a wall. */
+const WALL_TOLERANCE_M = 1;
+const BOUNDS_MARGIN_GRID = 10;
 
 let cityRenderer: CityRenderer | null = null;
 let tickerCallback: (() => void) | null = null;
+let currentGraph: RoadGraph | null = null;
+let currentBounds: Rect | null = null;
 let lastBuild: CityBuild | null = null;
 
 function readCamera(): CameraState {
@@ -38,38 +54,40 @@ function pixelsPerMetre(): number {
   return d.size / distance;
 }
 
-function buildDemoCity(): CityBuild {
+function sceneCentre(): { x: number; y: number } {
   const d = canvas.dimensions;
-  const origin = {
+  return {
     x: d.sceneRect.x + d.sceneRect.width / 2,
     y: d.sceneRect.y + d.sceneRect.height / 2
   };
-  const ppm = pixelsPerMetre();
-  const graph = demoGraph(origin, d.size);
-  return buildCity(graph, graphBounds(graph, 10 * d.size), ppm, lotOptionsFromMetres(ppm));
 }
 
-export function isEnabledForScene(): boolean {
-  return canvas?.scene?.getFlag(MODULE_ID, FLAG_ENABLED) === true;
+function regenerate(): CityBuild {
+  if (currentGraph === null || currentBounds === null) throw new Error("No city loaded.");
+  const ppm = pixelsPerMetre();
+  const started = performance.now();
+  const build = buildCity(currentGraph, currentBounds, ppm, lotOptionsFromMetres(ppm));
+  lastBuild = build;
+  console.log(
+    `${MODULE_ID} | ${build.buildingCount} buildings in ${build.blockCount} blocks ` +
+      `(${build.mesh.triangleCount} tris) in ${(performance.now() - started).toFixed(1)}ms`
+  );
+  return build;
 }
 
 export function mount(): void {
   if (cityRenderer !== null) return;
   if (!canvas?.ready || !canvas.app?.renderer || !canvas.primary) return;
 
-  const started = performance.now();
-  lastBuild = buildDemoCity();
-  const generateMS = performance.now() - started;
+  const stored = loadCityState();
+  currentGraph = stored?.graph ?? demoGraph(sceneCentre(), canvas.dimensions.size);
+  currentBounds = graphBounds(currentGraph, BOUNDS_MARGIN_GRID * canvas.dimensions.size);
 
   cityRenderer = new CityRenderer(
     canvas.app.renderer,
-    lastBuild.mesh,
+    regenerate().mesh,
     packPalette(DEFAULT_MATERIALS),
     { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: DEFAULT_CAMERA_HEIGHT_M }
-  );
-  console.log(
-    `${MODULE_ID} | generated ${lastBuild.buildingCount} buildings in ${lastBuild.blockCount} blocks ` +
-      `(${lastBuild.mesh.triangleCount} tris) in ${generateMS.toFixed(1)}ms`
   );
 
   // PrimaryCanvasGroup orders children by elevation, then sortLayer/sort/zIndex.
@@ -98,16 +116,74 @@ export function unmount(): void {
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
   cityRenderer.destroy();
   cityRenderer = null;
+  currentGraph = null;
+  currentBounds = null;
   lastBuild = null;
 
   console.log(`${MODULE_ID} | unmounted`);
 }
 
 export async function setSceneEnabled(enabled: boolean): Promise<void> {
-  if (!canvas?.scene) throw new Error("No active scene.");
-  await canvas.scene.setFlag(MODULE_ID, FLAG_ENABLED, enabled);
-  if (enabled) mount();
-  else unmount();
+  await setSceneEnabledFlag(enabled);
+  if (!enabled) {
+    unmount();
+    return;
+  }
+  if (loadCityState() === null) {
+    await saveCityState(demoGraph(sceneCentre(), canvas.dimensions.size));
+  }
+  mount();
+}
+
+/** Rebuild geometry from the in-memory graph and push it to the renderer. */
+export function rebuildGeometry(): CityBuild {
+  const build = regenerate();
+  cityRenderer?.setGeometry(build.mesh);
+  return build;
+}
+
+export async function buildWalls(): Promise<{ created: number; deleted: number }> {
+  if (lastBuild === null) throw new Error("No city loaded.");
+  const tolerance = WALL_TOLERANCE_M * pixelsPerMetre();
+  const segments = wallSegmentsFromBlocks(lastBuild.surfaces.blocks, { tolerancePx: tolerance });
+  const result = await replaceGeneratedWalls(segments);
+  console.log(
+    `${MODULE_ID} | ${result.created} walls (${Math.round(totalWallLength(segments) / pixelsPerMetre())}m), ` +
+      `replaced ${result.deleted}`
+  );
+  return result;
+}
+
+export async function clearWalls(): Promise<number> {
+  return deleteGeneratedWalls();
+}
+
+/** Remove a road and bring geometry and walls back into agreement. */
+export async function removeEdge(edgeId: string): Promise<CityBuild> {
+  if (currentGraph === null) throw new Error("No city loaded.");
+  const remaining = currentGraph.edges.filter((e) => e.id !== edgeId);
+  if (remaining.length === currentGraph.edges.length) {
+    throw new Error(`No edge "${edgeId}". Known: ${currentGraph.edges.map((e) => e.id).join(", ")}`);
+  }
+
+  currentGraph = { ...currentGraph, edges: remaining };
+  await saveCityState(currentGraph);
+  const build = rebuildGeometry();
+  await buildWalls();
+  return build;
+}
+
+export async function resetCity(): Promise<CityBuild> {
+  currentGraph = demoGraph(sceneCentre(), canvas.dimensions.size);
+  currentBounds = graphBounds(currentGraph, BOUNDS_MARGIN_GRID * canvas.dimensions.size);
+  await saveCityState(currentGraph);
+  const build = rebuildGeometry();
+  await buildWalls();
+  return build;
+}
+
+export function getGraph(): RoadGraph | null {
+  return currentGraph;
 }
 
 export function stats(): Record<string, unknown> | null {
@@ -115,7 +191,9 @@ export function stats(): Record<string, unknown> | null {
   return {
     ...cityRenderer.stats(),
     buildings: lastBuild?.buildingCount ?? 0,
-    blocks: lastBuild?.blockCount ?? 0
+    blocks: lastBuild?.blockCount ?? 0,
+    edges: currentGraph?.edges.length ?? 0,
+    generatedWalls: generatedWallIds().length
   };
 }
 
@@ -123,10 +201,12 @@ export function getRenderer(): CityRenderer | null {
   return cityRenderer;
 }
 
+export { isSceneEnabled };
+
 export function registerHooks(): void {
   Hooks.on("canvasReady", () => {
     unmount();
-    if (isEnabledForScene()) mount();
+    if (isSceneEnabled()) mount();
   });
   Hooks.on("canvasTearDown", () => unmount());
 }

@@ -27,6 +27,7 @@ export class CityRenderer {
   #target: any = null;
   #content: any;
   #mesh: CityMesh;
+  #palette: Uint8Array;
   #lastCamera: CameraState | null = null;
   #contentDirty = true;
   #renderCount = 0;
@@ -43,6 +44,7 @@ export class CityRenderer {
     this.#renderer = renderer;
     this.#pixelsPerMetre = options.pixelsPerMetre;
     this.#cameraHeightMetres = options.cameraHeightMetres;
+    this.#palette = palette;
 
     this.#mesh = new CityMesh(buffers, palette);
     this.#content = new PIXI.Container();
@@ -78,6 +80,15 @@ export class CityRenderer {
   }
 
   markContentDirty(): void {
+    this.#contentDirty = true;
+  }
+
+  /** Swap in regenerated geometry without tearing down the render target. */
+  setGeometry(buffers: MeshBuffers): void {
+    this.#content.removeChild(this.#mesh.display);
+    this.#mesh.destroy();
+    this.#mesh = new CityMesh(buffers, this.#palette);
+    this.#content.addChild(this.#mesh.display);
     this.#contentDirty = true;
   }
 

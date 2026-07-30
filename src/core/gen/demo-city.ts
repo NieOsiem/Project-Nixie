@@ -5,7 +5,7 @@ import type { Rect, Vec2 } from "../geom/types.js";
 import type { RoadGraph } from "../graph/road-graph.js";
 import { MATERIAL } from "../palette.js";
 import { buildingsForBlocks, type LotOptions } from "./blocks.js";
-import { buildRoadSurfaces } from "./roads.js";
+import { buildRoadSurfaces, type RoadSurfaces } from "./roads.js";
 
 const ARTERIAL = "arterial";
 const STREET = "street";
@@ -91,6 +91,7 @@ export function lotOptionsFromMetres(pixelsPerMetre: number): LotOptions {
 
 export interface CityBuild {
   mesh: MeshBuffers;
+  surfaces: RoadSurfaces;
   buildingCount: number;
   blockCount: number;
 }
@@ -113,5 +114,5 @@ export function buildCity(
     ...buildings.map(extrudeBuilding)
   ]);
 
-  return { mesh, buildingCount: buildings.length, blockCount: surfaces.blocks.length };
+  return { mesh, surfaces, buildingCount: buildings.length, blockCount: surfaces.blocks.length };
 }

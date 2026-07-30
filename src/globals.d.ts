@@ -13,4 +13,5 @@ declare const game: any;
 declare const ui: any;
 declare const Hooks: any;
 declare const CONFIG: any;
+declare const CONST: any;
 declare const foundry: any;

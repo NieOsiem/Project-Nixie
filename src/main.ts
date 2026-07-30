@@ -1,8 +1,14 @@
+import { MODULE_ID } from "./constants.js";
 import {
-  MODULE_ID,
+  buildWalls,
+  clearWalls,
+  getGraph,
   getRenderer,
-  isEnabledForScene,
+  isSceneEnabled,
+  rebuildGeometry,
   registerHooks,
+  removeEdge,
+  resetCity,
   setSceneEnabled,
   stats
 } from "./adapter/canvas.js";
@@ -14,8 +20,16 @@ Hooks.once("init", () => {
   module.api = {
     enable: () => setSceneEnabled(true),
     disable: () => setSceneEnabled(false),
-    isEnabled: () => isEnabledForScene(),
+    isEnabled: () => isSceneEnabled(),
     stats,
+
+    buildWalls,
+    clearWalls,
+    removeEdge,
+    resetCity,
+    getGraph,
+    rebuild: () => rebuildGeometry(),
+
     setRenderScale: (value: number) => {
       const r = getRenderer();
       if (r) r.renderScale = value;
