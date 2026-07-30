@@ -7,6 +7,7 @@
     "minimum": "12",
     "verified": "14"
   },
-  "esmodules": ["project-nixie.mjs"],
+  "esmodules": ["dist/project-nixie.mjs"],
+  "persistentStorage": true,
   "authors": [{ "name": "Vira" }]
 }
