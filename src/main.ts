@@ -20,6 +20,11 @@ Hooks.once("init", () => {
       const r = getRenderer();
       if (r) r.renderScale = value;
       return r?.renderScale ?? null;
+    },
+    setCameraHeight: (metres: number) => {
+      const r = getRenderer();
+      if (r) r.cameraHeightMetres = metres;
+      return r?.cameraHeightMetres ?? null;
     }
   };
 

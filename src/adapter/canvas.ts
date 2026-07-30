@@ -1,8 +1,15 @@
-import type { CameraState, Rect } from "../core/camera.js";
+import type { CameraState } from "../core/camera.js";
+import { demoLayout } from "../core/gen/demo-layout.js";
+import { extrudeBuilding, mergeMeshes, type MeshBuffers } from "../core/geom/extrude.js";
+import { DEFAULT_MATERIALS, packPalette } from "../core/palette.js";
 import { CityRenderer } from "../render/city-renderer.js";
 
 export const MODULE_ID = "project-nixie";
 const FLAG_ENABLED = "enabled";
+// Screen-space lean is height/(camHeight-height) times the on-screen distance from the
+// pivot, independent of zoom. 900 m puts a 130 m tower at ~0.18, which matches the
+// reference art; drop it toward 400 for a much harder lean.
+const DEFAULT_CAMERA_HEIGHT_M = 900;
 
 let cityRenderer: CityRenderer | null = null;
 let tickerCallback: (() => void) | null = null;
@@ -19,14 +26,19 @@ function readCamera(): CameraState {
   };
 }
 
-function demoRect(): Rect {
+function pixelsPerMetre(): number {
   const d = canvas.dimensions;
-  return {
-    x: d.sceneRect.x + d.sceneRect.width / 2 - d.size * 5,
-    y: d.sceneRect.y + d.sceneRect.height / 2 - d.size * 3,
-    width: d.size * 10,
-    height: d.size * 6
+  const distance = d.distance > 0 ? d.distance : 1;
+  return d.size / distance;
+}
+
+function buildDemoGeometry(): MeshBuffers {
+  const d = canvas.dimensions;
+  const origin = {
+    x: d.sceneRect.x + d.sceneRect.width / 2,
+    y: d.sceneRect.y + d.sceneRect.height / 2
   };
+  return mergeMeshes(demoLayout(origin, d.size).map(extrudeBuilding));
 }
 
 export function isEnabledForScene(): boolean {
@@ -37,7 +49,12 @@ export function mount(): void {
   if (cityRenderer !== null) return;
   if (!canvas?.ready || !canvas.app?.renderer || !canvas.primary) return;
 
-  cityRenderer = new CityRenderer(canvas.app.renderer, demoRect());
+  cityRenderer = new CityRenderer(
+    canvas.app.renderer,
+    buildDemoGeometry(),
+    packPalette(DEFAULT_MATERIALS),
+    { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: DEFAULT_CAMERA_HEIGHT_M }
+  );
 
   // PrimaryCanvasGroup orders children by elevation, then sortLayer/sort/zIndex.
   // Same comparator in v12 and v14, so this placement is generation-stable.
