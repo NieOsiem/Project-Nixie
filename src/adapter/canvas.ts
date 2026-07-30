@@ -1,7 +1,7 @@
 import { MODULE_ID } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
-import { buildChunk, chunkMarginM, cityChunks, type ChunkBuild } from "../core/gen/chunked.js";
-import { chunkId, chunksCovering } from "../core/gen/chunks.js";
+import { buildChunk, chunkMarginM, cityChunks } from "../core/gen/chunked.js";
+import { chunkId, chunksCovering, type ChunkKey } from "../core/gen/chunks.js";
 import {
   cityBounds,
   cityToPixels,
@@ -14,7 +14,7 @@ import {
 import { buildRoadSurfaces } from "../core/gen/roads.js";
 import { totalWallLength, wallSegmentsFromBlocks } from "../core/gen/walls.js";
 import { nextZoneId, zoneAt, type Zone, type ZoneParams } from "../core/gen/zones.js";
-import { emptyMesh } from "../core/geom/mesh.js";
+import { emptyMesh, type MeshBuffers } from "../core/geom/mesh.js";
 import {
   normalizeRect,
   ringBounds,
@@ -41,6 +41,8 @@ import {
 import { History } from "../core/history.js";
 import { DEFAULT_MATERIALS, packPalette } from "../core/palette.js";
 import { CityRenderer, type ChunkGeometry } from "../render/city-renderer.js";
+import { WorkerClient } from "../worker/client.js";
+import type { BuildChunkResult } from "../worker/protocol.js";
 import {
   isSceneEnabled,
   loadCityState,
@@ -74,6 +76,14 @@ export interface RebuildResult {
   ms: number;
 }
 
+/** The slice of a chunk build the adapter keeps. `ChunkBuild` and a worker result both fit. */
+interface ChunkRecord {
+  id: string;
+  mesh: MeshBuffers;
+  boundsM: Rect;
+  buildingCount: number;
+}
+
 let cityRenderer: CityRenderer | null = null;
 let tickerCallback: (() => void) | null = null;
 let currentCity: CityParams | null = null;
@@ -83,7 +93,16 @@ let cityListener: (() => void) | null = null;
 let autoWalls = true;
 let wallTimer: ReturnType<typeof setTimeout> | null = null;
 
-const chunks = new Map<string, ChunkBuild>();
+let workerClient: WorkerClient | null = null;
+/** Latched: a Worker that could not be constructed once will not construct on a retry either. */
+let workerUnavailable = false;
+let workerWarned = false;
+/** Bumped whenever the params change, so a build issued against the old ones is discardable. */
+let buildEpoch = 0;
+/** False while a full rebuild is in flight or was superseded — the chunk set may have holes. */
+let chunkSetComplete = false;
+
+const chunks = new Map<string, ChunkRecord>();
 const history = new History<CityParams>();
 
 function readCamera(): CameraState {
@@ -152,7 +171,10 @@ export function mount(): void {
     packPalette(DEFAULT_MATERIALS),
     { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: DEFAULT_CAMERA_HEIGHT_M }
   );
-  rebuildGeometry();
+  // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
+  // renderer's chunk set now, and nothing else drops that placeholder any more.
+  cityRenderer.clearChunks();
+  void rebuildGeometry().catch((err) => console.error(`${MODULE_ID} | rebuild failed`, err));
 
   // PrimaryCanvasGroup orders children by elevation, then sortLayer/sort/zIndex.
   // Same comparator in v12 and v14, so this placement is generation-stable.
@@ -182,11 +204,16 @@ export function unmount(): void {
     canvas.app?.ticker?.remove(tickerCallback);
     tickerCallback = null;
   }
+  workerClient?.terminate();
+  workerClient = null;
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
   cityRenderer.destroy();
   cityRenderer = null;
   currentCity = null;
   currentBounds = null;
+  // Discards builds still in flight, which would otherwise refill `chunks` after the clear.
+  buildEpoch++;
+  chunkSetComplete = false;
   chunks.clear();
   history.clear();
 
@@ -224,12 +251,16 @@ async function apply(next: CityParams, dirtyM: Rect | null = null): Promise<Rebu
   const previousBounds = currentBounds;
   currentCity = next;
   currentBounds = cityBounds(next, BOUNDS_MARGIN_M);
+  buildEpoch++;
   await saveCityState(next);
-  const incremental = dirtyM !== null && sameRect(previousBounds, currentBounds);
-  const result = incremental ? rebuildDirty(dirtyM) : rebuildAll();
+  // WHY: an incremental pass only touches chunks already in the set, so it cannot fill the
+  // holes a superseded full rebuild left behind.
+  const incremental =
+    chunkSetComplete && dirtyM !== null && sameRect(previousBounds, currentBounds);
+  // Ahead of the rebuild: the overlay draws from the params, which are already current.
   cityListener?.();
   scheduleWallSync();
-  return result;
+  return incremental ? rebuildDirty(dirtyM) : rebuildAll();
 }
 
 function scheduleWallSync(): void {
@@ -460,12 +491,105 @@ function junctionRect(graph: RoadGraph, nodeId: string, toM: Vec2): Rect | null 
   return ringBounds(points);
 }
 
-function chunkGeometry(city: CityParams, build: ChunkBuild, ppm: number): ChunkGeometry {
+function chunkGeometry(city: CityParams, build: ChunkRecord, ppm: number): ChunkGeometry {
   return {
     id: build.id,
     mesh: build.mesh,
     boundsPx: rectToPixels(build.boundsM, city.origin, ppm)
   };
+}
+
+function ensureWorker(): WorkerClient | null {
+  if (workerClient !== null || workerUnavailable) return workerClient;
+  try {
+    workerClient = new WorkerClient();
+  } catch (err) {
+    workerUnavailable = true;
+    noteWorkerFailure(err);
+  }
+  return workerClient;
+}
+
+/** WHY: a broken worker fails once per chunk — ~70 identical lines say nothing the first did not. */
+function noteWorkerFailure(err: unknown): void {
+  if (workerWarned) return;
+  workerWarned = true;
+  console.warn(`${MODULE_ID} | generation worker unusable, falling back to the main thread`, err);
+}
+
+function chunkRecord(result: BuildChunkResult): ChunkRecord {
+  return {
+    id: result.chunkId,
+    mesh: {
+      vertices: result.vertices,
+      indices: result.indices,
+      vertexCount: result.vertexCount,
+      triangleCount: result.triangleCount
+    },
+    boundsM: result.boundsM,
+    buildingCount: result.buildingCount
+  };
+}
+
+/** Never rejects on the worker's account: a failed request is retried here, synchronously. */
+async function buildOne(
+  client: WorkerClient | null,
+  city: CityParams,
+  key: ChunkKey,
+  bounds: Rect,
+  ppm: number
+): Promise<{ record: ChunkRecord; fellBack: boolean }> {
+  if (client !== null) {
+    try {
+      const result = await client.buildChunk({
+        params: city,
+        key,
+        cityBoundsM: bounds,
+        pixelsPerMetre: ppm
+      });
+      return { record: chunkRecord(result), fellBack: false };
+    } catch (err) {
+      noteWorkerFailure(err);
+    }
+  }
+  return { record: buildChunk(city, key, bounds, ppm), fellBack: client !== null };
+}
+
+function buildSource(client: WorkerClient | null, fallbacks: number): string {
+  if (client === null) return "main thread";
+  return fallbacks === 0 ? "worker" : `worker (${fallbacks} on main thread)`;
+}
+
+/** Issue every chunk at once and push each to the renderer as it lands. */
+async function runBuilds(
+  city: CityParams,
+  keys: ChunkKey[],
+  bounds: Rect,
+  ppm: number,
+  epoch: number,
+  full: boolean,
+  started: number
+): Promise<RebuildResult> {
+  const client = ensureWorker();
+  let rebuilt = 0;
+  let fallbacks = 0;
+
+  await Promise.all(
+    keys.map(async (key) => {
+      const outcome = await buildOne(client, city, key, bounds, ppm);
+      if (outcome.fellBack) fallbacks++;
+      // WHY: the params moved on while this was in flight. Dropping it is what keeps a slow
+      // chunk of an old graph from landing on top of a newer one.
+      if (epoch !== buildEpoch) return;
+      chunks.set(outcome.record.id, outcome.record);
+      cityRenderer?.setChunk(chunkGeometry(city, outcome.record, ppm));
+      rebuilt++;
+    })
+  );
+
+  const stale = epoch !== buildEpoch;
+  if (full && !stale) chunkSetComplete = true;
+  return report(full, rebuilt, started, buildSource(client, fallbacks), stale);
 }
 
 function totalBuildings(): number {
@@ -474,42 +598,53 @@ function totalBuildings(): number {
   return count;
 }
 
-function report(full: boolean, rebuilt: number, started: number): RebuildResult {
+function report(
+  full: boolean,
+  rebuilt: number,
+  started: number,
+  source: string,
+  stale: boolean
+): RebuildResult {
   const ms = performance.now() - started;
   const buildings = totalBuildings();
   console.log(
     `${MODULE_ID} | ${full ? "FULL" : "INCREMENTAL"} rebuild — regenerated ${rebuilt} of ` +
-      `${chunks.size} chunks in ${ms.toFixed(1)}ms (${buildings} buildings)`
+      `${chunks.size} chunks in ${ms.toFixed(1)}ms (${buildings} buildings) via ${source}` +
+      (stale ? " — superseded" : "")
   );
   return { full, chunks: rebuilt, buildings, ms };
 }
 
-function rebuildAll(): RebuildResult {
+async function rebuildAll(): Promise<RebuildResult> {
   const city = requireCity();
   const bounds = currentBounds;
   const started = performance.now();
+  const epoch = buildEpoch;
   const ppm = pixelsPerMetre();
-  const geometry: ChunkGeometry[] = [];
+  const keys = bounds === null ? [] : cityChunks(bounds);
 
-  chunks.clear();
-  if (bounds !== null) {
-    for (const key of cityChunks(bounds)) {
-      const build = buildChunk(city, key, bounds, ppm);
-      chunks.set(build.id, build);
-      geometry.push(chunkGeometry(city, build, ppm));
-    }
+  chunkSetComplete = false;
+  // Overwriting the surviving chunks is not enough — one the city no longer covers would
+  // otherwise stay on screen for ever.
+  const live = new Set(keys.map(chunkId));
+  for (const id of [...chunks.keys()]) {
+    if (live.has(id)) continue;
+    chunks.delete(id);
+    cityRenderer?.removeChunk(id);
   }
-  cityRenderer?.setChunks(geometry);
-  return report(true, geometry.length, started);
+
+  if (bounds === null) return report(true, 0, started, "main thread", false);
+  return runBuilds(city, keys, bounds, ppm, epoch, true, started);
 }
 
 /** Regenerate only the chunks a disturbed metre-space rect can reach. */
-function rebuildDirty(dirtyM: Rect): RebuildResult {
+async function rebuildDirty(dirtyM: Rect): Promise<RebuildResult> {
   const city = requireCity();
   const bounds = currentBounds;
   if (bounds === null) return rebuildAll();
 
   const started = performance.now();
+  const epoch = buildEpoch;
   const ppm = pixelsPerMetre();
   const margin = chunkMarginM(city);
   const grown: Rect = {
@@ -519,21 +654,14 @@ function rebuildDirty(dirtyM: Rect): RebuildResult {
     height: dirtyM.height + margin * 2
   };
 
-  let rebuilt = 0;
-  for (const key of chunksCovering(grown)) {
-    // The bounds are unchanged on this path, so the live set is already the whole city
-    // grid — a key outside it is off the city, not a chunk waiting to be made.
-    if (!chunks.has(chunkId(key))) continue;
-    const build = buildChunk(city, key, bounds, ppm);
-    chunks.set(build.id, build);
-    cityRenderer?.setChunk(chunkGeometry(city, build, ppm));
-    rebuilt++;
-  }
-  return report(false, rebuilt, started);
+  // The bounds are unchanged on this path, so the live set is already the whole city
+  // grid — a key outside it is off the city, not a chunk waiting to be made.
+  const keys = chunksCovering(grown).filter((key) => chunks.has(chunkId(key)));
+  return runBuilds(city, keys, bounds, ppm, epoch, false, started);
 }
 
 /** Rebuild every chunk from the in-memory params and push them to the renderer. */
-export function rebuildGeometry(): RebuildResult {
+export function rebuildGeometry(): Promise<RebuildResult> {
   return rebuildAll();
 }
 
@@ -597,6 +725,7 @@ export function stats(): Record<string, unknown> | null {
     edges: currentCity?.graph.edges.length ?? 0,
     zones: currentCity?.zones.length ?? 0,
     undoDepth: history.depth,
+    worker: workerClient !== null,
     autoWalls,
     generatedWalls: generatedWallIds().length
   };

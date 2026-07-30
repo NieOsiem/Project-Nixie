@@ -5,14 +5,43 @@
  * dispatcher stays testable under plain node.
  */
 
+import { buildChunk } from "../core/gen/chunked.js";
+import type { ChunkKey } from "../core/gen/chunks.js";
+import type { CityParams } from "../core/gen/demo-city.js";
+import type { Rect } from "../core/geom/types.js";
+
 export interface PingRequest {
   id: number;
   type: "ping";
   payload: unknown;
 }
 
+export interface BuildChunkRequest {
+  id: number;
+  type: "buildChunk";
+  params: CityParams;
+  key: ChunkKey;
+  cityBoundsM: Rect;
+  pixelsPerMetre: number;
+}
+
 /** Extend by adding an interface with its own `type` literal and unioning it here. */
-export type WorkerRequest = PingRequest;
+export type WorkerRequest = PingRequest | BuildChunkRequest;
+
+/**
+ * The renderer's slice of `ChunkBuild`. `surfaces` and `buildings` are deliberately dropped:
+ * they are large and only the whole-city wall pass consumes them.
+ */
+export interface BuildChunkResult {
+  key: ChunkKey;
+  chunkId: string;
+  vertices: Float32Array;
+  indices: Uint32Array;
+  vertexCount: number;
+  triangleCount: number;
+  boundsM: Rect;
+  buildingCount: number;
+}
 
 export interface WorkerSuccess {
   id: number;
@@ -39,6 +68,31 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
     switch (request.type) {
       case "ping":
         return { id: request.id, ok: true, result: request.payload };
+      case "buildChunk": {
+        const build = buildChunk(
+          request.params,
+          request.key,
+          request.cityBoundsM,
+          request.pixelsPerMetre
+        );
+        const result: BuildChunkResult = {
+          key: build.key,
+          chunkId: build.id,
+          vertices: build.mesh.vertices,
+          indices: build.mesh.indices,
+          vertexCount: build.mesh.vertexCount,
+          triangleCount: build.mesh.triangleCount,
+          boundsM: build.boundsM,
+          buildingCount: build.buildingCount
+        };
+        return {
+          id: request.id,
+          ok: true,
+          result,
+          // WHY: TypedArray.buffer widens to ArrayBufferLike; SharedArrayBuffer is unavailable here.
+          transfer: [result.vertices.buffer as ArrayBuffer, result.indices.buffer as ArrayBuffer]
+        };
+      }
       default:
         throw new Error(`unknown request type: ${String((request as WorkerRequest).type)}`);
     }

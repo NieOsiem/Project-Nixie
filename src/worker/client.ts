@@ -1,5 +1,10 @@
 import { MODULE_ID } from "../constants.js";
-import type { WorkerRequest, WorkerResponse } from "./protocol.js";
+import type {
+  BuildChunkRequest,
+  BuildChunkResult,
+  WorkerRequest,
+  WorkerResponse
+} from "./protocol.js";
 
 /** A request with the id stripped — `WorkerClient` assigns it. Distributes over the union. */
 export type RequestBody<T extends WorkerRequest = WorkerRequest> = T extends T
@@ -47,6 +52,10 @@ export class WorkerClient {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  buildChunk(body: Omit<BuildChunkRequest, "id" | "type">): Promise<BuildChunkResult> {
+    return this.request({ ...body, type: "buildChunk" }) as Promise<BuildChunkResult>;
   }
 
   terminate(): void {
