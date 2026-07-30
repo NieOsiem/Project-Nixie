@@ -1,8 +1,4 @@
-import {
-  ATTRIBUTE_OFFSETS,
-  VERTEX_STRIDE_BYTES,
-  type MeshBuffers
-} from "../core/geom/extrude.js";
+import { ATTRIBUTE_OFFSETS, VERTEX_STRIDE_BYTES, type MeshBuffers } from "../core/geom/mesh.js";
 import { EMISSIVE_MAX, PALETTE_ROWS, PALETTE_SIZE } from "../core/palette.js";
 import { CITY_FRAG, CITY_VERT } from "./shaders/city.js";
 

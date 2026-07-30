@@ -56,7 +56,10 @@ export const MATERIAL = {
   ROOF_WARM: 2,
   WALL_MAGENTA: 3,
   WALL_TEAL: 4,
-  ROOF_ACCENT: 5
+  ROOF_ACCENT: 5,
+  GROUND: 6,
+  ROAD: 7,
+  SIDEWALK: 8
 } as const;
 
 export const DEFAULT_MATERIALS: Material[] = [
@@ -65,5 +68,8 @@ export const DEFAULT_MATERIALS: Material[] = [
   { base: rgb(0.145, 0.105, 0.11), emissive: rgb(0, 0, 0), emissiveStrength: 0 },
   { base: rgb(0.205, 0.115, 0.175), emissive: rgb(1, 0.38, 0.56), emissiveStrength: 0.38 },
   { base: rgb(0.1, 0.16, 0.2), emissive: rgb(0.28, 0.86, 1), emissiveStrength: 0.3 },
-  { base: rgb(0.19, 0.135, 0.1), emissive: rgb(1, 0.64, 0.32), emissiveStrength: 0.52 }
+  { base: rgb(0.19, 0.135, 0.1), emissive: rgb(1, 0.64, 0.32), emissiveStrength: 0.52 },
+  { base: rgb(0.055, 0.048, 0.07), emissive: rgb(0, 0, 0), emissiveStrength: 0 },
+  { base: rgb(0.035, 0.032, 0.045), emissive: rgb(0.3, 0.16, 0.34), emissiveStrength: 0.06 },
+  { base: rgb(0.115, 0.1, 0.115), emissive: rgb(0.9, 0.55, 0.4), emissiveStrength: 0.07 }
 ];

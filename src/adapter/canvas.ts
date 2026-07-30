@@ -1,6 +1,11 @@
 import type { CameraState } from "../core/camera.js";
-import { demoLayout } from "../core/gen/demo-layout.js";
-import { extrudeBuilding, mergeMeshes, type MeshBuffers } from "../core/geom/extrude.js";
+import {
+  buildCity,
+  demoGraph,
+  graphBounds,
+  lotOptionsFromMetres,
+  type CityBuild
+} from "../core/gen/demo-city.js";
 import { DEFAULT_MATERIALS, packPalette } from "../core/palette.js";
 import { CityRenderer } from "../render/city-renderer.js";
 
@@ -13,6 +18,7 @@ const DEFAULT_CAMERA_HEIGHT_M = 900;
 
 let cityRenderer: CityRenderer | null = null;
 let tickerCallback: (() => void) | null = null;
+let lastBuild: CityBuild | null = null;
 
 function readCamera(): CameraState {
   return {
@@ -32,13 +38,15 @@ function pixelsPerMetre(): number {
   return d.size / distance;
 }
 
-function buildDemoGeometry(): MeshBuffers {
+function buildDemoCity(): CityBuild {
   const d = canvas.dimensions;
   const origin = {
     x: d.sceneRect.x + d.sceneRect.width / 2,
     y: d.sceneRect.y + d.sceneRect.height / 2
   };
-  return mergeMeshes(demoLayout(origin, d.size).map(extrudeBuilding));
+  const ppm = pixelsPerMetre();
+  const graph = demoGraph(origin, d.size);
+  return buildCity(graph, graphBounds(graph, 10 * d.size), ppm, lotOptionsFromMetres(ppm));
 }
 
 export function isEnabledForScene(): boolean {
@@ -49,11 +57,19 @@ export function mount(): void {
   if (cityRenderer !== null) return;
   if (!canvas?.ready || !canvas.app?.renderer || !canvas.primary) return;
 
+  const started = performance.now();
+  lastBuild = buildDemoCity();
+  const generateMS = performance.now() - started;
+
   cityRenderer = new CityRenderer(
     canvas.app.renderer,
-    buildDemoGeometry(),
+    lastBuild.mesh,
     packPalette(DEFAULT_MATERIALS),
     { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: DEFAULT_CAMERA_HEIGHT_M }
+  );
+  console.log(
+    `${MODULE_ID} | generated ${lastBuild.buildingCount} buildings in ${lastBuild.blockCount} blocks ` +
+      `(${lastBuild.mesh.triangleCount} tris) in ${generateMS.toFixed(1)}ms`
   );
 
   // PrimaryCanvasGroup orders children by elevation, then sortLayer/sort/zIndex.
@@ -82,6 +98,7 @@ export function unmount(): void {
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
   cityRenderer.destroy();
   cityRenderer = null;
+  lastBuild = null;
 
   console.log(`${MODULE_ID} | unmounted`);
 }
@@ -94,7 +111,12 @@ export async function setSceneEnabled(enabled: boolean): Promise<void> {
 }
 
 export function stats(): Record<string, unknown> | null {
-  return cityRenderer?.stats() ?? null;
+  if (cityRenderer === null) return null;
+  return {
+    ...cityRenderer.stats(),
+    buildings: lastBuild?.buildingCount ?? 0,
+    blocks: lastBuild?.blockCount ?? 0
+  };
 }
 
 export function getRenderer(): CityRenderer | null {

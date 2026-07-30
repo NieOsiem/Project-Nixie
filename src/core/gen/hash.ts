@@ -1,0 +1,17 @@
+/**
+ * Deterministic scalar hash in [0, 1). Stands in for a seeded RNG until S4 introduces
+ * one — same input always gives the same city, on every client, forever.
+ */
+export function hash2(x: number, y: number): number {
+  let h = Math.imul((x | 0) ^ 0x9e3779b9, 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13) ^ (y | 0), 0xc2b2ae35);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+/** Deterministic pick from a list. */
+export function hashPick<T>(items: readonly T[], x: number, y: number, salt = 0): T {
+  if (items.length === 0) throw new Error("hashPick needs a non-empty list.");
+  const index = Math.min(items.length - 1, Math.floor(hash2(x + salt * 7919, y - salt * 104729) * items.length));
+  return items[index]!;
+}

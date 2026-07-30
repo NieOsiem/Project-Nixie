@@ -5,7 +5,7 @@ import {
   visibleWorldRect,
   type CameraState
 } from "../core/camera.js";
-import type { MeshBuffers } from "../core/geom/extrude.js";
+import type { MeshBuffers } from "../core/geom/mesh.js";
 import { CityMesh } from "./city-mesh.js";
 
 export interface CityRendererOptions {

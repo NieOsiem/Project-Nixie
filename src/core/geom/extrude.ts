@@ -1,52 +1,29 @@
-export interface Vec2 {
-  x: number;
-  y: number;
-}
-
-/** Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1). */
-export const VERTEX_FLOATS = 5;
-export const VERTEX_STRIDE_BYTES = VERTEX_FLOATS * 4;
-export const ATTRIBUTE_OFFSETS = { pos: 0, height: 8, material: 12, shade: 16 } as const;
+import { MeshBuilder, type MeshBuffers } from "./mesh.js";
+import { triangulate } from "./tessellate.js";
+import { ringArea, type Ring, type Vec2 } from "./types.js";
 
 export interface BuildingSpec {
-  /** Convex footprint in world pixels. Winding is normalised internally. */
-  footprint: Vec2[];
+  /** Footprint in world pixels. Winding is normalised internally. */
+  footprint: Ring;
   /** Height in metres. Stays in metres so geometry survives a grid-size change. */
   height: number;
   roofMaterial: number;
   wallMaterial: number;
 }
 
-export interface MeshBuffers {
-  vertices: Float32Array;
-  indices: Uint32Array;
-  vertexCount: number;
-  triangleCount: number;
-}
-
 /** Direction the key light arrives from, in world space (y grows downward). */
 const LIGHT_DIRECTION: Vec2 = { x: -0.5547, y: -0.8321 };
-const SHADE_MIN = 0.32;
-const SHADE_MAX = 1;
-const ROOF_SHADE = 1;
-
-export function signedArea(poly: Vec2[]): number {
-  let sum = 0;
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i]!;
-    const b = poly[(i + 1) % poly.length]!;
-    sum += a.x * b.y - b.x * a.y;
-  }
-  return sum / 2;
-}
+export const SHADE_MIN = 0.32;
+export const SHADE_MAX = 1;
+export const ROOF_SHADE = 1;
 
 /**
- * Normalise winding so `signedArea` is positive, which makes (dy, -dx) the outward
- * edge normal. Avoids reasoning about clockwise-ness in a y-down coordinate system,
- * where the visual and mathematical senses are opposite.
+ * Normalise winding so `ringArea` is positive, which makes (dy, -dx) the outward edge
+ * normal. Avoids reasoning about clockwise-ness in a y-down coordinate system, where
+ * the visual and mathematical senses are opposite.
  */
-export function withPositiveArea(poly: Vec2[]): Vec2[] {
-  return signedArea(poly) < 0 ? [...poly].reverse() : poly;
+export function withPositiveArea(ring: Ring): Ring {
+  return ringArea(ring) < 0 ? [...ring].reverse() : ring;
 }
 
 /** Lambert-ish shade for a wall, from the outward normal of one footprint edge. */
@@ -67,31 +44,19 @@ export function extrudeBuilding(spec: BuildingSpec): MeshBuffers {
   const n = poly.length;
   if (n < 3) throw new Error(`Footprint needs at least 3 points, got ${n}.`);
 
-  const vertexCount = n * 5;
-  const triangleCount = n * 3 - 2;
-  const vertices = new Float32Array(vertexCount * VERTEX_FLOATS);
-  const indices = new Uint32Array(triangleCount * 3);
+  const builder = new MeshBuilder(n * 5, n * 3 - 2);
 
-  let v = 0;
-  const push = (p: Vec2, height: number, material: number, shade: number): number => {
-    const at = v * VERTEX_FLOATS;
-    vertices[at] = p.x;
-    vertices[at + 1] = p.y;
-    vertices[at + 2] = height;
-    vertices[at + 3] = material;
-    vertices[at + 4] = shade;
-    return v++;
-  };
-
-  // Roof cap, fan-triangulated. Convex only — S2 swaps in a general triangulator.
-  const roofStart = v;
-  for (let i = 0; i < n; i++) push(poly[i]!, spec.height, spec.roofMaterial, ROOF_SHADE);
-
-  let t = 0;
-  for (let i = 1; i < n - 1; i++) {
-    indices[t++] = roofStart;
-    indices[t++] = roofStart + i;
-    indices[t++] = roofStart + i + 1;
+  const roof = triangulate([poly]);
+  const roofBase = builder.vertexCount;
+  for (const p of roof.positions) {
+    builder.vertex(p.x, p.y, spec.height, spec.roofMaterial, ROOF_SHADE);
+  }
+  for (let i = 0; i < roof.indices.length; i += 3) {
+    builder.triangle(
+      roofBase + roof.indices[i]!,
+      roofBase + roof.indices[i + 1]!,
+      roofBase + roof.indices[i + 2]!
+    );
   }
 
   for (let i = 0; i < n; i++) {
@@ -99,38 +64,14 @@ export function extrudeBuilding(spec: BuildingSpec): MeshBuffers {
     const b = poly[(i + 1) % n]!;
     const shade = wallShade(a, b);
 
-    const base = push(a, 0, spec.wallMaterial, shade);
-    push(b, 0, spec.wallMaterial, shade);
-    push(b, spec.height, spec.wallMaterial, shade);
-    push(a, spec.height, spec.wallMaterial, shade);
+    const base = builder.vertex(a.x, a.y, 0, spec.wallMaterial, shade);
+    builder.vertex(b.x, b.y, 0, spec.wallMaterial, shade);
+    builder.vertex(b.x, b.y, spec.height, spec.wallMaterial, shade);
+    builder.vertex(a.x, a.y, spec.height, spec.wallMaterial, shade);
 
-    indices[t++] = base;
-    indices[t++] = base + 1;
-    indices[t++] = base + 2;
-    indices[t++] = base;
-    indices[t++] = base + 2;
-    indices[t++] = base + 3;
+    builder.triangle(base, base + 1, base + 2);
+    builder.triangle(base, base + 2, base + 3);
   }
 
-  return { vertices, indices, vertexCount, triangleCount };
-}
-
-export function mergeMeshes(parts: MeshBuffers[]): MeshBuffers {
-  const vertexCount = parts.reduce((sum, p) => sum + p.vertexCount, 0);
-  const triangleCount = parts.reduce((sum, p) => sum + p.triangleCount, 0);
-  const vertices = new Float32Array(vertexCount * VERTEX_FLOATS);
-  const indices = new Uint32Array(triangleCount * 3);
-
-  let vertexOffset = 0;
-  let indexOffset = 0;
-  for (const part of parts) {
-    vertices.set(part.vertices, vertexOffset * VERTEX_FLOATS);
-    for (let i = 0; i < part.indices.length; i++) {
-      indices[indexOffset + i] = part.indices[i]! + vertexOffset;
-    }
-    vertexOffset += part.vertexCount;
-    indexOffset += part.indices.length;
-  }
-
-  return { vertices, indices, vertexCount, triangleCount };
+  return builder.build();
 }
