@@ -29,8 +29,8 @@ const horizontal = (): RoadGraph => ({
   classes: CLASSES
 });
 
-const draw = (g: RoadGraph, from: [number, number], to: [number, number], snapPx = 1): RoadGraph =>
-  insertRoad(g, { x: from[0], y: from[1] }, { x: to[0], y: to[1] }, "street", { snapPx });
+const draw = (g: RoadGraph, from: [number, number], to: [number, number], snapM = 1): RoadGraph =>
+  insertRoad(g, { x: from[0], y: from[1] }, { x: to[0], y: to[1] }, "street", { snapM });
 
 describe("projectOnSegment", () => {
   it("clamps to the segment", () => {
@@ -171,7 +171,7 @@ describe("pruneOrphanNodes", () => {
 
 describe("moveNode", () => {
   it("drags a junction and takes its roads with it", () => {
-    const g = moveNode(horizontal(), "a", { x: -40, y: -30 }, { snapPx: 10 });
+    const g = moveNode(horizontal(), "a", { x: -40, y: -30 }, { snapM: 10 });
     expect(g.nodes.find((n) => n.id === "a")).toEqual({ id: "a", x: -40, y: -30 });
     expect(g.edges).toHaveLength(1);
   });
@@ -179,7 +179,7 @@ describe("moveNode", () => {
   it("welds onto the junction it is dropped on", () => {
     const crossed = draw(horizontal(), [50, -50], [50, 50]);
     const junction = crossed.nodes.find((n) => n.x === 50 && n.y === 0)!;
-    const g = moveNode(crossed, "a", { x: 50, y: 2 }, { snapPx: 10 });
+    const g = moveNode(crossed, "a", { x: 50, y: 2 }, { snapM: 10 });
 
     expect(g.nodes.some((n) => n.id === "a")).toBe(false);
     expect(g.edges.some((e) => e.a === "a" || e.b === "a")).toBe(false);
@@ -191,8 +191,8 @@ describe("moveNode", () => {
 
   it("is a no-op for an unknown node or an unmoved one", () => {
     const start = horizontal();
-    expect(moveNode(start, "nope", { x: 5, y: 5 }, { snapPx: 1 })).toBe(start);
-    expect(moveNode(start, "a", { x: 0, y: 0 }, { snapPx: 0 })).toBe(start);
+    expect(moveNode(start, "nope", { x: 5, y: 5 }, { snapM: 1 })).toBe(start);
+    expect(moveNode(start, "a", { x: 0, y: 0 }, { snapM: 0 })).toBe(start);
   });
 });
 

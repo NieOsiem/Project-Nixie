@@ -4,6 +4,8 @@ import {
   buildCity,
   cityBounds,
   demoCity,
+  metresToPixels,
+  pixelsToMetres,
   type CityBuild,
   type CityParams
 } from "../core/gen/demo-city.js";
@@ -17,6 +19,7 @@ import {
   nearestEdge,
   nearestNode,
   removeRoad,
+  snapToGraph,
   toggleSidewalks
 } from "../core/graph/edit.js";
 import type { RoadGraph, RoadNode } from "../core/graph/road-graph.js";
@@ -39,7 +42,8 @@ import {
 const DEFAULT_CAMERA_HEIGHT_M = 900;
 /** One metre of slack collapses junction-disc arcs without visibly moving a wall. */
 const WALL_TOLERANCE_M = 1;
-const BOUNDS_MARGIN_GRID = 10;
+/** Ten grid squares on the 2 m/square scene contract. Metres, so a regrid cannot move it. */
+const BOUNDS_MARGIN_M = 20;
 /**
  * Wall CRUD is a document round trip per edit, so a stroke-by-stroke rebuild makes
  * drawing feel like it stutters. Coalescing means one rebuild per pause instead.
@@ -76,10 +80,14 @@ function readCamera(): CameraState {
   };
 }
 
+/** Metres per grid square — the scene's own `distance`. */
+function gridMetres(): number {
+  const distance = canvas.dimensions.distance;
+  return distance > 0 ? distance : 1;
+}
+
 export function pixelsPerMetre(): number {
-  const d = canvas.dimensions;
-  const distance = d.distance > 0 ? d.distance : 1;
-  return d.size / distance;
+  return canvas.dimensions.size / gridMetres();
 }
 
 function sceneCentre(): Vec2 {
@@ -88,6 +96,20 @@ function sceneCentre(): Vec2 {
     x: d.sceneRect.x + d.sceneRect.width / 2,
     y: d.sceneRect.y + d.sceneRect.height / 2
   };
+}
+
+/** Where city metre coordinate (0, 0) sits, in scene world pixels. */
+function cityOrigin(): Vec2 {
+  return currentCity?.origin ?? sceneCentre();
+}
+
+/** World pixels in, city metres out. Every pointer coordinate crosses this on its way in. */
+export function worldToMetres(p: Vec2): Vec2 {
+  return pixelsToMetres(p, cityOrigin(), pixelsPerMetre());
+}
+
+export function metresToWorld(p: Vec2): Vec2 {
+  return metresToPixels(p, cityOrigin(), pixelsPerMetre());
 }
 
 function requireCity(): CityParams {
@@ -117,9 +139,9 @@ export function mount(): void {
 
   const stored = loadCityState();
   currentCity = stored
-    ? { graph: stored.graph, base: stored.base, zones: stored.zones }
-    : demoCity(sceneCentre(), canvas.dimensions.size);
-  currentBounds = cityBounds(currentCity, BOUNDS_MARGIN_GRID * canvas.dimensions.size);
+    ? { origin: stored.origin, graph: stored.graph, base: stored.base, zones: stored.zones }
+    : demoCity(sceneCentre());
+  currentBounds = cityBounds(currentCity, BOUNDS_MARGIN_M);
   history.clear();
 
   cityRenderer = new CityRenderer(
@@ -176,7 +198,7 @@ export async function setSceneEnabled(enabled: boolean): Promise<void> {
     return;
   }
   if (loadCityState() === null) {
-    await saveCityState(demoCity(sceneCentre(), canvas.dimensions.size));
+    await saveCityState(demoCity(sceneCentre()));
   }
   mount();
 }
@@ -193,7 +215,7 @@ async function commit(next: CityParams): Promise<CityBuild> {
 
 async function apply(next: CityParams): Promise<CityBuild> {
   currentCity = next;
-  currentBounds = cityBounds(next, BOUNDS_MARGIN_GRID * canvas.dimensions.size);
+  currentBounds = cityBounds(next, BOUNDS_MARGIN_M);
   await saveCityState(next);
   const build = rebuildGeometry();
   cityListener?.();
@@ -215,20 +237,17 @@ function scheduleWallSync(): void {
  * apart (vertices plus centres), so staying under that keeps a deliberately chosen
  * neighbouring point from being swallowed by the node next to it.
  */
-export function snapRadiusPx(): number {
-  return canvas.dimensions.size * 0.4;
+export function snapRadiusM(): number {
+  return gridMetres() * 0.4;
 }
 
 /** Erase should hit anywhere on a road, not just within a hair of its centreline. */
-function eraseReachPx(graph: RoadGraph): number {
-  const ppm = pixelsPerMetre();
-  const widest = graph.classes.reduce(
-    (max, c) => Math.max(max, (c.widthM / 2 + c.sidewalkM) * ppm),
-    0
-  );
-  return Math.max(snapRadiusPx(), widest);
+function eraseReachM(graph: RoadGraph): number {
+  const widest = graph.classes.reduce((max, c) => Math.max(max, c.widthM / 2 + c.sidewalkM), 0);
+  return Math.max(snapRadiusM(), widest);
 }
 
+/** Foundry's grid snap is a pixel-space call, so this stays pixels in, pixels out. */
 export function snapWorldPoint(p: Vec2): Vec2 {
   const modes = CONST.GRID_SNAPPING_MODES;
   const snapped = canvas.grid.getSnappedPoint(p, {
@@ -238,9 +257,19 @@ export function snapWorldPoint(p: Vec2): Vec2 {
   return { x: snapped.x, y: snapped.y };
 }
 
+/** Grid snap, then fuse to whatever road or junction is already within reach. */
+export function snapRoadPoint(p: Vec2): Vec2 {
+  const snapped = snapWorldPoint(p);
+  const city = currentCity;
+  if (city === null) return snapped;
+  return metresToWorld(snapToGraph(city.graph, worldToMetres(snapped), snapRadiusM()));
+}
+
 export async function drawRoad(from: Vec2, to: Vec2, classId: string): Promise<CityBuild | null> {
   const city = requireCity();
-  const graph = insertRoad(city.graph, from, to, classId, { snapPx: snapRadiusPx() });
+  const graph = insertRoad(city.graph, worldToMetres(from), worldToMetres(to), classId, {
+    snapM: snapRadiusM()
+  });
   if (graph === city.graph) return null;
   return commit({ ...city, graph });
 }
@@ -248,14 +277,15 @@ export async function drawRoad(from: Vec2, to: Vec2, classId: string): Promise<C
 /** Delete whatever the click landed on: a road first, else the zone underneath. */
 export async function eraseAt(p: Vec2): Promise<"road" | "zone" | null> {
   const city = requireCity();
+  const at = worldToMetres(p);
 
-  const edge = nearestEdge(city.graph, p, eraseReachPx(city.graph));
+  const edge = nearestEdge(city.graph, at, eraseReachM(city.graph));
   if (edge !== null) {
     await commit({ ...city, graph: removeRoad(city.graph, edge.id) });
     return "road";
   }
 
-  const zone = zoneAt(city.zones, p);
+  const zone = zoneAt(city.zones, at);
   if (zone !== null) {
     await commit({ ...city, zones: city.zones.filter((z) => z.id !== zone.id) });
     return "zone";
@@ -263,16 +293,16 @@ export async function eraseAt(p: Vec2): Promise<"road" | "zone" | null> {
   return null;
 }
 
-/** The junction under the cursor, for the edit tool's grab test. */
+/** The junction under the cursor, for the edit tool's grab test. Its position is metres. */
 export function junctionAt(p: Vec2): RoadNode | null {
   const city = currentCity;
-  return city === null ? null : nearestNode(city.graph, p, snapRadiusPx());
+  return city === null ? null : nearestNode(city.graph, worldToMetres(p), snapRadiusM());
 }
 
 /** Drag a junction somewhere else. Dropping it on another junction welds the two. */
 export async function moveJunction(nodeId: string, to: Vec2): Promise<CityBuild | null> {
   const city = requireCity();
-  const graph = moveNode(city.graph, nodeId, to, { snapPx: snapRadiusPx() });
+  const graph = moveNode(city.graph, nodeId, worldToMetres(to), { snapM: snapRadiusM() });
   if (graph === city.graph) return null;
   return commit({ ...city, graph });
 }
@@ -280,16 +310,23 @@ export async function moveJunction(nodeId: string, to: Vec2): Promise<CityBuild 
 /** Flip the pavement on the road under the cursor. */
 export async function toggleWalkwayAt(p: Vec2): Promise<boolean> {
   const city = requireCity();
-  const edge = nearestEdge(city.graph, p, eraseReachPx(city.graph));
+  const edge = nearestEdge(city.graph, worldToMetres(p), eraseReachM(city.graph));
   if (edge === null) return false;
   await commit({ ...city, graph: toggleSidewalks(city.graph, edge.id) });
   return true;
 }
 
+/** `rect` arrives in world pixels from the drag; the zone stores it in metres. */
 export async function createZone(rect: Rect, params?: Partial<ZoneParams>): Promise<Zone | null> {
   const city = requireCity();
-  const area = normalizeRect(rect);
-  const min = canvas.dimensions.size;
+  const topLeft = worldToMetres({ x: rect.x, y: rect.y });
+  const ppm = pixelsPerMetre();
+  const area = normalizeRect({
+    ...topLeft,
+    width: rect.width / ppm,
+    height: rect.height / ppm
+  });
+  const min = gridMetres();
   if (area.width < min || area.height < min) return null;
 
   const zone: Zone = {
@@ -305,7 +342,7 @@ export async function createZone(rect: Rect, params?: Partial<ZoneParams>): Prom
 
 export async function reseedZoneAt(p: Vec2): Promise<Zone | null> {
   const city = requireCity();
-  const zone = zoneAt(city.zones, p);
+  const zone = zoneAt(city.zones, worldToMetres(p));
   if (zone === null) return null;
   const reseeded: Zone = { ...zone, seed: randomSeed() };
   await commit({
@@ -413,7 +450,7 @@ export async function removeEdge(edgeId: string): Promise<CityBuild> {
 }
 
 export async function resetCity(): Promise<CityBuild> {
-  return commit(demoCity(sceneCentre(), canvas.dimensions.size));
+  return commit(demoCity(sceneCentre()));
 }
 
 export function getCity(): CityParams | null {

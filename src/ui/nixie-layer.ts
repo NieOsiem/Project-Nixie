@@ -5,16 +5,16 @@ import {
   getCity,
   isMounted,
   junctionAt,
+  metresToWorld,
   moveJunction,
   pixelsPerMetre,
   reseedZoneAt,
   setCityListener,
-  snapRadiusPx,
+  snapRoadPoint,
   snapWorldPoint,
   toggleWalkwayAt
 } from "../adapter/canvas.js";
 import type { Vec2 } from "../core/geom/types.js";
-import { snapToGraph } from "../core/graph/edit.js";
 import { classMap, incidentEdges, nodeMap } from "../core/graph/road-graph.js";
 
 /** Must match the key this layer is registered under in `CONFIG.Canvas.layers`. */
@@ -34,6 +34,7 @@ const COLOR_NODE = 0xffc94a;
 const COLOR_ZONE = 0xff5c9d;
 const COLOR_PREVIEW = 0x74ffa8;
 
+/** Points are world pixels throughout — the adapter converts to metres at the core boundary. */
 type Drag =
   | { kind: "road"; classId: string; origin: Vec2; current: Vec2 }
   | { kind: "node"; nodeId: string; origin: Vec2; current: Vec2 }
@@ -132,17 +133,21 @@ export function nixieLayerClass(): any {
       const nodes = nodeMap(city.graph);
       const classes = classMap(city.graph);
 
+      // Params are metres; PIXI draws in world pixels.
       for (const zone of city.zones) {
+        const at = metresToWorld({ x: zone.rect.x, y: zone.rect.y });
         g.lineStyle({ width: grid * 0.06, color: COLOR_ZONE, alpha: 0.85 });
         g.beginFill(COLOR_ZONE, 0.05);
-        g.drawRect(zone.rect.x, zone.rect.y, zone.rect.width, zone.rect.height);
+        g.drawRect(at.x, at.y, zone.rect.width * ppm, zone.rect.height * ppm);
         g.endFill();
       }
 
       for (const edge of city.graph.edges) {
-        const a = nodes.get(edge.a);
-        const b = nodes.get(edge.b);
-        if (!a || !b) continue;
+        const from = nodes.get(edge.a);
+        const to = nodes.get(edge.b);
+        if (!from || !to) continue;
+        const a = metresToWorld(from);
+        const b = metresToWorld(to);
         const roadClass = classes.get(edge.classId);
         const widthM = roadClass?.widthM ?? 6;
         const sidewalkM = edge.sidewalks === false ? 0 : (roadClass?.sidewalkM ?? 0);
@@ -165,7 +170,10 @@ export function nixieLayerClass(): any {
       const handle = game.activeTool === TOOL.EDIT ? grid * 0.14 : grid * 0.09;
       g.lineStyle(0);
       g.beginFill(COLOR_NODE, 0.95);
-      for (const node of city.graph.nodes) g.drawCircle(node.x, node.y, handle);
+      for (const node of city.graph.nodes) {
+        const at = metresToWorld(node);
+        g.drawCircle(at.x, at.y, handle);
+      }
       g.endFill();
     }
 
@@ -197,7 +205,8 @@ export function nixieLayerClass(): any {
           for (const edge of incidentEdges(city.graph, drag.nodeId)) {
             const other = nodes.get(edge.a === drag.nodeId ? edge.b : edge.a);
             if (!other) continue;
-            g.moveTo(other.x, other.y);
+            const at = metresToWorld(other);
+            g.moveTo(at.x, at.y);
             g.lineTo(drag.current.x, drag.current.y);
           }
         }
@@ -222,13 +231,6 @@ export function nixieLayerClass(): any {
       g.endFill();
     }
 
-    /** Grid snap, then fuse to whatever road or junction is already within reach. */
-    #snapRoadPoint(p: Vec2): Vec2 {
-      const snapped = snapWorldPoint(p);
-      const city = getCity();
-      return city === null ? snapped : snapToGraph(city.graph, snapped, snapRadiusPx());
-    }
-
     #pointer(event: any): Vec2 {
       const p = event.getLocalPosition(canvas.stage);
       return { x: p.x, y: p.y };
@@ -250,10 +252,10 @@ export function nixieLayerClass(): any {
       } else if (tool === TOOL.EDIT) {
         const node = junctionAt(point);
         if (node === null) return;
-        const at = { x: node.x, y: node.y };
+        const at = metresToWorld(node);
         this.#drag = { kind: "node", nodeId: node.id, origin: at, current: at };
       } else if (classId !== null) {
-        const snapped = this.#snapRoadPoint(point);
+        const snapped = snapRoadPoint(point);
         this.#drag = { kind: "road", classId, origin: snapped, current: snapped };
       } else {
         return;
@@ -267,7 +269,7 @@ export function nixieLayerClass(): any {
       const point = this.#pointer(event);
       // A dragged junction snaps to the grid only. Snapping it to the graph would pin it
       // to its own incident roads and it would never move.
-      drag.current = drag.kind === "road" ? this.#snapRoadPoint(point) : snapWorldPoint(point);
+      drag.current = drag.kind === "road" ? snapRoadPoint(point) : snapWorldPoint(point);
       this.#refreshPreview();
     }
 
@@ -295,7 +297,7 @@ export function nixieLayerClass(): any {
         report("junction move", moveJunction(drag.nodeId, snapWorldPoint(point)));
         return;
       }
-      report("road draw", drawRoad(drag.origin, this.#snapRoadPoint(point), drag.classId));
+      report("road draw", drawRoad(drag.origin, snapRoadPoint(point), drag.classId));
     }
 
     _onDragLeftCancel(): void {

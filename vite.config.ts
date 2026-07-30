@@ -9,9 +9,12 @@ export default defineConfig({
     sourcemap: true,
     minify: false,
     lib: {
-      entry: "src/main.ts",
+      entry: {
+        "project-nixie": "src/main.ts",
+        "nixie-worker": "src/worker/nixie-worker.ts"
+      },
       formats: ["es"],
-      fileName: () => "project-nixie.mjs"
+      fileName: (_format, entryName) => `${entryName}.mjs`
     },
     // WHY: the module lives on a CIFS share, which delivers no inotify events.
     // Watch mode has to poll or it silently never rebuilds.

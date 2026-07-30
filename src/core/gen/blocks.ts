@@ -33,6 +33,20 @@ export interface LotRegion {
   clip: MultiPolygon | null;
 }
 
+/**
+ * The absolute city frame lot identity is hashed in, so height and material survive a
+ * scene regrid.
+ *
+ * WHY: this is deliberately not `LotOptions.originPx`, which is the per-region lot-grid
+ * anchor — a zone's own corner. Hashing against that would reshuffle a zone's buildings
+ * whenever the zone moved or resized. Every region must hash in one shared frame.
+ */
+export interface HashFrame {
+  /** World-pixel point at which city metre coordinate (0, 0) sits. */
+  originPx: Vec2;
+  pixelsPerMetre: number;
+}
+
 const WALL_MATERIALS = [MATERIAL.WALL_VIOLET, MATERIAL.WALL_MAGENTA, MATERIAL.WALL_TEAL] as const;
 const ROOF_MATERIALS = [MATERIAL.ROOF_DARK, MATERIAL.ROOF_WARM, MATERIAL.ROOF_ACCENT] as const;
 
@@ -80,7 +94,11 @@ export function subdivideBlock(block: Polygon, options: LotOptions): Polygon[] {
   return lots;
 }
 
-export function buildingsForBlocks(blocks: MultiPolygon, regions: LotRegion[]): BuildingSpec[] {
+export function buildingsForBlocks(
+  blocks: MultiPolygon,
+  regions: LotRegion[],
+  frame: HashFrame
+): BuildingSpec[] {
   const specs: BuildingSpec[] = [];
   for (const region of regions) {
     const area = region.clip === null ? blocks : intersection(blocks, region.clip);
@@ -90,8 +108,10 @@ export function buildingsForBlocks(blocks: MultiPolygon, regions: LotRegion[]): 
       for (const lot of subdivideBlock(block, options)) {
         const ring = lot[0]!;
         const centre = ringCentroid(ring);
-        const cx = Math.round(centre.x);
-        const cy = Math.round(centre.y);
+        // Decimetres in absolute city metres. Metres alone would collide two slivers on
+        // one key; float noise here is ~1e-11 m, so the rounding is exact.
+        const cx = Math.round(((centre.x - frame.originPx.x) / frame.pixelsPerMetre) * 10);
+        const cy = Math.round(((centre.y - frame.originPx.y) / frame.pixelsPerMetre) * 10);
         const t = hash2(cx, cy, seed);
 
         specs.push({

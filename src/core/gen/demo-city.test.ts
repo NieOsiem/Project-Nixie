@@ -9,19 +9,24 @@ import { lotRegions } from "./zones.js";
 import {
   buildCity,
   cityBounds,
+  cityToPixels,
   demoCity,
   demoGraph,
   graphBounds,
+  rectToPixels,
   ROAD_CLASSES,
-  withRoadClasses
+  withRoadClasses,
+  type CityParams
 } from "./demo-city.js";
 
+/** Scene world-pixel point at which city metre (0, 0) sits. */
 const ORIGIN = { x: 5000, y: 4000 };
-const GRID = 50;
-const PPM = GRID / 2;
+const PPM = 25;
+/** Ten grid squares at the 2 m/square scene contract. */
+const MARGIN_M = 20;
 
 describe("demoGraph", () => {
-  const graph = demoGraph(ORIGIN, GRID);
+  const graph = demoGraph();
 
   it("is structurally valid", () => {
     expect(validateGraph(graph)).toEqual([]);
@@ -36,31 +41,31 @@ describe("demoGraph", () => {
     expect(nodeDegree(graph, "D")).toBe(4);
   });
 
-  it("places nodes relative to the origin in grid units", () => {
+  it("places nodes in metres relative to the city origin", () => {
     const e = graph.nodes.find((n) => n.id === "E");
-    expect(e).toEqual({ id: "E", x: ORIGIN.x, y: ORIGIN.y });
+    expect(e).toEqual({ id: "E", x: 0, y: 0 });
     const c = graph.nodes.find((n) => n.id === "C");
-    expect(c).toEqual({ id: "C", x: ORIGIN.x + 40 * GRID, y: ORIGIN.y - 26 * GRID });
+    expect(c).toEqual({ id: "C", x: 80, y: -52 });
   });
 });
 
 describe("graphBounds", () => {
   it("wraps every node with the requested margin", () => {
-    const graph = demoGraph(ORIGIN, GRID);
-    const b = graphBounds(graph, 10 * GRID);
+    const graph = demoGraph();
+    const b = graphBounds(graph, MARGIN_M);
     for (const n of graph.nodes) {
       expect(n.x).toBeGreaterThanOrEqual(b.x);
       expect(n.x).toBeLessThanOrEqual(b.x + b.width);
       expect(n.y).toBeGreaterThanOrEqual(b.y);
       expect(n.y).toBeLessThanOrEqual(b.y + b.height);
     }
-    expect(b.width).toBe(80 * GRID + 20 * GRID);
+    expect(b.width).toBe(160 + MARGIN_M * 2);
   });
 });
 
 describe("cityBounds", () => {
   it("grows to cover zones as well as roads", () => {
-    const city = demoCity(ORIGIN, GRID);
+    const city = demoCity(ORIGIN);
     const roadsOnly = cityBounds(city, 0)!;
     const far = { x: roadsOnly.x + roadsOnly.width + 1000, y: roadsOnly.y, width: 500, height: 500 };
     const withZone = cityBounds({ ...city, zones: [{ ...city.base, id: "z1", rect: far }] }, 0)!;
@@ -68,14 +73,15 @@ describe("cityBounds", () => {
   });
 
   it("is null for a city with nothing in it", () => {
-    expect(cityBounds({ graph: { nodes: [], edges: [], classes: [] }, base: demoCity(ORIGIN, GRID).base, zones: [] }, 10)).toBeNull();
+    expect(cityBounds({ origin: ORIGIN, graph: { nodes: [], edges: [], classes: [] }, base: demoCity(ORIGIN).base, zones: [] }, 10)).toBeNull();
   });
 });
 
 describe("buildCity", () => {
-  const city = demoCity(ORIGIN, GRID);
-  const bounds = graphBounds(city.graph, 10 * GRID);
-  const build = buildCity(city, bounds, PPM);
+  const city = demoCity(ORIGIN);
+  const boundsM = graphBounds(city.graph, MARGIN_M);
+  const bounds = rectToPixels(boundsM, ORIGIN, PPM);
+  const build = buildCity(city, boundsM, PPM);
 
   it("produces blocks and buildings", () => {
     expect(build.blockCount).toBeGreaterThan(3);
@@ -89,6 +95,7 @@ describe("buildCity", () => {
     for (const i of build.mesh.indices) expect(i).toBeLessThan(build.mesh.vertexCount);
   });
 
+  // Bounds are metres; the mesh is world pixels, so the comparison converts.
   it("keeps every vertex inside the city bounds", () => {
     for (let i = 0; i < build.mesh.vertexCount; i++) {
       const x = build.mesh.vertices[i * VERTEX_FLOATS]!;
@@ -113,7 +120,7 @@ describe("buildCity", () => {
   });
 
   it("is deterministic", () => {
-    const again = buildCity(city, bounds, PPM);
+    const again = buildCity(city, boundsM, PPM);
     expect(again.buildingCount).toBe(build.buildingCount);
     expect(again.mesh.triangleCount).toBe(build.mesh.triangleCount);
     expect(Array.from(again.mesh.vertices)).toEqual(Array.from(build.mesh.vertices));
@@ -141,15 +148,20 @@ describe("ROAD_CLASSES", () => {
 });
 
 describe("growing the city", () => {
-  const city = demoCity(ORIGIN, GRID);
+  const city = demoCity(ORIGIN);
 
   // Blocks inside the road network are carved by roads on every side, so they cannot be
   // touched by the bounds rect moving. Their buildings must survive an extension exactly.
-  const core = graphBounds(city.graph, 0);
-  const specsInsideNetwork = (params: typeof city): string[] => {
-    const bounds = cityBounds(params, 10 * GRID)!;
-    const surfaces = buildRoadSurfaces(params.graph, bounds, PPM);
-    const specs = buildingsForBlocks(surfaces.blocks, lotRegions(params.base, params.zones, bounds, PPM));
+  const core = rectToPixels(graphBounds(city.graph, 0), ORIGIN, PPM);
+  const specsInsideNetwork = (params: CityParams): string[] => {
+    const bounds = rectToPixels(cityBounds(params, MARGIN_M)!, params.origin, PPM);
+    const px = cityToPixels(params, PPM);
+    const surfaces = buildRoadSurfaces(px.graph, bounds, PPM);
+    const specs = buildingsForBlocks(
+      surfaces.blocks,
+      lotRegions(params.base, px.zones, bounds, PPM, params.origin),
+      { originPx: params.origin, pixelsPerMetre: PPM }
+    );
     return specs
       .filter((s) => {
         const b = ringBounds(s.footprint);
@@ -168,17 +180,52 @@ describe("growing the city", () => {
     const before = specsInsideNetwork(city);
     const grown = {
       ...city,
-      graph: insertRoad(
-        city.graph,
-        { x: ORIGIN.x + 60 * GRID, y: ORIGIN.y - 60 * GRID },
-        { x: ORIGIN.x + 60 * GRID, y: ORIGIN.y + 60 * GRID },
-        "street",
-        { snapPx: GRID * 0.4 }
-      )
+      graph: insertRoad(city.graph, { x: 120, y: -120 }, { x: 120, y: 120 }, "street", {
+        snapM: 0.8
+      })
     };
 
-    expect(cityBounds(grown, 10 * GRID)!.width).toBeGreaterThan(cityBounds(city, 10 * GRID)!.width);
+    expect(cityBounds(grown, MARGIN_M)!.width).toBeGreaterThan(cityBounds(city, MARGIN_M)!.width);
     expect(before.length).toBeGreaterThan(20);
     expect(specsInsideNetwork(grown)).toEqual(before);
+  });
+});
+
+// The whole point of storing the city in metres: a scene regrid rescales it, never
+// regenerates it. Positions, heights and materials all have to survive.
+describe("changing the scene grid size", () => {
+  const city = demoCity(ORIGIN);
+  const boundsM = cityBounds(city, MARGIN_M)!;
+
+  const specsAt = (ppm: number) => {
+    const bounds = rectToPixels(boundsM, ORIGIN, ppm);
+    const px = cityToPixels(city, ppm);
+    const surfaces = buildRoadSurfaces(px.graph, bounds, ppm);
+    return buildingsForBlocks(
+      surfaces.blocks,
+      lotRegions(city.base, px.zones, bounds, ppm, ORIGIN),
+      { originPx: ORIGIN, pixelsPerMetre: ppm }
+    );
+  };
+
+  const coarse = specsAt(25);
+  const fine = specsAt(60);
+
+  it("produces the same buildings in the same metre positions", () => {
+    const metres = (specs: typeof coarse, ppm: number): string[] =>
+      specs.map((s) =>
+        s.footprint
+          .map((p) => `${((p.x - ORIGIN.x) / ppm).toFixed(3)},${((p.y - ORIGIN.y) / ppm).toFixed(3)}`)
+          .join(" ")
+      );
+    expect(coarse.length).toBeGreaterThan(20);
+    expect(fine).toHaveLength(coarse.length);
+    expect(metres(fine, 60)).toEqual(metres(coarse, 25));
+  });
+
+  it("keeps every height and material identical", () => {
+    expect(fine.map((s) => s.height)).toEqual(coarse.map((s) => s.height));
+    expect(fine.map((s) => s.wallMaterial)).toEqual(coarse.map((s) => s.wallMaterial));
+    expect(fine.map((s) => s.roofMaterial)).toEqual(coarse.map((s) => s.roofMaterial));
   });
 });

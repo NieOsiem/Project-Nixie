@@ -14,7 +14,7 @@ export interface ZoneParams {
 
 export interface Zone extends ZoneParams {
   id: string;
-  /** The area this zone governs, in world pixels. */
+  /** The area this zone governs, in metres relative to the city origin. */
   rect: Rect;
 }
 
@@ -28,16 +28,6 @@ export const DEFAULT_ZONE_PARAMS: ZoneParams = {
 
 /** Lots below this are slivers left by a block edge clipping a lot cell. */
 const MIN_LOT_AREA_M2 = 40;
-
-/**
- * The unzoned lot grid anchors to world zero, never to the city bounds.
- *
- * WHY: bounds are recomputed on every edit, so anchoring there slides the entire lot
- * grid — and therefore every unzoned building's footprint, height and material — the
- * moment a road extends past the old edge. Zones are safe already: they anchor to their
- * own stored rect.
- */
-const BASE_ORIGIN: Vec2 = { x: 0, y: 0 };
 
 export function lotOptions(params: ZoneParams, originPx: Vec2, pixelsPerMetre: number): LotOptions {
   return {
@@ -58,19 +48,24 @@ export function lotOptions(params: ZoneParams, originPx: Vec2, pixelsPerMetre: n
  * it is what makes reseeding a zone provably unable to disturb its neighbours.
  *
  * Each region anchors its lot grid to its own top-left corner, so blocks inside a zone
- * share a rhythm and changing one zone's lot size cannot shift another's.
+ * share a rhythm and changing one zone's lot size cannot shift another's. The leftover
+ * anchors to `originPx` — metre coordinate (0, 0) — never to the bounds, which move on
+ * every edit and would slide every unzoned building with them.
+ *
+ * Zones and bounds arrive already converted to world pixels.
  */
 export function lotRegions(
   base: ZoneParams,
-  zones: Zone[],
-  bounds: Rect,
-  pixelsPerMetre: number
+  zonesPx: Zone[],
+  boundsPx: Rect,
+  pixelsPerMetre: number,
+  originPx: Vec2
 ): LotRegion[] {
   const regions: LotRegion[] = [];
   const covered: MultiPolygon[] = [];
 
-  for (let i = zones.length - 1; i >= 0; i--) {
-    const zone = zones[i]!;
+  for (let i = zonesPx.length - 1; i >= 0; i--) {
+    const zone = zonesPx[i]!;
     const rect = ringAsMulti(rectRing(zone.rect));
     const own = difference(rect, covered);
     covered.push(rect);
@@ -82,12 +77,12 @@ export function lotRegions(
     });
   }
 
-  const rest = covered.length === 0 ? null : difference(ringAsMulti(rectRing(bounds)), covered);
+  const rest = covered.length === 0 ? null : difference(ringAsMulti(rectRing(boundsPx)), covered);
   if (rest === null || rest.length > 0) {
     regions.push({
       seed: base.seed,
       clip: rest,
-      options: lotOptions(base, BASE_ORIGIN, pixelsPerMetre)
+      options: lotOptions(base, originPx, pixelsPerMetre)
     });
   }
   return regions;

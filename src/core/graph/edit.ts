@@ -3,16 +3,16 @@ import { nodeMap, type RoadEdge, type RoadGraph, type RoadNode } from "./road-gr
 
 export interface EditOptions {
   /** A drawn endpoint closer than this to an existing node or road fuses into it. */
-  snapPx: number;
+  snapM: number;
 }
 
 const EPS = 1e-6;
 /**
  * A stop is either an exact crossing or a point projected onto a segment, so float noise
- * is a few ULPs at world scale. A thousandth of a pixel is far above that and far below
- * anything the boolean pass (which snaps at 1e-3) can tell apart.
+ * is a few ULPs at city scale. One millimetre is far above that and far below anything a
+ * road width or the pixel-space boolean pass can tell apart.
  */
-const ON_EDGE_PX = 1e-3;
+const ON_EDGE_M = 1e-3;
 
 const dist = (a: Vec2, b: Vec2): number => Math.hypot(b.x - a.x, b.y - a.y);
 
@@ -49,9 +49,9 @@ function freshId(prefix: string, used: Set<string>): string {
 }
 
 /** Nearest node, else nearest point on a road, else p unchanged. */
-export function snapToGraph(graph: RoadGraph, p: Vec2, snapPx: number): Vec2 {
+export function snapToGraph(graph: RoadGraph, p: Vec2, snapM: number): Vec2 {
   let best: Vec2 | null = null;
-  let bestD = snapPx;
+  let bestD = snapM;
 
   for (const n of graph.nodes) {
     const d = dist(n, p);
@@ -77,10 +77,10 @@ export function snapToGraph(graph: RoadGraph, p: Vec2, snapPx: number): Vec2 {
   return best ?? { x: p.x, y: p.y };
 }
 
-/** The junction closest to p, within maxPx. */
-export function nearestNode(graph: RoadGraph, p: Vec2, maxPx: number): RoadNode | null {
+/** The junction closest to p, within maxM. */
+export function nearestNode(graph: RoadGraph, p: Vec2, maxM: number): RoadNode | null {
   let best: RoadNode | null = null;
-  let bestD = maxPx;
+  let bestD = maxM;
   for (const n of graph.nodes) {
     const d = dist(n, p);
     if (d <= bestD) {
@@ -91,11 +91,11 @@ export function nearestNode(graph: RoadGraph, p: Vec2, maxPx: number): RoadNode 
   return best;
 }
 
-/** The road whose centreline passes closest to p, within maxPx. */
-export function nearestEdge(graph: RoadGraph, p: Vec2, maxPx: number): RoadEdge | null {
+/** The road whose centreline passes closest to p, within maxM. */
+export function nearestEdge(graph: RoadGraph, p: Vec2, maxM: number): RoadEdge | null {
   const nodes = nodeMap(graph);
   let best: RoadEdge | null = null;
-  let bestD = maxPx;
+  let bestD = maxM;
   for (const e of graph.edges) {
     const a = nodes.get(e.a);
     const b = nodes.get(e.b);
@@ -128,11 +128,11 @@ export function insertRoad(
   const edges: RoadEdge[] = graph.edges.map((e) => ({ ...e }));
   const nodeIds = new Set(nodes.map((n) => n.id));
   const edgeIds = new Set(edges.map((e) => e.id));
-  const snapPx = Math.max(options.snapPx, 0);
+  const snapM = Math.max(options.snapM, 0);
 
-  const a = snapToGraph(graph, from, snapPx);
-  const b = snapToGraph(graph, to, snapPx);
-  if (dist(a, b) <= Math.max(snapPx, EPS)) return graph;
+  const a = snapToGraph(graph, from, snapM);
+  const b = snapToGraph(graph, to, snapM);
+  if (dist(a, b) <= Math.max(snapM, EPS)) return graph;
 
   const byId = new Map(nodes.map((n) => [n.id, n] as const));
   const stops: { t: number; point: Vec2 }[] = [
@@ -154,7 +154,7 @@ export function insertRoad(
 
   const resolve = (point: Vec2): string => {
     for (const n of nodes) {
-      if (dist(n, point) <= Math.max(snapPx, ON_EDGE_PX)) return n.id;
+      if (dist(n, point) <= Math.max(snapM, ON_EDGE_M)) return n.id;
     }
     const id = freshId("n", nodeIds);
     const node: RoadNode = { id, x: point.x, y: point.y };
@@ -170,7 +170,7 @@ export function insertRoad(
       const q = byId.get(e.b);
       if (!p || !q) continue;
       const proj = projectOnSegment(p, q, point);
-      if (proj.u <= 0 || proj.u >= 1 || dist(proj.point, point) > ON_EDGE_PX) continue;
+      if (proj.u <= 0 || proj.u >= 1 || dist(proj.point, point) > ON_EDGE_M) continue;
       const tailId = freshId("e", edgeIds);
       edgeIds.add(tailId);
       edges.splice(i + 1, 0, { id: tailId, a: id, b: e.b, classId: e.classId });
@@ -251,7 +251,7 @@ export function moveNode(
   if (!node) return graph;
 
   for (const other of graph.nodes) {
-    if (other.id !== nodeId && dist(other, to) <= options.snapPx) {
+    if (other.id !== nodeId && dist(other, to) <= options.snapM) {
       return mergeNodes(graph, nodeId, other.id);
     }
   }
