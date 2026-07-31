@@ -141,14 +141,18 @@ const lit = (
 /**
  * Shared surfaces. Emissive strengths here stay low: these cover most of the ground plane,
  * and anything above the bloom threshold over that much area washes the whole scene out.
+ *
+ * WHY these look small: the shader multiplies strength by EMISSIVE_MAX, so the value that has
+ * to clear the 0.55 luma bloom threshold is `strength * 4`, not `strength`. Anything here above
+ * ~0.13 glows. KERB sat at 0.95 and drew a lit cyan outline along every street.
  */
 export const CITY_SURFACES: Material[] = [
   dark(0.1, 0.078, 0.155),
   lit(rgb(0.085, 0.07, 0.135), rgb(0.42, 0.26, 0.72), 0.09),
-  lit(rgb(0.165, 0.14, 0.215), rgb(1, 0.7, 0.52), 0.11),
-  lit(rgb(0.18, 0.15, 0.23), rgb(0.62, 0.46, 0.9), 0.22),
-  lit(rgb(0.21, 0.19, 0.28), rgb(0.55, 0.68, 1), 0.22),
-  lit(rgb(0.07, 0.11, 0.13), rgb(0.25, 0.95, 0.88), 0.95)
+  lit(rgb(0.165, 0.14, 0.215), rgb(1, 0.7, 0.52), 0.06),
+  lit(rgb(0.18, 0.15, 0.23), rgb(0.62, 0.46, 0.9), 0.08),
+  lit(rgb(0.21, 0.19, 0.28), rgb(0.55, 0.68, 1), 0.09),
+  lit(rgb(0.12, 0.115, 0.165), rgb(0.25, 0.95, 0.88), 0.06)
 ];
 
 const district = (name: string, materials: Material[]): DistrictPalette => ({ name, materials });

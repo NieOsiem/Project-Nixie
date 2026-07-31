@@ -53,7 +53,10 @@ void main() {
   float dist = length(vec3(fromPivot, uCamHeight - hpx)) - 1.5 * uPixelsPerMetre;
   float z = clamp(dist / uDepthFar, 0.0, 1.0) * 2.0 - 1.0;
 
-  gl_Position = vec4((projectionMatrix * translationMatrix * vec3(leaned, 1.0)).xy, z, 1.0);
+  // WHY: unit w interpolates local coordinates per triangle. Homogeneous w keeps the quad seamless.
+  float perspectiveW = eye / (eye + hpx * uLeanStrength);
+  vec2 projected = (projectionMatrix * translationMatrix * vec3(leaned, 1.0)).xy;
+  gl_Position = vec4(projected * perspectiveW, z * perspectiveW, perspectiveW);
 }
 `;
 

@@ -13,10 +13,10 @@ const KNEE = 0.25;
 const LUMA = "vec3(0.299, 0.587, 0.114)";
 
 /** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG. */
-const BODY_CHROMA = 0.42;
+const BODY_CHROMA = 0.55;
 const NEON_CHROMA = 1.15;
 /** Darkening at the far edge of the depth falloff. */
-const DEPTH_FALLOFF = 0.42;
+const DEPTH_FALLOFF = 0.25;
 
 /**
  * Unit quad. The mesh transform scales it to the target, so `aCorner` is also the UV.
@@ -147,7 +147,7 @@ void main() {
   // Chroma as a function of luma: dark masses go near-neutral, bright things keep and gain
   // saturation. Full chroma on the bases is what makes every roof compete with the signage.
   float l = dot(c, ${LUMA});
-  float chroma = mix(${BODY_CHROMA}, ${NEON_CHROMA}, smoothstep(0.10, 0.55, l));
+  float chroma = mix(${BODY_CHROMA}, ${NEON_CHROMA}, smoothstep(0.18, 0.62, l));
   c = max(mix(vec3(l), c, chroma), vec3(0.0));
 
   float m = max(max(c.r, c.g), c.b);

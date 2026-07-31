@@ -15,7 +15,7 @@ describe("composite shader", () => {
 
   it("grades chroma by luma so dark masses desaturate and bright signage does not", () => {
     expect(COMPOSITE_FRAG).toContain(
-      "float chroma = mix(0.42, 1.15, smoothstep(0.10, 0.55, l));"
+      "float chroma = mix(0.55, 1.15, smoothstep(0.18, 0.62, l));"
     );
     expect(COMPOSITE_FRAG).toContain("c = max(mix(vec3(l), c, chroma), vec3(0.0));");
   });
@@ -23,7 +23,7 @@ describe("composite shader", () => {
   it("falls off with screen distance from the projection pivot, not the frame centre", () => {
     expect(COMPOSITE_FRAG).toContain("uniform vec2 uPivotUv;");
     expect(COMPOSITE_FRAG).toContain(
-      "c *= 1.0 - 0.42 * smoothstep(0.20, 0.72, length(vUv - uPivotUv));"
+      "c *= 1.0 - 0.25 * smoothstep(0.20, 0.72, length(vUv - uPivotUv));"
     );
   });
 

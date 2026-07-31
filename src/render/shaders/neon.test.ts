@@ -11,4 +11,11 @@ describe("neon shaders", () => {
   it("uses neither discard nor unavailable derivatives", () => {
     expect(NEON_FRAG).not.toMatch(/\bdiscard\s*;|\bfwidth\s*\(|\bdFdx\s*\(|\bdFdy\s*\(/);
   });
+
+  it("perspective-corrects local coordinates across both quad triangles", () => {
+    expect(NEON_VERT).toContain("float perspectiveW = eye / (eye + hpx * uLeanStrength);");
+    expect(NEON_VERT).toContain(
+      "gl_Position = vec4(projected * perspectiveW, z * perspectiveW, perspectiveW);"
+    );
+  });
 });

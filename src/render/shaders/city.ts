@@ -58,7 +58,11 @@ void main() {
   vec4 base = texture2DLod(uPalette, vec2(u, 0.25), 0.0);
   vec4 emissive = texture2DLod(uPalette, vec2(u, 0.75), 0.0);
 
-  vBase = base.rgb;
+  // Exposure on the material bodies only. The reference is a mid-key image lit by a large soft
+  // sky, not a black frame with lights in it; the palette bases alone land ~5x under that once
+  // shade and canyon have multiplied them down. Emissives are deliberately not gained — that
+  // would just move the bloom threshold, and this must not change what glows.
+  vBase = base.rgb * 1.7;
   vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);
   vShade = aShade;
   vKind = aKind;
@@ -77,7 +81,10 @@ void main() {
   float dist = length(vec3(fromPivot, uCamHeight - hpx));
   float z = clamp(dist / uDepthFar, 0.0, 1.0) * 2.0 - 1.0;
 
-  gl_Position = vec4((projectionMatrix * translationMatrix * vec3(leaned, 1.0)).xy, z, 1.0);
+  // WHY: unit w interpolates facade coordinates per triangle. Homogeneous w keeps the quad seamless.
+  float perspectiveW = eye / (eye + hpx * uLeanStrength);
+  vec2 projected = (projectionMatrix * translationMatrix * vec3(leaned, 1.0)).xy;
+  gl_Position = vec4(projected * perspectiveW, z * perspectiveW, perspectiveW);
 }
 `;
 
@@ -162,7 +169,7 @@ vec3 facade() {
   // vEmissive already carries strength * EMISSIVE_MAX (~1.1 peak for a wall), so these
   // are fractions of it: 1.15 clears the ~0.55 bloom threshold, 0.14 stays well under.
   float light = 0.14 + max(max(1.15 * lit, 0.7 * parapet), shop);
-  float canyon = mix(0.45, 1.0, smoothstep(0.0, 12.0, vHeight));
+  float canyon = mix(0.62, 1.0, smoothstep(0.0, 12.0, vHeight));
   return vBase * vShade * canyon * (1.0 - 0.60 * recess) + vEmissive * light;
 }
 
@@ -220,8 +227,11 @@ vec3 clutter() {
   float cap = 1.0 - step(-0.5, vShade);
   float edge = smoothstep(0.68, 0.84, max(abs(vU), abs(vTop))) * cap;
   vec3 sideColour = vBase * vShade + vEmissive;
-  vec3 capColour = vBase * 0.55 + vEmissive * 0.12;
-  vec3 rimColour = vBase * 1.35 + vEmissive * 0.75 + vec3(0.025, 0.02, 0.06);
+  // Cap lighter than the roof it sits on and the lip darker, not the reverse: a raised box
+  // catches more sky than the deck. Inverted, and with emissive on the rim, every box read as
+  // a dark hole in a lit frame — dozens of neon picture frames scattered over the skyline.
+  vec3 capColour = vBase * 1.12 + vEmissive * 0.10;
+  vec3 rimColour = vBase * 0.72 + vEmissive * 0.05;
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
 
@@ -230,6 +240,6 @@ void main() {
   if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
-  gl_FragColor = vec4(colour + vec3(0.012, 0.009, 0.03), 1.0);
+  gl_FragColor = vec4(colour + vec3(0.045, 0.04, 0.085), 1.0);
 }
 `;

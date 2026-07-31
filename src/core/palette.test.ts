@@ -141,8 +141,12 @@ describe("shipped palettes", () => {
 
   it("keeps the ground plane and paint below the bloom threshold", () => {
     // WHY: broad shared surfaces wash out the scene above 0.55; paint above it floats in a halo.
-    for (const m of CITY_SURFACES.slice(0, 5)) {
-      const peak = Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength;
+    // Scaled by EMISSIVE_MAX because that is what the shader multiplies by — without it this
+    // read 4x low and let KERB sit at 0.95, drawing a lit cyan outline along every street.
+    // Covers all of CITY_SURFACES: the slice(0, 5) this replaces skipped KERB entirely.
+    for (const m of CITY_SURFACES) {
+      const peak =
+        Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength * EMISSIVE_MAX;
       expect(peak).toBeLessThan(0.55);
     }
   });
