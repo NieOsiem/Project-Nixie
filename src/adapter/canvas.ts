@@ -109,9 +109,9 @@ interface ChunkRecord {
 
 let cityRenderer: CityRenderer | null = null;
 let footProbe: FootProbe | null = null;
-/** Tokens whose feet the probe is holding a verdict for, in slot order. */
+/** Tokens whose ground point the probe is holding a verdict for, in slot order. */
 let probedTokens: any[] = [];
-const probedFeet: number[] = [];
+const probedGround: number[] = [];
 let tickerCallback: (() => void) | null = null;
 let currentCity: CityParams | null = null;
 /** City extent in metres. Chunk generation clamps to it, so a change invalidates every chunk. */
@@ -1001,10 +1001,10 @@ function restoreTokenSortLayers(): void {
 /**
  * Decide, per token, whether the building overlay may clip it.
  *
- * A token sprite is a billboard, so only its feet stand on the ground the mask describes.
- * One whose feet are on visible ground is in front of the building whatever its head
- * overlaps, and goes above the overlay whole; one whose feet are hidden stays below it and
- * is clipped per pixel. Elevation already outranks both in the group's comparator.
+ * A token sprite is a billboard, so only its footing is on the ground the mask describes.
+ * One standing on visible ground is in front of the building whatever its head overlaps,
+ * and goes above the overlay whole; one standing on hidden ground stays below it and is
+ * clipped per pixel. Elevation already outranks both in the group's comparator.
  */
 function sortTokensAgainstOverlay(frame: MaskFrame | null): void {
   const probe = footProbe;
@@ -1024,16 +1024,18 @@ function sortTokensAgainstOverlay(frame: MaskFrame | null): void {
   if (moved) canvas.primary.sortDirty = true;
 
   probedTokens = [];
-  probedFeet.length = 0;
+  probedGround.length = 0;
   for (const token of canvas.tokens?.placeables ?? []) {
     const mesh = token?.mesh;
     if (mesh === undefined || mesh === null || mesh.destroyed === true) continue;
     if (probedTokens.length >= probe.capacity) break;
     probedTokens.push(token);
-    // Bottom centre of the occupied square: where the sprite's feet meet the ground.
-    probedFeet.push(token.center.x, token.center.y + token.h / 2);
+    // WHY: the square's bottom edge sits half a cell downhill of the token, which flips the
+    // verdict a half-token late against a leaned facade. `center` is where Foundry itself
+    // puts the token for vision and range.
+    probedGround.push(token.center.x, token.center.y);
   }
-  probe.submit(frame, probedFeet, probedTokens.length);
+  probe.submit(frame, probedGround, probedTokens.length);
 }
 
 export function getRenderer(): CityRenderer | null {
