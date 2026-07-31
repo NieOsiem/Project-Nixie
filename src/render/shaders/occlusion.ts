@@ -65,3 +65,41 @@ void main() {
   gl_FragColor = texture2D(uCity, vUv) * coverage;
 }
 `;
+
+/**
+ * One point per token, sampling the building mask at the ground the token stands on.
+ *
+ * A token sprite is a billboard: only its feet are really on the ground, so the mask —
+ * which answers for ground points — may only be asked about that one pixel. Reading it
+ * back a point at a time would stall on every token, so the whole set lands in one row.
+ */
+export const FOOT_PROBE_VERT = `
+precision highp float;
+
+attribute vec2 aSlot;
+attribute vec2 aFootUv;
+
+uniform mat3 projectionMatrix;
+uniform mat3 translationMatrix;
+
+varying vec2 vFootUv;
+
+void main() {
+  vFootUv = aFootUv;
+  gl_PointSize = 1.0;
+  gl_Position = vec4((projectionMatrix * translationMatrix * vec3(aSlot, 1.0)).xy, 0.0, 1.0);
+}
+`;
+
+export const FOOT_PROBE_FRAG = `
+precision highp float;
+
+varying vec2 vFootUv;
+
+uniform sampler2D uMask;
+
+void main() {
+  bool offScreen = vFootUv.x < 0.0 || vFootUv.x > 1.0 || vFootUv.y < 0.0 || vFootUv.y > 1.0;
+  gl_FragColor = vec4(offScreen ? 0.0 : texture2D(uMask, vFootUv).a);
+}
+`;

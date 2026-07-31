@@ -62,6 +62,7 @@ import {
   type ChunkGeometry,
   type LeanCalibrationPoint
 } from "../render/city-renderer.js";
+import { FootProbe, isCovered, type MaskFrame } from "../render/foot-probe.js";
 import { WorkerClient } from "../worker/client.js";
 import type { BuildChunkResult } from "../worker/protocol.js";
 import {
@@ -107,6 +108,10 @@ interface ChunkRecord {
 }
 
 let cityRenderer: CityRenderer | null = null;
+let footProbe: FootProbe | null = null;
+/** Tokens whose feet the probe is holding a verdict for, in slot order. */
+let probedTokens: any[] = [];
+const probedFeet: number[] = [];
 let tickerCallback: (() => void) | null = null;
 let currentCity: CityParams | null = null;
 /** City extent in metres. Chunk generation clamps to it, so a change invalidates every chunk. */
@@ -217,6 +222,7 @@ export function mount(): void {
   cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
+  footProbe = new FootProbe(canvas.app.renderer);
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
   // renderer's chunk set now, and nothing else drops that placeholder any more.
   cityRenderer.clearChunks();
@@ -239,7 +245,12 @@ export function mount(): void {
 
   // HIGH outruns PIXI.Application's own render, which sits at LOW; the offscreen
   // target is therefore current by the time the stage is drawn.
-  tickerCallback = () => cityRenderer?.update(readCamera());
+  tickerCallback = () => {
+    const renderer = cityRenderer;
+    if (renderer === null) return;
+    renderer.update(readCamera());
+    sortTokensAgainstOverlay(renderer.maskFrame());
+  };
   canvas.app.ticker.add(tickerCallback, null, PIXI.UPDATE_PRIORITY.HIGH);
 
   cityListener?.();
@@ -259,6 +270,9 @@ export function unmount(): void {
   }
   workerClient?.terminate();
   workerClient = null;
+  restoreTokenSortLayers();
+  footProbe?.destroy();
+  footProbe = null;
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
   cityRenderer.overlay.parent?.removeChild(cityRenderer.overlay);
   cityRenderer.destroy();
@@ -661,6 +675,7 @@ export function setBloom(enabled: boolean, strength?: number): void {
   if (cityRenderer === null) return;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
+  footProbe = new FootProbe(canvas.app.renderer);
 }
 
 /**
@@ -957,6 +972,68 @@ export function stats(): Record<string, unknown> | null {
     palettePreview: palettePreview?.id ?? null,
     generatedWalls: generatedWallIds().length
   };
+}
+
+/** Foundry's own layer for tokens; the overlay sits between this and `ABOVE_OVERLAY`. */
+const tokenSortLayer = (): number =>
+  canvas.primary?.constructor?.SORT_LAYERS?.TOKENS ?? 700;
+
+/** Above the building overlay, below weather at 1000. */
+const ABOVE_OVERLAY_SORT_LAYER = 950;
+
+function setSortLayer(token: any, layer: number): boolean {
+  const mesh = token?.mesh;
+  if (mesh === undefined || mesh === null || mesh.destroyed === true) return false;
+  if (mesh.sortLayer === layer) return false;
+  mesh.sortLayer = layer;
+  return true;
+}
+
+function restoreTokenSortLayers(): void {
+  const layer = tokenSortLayer();
+  let moved = false;
+  for (const token of probedTokens) moved = setSortLayer(token, layer) || moved;
+  probedTokens = [];
+  footProbe?.clear();
+  if (moved && canvas.primary) canvas.primary.sortDirty = true;
+}
+
+/**
+ * Decide, per token, whether the building overlay may clip it.
+ *
+ * A token sprite is a billboard, so only its feet stand on the ground the mask describes.
+ * One whose feet are on visible ground is in front of the building whatever its head
+ * overlaps, and goes above the overlay whole; one whose feet are hidden stays below it and
+ * is clipped per pixel. Elevation already outranks both in the group's comparator.
+ */
+function sortTokensAgainstOverlay(frame: MaskFrame | null): void {
+  const probe = footProbe;
+  if (probe === null) return;
+  if (frame === null) {
+    restoreTokenSortLayers();
+    return;
+  }
+
+  const below = tokenSortLayer();
+  const verdicts = probe.verdicts();
+  let moved = false;
+  for (let i = 0; i < probedTokens.length; i++) {
+    const layer = isCovered(verdicts[i]) ? below : ABOVE_OVERLAY_SORT_LAYER;
+    moved = setSortLayer(probedTokens[i], layer) || moved;
+  }
+  if (moved) canvas.primary.sortDirty = true;
+
+  probedTokens = [];
+  probedFeet.length = 0;
+  for (const token of canvas.tokens?.placeables ?? []) {
+    const mesh = token?.mesh;
+    if (mesh === undefined || mesh === null || mesh.destroyed === true) continue;
+    if (probedTokens.length >= probe.capacity) break;
+    probedTokens.push(token);
+    // Bottom centre of the occupied square: where the sprite's feet meet the ground.
+    probedFeet.push(token.center.x, token.center.y + token.h / 2);
+  }
+  probe.submit(frame, probedFeet, probedTokens.length);
 }
 
 export function getRenderer(): CityRenderer | null {

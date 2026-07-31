@@ -18,6 +18,7 @@ import {
 } from "./chunk-culling.js";
 import { CityMesh } from "./city-mesh.js";
 import { NeonMesh } from "./neon-mesh.js";
+import type { MaskFrame } from "./foot-probe.js";
 import { PaletteTexture } from "./palette-texture.js";
 import { ScreenQuad } from "./screen-quad.js";
 import { CITY_OVERLAY_FRAG } from "./shaders/occlusion.js";
@@ -283,6 +284,20 @@ export class CityRenderer {
   updatePalette(palette: Uint8Array): void {
     this.#palette.update(palette);
     this.#contentDirty = true;
+  }
+
+  /** The silhouette the overlay clips to, for asking whether a ground point is hidden. */
+  maskFrame(): MaskFrame | null {
+    const camera = this.#lastCamera;
+    if (camera === null || this.#maskTarget === null) return null;
+    const view = visibleWorldRect(camera);
+    return {
+      texture: this.#maskTarget,
+      viewX: view.x,
+      viewY: view.y,
+      viewWidth: view.width,
+      viewHeight: view.height
+    };
   }
 
   update(camera: CameraState): void {
