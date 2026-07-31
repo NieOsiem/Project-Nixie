@@ -1,14 +1,23 @@
-import { setBloom, setCameraHeightM, setRenderScale } from "./adapter/canvas.js";
 import {
+  setBloom,
+  setCameraHeightM,
+  setCameraZoomMode,
+  setRenderScale
+} from "./adapter/canvas.js";
+import {
+  CAMERA_ZOOM_MODE,
   MODULE_ID,
   SETTING_BLOOM,
   SETTING_BLOOM_STRENGTH,
   SETTING_CAMERA_HEIGHT,
+  SETTING_CAMERA_ZOOM_MODE,
   SETTING_RENDER_SCALE
 } from "./constants.js";
+import type { CameraZoomMode } from "./constants.js";
 
 export type NixieSettingKey =
   | typeof SETTING_CAMERA_HEIGHT
+  | typeof SETTING_CAMERA_ZOOM_MODE
   | typeof SETTING_RENDER_SCALE
   | typeof SETTING_BLOOM
   | typeof SETTING_BLOOM_STRENGTH;
@@ -25,8 +34,9 @@ const RANGES: Partial<Record<NixieSettingKey, SettingRange>> = {
   [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 }
 };
 
-const DEFAULTS: Record<NixieSettingKey, number | boolean> = {
+const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
   [SETTING_CAMERA_HEIGHT]: 500,
+  [SETTING_CAMERA_ZOOM_MODE]: CAMERA_ZOOM_MODE.DOLLY,
   [SETTING_RENDER_SCALE]: 1,
   [SETTING_BLOOM]: true,
   [SETTING_BLOOM_STRENGTH]: 1.35
@@ -48,7 +58,10 @@ export function settingValue<T>(key: NixieSettingKey): T {
  * (`client/core/settings.js:213`), so a plain `type: Number` accepts anything the console
  * hands it. Clamp here or the sheet's slider and `module.api` disagree.
  */
-export async function setSettingValue(key: NixieSettingKey, value: number | boolean): Promise<void> {
+export async function setSettingValue(
+  key: NixieSettingKey,
+  value: number | boolean | CameraZoomMode
+): Promise<void> {
   const range = RANGES[key];
   const clamped =
     typeof value === "number" && range !== undefined
@@ -60,6 +73,7 @@ export async function setSettingValue(key: NixieSettingKey, value: number | bool
 /** Stored values are the truth on load; the adapter keeps them until a renderer mounts. */
 export function applySettings(): void {
   setCameraHeightM(settingValue<number>(SETTING_CAMERA_HEIGHT));
+  setCameraZoomMode(settingValue<CameraZoomMode>(SETTING_CAMERA_ZOOM_MODE));
   setRenderScale(settingValue<number>(SETTING_RENDER_SCALE));
   setBloom(settingValue<boolean>(SETTING_BLOOM), settingValue<number>(SETTING_BLOOM_STRENGTH));
 }
@@ -74,6 +88,20 @@ export function registerSettings(): void {
     range: RANGES[SETTING_CAMERA_HEIGHT],
     default: DEFAULTS[SETTING_CAMERA_HEIGHT],
     onChange: (value: number) => setCameraHeightM(value)
+  });
+
+  game.settings.register(MODULE_ID, SETTING_CAMERA_ZOOM_MODE, {
+    name: "Camera Zoom Mode",
+    hint: "Dolly changes lean with zoom. Fixed preserves the same perspective at every zoom level.",
+    scope: "world",
+    config: true,
+    type: String,
+    choices: {
+      [CAMERA_ZOOM_MODE.DOLLY]: "Dolly",
+      [CAMERA_ZOOM_MODE.FIXED]: "Fixed Altitude"
+    },
+    default: DEFAULTS[SETTING_CAMERA_ZOOM_MODE],
+    onChange: (value: CameraZoomMode) => setCameraZoomMode(value)
   });
 
   game.settings.register(MODULE_ID, SETTING_RENDER_SCALE, {

@@ -1,4 +1,8 @@
-import { MODULE_ID } from "../constants.js";
+import {
+  CAMERA_ZOOM_MODE,
+  MODULE_ID,
+  type CameraZoomMode
+} from "../constants.js";
 import type { CameraState } from "../core/camera.js";
 import { buildChunk, chunkMarginM, cityChunks } from "../core/gen/chunked.js";
 import { chunkId, chunksCovering, type ChunkKey } from "../core/gen/chunks.js";
@@ -53,7 +57,11 @@ import {
   type DistrictPalette,
   type Material
 } from "../core/palette.js";
-import { CityRenderer, type ChunkGeometry } from "../render/city-renderer.js";
+import {
+  CityRenderer,
+  type ChunkGeometry,
+  type LeanCalibrationPoint
+} from "../render/city-renderer.js";
 import { WorkerClient } from "../worker/client.js";
 import type { BuildChunkResult } from "../worker/protocol.js";
 import {
@@ -66,9 +74,9 @@ import {
   generatedWallIds
 } from "./documents.js";
 
-// Screen-space lean is height/(camHeight-height) times the on-screen distance from the
-// pivot, independent of zoom. 500 m puts a 130 m tower at ~0.35; drop it toward 350 for a
-// harder lean, raise it toward 2000 for near-flat. Overridden by the world setting.
+// At strength 1, screen-space lean is height/(camHeight-height) times the on-screen
+// distance from the pivot. 500 m puts a 130 m tower at ~0.35; Dolly varies strength while
+// Fixed holds it at 1. Overridden by the world setting.
 const DEFAULT_CAMERA_HEIGHT_M = 500;
 /** One metre of slack collapses junction-disc arcs without visibly moving a wall. */
 const WALL_TOLERANCE_M = 1;
@@ -110,9 +118,12 @@ let wallTimer: ReturnType<typeof setTimeout> | null = null;
 /**
  * Look dials. Held here rather than read from `game.settings` so this module never imports
  * the settings module, which imports this one — `settings.ts` pushes values in instead.
- * All four tolerate being set before a renderer exists.
+ * Each tolerates being set before a renderer exists.
  */
 let cameraHeightM = DEFAULT_CAMERA_HEIGHT_M;
+let cameraZoomMode: CameraZoomMode = CAMERA_ZOOM_MODE.DOLLY;
+let leanOverride: number | null = null;
+const leanCalibrationPoints: LeanCalibrationPoint[] = [];
 let renderScale = 1;
 let bloomEnabled = true;
 let bloomStrength = 1;
@@ -196,9 +207,14 @@ export function mount(): void {
     canvas.app.renderer,
     emptyMesh(),
     packPalette(paletteBanks(currentCity)),
-    { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: cameraHeightM }
+    {
+      pixelsPerMetre: pixelsPerMetre(),
+      cameraHeightMetres: cameraHeightM,
+      cameraZoomMode
+    }
   );
   cityRenderer.renderScale = renderScale;
+  cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
@@ -578,6 +594,51 @@ export function setCameraHeightM(metres: number): number {
   cameraHeightM = Math.max(50, metres);
   if (cityRenderer !== null) cityRenderer.cameraHeightMetres = cameraHeightM;
   return cameraHeightM;
+}
+
+export function setCameraZoomMode(mode: CameraZoomMode): CameraZoomMode {
+  cameraZoomMode = mode;
+  if (cityRenderer !== null) cityRenderer.cameraZoomMode = cameraZoomMode;
+  return cameraZoomMode;
+}
+
+export function setLeanAtCurrentZoom(value: number | null): LeanCalibrationPoint {
+  const renderer = cityRenderer;
+  if (renderer === null) throw new Error("No city renderer is mounted.");
+  leanOverride = value;
+  renderer.leanOverride = value;
+  return renderer.leanCalibrationPoint();
+}
+
+export function adjustLeanAtCurrentZoom(delta: number): LeanCalibrationPoint {
+  if (!Number.isFinite(delta)) throw new Error("Lean adjustment must be finite.");
+  const renderer = cityRenderer;
+  if (renderer === null) throw new Error("No city renderer is mounted.");
+  return setLeanAtCurrentZoom(renderer.leanCalibrationPoint().leanStrength + delta);
+}
+
+export function saveLeanCalibrationPoint(): LeanCalibrationPoint {
+  const renderer = cityRenderer;
+  if (renderer === null) throw new Error("No city renderer is mounted.");
+  const point = renderer.leanCalibrationPoint();
+  leanCalibrationPoints.push(point);
+  return point;
+}
+
+export function getLeanCalibrationReport(): {
+  current: LeanCalibrationPoint | null;
+  points: LeanCalibrationPoint[];
+} {
+  return {
+    current: cityRenderer?.leanCalibrationPoint() ?? null,
+    points: leanCalibrationPoints.map((point) => ({ ...point }))
+  };
+}
+
+export function clearLeanCalibration(): void {
+  leanCalibrationPoints.length = 0;
+  leanOverride = null;
+  if (cityRenderer !== null) cityRenderer.leanOverride = null;
 }
 
 export function setRenderScale(value: number): number {

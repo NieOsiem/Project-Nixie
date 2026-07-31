@@ -35,6 +35,7 @@ export class NeonMesh {
       uPivot: this.#pivot,
       uPixelsPerMetre: 25,
       uCamHeight: 8750,
+      uLeanStrength: 1,
       uDepthFar: 20000,
       uEmissiveMax: EMISSIVE_MAX,
       uPalette: palette.texture
@@ -55,6 +56,7 @@ export class NeonMesh {
     this.#pivot[1] = c.pivotY;
     u.uPixelsPerMetre = c.pixelsPerMetre;
     u.uCamHeight = c.cameraHeightPx;
+    u.uLeanStrength = c.leanStrength;
     u.uDepthFar = c.depthFar;
   }
 

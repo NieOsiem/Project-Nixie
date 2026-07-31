@@ -1,3 +1,4 @@
+import { CAMERA_ZOOM_MODE, type CameraZoomMode } from "../constants.js";
 import {
   cameraEquals,
   cloneCamera,
@@ -7,6 +8,7 @@ import {
 } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
+import { dollyLeanStrength } from "../core/lean-curve.js";
 import { BloomChain } from "./bloom.js";
 import {
   UNCULLED_BOUNDS,
@@ -23,6 +25,20 @@ export type { ChunkGeometry } from "./chunk-culling.js";
 export interface CityRendererOptions {
   pixelsPerMetre: number;
   cameraHeightMetres: number;
+  cameraZoomMode: CameraZoomMode;
+}
+
+export interface LeanCalibrationPoint {
+  zoom: number;
+  leanStrength: number;
+  automaticLeanStrength: number;
+  leanOverride: number | null;
+  cameraZoomMode: CameraZoomMode;
+  cameraHeightMetres: number;
+  pixelsPerMetre: number;
+  screenWidth: number;
+  screenHeight: number;
+  renderScale: number;
 }
 
 interface LiveChunk {
@@ -62,6 +78,11 @@ export class CityRenderer {
   #renderScale = 1;
   #pixelsPerMetre: number;
   #cameraHeightMetres: number;
+  #cameraZoomMode: CameraZoomMode;
+  #cameraZoom = 1;
+  #automaticLeanStrength = 1;
+  #leanStrength = 1;
+  #leanOverride: number | null = null;
 
   constructor(
     renderer: any,
@@ -72,6 +93,7 @@ export class CityRenderer {
     this.#renderer = renderer;
     this.#pixelsPerMetre = options.pixelsPerMetre;
     this.#cameraHeightMetres = options.cameraHeightMetres;
+    this.#cameraZoomMode = options.cameraZoomMode;
     // One texture for every chunk: retinting a district must not mean an upload per chunk.
     this.#palette = new PaletteTexture(palette);
     this.#bloom = new BloomChain(renderer);
@@ -107,6 +129,50 @@ export class CityRenderer {
     if (clamped === this.#cameraHeightMetres) return;
     this.#cameraHeightMetres = clamped;
     this.#contentDirty = true;
+  }
+
+  get cameraZoomMode(): CameraZoomMode {
+    return this.#cameraZoomMode;
+  }
+
+  set cameraZoomMode(value: CameraZoomMode) {
+    if (value === this.#cameraZoomMode) return;
+    this.#cameraZoomMode = value;
+    this.#contentDirty = true;
+  }
+
+  get leanOverride(): number | null {
+    return this.#leanOverride;
+  }
+
+  set leanOverride(value: number | null) {
+    if (value !== null && (!Number.isFinite(value) || value < 0)) {
+      throw new Error("Lean override must be a finite non-negative number or null.");
+    }
+    if (value === this.#leanOverride) return;
+    this.#leanOverride = value;
+    this.#contentDirty = true;
+  }
+
+  leanCalibrationPoint(): LeanCalibrationPoint {
+    const camera = this.#lastCamera;
+    if (camera === null) throw new Error("The city has not rendered a camera frame yet.");
+    const leanStrength =
+      this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
+        ? (this.#leanOverride ?? this.#automaticLeanStrength)
+        : 1;
+    return {
+      zoom: this.#cameraZoom,
+      leanStrength,
+      automaticLeanStrength: this.#automaticLeanStrength,
+      leanOverride: this.#leanOverride,
+      cameraZoomMode: this.#cameraZoomMode,
+      cameraHeightMetres: this.#cameraHeightMetres,
+      pixelsPerMetre: this.#pixelsPerMetre,
+      screenWidth: camera.screenWidth,
+      screenHeight: camera.screenHeight,
+      renderScale: this.#renderScale
+    };
   }
 
   get bloomEnabled(): boolean {
@@ -204,12 +270,22 @@ export class CityRenderer {
 
     const view = visibleWorldRect(camera);
     const t = offscreenTransform(camera, this.#renderScale);
+    const zoom = camera.scale > 0 ? camera.scale : 1;
+    const automaticLeanStrength = dollyLeanStrength(zoom);
+    const leanStrength =
+      this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
+        ? (this.#leanOverride ?? automaticLeanStrength)
+        : 1;
     const cameraHeightPx = this.#cameraHeightMetres * this.#pixelsPerMetre;
+    this.#cameraZoom = zoom;
+    this.#automaticLeanStrength = automaticLeanStrength;
+    this.#leanStrength = leanStrength;
     const uniforms = {
       pivotX: camera.pivotX,
       pivotY: camera.pivotY,
       pixelsPerMetre: this.#pixelsPerMetre,
       cameraHeightPx,
+      leanStrength,
       // Generous, because geometry outside the view still leans into it. Depth is
       // 24-bit, so the slack costs no meaningful precision.
       depthFar: 2 * Math.hypot(0.5 * Math.hypot(view.width, view.height), cameraHeightPx),
@@ -264,6 +340,11 @@ export class CityRenderer {
       renderCount: this.#renderCount,
       renderScale: this.#renderScale,
       cameraHeightMetres: this.#cameraHeightMetres,
+      cameraZoomMode: this.#cameraZoomMode,
+      cameraZoom: this.#cameraZoom,
+      automaticLeanStrength: this.#automaticLeanStrength,
+      leanStrength: this.#leanStrength,
+      leanOverride: this.#leanOverride,
       pixelsPerMetre: this.#pixelsPerMetre,
       chunks: this.#chunks.size,
       chunksDrawn: this.#chunksDrawn,

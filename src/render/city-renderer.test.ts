@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CAMERA_ZOOM_MODE } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
+import { dollyLeanStrength } from "../core/lean-curve.js";
 import { WHOLE_CITY_CHUNK_ID } from "./chunk-culling.js";
 import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
 
@@ -176,7 +178,8 @@ const hostRenderer = {
 const raw = (initial = buffers(4)): CityRenderer =>
   new CityRenderer(hostRenderer, initial, new Uint8Array(512), {
     pixelsPerMetre: 25,
-    cameraHeightMetres: 900
+    cameraHeightMetres: 900,
+    cameraZoomMode: CAMERA_ZOOM_MODE.DOLLY
   });
 
 /** Bloom is on by default; the chunk tests count meshes, and its quads are not the subject. */
@@ -300,13 +303,16 @@ describe("CityRenderer neon pass", () => {
     const r = make();
     r.clearChunks();
     r.setChunk(neonChunk("0,0", NEAR, 3, 2));
-    r.update(cam());
+    r.update(cam({ scale: 4 }));
 
     expect(renderLog).toHaveLength(2);
     expect(renderLog[0]?.options.clear).toBe(true);
     expect(renderLog[1]?.options.clear).toBe(false);
     expect(renderLog[1]?.options.renderTexture).toBe(renderLog[0]?.options.renderTexture);
     expect((renderLog[1]?.content as StubContainer).children).toHaveLength(1);
+    expect(
+      (renderLog[1]?.content as StubContainer).children[0]?.shader.uniforms.uLeanStrength
+    ).toBeGreaterThan(1);
     r.destroy();
   });
 
@@ -526,6 +532,7 @@ describe("CityRenderer culling", () => {
     expect(uniforms).toHaveLength(3);
     for (const u of uniforms.slice(0, 2)) {
       expect(u.uCamHeight).toBe(900 * 25);
+      expect(u.uLeanStrength).toBeCloseTo(dollyLeanStrength(1));
       expect(u.uPixelsPerMetre).toBe(25);
     }
     expect(uniforms[2]?.uCamHeight).toBe(8750);
@@ -540,6 +547,96 @@ describe("CityRenderer culling", () => {
     const u = renderedContent?.children[0]?.shader.uniforms;
     expect(u?.uPixelsPerMetre).toBe(25);
     expect(u?.uScreenPxPerMetre).toBe(25 * 4 * 0.5);
+    r.destroy();
+  });
+
+  it("raises Dolly lean quadratically without changing camera height", () => {
+    const r = make();
+    r.update(cam({ scale: 2 }));
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uCamHeight).toBe(900 * 25);
+    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(2));
+    r.destroy();
+  });
+
+  it("leaves the Dolly curve uncapped below its reference zoom", () => {
+    const r = make();
+    r.update(cam({ scale: 0.5 }));
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uCamHeight).toBe(900 * 25);
+    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(0.5));
+    expect(r.stats()).toMatchObject({
+      cameraZoom: 0.5,
+      leanOverride: null
+    });
+    r.destroy();
+  });
+
+  it("applies and reports an uncapped calibration override", () => {
+    const r = make();
+    const camera = cam({ scale: 1.75 });
+    r.update(camera);
+    const afterAutomatic = renderCalls;
+
+    r.leanOverride = 12.5;
+    expect(r.leanCalibrationPoint()).toMatchObject({
+      zoom: 1.75,
+      leanStrength: 12.5,
+      leanOverride: 12.5,
+      cameraZoomMode: CAMERA_ZOOM_MODE.DOLLY,
+      cameraHeightMetres: 900,
+      pixelsPerMetre: 25,
+      screenWidth: SCREEN_W,
+      screenHeight: SCREEN_H,
+      renderScale: 1
+    });
+    r.update(camera);
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uLeanStrength).toBe(12.5);
+    expect(renderCalls).toBe(afterAutomatic + 1);
+    r.destroy();
+  });
+
+  it("restores the automatic curve when the calibration override is cleared", () => {
+    const r = make();
+    r.leanOverride = 0;
+    r.update(cam({ scale: 2 }));
+    expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBe(0);
+
+    r.leanOverride = null;
+    r.update(cam({ scale: 2 }));
+    expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBeCloseTo(
+      dollyLeanStrength(2)
+    );
+    r.destroy();
+  });
+
+  it("switches a live renderer from Dolly to Fixed mode", () => {
+    const r = make();
+    const camera = cam({ scale: 4 });
+    r.update(camera);
+    const afterDolly = renderCalls;
+
+    r.cameraZoomMode = CAMERA_ZOOM_MODE.FIXED;
+    r.update(camera);
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uCamHeight).toBe(900 * 25);
+    expect(u?.uLeanStrength).toBe(1);
+    expect(renderCalls).toBe(afterDolly + 1);
+    r.destroy();
+  });
+
+  it("does not cap Dolly lean at high zoom", () => {
+    const r = make();
+    r.update(cam({ scale: 20 }));
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uCamHeight).toBe(900 * 25);
+    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(20));
     r.destroy();
   });
 });

@@ -15,6 +15,14 @@ export const GENERATOR_VERSION = 3;
 
 /** Client and world settings, registered in `settings.ts`. */
 export const SETTING_CAMERA_HEIGHT = "cameraHeightM";
+export const SETTING_CAMERA_ZOOM_MODE = "cameraZoomMode";
 export const SETTING_RENDER_SCALE = "renderScale";
 export const SETTING_BLOOM = "bloom";
 export const SETTING_BLOOM_STRENGTH = "bloomStrength";
+
+export const CAMERA_ZOOM_MODE = {
+  FIXED: "fixed",
+  DOLLY: "dolly"
+} as const;
+
+export type CameraZoomMode = (typeof CAMERA_ZOOM_MODE)[keyof typeof CAMERA_ZOOM_MODE];

@@ -1,11 +1,20 @@
-import { MODULE_ID, SETTING_CAMERA_HEIGHT, SETTING_RENDER_SCALE } from "./constants.js";
 import {
+  MODULE_ID,
+  SETTING_CAMERA_HEIGHT,
+  SETTING_CAMERA_ZOOM_MODE,
+  SETTING_RENDER_SCALE,
+  type CameraZoomMode
+} from "./constants.js";
+import {
+  adjustLeanAtCurrentZoom,
   autoWallsEnabled,
   buildWalls,
+  clearLeanCalibration,
   clearWalls,
   commitDistrictPalette,
   getCity,
   getGraph,
+  getLeanCalibrationReport,
   isSceneEnabled,
   listDistricts,
   rebuildGeometry,
@@ -14,8 +23,10 @@ import {
   removeEdge,
   reseedBase,
   resetCity,
+  saveLeanCalibrationPoint,
   setAutoWalls,
   setBaseParams,
+  setLeanAtCurrentZoom,
   setSceneEnabled,
   setZoneParams,
   stats,
@@ -100,7 +111,17 @@ Hooks.once("init", () => {
     setCameraHeight: async (metres: number) => {
       await setSettingValue(SETTING_CAMERA_HEIGHT, metres);
       return settingValue<number>(SETTING_CAMERA_HEIGHT);
-    }
+    },
+    setCameraZoomMode: async (mode: CameraZoomMode) => {
+      await setSettingValue(SETTING_CAMERA_ZOOM_MODE, mode);
+      return settingValue<CameraZoomMode>(SETTING_CAMERA_ZOOM_MODE);
+    },
+
+    setLeanAtCurrentZoom,
+    adjustLeanAtCurrentZoom,
+    saveLeanCalibrationPoint,
+    getLeanCalibrationReport,
+    clearLeanCalibration
   };
 
   console.log(`${MODULE_ID} | initialised`);

@@ -10,6 +10,7 @@ export interface CameraUniforms {
   /** World pixels per metre times the offscreen stage scale, i.e. screen pixels per metre. */
   screenPxPerMetre: number;
   cameraHeightPx: number;
+  leanStrength: number;
   depthFar: number;
 }
 
@@ -43,6 +44,7 @@ export class CityMesh {
       uPixelsPerMetre: 25,
       uScreenPxPerMetre: 25,
       uCamHeight: 8750,
+      uLeanStrength: 1,
       uDepthFar: 20000,
       uEmissiveMax: EMISSIVE_MAX,
       uPalette: palette.texture
@@ -62,6 +64,7 @@ export class CityMesh {
     u.uPixelsPerMetre = c.pixelsPerMetre;
     u.uScreenPxPerMetre = c.screenPxPerMetre;
     u.uCamHeight = c.cameraHeightPx;
+    u.uLeanStrength = c.leanStrength;
     u.uDepthFar = c.depthFar;
   }
 

@@ -23,6 +23,7 @@ uniform mat3 translationMatrix;
 uniform vec2 uPivot;
 uniform float uPixelsPerMetre;
 uniform float uCamHeight;
+uniform float uLeanStrength;
 uniform float uDepthFar;
 uniform float uEmissiveMax;
 uniform sampler2D uPalette;
@@ -34,7 +35,7 @@ void main() {
   float hpx = aHeight * uPixelsPerMetre;
   vec2 fromPivot = aPos - uPivot;
   float eye = max(uCamHeight - hpx, 1.0);
-  vec2 leaned = aPos + fromPivot * (hpx / eye);
+  vec2 leaned = aPos + fromPivot * (hpx / eye) * uLeanStrength;
 
   // texture2DLod, not texture2D: GLSL ES 1.00 only guarantees the explicit-LOD
   // sampling functions inside a vertex shader.
