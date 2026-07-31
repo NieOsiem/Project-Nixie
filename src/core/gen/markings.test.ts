@@ -69,6 +69,16 @@ function quadsOn(quads: MarkingQuad[], a: Vec2, b: Vec2, halfWidth: number): Mar
 
 const node = (graph: RoadGraph, id: string): Vec2 => nodeMap(graph).get(id)!;
 
+function distanceToSegment(p: Vec2, a: Vec2, b: Vec2): number {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  const dx = (b.x - a.x) / len;
+  const dy = (b.y - a.y) / len;
+  const vx = p.x - a.x;
+  const vy = p.y - a.y;
+  const t = Math.min(len, Math.max(0, vx * dx + vy * dy));
+  return Math.hypot(vx - dx * t, vy - dy * t);
+}
+
 /* -------------------------------------------- */
 /*  Chunk emulation — mirrors chunked.ts         */
 /* -------------------------------------------- */
@@ -244,15 +254,6 @@ describe("junction clearance", () => {
     expect(quads.length).toBeGreaterThan(10);
 
     const halfPx = halfM * PPM;
-    const distanceTo = (p: Vec2, a: Vec2, b: Vec2): number => {
-      const len = Math.hypot(b.x - a.x, b.y - a.y);
-      const dx = (b.x - a.x) / len;
-      const dy = (b.y - a.y) / len;
-      const vx = p.x - a.x;
-      const vy = p.y - a.y;
-      const t = Math.min(len, Math.max(0, vx * dx + vy * dy));
-      return Math.hypot(vx - dx * t, vy - dy * t);
-    };
     const through: [Vec2, Vec2] = [node(px, "w"), node(px, "e")];
     const stub: [Vec2, Vec2] = [node(px, "s"), node(px, "tip")];
 
@@ -262,7 +263,7 @@ describe("junction clearance", () => {
       const alongY = Math.abs(q.ring[1]!.y - q.ring[0]!.y);
       const foreign = alongX > alongY ? stub : through;
       for (const p of q.ring) {
-        expect(distanceTo(p, foreign[0], foreign[1])).toBeGreaterThanOrEqual(halfPx - 1e-6);
+        expect(distanceToSegment(p, foreign[0], foreign[1])).toBeGreaterThanOrEqual(halfPx - 1e-6);
         checked++;
       }
     }
@@ -289,6 +290,25 @@ describe("junction clearance", () => {
     );
 
     expect(nearby).toHaveLength(2);
+  });
+
+  it("keeps the wide road's kerb out of the default city's narrower diagonal arm", () => {
+    const d = node(GRAPH_PX, "D");
+    const e = node(GRAPH_PX, "E");
+    const b = node(GRAPH_PX, "B");
+    const horizontalKerbs = byMaterial(
+      quadsOn(QUADS, d, e, (16 / 2 + 3) * PPM),
+      MATERIAL.KERB
+    ).filter((q) => Math.abs(q.ring[1]!.y - q.ring[0]!.y) < 1e-9);
+
+    expect(horizontalKerbs.length).toBeGreaterThan(2);
+    for (const q of horizontalKerbs) {
+      for (const p of q.ring) {
+        expect(distanceToSegment(p, d, b)).toBeGreaterThanOrEqual(
+          (9 / 2 + 2.5) * PPM - 1e-6
+        );
+      }
+    }
   });
 
   /**

@@ -111,8 +111,8 @@ function segments(from: number, to: number, step: number): [number, number][] {
  * (w_other + halfWidth·cos θ) / sin θ — far past the disc — so a marking inset by the radius
  * alone is drawn straight across the open junction. That is the broken-neon-line artifact.
  *
- * The `cos` test is what keeps a straight-through split (θ = π, equal widths) at zero inset:
- * there the line already lies on the pavement boundary and the kerb must run through.
+ * Straight-through arms are skipped before the miter; the collinear width check handles
+ * same-direction overlaps whose kerb already lies outside the neighbouring pavement.
  */
 function pavementInset(dir: Vec2, others: Arm[], halfWidth: number, maxInset: number): number {
   let inset = 0;
@@ -124,7 +124,7 @@ function pavementInset(dir: Vec2, others: Arm[], halfWidth: number, maxInset: nu
     if (dot <= STRAIGHT_THROUGH_DOT) continue;
     const cos = Math.abs(dot);
     const sin = Math.abs(dir.x * other.dir.y - dir.y * other.dir.x);
-    if (halfWidth * cos >= other.pavedHalf) continue;
+    if (sin <= 0 && halfWidth * cos >= other.pavedHalf) continue;
     const reach = sin <= 0 ? maxInset : (other.pavedHalf + halfWidth * cos) / sin;
     inset = Math.max(inset, Math.min(reach, maxInset));
   }
