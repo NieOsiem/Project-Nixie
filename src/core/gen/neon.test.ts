@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { BuildingSpec } from "../geom/extrude.js";
+import { describeBuildingMassing, type BuildingSpec } from "../geom/extrude.js";
 import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
-import { rectRing, ringBounds } from "../geom/types.js";
+import { rectRing, ringBounds, ringCentroid } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
 import { hash2 } from "./hash.js";
 import {
@@ -38,6 +38,15 @@ function cityOf(count: number): BuildingSpec[] {
   }
   return specs;
 }
+
+const detailedTower = (seed: number): BuildingSpec => ({
+  footprint: rectRing({ x: 0, y: 0, width: 30 * PPM, height: 24 * PPM }),
+  height: 80,
+  roofMaterial: materialIndex(FIRST_ZONE_BANK, DISTRICT_SLOT.ROOF_A),
+  wallMaterial: materialIndex(FIRST_ZONE_BANK, DISTRICT_SLOT.WALL_A),
+  seed,
+  detailedMassing: true
+});
 
 const vertexAt = (m: MeshBuffers, i: number) => {
   const at = i * VERTEX_FLOATS;
@@ -208,5 +217,48 @@ describe("neonMesh", () => {
       if (vertexAt(m, q).radial === 0) signs++;
     }
     expect(signs).toBeLessThan(800);
+  });
+
+  it("keeps facade signs below the outer tier of detailed towers", () => {
+    let facades = 0;
+    for (let i = 0; i < 300; i++) {
+      const spec = detailedTower(hash2(i, 71, 13));
+      const outerTop = describeBuildingMassing(spec, PPM).volumes[0]!.topHeight;
+      const mesh = neonMesh([spec], PPM);
+      for (let q = 0; q < mesh.vertexCount; q += 4) {
+        if (vertexAt(mesh, q).radial !== 0) continue;
+        const heights = [0, 1, 2, 3].map((corner) => vertexAt(mesh, q + corner).height);
+        if (Math.max(...heights) - Math.min(...heights) < 1e-5) continue;
+        facades++;
+        expect(Math.max(...heights)).toBeLessThanOrEqual(outerTop + 1e-5);
+      }
+    }
+    expect(facades).toBeGreaterThan(20);
+  });
+
+  it("centres rooftop strips on the actual offset top footprint", () => {
+    let checked = false;
+    for (let i = 0; i < 500 && !checked; i++) {
+      const spec = detailedTower(hash2(i, 81, 17));
+      const massing = describeBuildingMassing(spec, PPM);
+      const outerCentre = ringCentroid(massing.volumes[0]!.footprint);
+      const top = massing.volumes[massing.volumes.length - 1]!;
+      const topCentre = ringCentroid(top.footprint);
+      if (Math.hypot(topCentre.x - outerCentre.x, topCentre.y - outerCentre.y) < 0.01) continue;
+
+      const mesh = neonMesh([spec], PPM);
+      for (let q = 0; q < mesh.vertexCount; q += 4) {
+        const vertices = [0, 1, 2, 3].map((corner) => vertexAt(mesh, q + corner));
+        if (vertices[0]!.radial !== 0) continue;
+        if (!vertices.every((vertex) => Math.abs(vertex.height - top.topHeight) < 1e-5)) continue;
+        const cx = vertices.reduce((sum, vertex) => sum + vertex.x, 0) / vertices.length;
+        const cy = vertices.reduce((sum, vertex) => sum + vertex.y, 0) / vertices.length;
+        expect(cx).toBeCloseTo(topCentre.x, 4);
+        expect(cy).toBeCloseTo(topCentre.y, 4);
+        checked = true;
+        break;
+      }
+    }
+    expect(checked).toBe(true);
   });
 });

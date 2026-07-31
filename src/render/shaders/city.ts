@@ -1,4 +1,4 @@
-import { PALETTE_SIZE } from "../../core/palette.js";
+import { BANK_SIZE, DISTRICT_SLOT, PALETTE_SIZE } from "../../core/palette.js";
 
 /**
  * Fake-3D extrusion.
@@ -36,6 +36,7 @@ uniform sampler2D uPalette;
 
 varying vec3 vBase;
 varying vec3 vEmissive;
+varying vec3 vAccent;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -57,6 +58,13 @@ void main() {
   float u = (aMaterial + 0.5) / ${PALETTE_SIZE}.0;
   vec4 base = texture2DLod(uPalette, vec2(u, 0.25), 0.0);
   vec4 emissive = texture2DLod(uPalette, vec2(u, 0.75), 0.0);
+  float bank = floor(aMaterial / ${BANK_SIZE}.0) * ${BANK_SIZE}.0;
+  float accentSlot = mix(
+    ${DISTRICT_SLOT.NEON_A}.0,
+    ${DISTRICT_SLOT.NEON_B}.0,
+    step(0.5, fract(aSeed * 17.0 + 0.13)));
+  float accentU = (bank + accentSlot + 0.5) / ${PALETTE_SIZE}.0;
+  vec4 accent = texture2DLod(uPalette, vec2(accentU, 0.75), 0.0);
 
   // Exposure on the material bodies only. The reference is a mid-key image lit by a large soft
   // sky, not a black frame with lights in it; the palette bases alone land ~5x under that once
@@ -64,6 +72,7 @@ void main() {
   // would just move the bloom threshold, and this must not change what glows.
   vBase = base.rgb * 1.7;
   vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);
+  vAccent = accent.rgb * (accent.a * uEmissiveMax) * 0.36;
   vShade = aShade;
   vKind = aKind;
   vHeight = aHeight;
@@ -100,6 +109,7 @@ precision highp float;
 
 varying vec3 vBase;
 varying vec3 vEmissive;
+varying vec3 vAccent;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -111,13 +121,17 @@ varying vec2 vRoofCentreM;
 varying float vUpPxPerMetre;
 
 uniform float uScreenPxPerMetre;
+uniform float uDetailQuality;
 
-const float FLOOR_M = 3.4;
-const float WINDOW_M = 3.0;
+const float FLOOR_M = 3.6;
+const float GRID_M = 4.6;
+const float RIBBON_M = 1.35;
+const float FIN_M = 3.8;
+const float FEATURE_M = 18.0;
 const float SHOPFRONT_M = 4.0;
 const float BAY_M = 5.0;
-const float BAND_M = 0.35;
 const float PARAPET_M = 0.8;
+const float ARCHITECTURE_MIN_M = 6.0;
 
 float hash11(float x) {
   return fract(sin(x * 78.233) * 43758.5453);
@@ -143,39 +157,105 @@ vec3 facade() {
   float alongPx = max(uScreenPxPerMetre, 0.0001);
   float wUp = 0.6 / upPx;
   float wAlong = 0.6 / alongPx;
+  float architecture = step(ARCHITECTURE_MIN_M, vTop);
+  if (architecture < 0.5) return vBase * vShade + vEmissive;
 
-  float above = vHeight - SHOPFRONT_M;
-  float upper = smoothstep(-wUp, wUp, above);
-  float style = step(0.35, hash11(vSeed + 0.37));
-
-  float fx = fract(vU / WINDOW_M);
+  float aboveRaw = vHeight - SHOPFRONT_M;
+  float above = max(aboveRaw, 0.0);
+  float upper = smoothstep(-wUp, wUp, aboveRaw);
+  float floorId = floor(above / FLOOR_M);
+  float sectionFloors = floor(mix(4.0, 9.0, hash11(vSeed + 1.73)));
+  float section = floor(floorId / sectionFloors);
+  float sectionTone = mix(0.82, 1.0, hash11(vSeed + section * 13.37 + 2.19));
   float fy = fract(above / FLOOR_M);
-  float pane = slab(fx, 0.20, 0.80, wAlong / WINDOW_M) * slab(fy, 0.22, 0.78, wUp / FLOOR_M);
-  float on = step(0.58, hash21(vec2(floor(vU / WINDOW_M), floor(above / FLOOR_M)) + vSeed * 91.0));
-  float grid = min(lod(FLOOR_M, upPx), lod(WINDOW_M, alongPx));
+  float parapet = smoothstep(vTop - PARAPET_M - wUp, vTop - PARAPET_M + wUp, vHeight);
+  float canyon = mix(0.68, 1.0, smoothstep(0.0, 12.0, vHeight));
 
-  float band = slab(fy, 0.08, 0.08 + BAND_M / FLOOR_M, wUp / FLOOR_M) * lod(FLOOR_M, upPx);
+  // WHY: parapet emission is ~1.0 against a 0.55 bloom threshold, so ungated it lit every roof
+  // edge in the city and the skyline read as wireframe. Lit coping is a minority style; the rest
+  // get a value-only cap. Decided before the quality branch so a building cannot change style
+  // between a moving and a settled frame.
+  float parapetGlow = step(0.62, hash11(vSeed + 3.41));
+  float coping = parapet * (1.0 - parapetGlow);
 
-  float lit = mix(pane * on * grid, band, style) * upper;
-  float recess = pane * (1.0 - on) * grid * upper * (1.0 - style);
+  // WHY: moving frames skip cell work; one section-coherent ribbon avoids shimmer.
+  if (uDetailQuality < 0.5) {
+    float movingRibbon = slab(
+      fy,
+      0.18,
+      0.18 + RIBBON_M / FLOOR_M,
+      wUp / FLOOR_M);
+    float movingOn = step(0.24, hash11(vSeed + section * 7.91 + 4.07));
+    float movingLight = movingRibbon * movingOn * upper * lod(FLOOR_M, upPx);
+    vec3 body = vBase * vShade * canyon * sectionTone * (1.0 + 0.30 * coping);
+    return body
+      + vEmissive * (0.08 + 0.68 * parapet * parapetGlow)
+      + vAccent * (0.68 * movingLight);
+  }
+
+  float family = hash11(vSeed + 0.37);
+  float gridStyle = 1.0 - step(0.35, family);
+  float ribbonStyle = step(0.35, family) * (1.0 - step(0.65, family));
+  float finStyle = step(0.65, family) * (1.0 - step(0.85, family));
+  float featureStyle = step(0.85, family);
+
+  float gx = fract(vU / GRID_M);
+  float gridPane = slab(gx, 0.12, 0.88, wAlong / GRID_M)
+    * slab(fy, 0.14, 0.86, wUp / FLOOR_M);
+  float gridLod = min(lod(FLOOR_M, upPx), lod(GRID_M, alongPx));
+  float litThreshold = mix(0.20, 0.40, hash11(vSeed + section * 5.23 + 6.11));
+  float gridOn = step(
+    litThreshold,
+    hash21(vec2(floor(vU / (GRID_M * 2.0)), floor(floorId / 2.0)) + vSeed * 91.0));
+
+  float ribbon = slab(
+    fy,
+    0.18,
+    0.18 + RIBBON_M / FLOOR_M,
+    wUp / FLOOR_M) * lod(FLOOR_M, upPx);
+  float ribbonOn = step(0.24, hash11(vSeed + section * 7.91 + 8.03));
+
+  float finX = fract(vU / FIN_M);
+  float fin = slab(finX, 0.08, 0.56, wAlong / FIN_M) * lod(FIN_M, alongPx);
+  float finOn = step(0.28, hash11(vSeed + section * 9.17 + 9.13));
+
+  float featureX = fract((vU + vSeed * FEATURE_M) / FEATURE_M);
+  float wallN = vHeight / max(vTop, 0.0001);
+  float feature = slab(featureX, 0.24, 0.76, wAlong / FEATURE_M)
+    * slab(wallN, 0.20, 0.78, wUp / max(vTop, 0.0001))
+    * lod(FEATURE_M, alongPx);
+  float featureOn = step(0.32, hash11(vSeed + section * 11.71 + 10.31));
+
+  float lit = upper * (
+    gridStyle * gridPane * gridOn * gridLod
+    + ribbonStyle * ribbon * ribbonOn
+    + finStyle * fin * finOn
+    + featureStyle * feature * featureOn);
+  float glass = upper * (
+    gridStyle * gridPane * gridLod
+    + ribbonStyle * ribbon
+    + finStyle * fin
+    + featureStyle * feature);
+  float recess = glass * (1.0 - min(lit, 1.0));
 
   float bay = fract(vU / BAY_M);
-  float shop = slab(bay, 0.10, 0.90, wAlong / BAY_M)
-    * slab(vHeight, 0.5, SHOPFRONT_M - 0.6, wUp)
+  float shop = slab(bay, 0.08, 0.92, wAlong / BAY_M)
+    * slab(vHeight, 0.45, SHOPFRONT_M - 0.45, wUp)
     * lod(BAY_M, alongPx);
 
-  float parapet = smoothstep(vTop - PARAPET_M - wUp, vTop - PARAPET_M + wUp, vHeight);
-
-  // vEmissive already carries strength * EMISSIVE_MAX (~1.1 peak for a wall), so these
-  // are fractions of it: 1.15 clears the ~0.55 bloom threshold, 0.14 stays well under.
-  float light = 0.14 + max(max(1.15 * lit, 0.7 * parapet), shop);
-  float canyon = mix(0.62, 1.0, smoothstep(0.0, 12.0, vHeight));
-  return vBase * vShade * canyon * (1.0 - 0.60 * recess) + vEmissive * light;
+  float articulation = sectionTone
+    * (1.0 - 0.16 * finStyle * (1.0 - fin) * upper);
+  vec3 body = vBase * vShade * canyon * articulation * (1.0 - 0.58 * recess)
+    * (1.0 + 0.30 * coping);
+  return body
+    + vEmissive * (0.08 + 0.72 * parapet * parapetGlow)
+    + vAccent * max(0.96 * lit, 0.88 * shop);
 }
 
 vec3 roof() {
   vec2 extentM = max(vec2(vU, abs(vShade)), vec2(0.0001));
-  float structured = step(0.0, vShade);
+  float architecture = step(ARCHITECTURE_MIN_M, vHeight);
+  float structured = step(0.0, vShade) * architecture;
   float angle = vTop;
   float ca = cos(angle);
   float sa = sin(angle);
@@ -183,44 +263,52 @@ vec3 roof() {
   vec2 local = mat2(ca, -sa, sa, ca) * fromCentre / extentM;
   float aa = 0.75 / max(min(extentM.x, extentM.y) * uScreenPxPerMetre, 1.0);
   float detailLod = lod(min(extentM.x, extentM.y), uScreenPxPerMetre) * structured;
-  float slope = clamp(0.5 + 0.5 * dot(fromCentre / max(length(extentM), 0.0001), vec2(0.5547, 0.8321)), 0.0, 1.0);
-  float plane = mix(1.0, 0.84, slope);
-  float inside = slab(local.x, -0.72, 0.72, aa) * slab(local.y, -0.72, 0.72, aa);
+  float slope = clamp(
+    0.5 + 0.5 * dot(fromCentre / max(length(extentM), 0.0001), vec2(0.5547, 0.8321)),
+    0.0,
+    1.0);
+  float plane = mix(1.08, 0.82, slope);
 
-  float padX = (hash11(vSeed + 5.31) - 0.5) * 0.24;
-  float padY = (hash11(vSeed + 6.17) - 0.5) * 0.24;
-  float padW = mix(0.26, 0.46, hash11(vSeed + 7.03));
-  float padH = mix(0.18, 0.34, hash11(vSeed + 8.11));
-  float padOuter = slab(local.x, padX - padW, padX + padW, aa)
-    * slab(local.y, padY - padH, padY + padH, aa);
-  float padInner = slab(local.x, padX - padW + 0.06, padX + padW - 0.06, aa)
-    * slab(local.y, padY - padH + 0.06, padY + padH - 0.06, aa);
+  float frameOuter = slab(local.x, -0.96, 0.96, aa) * slab(local.y, -0.96, 0.96, aa);
+  float frameInner = slab(local.x, -0.78, 0.78, aa) * slab(local.y, -0.78, 0.78, aa);
+  float frame = max(frameOuter - frameInner, 0.0) * detailLod;
+  float directionalBevel = clamp(0.5 + dot(local, vec2(0.2774, 0.4160)), 0.0, 1.0);
 
-  float barW = mix(0.045, 0.08, hash11(vSeed + 9.23));
-  float barL = mix(0.30, 0.52, hash11(vSeed + 10.37));
-  float barGap = mix(0.10, 0.20, hash11(vSeed + 11.41));
-  float barsOuter = max(
-    slab(local.x, -barL, barL, aa) * slab(local.y, -barGap - barW - 0.04, -barGap + barW + 0.04, aa),
-    slab(local.x, -barL, barL, aa) * slab(local.y, barGap - barW - 0.04, barGap + barW + 0.04, aa));
-  float barsInner = max(
-    slab(local.x, -barL + 0.04, barL - 0.04, aa) * slab(local.y, -barGap - barW, -barGap + barW, aa),
-    slab(local.x, -barL + 0.04, barL - 0.04, aa) * slab(local.y, barGap - barW, barGap + barW, aa));
+  if (architecture < 0.5) return vBase * plane + vEmissive;
+  if (uDetailQuality < 0.5) {
+    float movingFrame = frame * mix(0.08, 0.24, directionalBevel);
+    return vBase * plane * (1.0 + movingFrame)
+      + vEmissive * 0.10
+      + vAccent * (0.34 * frame);
+  }
+
+  float insetOuter = slab(local.x, -0.70, 0.70, aa) * slab(local.y, -0.62, 0.62, aa);
+  float insetInner = slab(local.x, -0.57, 0.57, aa) * slab(local.y, -0.47, 0.47, aa);
+  float insetDeck = insetInner * detailLod;
+  float insetRim = max(insetOuter - insetInner, 0.0) * detailLod;
+
+  float skylightArea = slab(local.x, -0.68, 0.68, aa)
+    * slab(local.y, -0.58, 0.58, aa)
+    * detailLod;
+  float stripe = fract((local.y + 0.58) / 0.28);
+  float skylightBars = slab(stripe, 0.14, 0.66, aa / 0.28) * skylightArea;
 
   float style = hash11(vSeed + 12.59);
-  float padStyle = 1.0 - step(0.42, style);
-  float barsStyle = step(0.42, style) * (1.0 - step(0.78, style));
-  float pad = padInner * padStyle * inside * detailLod;
-  float padRim = (padOuter - padInner) * padStyle * inside * detailLod;
-  float skylight = barsInner * barsStyle * inside * detailLod;
-  float skylightRim = (barsOuter - barsInner) * barsStyle * inside * detailLod;
-  float frameOuter = slab(local.x, -0.92, 0.92, aa) * slab(local.y, -0.92, 0.92, aa);
-  float frameInner = slab(local.x, -0.78, 0.78, aa) * slab(local.y, -0.78, 0.78, aa);
-  float frame = (frameOuter - frameInner) * detailLod;
+  float insetStyle = 1.0 - step(0.48, style);
+  float skylightStyle = step(0.48, style) * (1.0 - step(0.82, style));
+  float structure = 1.0
+    + frame * mix(0.12, 0.34, directionalBevel)
+    + insetStyle * (
+      -0.30 * insetDeck
+      + insetRim * mix(0.14, 0.42, directionalBevel))
+    + skylightStyle * (-0.18 * skylightArea + 0.10 * skylightBars);
 
-  float structure = 1.0 + 0.16 * frame
-    - 0.10 * pad + 0.20 * padRim + 0.24 * skylight - 0.18 * skylightRim;
   return vBase * plane * structure
-    + vEmissive * (1.0 + 0.25 * frame + 0.85 * skylight);
+    + vEmissive * 0.10
+    + vAccent * (
+      0.42 * frame
+      + 0.52 * insetStyle * insetRim
+      + 0.92 * skylightStyle * skylightBars);
 }
 
 vec3 clutter() {
@@ -235,11 +323,21 @@ vec3 clutter() {
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
 
+vec3 architectureDetail() {
+  float cap = 1.0 - step(-0.5, vShade);
+  float edge = smoothstep(0.70, 0.90, max(abs(vU), abs(vTop))) * cap;
+  vec3 sideColour = vBase * vShade + vEmissive;
+  vec3 capColour = vBase * 1.08 + vEmissive;
+  vec3 rimColour = vBase * 0.78 + vEmissive * 0.82;
+  return mix(sideColour, mix(capColour, rimColour, edge), cap);
+}
+
 void main() {
   vec3 colour = vBase * vShade + vEmissive;
   if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
-  gl_FragColor = vec4(colour + vec3(0.045, 0.04, 0.085), 1.0);
+  else if (vKind > 4.5 && vKind < 5.5) colour = architectureDetail();
+  gl_FragColor = vec4(colour + vec3(0.020, 0.014, 0.035), 1.0);
 }
 `;

@@ -4,6 +4,8 @@ import { rectsIntersect, type Rect } from "../core/geom/types.js";
 export interface ChunkGeometry {
   id: string;
   mesh: MeshBuffers;
+  /** Optional geometry reserved for higher quality tiers. */
+  detail?: MeshBuffers;
   /** Additive neon quads for this chunk, drawn in a second pass over the same bounds. */
   neon?: MeshBuffers;
   /** Culling bounds in WORLD PIXELS, already including any building overhang. */

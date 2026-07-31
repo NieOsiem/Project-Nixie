@@ -39,6 +39,10 @@ export interface BuildChunkResult {
   indices: Uint32Array;
   vertexCount: number;
   triangleCount: number;
+  detailVertices: Float32Array;
+  detailIndices: Uint32Array;
+  detailVertexCount: number;
+  detailTriangleCount: number;
   neonVertices: Float32Array;
   neonIndices: Uint32Array;
   neonVertexCount: number;
@@ -87,6 +91,10 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           indices: build.mesh.indices,
           vertexCount: build.mesh.vertexCount,
           triangleCount: build.mesh.triangleCount,
+          detailVertices: build.detail.vertices,
+          detailIndices: build.detail.indices,
+          detailVertexCount: build.detail.vertexCount,
+          detailTriangleCount: build.detail.triangleCount,
           neonVertices: build.neon.vertices,
           neonIndices: build.neon.indices,
           neonVertexCount: build.neon.vertexCount,
@@ -100,10 +108,12 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           ok: true,
           result,
           // WHY: TypedArray.buffer widens to ArrayBufferLike; SharedArrayBuffer is unavailable here.
-          // All four are exact-sized allocations, so no two share a buffer and one list is legal.
+          // All six are exact-sized allocations, so no two share a buffer and one list is legal.
           transfer: [
             result.vertices.buffer as ArrayBuffer,
             result.indices.buffer as ArrayBuffer,
+            result.detailVertices.buffer as ArrayBuffer,
+            result.detailIndices.buffer as ArrayBuffer,
             result.neonVertices.buffer as ArrayBuffer,
             result.neonIndices.buffer as ArrayBuffer
           ]

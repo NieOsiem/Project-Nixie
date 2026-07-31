@@ -19,6 +19,7 @@ import {
   packPalette,
   presetByName,
   zoneBank,
+  type DistrictPalette,
   type Material
 } from "./palette.js";
 
@@ -34,6 +35,20 @@ const emissiveAt = (d: Uint8Array, i: number): number[] => {
   const at = (PALETTE_SIZE + i) * 4;
   return [...d.slice(at, at + 4)];
 };
+
+const legacyNeonSprawl = (): DistrictPalette => ({
+  name: "Neon Sprawl",
+  materials: [
+    { base: { r: 0.165, g: 0.12, b: 0.275 }, emissive: { r: 0.62, g: 0.34, b: 0.95 }, emissiveStrength: 0.26 },
+    { base: { r: 0.24, g: 0.105, b: 0.19 }, emissive: { r: 1, g: 0.28, b: 0.58 }, emissiveStrength: 0.32 },
+    { base: { r: 0.085, g: 0.19, b: 0.22 }, emissive: { r: 0.22, g: 0.9, b: 1 }, emissiveStrength: 0.28 },
+    { base: { r: 0.12, g: 0.095, b: 0.195 }, emissive: { r: 0.5, g: 0.3, b: 0.9 }, emissiveStrength: 0.05 },
+    { base: { r: 0.075, g: 0.16, b: 0.18 }, emissive: { r: 0.2, g: 0.85, b: 0.95 }, emissiveStrength: 0.06 },
+    { base: { r: 0.19, g: 0.085, b: 0.16 }, emissive: { r: 0.95, g: 0.3, b: 0.6 }, emissiveStrength: 0.06 },
+    { base: { r: 0.025, g: 0.008, b: 0.015 }, emissive: { r: 1, g: 0.24, b: 0.6 }, emissiveStrength: 1.6 },
+    { base: { r: 0.008, g: 0.02, b: 0.022 }, emissive: { r: 0.28, g: 0.95, b: 1 }, emissiveStrength: 1.5 }
+  ]
+});
 
 describe("packPalette", () => {
   it("always fills the full texture regardless of bank count", () => {
@@ -151,6 +166,31 @@ describe("shipped palettes", () => {
     }
   });
 
+  it("separates Neon Sprawl bodies, wall light, and strong architectural accents", () => {
+    const [wallA, wallB, wallC, , , , neonA, neonB] = DEFAULT_DISTRICT_PALETTE.materials;
+    expect(wallA).toMatchObject({
+      base: { r: 0.17, g: 0.105, b: 0.3 },
+      emissive: { r: 0.18, g: 1, b: 0.78 },
+      emissiveStrength: 0.34
+    });
+    expect(wallB).toMatchObject({
+      emissive: { r: 1, g: 0.2, b: 0.62 },
+      emissiveStrength: 0.36
+    });
+    expect(wallC).toMatchObject({
+      emissive: { r: 0.18, g: 0.78, b: 1 },
+      emissiveStrength: 0.34
+    });
+    expect(neonA).toMatchObject({
+      emissive: { r: 1, g: 0.18, b: 0.58 },
+      emissiveStrength: 1.65
+    });
+    expect(neonB).toMatchObject({
+      emissive: { r: 0.18, g: 1, b: 0.82 },
+      emissiveStrength: 1.55
+    });
+  });
+
   it("finds presets by name and nothing else", () => {
     expect(presetByName(DEFAULT_DISTRICT_PALETTE.name)).toEqual(DEFAULT_DISTRICT_PALETTE);
     expect(presetByName("no such preset")).toBeNull();
@@ -158,6 +198,14 @@ describe("shipped palettes", () => {
 });
 
 describe("normalizePalette", () => {
+  it("upgrades the exact legacy Neon Sprawl preset without overwriting edits", () => {
+    expect(normalizePalette(legacyNeonSprawl())).toEqual(DEFAULT_DISTRICT_PALETTE);
+
+    const customized = legacyNeonSprawl();
+    customized.materials[0]!.base.r = 0.166;
+    expect(normalizePalette(customized).materials[0]!.base.r).toBe(0.166);
+  });
+
   it("pads a short stored bank from the default", () => {
     const p = normalizePalette({ name: "Half", materials: [mat(), mat()] });
     expect(p.materials).toHaveLength(BANK_SIZE);

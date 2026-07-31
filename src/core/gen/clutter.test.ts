@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BuildingSpec } from "../geom/extrude.js";
+import { describeBuildingMassing, type BuildingSpec } from "../geom/extrude.js";
 import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
 import { rectRing, type Ring, type Vec2 } from "../geom/types.js";
 import { hash2 } from "./hash.js";
@@ -97,6 +97,22 @@ describe("clutterMesh", () => {
       }
     }
     expect(boxes).toBeGreaterThan(0);
+  });
+
+  it("places clutter on the inset top roof of a stepped building", () => {
+    const building = { ...spec(0.37), detailedMassing: true };
+    const roof = describeBuildingMassing(building, PPM).volumes.at(-1)!;
+    const mesh = clutterMesh([building], PPM);
+
+    expect(mesh.vertexCount).toBeGreaterThan(0);
+    for (let box = 0; box < mesh.vertexCount / 20; box++) {
+      for (let corner = 0; corner < 4; corner++) {
+        expect(pointInRing(vertexAt(mesh, box * 20 + corner), roof.footprint)).toBe(true);
+      }
+      for (const bottom of [4, 5, 8, 9, 12, 13, 16, 17]) {
+        expect(vertexAt(mesh, box * 20 + bottom).height).toBe(roof.topHeight);
+      }
+    }
   });
 
   it("survives a scene regrid without changing metre positions", () => {

@@ -129,7 +129,8 @@ export function buildingsForBlocks(
             Math.pow(t, HEIGHT_EXPONENT) * (options.maxHeightM - options.minHeightM),
           roofMaterial: materialIndex(bank, hashPick(ROOF_SLOTS, cx, cy, 1, seed)),
           wallMaterial: materialIndex(bank, hashPick(WALL_SLOTS, cx, cy, 2, seed)),
-          seed: facadeSeed(cx, cy, seed)
+          seed: facadeSeed(cx, cy, seed),
+          detailedMassing: true
         });
       }
     }

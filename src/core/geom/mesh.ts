@@ -11,6 +11,7 @@
  * | ROOF   | half-width, metres      | longest-edge angle | building hash |
  * | NEON   | local quad u, -1..1     | local quad v    | glow strength  |
  * | CLUTTER| cap local u, -1..1      | cap local v     | unused         |
+ * | DETAIL | cap local u, -1..1      | cap local v     | detail hash    |
  *
  * `aShade` is surface shade except on ROOF (signed half-height; negative disables structures)
  * and NEON (0 selects sign falloff, 1 radial). CLUTTER uses negative shade for its cap.
@@ -30,7 +31,7 @@ export const ATTRIBUTE_OFFSETS = {
 } as const;
 
 /** What the fragment shader should draw on a vertex. Values are read in `city.ts`. */
-export const KIND = { FLAT: 0, WALL: 1, ROOF: 2, NEON: 3, CLUTTER: 4 } as const;
+export const KIND = { FLAT: 0, WALL: 1, ROOF: 2, NEON: 3, CLUTTER: 4, DETAIL: 5 } as const;
 
 export interface MeshBuffers {
   vertices: Float32Array;

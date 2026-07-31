@@ -20,6 +20,7 @@ import {
 import { nodeMap, type RoadGraph } from "../graph/road-graph.js";
 import { MATERIAL } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { buildingDetailMesh } from "./building-detail.js";
 import { parkedCars } from "./cars.js";
 import { CLUTTER_MAX_HEIGHT_M, CLUTTER_MIN_BUILDING_M, clutterMesh } from "./clutter.js";
 import { chunkId, chunkQueryRect, chunkRect, chunksCovering, type ChunkKey } from "./chunks.js";
@@ -37,7 +38,10 @@ import { lotRegions } from "./zones.js";
 export interface ChunkBuild {
   key: ChunkKey;
   id: string;
+  /** Complete baseline scene, kept visible at every render quality. */
   mesh: MeshBuffers;
+  /** Additional geometry reserved for higher render-quality tiers. */
+  detail: MeshBuffers;
   /** Additive neon quads. A separate mesh because it needs its own blend and depth state. */
   neon: MeshBuffers;
   /** Flat surfaces already clipped to the chunk rect. Disjoint between chunks. */
@@ -177,6 +181,14 @@ function meshBoundsM(mesh: MeshBuffers, origin: Vec2, pixelsPerMetre: number): R
   );
 }
 
+function meshMaxHeightM(mesh: MeshBuffers): number {
+  let height = 0;
+  for (let i = 0; i < mesh.vertexCount; i++) {
+    height = Math.max(height, mesh.vertices[i * VERTEX_FLOATS + 2]!);
+  }
+  return height;
+}
+
 export function buildChunk(
   params: CityParams,
   key: ChunkKey,
@@ -195,6 +207,7 @@ export function buildChunk(
       key,
       id,
       mesh: emptyMesh(),
+      detail: emptyMesh(),
       neon: emptyMesh(),
       surfaces: { road: [], sidewalk: [], blocks: [] },
       buildings: [],
@@ -294,10 +307,21 @@ export function buildChunk(
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
     ...markingMeshes(markings),
-    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
     ...kept.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
+    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
     clutterMesh(kept, pixelsPerMetre)
   ]);
+  const detail = buildingDetailMesh(kept, pixelsPerMetre);
+  const detailBounds = meshBoundsM(detail, params.origin, pixelsPerMetre);
+  if (detailBounds !== null) {
+    boundsM = unionRect(boundsM, detailBounds);
+    const detailHeight = meshMaxHeightM(detail);
+    boundsM = unionRect(boundsM, {
+      ...detailBounds,
+      x: detailBounds.x - LIGHT_DIRECTION.x * detailHeight * SHADOW_LENGTH,
+      y: detailBounds.y - LIGHT_DIRECTION.y * detailHeight * SHADOW_LENGTH
+    });
+  }
 
   const neon = neonMesh(kept, pixelsPerMetre);
   const neonBounds = meshBoundsM(neon, params.origin, pixelsPerMetre);
@@ -307,6 +331,7 @@ export function buildChunk(
     key,
     id,
     mesh,
+    detail,
     neon,
     surfaces,
     buildings: kept,

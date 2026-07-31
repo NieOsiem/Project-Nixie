@@ -129,7 +129,7 @@ export function registerSettings(): void {
 
   game.settings.register(MODULE_ID, SETTING_ANTIALIAS, {
     name: "Antialiasing",
-    hint: "Supersample the city before presenting it. Disable this first on a weak client.",
+    hint: "Supersample one high-quality frame after panning stops. Disable this first on a weak client.",
     scope: "client",
     config: true,
     type: Boolean,
@@ -140,7 +140,7 @@ export function registerSettings(): void {
 
   game.settings.register(MODULE_ID, SETTING_ANTIALIAS_FACTOR, {
     name: "Antialiasing Factor",
-    hint: "Supersampling resolution multiplier. Cost rises with the square of this value.",
+    hint: "Settled-frame resolution multiplier. Its one-frame cost rises with the square of this value.",
     scope: "client",
     config: true,
     type: Number,

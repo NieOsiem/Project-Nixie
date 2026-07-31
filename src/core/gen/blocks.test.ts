@@ -118,7 +118,9 @@ describe("buildingsForBlocks", () => {
 
   it("produces one spec per lot", () => {
     const blocks = [block(0, 0, 300, 300)];
-    expect(buildingsForBlocks(blocks, region(), FRAME)).toHaveLength(9);
+    const specs = buildingsForBlocks(blocks, region(), FRAME);
+    expect(specs).toHaveLength(9);
+    expect(specs.every((spec) => spec.detailedMassing === true)).toBe(true);
   });
 
   it("keeps heights inside the configured range", () => {

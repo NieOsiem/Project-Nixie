@@ -31,42 +31,55 @@ export class BloomChain {
   #wideA: any = null;
   #wideB: any = null;
   #out: any = null;
+  #capacityWidth = 0;
+  #capacityHeight = 0;
   #width = 0;
   #height = 0;
 
   #srcTexel = new Float32Array(2);
   #bloomTexel = new Float32Array(2);
   #wideTexel = new Float32Array(2);
+  #sceneUvScale = new Float32Array([1, 1]);
+  #bloomUvScale = new Float32Array([1, 1]);
+  #wideUvScale = new Float32Array([1, 1]);
+  #shadowUvScale = new Float32Array([1, 1]);
+  #maskUvScale = new Float32Array([1, 1]);
 
   constructor(renderer: any) {
     this.#renderer = renderer;
 
     this.#threshold = new ScreenQuad(THRESHOLD_FRAG, {
       uScene: PIXI.Texture.EMPTY,
-      uSrcTexel: this.#srcTexel
+      uSrcTexel: this.#srcTexel,
+      uSceneUvScale: this.#sceneUvScale
     });
     this.#blurH = new ScreenQuad(BLUR_FRAG, {
       uTex: PIXI.Texture.EMPTY,
       uTexel: this.#bloomTexel,
+      uTexUvScale: this.#bloomUvScale,
       uDir: new Float32Array([1, 0])
     });
     this.#blurV = new ScreenQuad(BLUR_FRAG, {
       uTex: PIXI.Texture.EMPTY,
       uTexel: this.#bloomTexel,
+      uTexUvScale: this.#bloomUvScale,
       uDir: new Float32Array([0, 1])
     });
     this.#downsampleWide = new ScreenQuad(DOWNSAMPLE_FRAG, {
       uTex: PIXI.Texture.EMPTY,
-      uSrcTexel: this.#bloomTexel
+      uSrcTexel: this.#bloomTexel,
+      uTexUvScale: this.#bloomUvScale
     });
     this.#wideBlurH = new ScreenQuad(BLUR_FRAG, {
       uTex: PIXI.Texture.EMPTY,
       uTexel: this.#wideTexel,
+      uTexUvScale: this.#wideUvScale,
       uDir: new Float32Array([1, 0])
     });
     this.#wideBlurV = new ScreenQuad(BLUR_FRAG, {
       uTex: PIXI.Texture.EMPTY,
       uTexel: this.#wideTexel,
+      uTexUvScale: this.#wideUvScale,
       uDir: new Float32Array([0, 1])
     });
     this.#composite = new ScreenQuad(COMPOSITE_FRAG, {
@@ -77,7 +90,12 @@ export class BloomChain {
       uBuildingMask: PIXI.Texture.EMPTY,
       uNarrowStrength: 1,
       uWideStrength: WIDE_STRENGTH,
-      uPivotUv: new Float32Array([0.5, 0.5])
+      uPivotUv: new Float32Array([0.5, 0.5]),
+      uSceneUvScale: this.#sceneUvScale,
+      uBloomUvScale: this.#bloomUvScale,
+      uWideUvScale: this.#wideUvScale,
+      uShadowUvScale: this.#shadowUvScale,
+      uMaskUvScale: this.#maskUvScale
     });
   }
 
@@ -91,6 +109,9 @@ export class BloomChain {
   ): any {
     this.#ensureTargets(scene);
     const renderer = this.#renderer;
+    this.#setUvScale(this.#sceneUvScale, scene);
+    this.#setUvScale(this.#shadowUvScale, shadow);
+    this.#setUvScale(this.#maskUvScale, buildingMask);
 
     this.#threshold.uniforms.uScene = scene;
     renderer.render(this.#threshold.display, { renderTexture: this.#bloomA, clear: true });
@@ -136,29 +157,67 @@ export class BloomChain {
   }
 
   #ensureTargets(scene: any): void {
-    if (this.#out !== null && this.#width === scene.width && this.#height === scene.height) return;
+    const capacityWidth = scene.baseTexture?.width ?? scene.width;
+    const capacityHeight = scene.baseTexture?.height ?? scene.height;
+    if (
+      this.#out === null ||
+      this.#capacityWidth !== capacityWidth ||
+      this.#capacityHeight !== capacityHeight
+    ) {
+      this.#releaseTargets();
+      this.#capacityWidth = capacityWidth;
+      this.#capacityHeight = capacityHeight;
 
-    this.#releaseTargets();
+      const capacityBloomWidth = Math.max(1, Math.ceil(capacityWidth / NARROW_DOWNSAMPLE));
+      const capacityBloomHeight = Math.max(1, Math.ceil(capacityHeight / NARROW_DOWNSAMPLE));
+      const capacityWideWidth = Math.max(1, Math.ceil(capacityWidth / WIDE_DOWNSAMPLE));
+      const capacityWideHeight = Math.max(1, Math.ceil(capacityHeight / WIDE_DOWNSAMPLE));
+      this.#bloomA = this.#createTarget(
+        capacityBloomWidth,
+        capacityBloomHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#bloomB = this.#createTarget(
+        capacityBloomWidth,
+        capacityBloomHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#wideA = this.#createTarget(
+        capacityWideWidth,
+        capacityWideHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#wideB = this.#createTarget(
+        capacityWideWidth,
+        capacityWideHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#out = this.#createTarget(capacityWidth, capacityHeight, PIXI.TYPES.UNSIGNED_BYTE);
+    }
+
+    if (this.#width === scene.width && this.#height === scene.height) return;
     this.#width = scene.width;
     this.#height = scene.height;
 
-    const bw = Math.max(1, Math.ceil(scene.width / NARROW_DOWNSAMPLE));
-    const bh = Math.max(1, Math.ceil(scene.height / NARROW_DOWNSAMPLE));
-    const ww = Math.max(1, Math.ceil(scene.width / WIDE_DOWNSAMPLE));
-    const wh = Math.max(1, Math.ceil(scene.height / WIDE_DOWNSAMPLE));
-    this.#bloomA = this.#createTarget(bw, bh, PIXI.TYPES.HALF_FLOAT);
-    this.#bloomB = this.#createTarget(bw, bh, PIXI.TYPES.HALF_FLOAT);
-    this.#wideA = this.#createTarget(ww, wh, PIXI.TYPES.HALF_FLOAT);
-    this.#wideB = this.#createTarget(ww, wh, PIXI.TYPES.HALF_FLOAT);
-    this.#out = this.#createTarget(scene.width, scene.height, PIXI.TYPES.UNSIGNED_BYTE);
+    const bw = Math.max(1, Math.ceil(this.#width / NARROW_DOWNSAMPLE));
+    const bh = Math.max(1, Math.ceil(this.#height / NARROW_DOWNSAMPLE));
+    const ww = Math.max(1, Math.ceil(this.#width / WIDE_DOWNSAMPLE));
+    const wh = Math.max(1, Math.ceil(this.#height / WIDE_DOWNSAMPLE));
+    this.#resizeFrame(this.#bloomA, bw, bh);
+    this.#resizeFrame(this.#bloomB, bw, bh);
+    this.#resizeFrame(this.#wideA, ww, wh);
+    this.#resizeFrame(this.#wideB, ww, wh);
+    this.#resizeFrame(this.#out, this.#width, this.#height);
+    this.#setUvScale(this.#bloomUvScale, this.#bloomA);
+    this.#setUvScale(this.#wideUvScale, this.#wideA);
 
     const resolution = this.#renderer.resolution;
-    this.#srcTexel[0] = 1 / (scene.width * resolution);
-    this.#srcTexel[1] = 1 / (scene.height * resolution);
-    this.#bloomTexel[0] = 1 / (bw * resolution);
-    this.#bloomTexel[1] = 1 / (bh * resolution);
-    this.#wideTexel[0] = 1 / (ww * resolution);
-    this.#wideTexel[1] = 1 / (wh * resolution);
+    this.#srcTexel[0] = 1 / (capacityWidth * resolution);
+    this.#srcTexel[1] = 1 / (capacityHeight * resolution);
+    this.#bloomTexel[0] = 1 / ((this.#bloomA.baseTexture?.width ?? bw) * resolution);
+    this.#bloomTexel[1] = 1 / ((this.#bloomA.baseTexture?.height ?? bh) * resolution);
+    this.#wideTexel[0] = 1 / ((this.#wideA.baseTexture?.width ?? ww) * resolution);
+    this.#wideTexel[1] = 1 / ((this.#wideA.baseTexture?.height ?? wh) * resolution);
 
     this.#threshold.sizeTo(this.#bloomA);
     this.#blurH.sizeTo(this.#bloomB);
@@ -182,6 +241,18 @@ export class BloomChain {
     });
   }
 
+  #resizeFrame(target: any, width: number, height: number): void {
+    if (target.width === width && target.height === height) return;
+    // WHY: Pixi resets frameless targets to capacity after rendering. Keep an explicit active frame while reusing the allocation.
+    target.noFrame = false;
+    target.resize(width, height, false);
+  }
+
+  #setUvScale(out: Float32Array, texture: any): void {
+    out[0] = texture.width / (texture.baseTexture?.width ?? texture.width);
+    out[1] = texture.height / (texture.baseTexture?.height ?? texture.height);
+  }
+
   #releaseTargets(): void {
     for (const target of [this.#bloomA, this.#bloomB, this.#wideA, this.#wideB, this.#out]) {
       target?.destroy(true);
@@ -191,6 +262,8 @@ export class BloomChain {
     this.#wideA = null;
     this.#wideB = null;
     this.#out = null;
+    this.#capacityWidth = 0;
+    this.#capacityHeight = 0;
     this.#width = 0;
     this.#height = 0;
   }

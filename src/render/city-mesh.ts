@@ -15,6 +15,7 @@ export interface CameraUniforms {
   cameraHeightPx: number;
   leanStrength: number;
   depthFar: number;
+  detailQuality: number;
 }
 
 /** Extruded city geometry as one draw call, coloured through a palette lookup. */
@@ -54,6 +55,7 @@ export class CityMesh {
       uCamHeight: 8750,
       uLeanStrength: 1,
       uDepthFar: 20000,
+      uDetailQuality: 1,
       uEmissiveMax: EMISSIVE_MAX,
       uPalette: palette.texture
     });
@@ -87,6 +89,7 @@ export class CityMesh {
     u.uCamHeight = c.cameraHeightPx;
     u.uLeanStrength = c.leanStrength;
     u.uDepthFar = c.depthFar;
+    u.uDetailQuality = c.detailQuality;
 
     const m = this.#maskShader.uniforms;
     m.uPixelsPerMetre = c.pixelsPerMetre;

@@ -63,6 +63,7 @@ import {
   type LeanCalibrationPoint
 } from "../render/city-renderer.js";
 import { FootProbe, isCovered, type MaskFrame } from "../render/foot-probe.js";
+import { FrameQualityController } from "../render/frame-quality.js";
 import { WorkerClient } from "../worker/client.js";
 import type { BuildChunkResult } from "../worker/protocol.js";
 import {
@@ -102,6 +103,7 @@ export interface RebuildResult {
 interface ChunkRecord {
   id: string;
   mesh: MeshBuffers;
+  detail: MeshBuffers;
   neon: MeshBuffers;
   boundsM: Rect;
   buildingCount: number;
@@ -113,6 +115,7 @@ let footProbe: FootProbe | null = null;
 let probedTokens: any[] = [];
 const probedGround: number[] = [];
 let tickerCallback: (() => void) | null = null;
+const frameQuality = new FrameQualityController();
 let currentCity: CityParams | null = null;
 /** City extent in metres. Chunk generation clamps to it, so a change invalidates every chunk. */
 let currentBounds: Rect | null = null;
@@ -225,6 +228,7 @@ export function mount(): void {
   cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
+  frameQuality.reset();
   footProbe = new FootProbe(canvas.app.renderer);
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
   // renderer's chunk set now, and nothing else drops that placeholder any more.
@@ -251,7 +255,8 @@ export function mount(): void {
   tickerCallback = () => {
     const renderer = cityRenderer;
     if (renderer === null) return;
-    renderer.update(readCamera());
+    const camera = readCamera();
+    renderer.update(camera, frameQuality.sample(camera, performance.now()));
     sortTokensAgainstOverlay(renderer.maskFrame());
   };
   canvas.app.ticker.add(tickerCallback, null, PIXI.UPDATE_PRIORITY.HIGH);
@@ -280,6 +285,7 @@ export function unmount(): void {
   cityRenderer.overlay.parent?.removeChild(cityRenderer.overlay);
   cityRenderer.destroy();
   cityRenderer = null;
+  frameQuality.reset();
   currentCity = null;
   currentBounds = null;
   // Discards builds still in flight, which would otherwise refill `chunks` after the clear.
@@ -684,7 +690,6 @@ export function setBloom(enabled: boolean, strength?: number): void {
   if (cityRenderer === null) return;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
-  footProbe = new FootProbe(canvas.app.renderer);
 }
 
 /**
@@ -738,6 +743,7 @@ function chunkGeometry(city: CityParams, build: ChunkRecord, ppm: number): Chunk
   return {
     id: build.id,
     mesh: build.mesh,
+    detail: build.detail,
     neon: build.neon,
     boundsPx: rectToPixels(build.boundsM, city.origin, ppm)
   };
@@ -769,6 +775,12 @@ function chunkRecord(result: BuildChunkResult): ChunkRecord {
       indices: result.indices,
       vertexCount: result.vertexCount,
       triangleCount: result.triangleCount
+    },
+    detail: {
+      vertices: result.detailVertices,
+      indices: result.detailIndices,
+      vertexCount: result.detailVertexCount,
+      triangleCount: result.detailTriangleCount
     },
     neon: {
       vertices: result.neonVertices,
@@ -832,6 +844,7 @@ async function runBuilds(
       // chunk of an old graph from landing on top of a newer one.
       if (epoch !== buildEpoch) return;
       chunks.set(outcome.record.id, outcome.record);
+      frameQuality.reset();
       cityRenderer?.setChunk(chunkGeometry(city, outcome.record, ppm));
       rebuilt++;
     })

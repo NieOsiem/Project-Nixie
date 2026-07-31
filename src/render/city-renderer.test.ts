@@ -6,6 +6,7 @@ import type { Rect } from "../core/geom/types.js";
 import { dollyLeanStrength } from "../core/lean-curve.js";
 import { WHOLE_CITY_CHUNK_ID } from "./chunk-culling.js";
 import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
+import { FRAME_QUALITY } from "./frame-quality.js";
 
 /**
  * A stub PIXI, not a GL context. It exists to count live GPU-backed objects, which is
@@ -106,16 +107,31 @@ const PIXI_STUB = {
       scaleMode?: number;
     }) => {
       live.renderTextures++;
+      const baseTexture = { width: options.width, height: options.height };
+      const frame = { width: options.width, height: options.height };
+      const orig = { width: options.width, height: options.height };
       return {
         width: options.width,
         height: options.height,
+        baseTexture,
+        frame,
+        orig,
+        noFrame: true,
         format: options.format,
         type: options.type,
         scaleMode: options.scaleMode,
         framebuffer: { enableDepth: () => {} },
-        resize(w: number, h: number) {
+        resize(w: number, h: number, resizeBaseTexture = true) {
           this.width = w;
           this.height = h;
+          frame.width = w;
+          frame.height = h;
+          orig.width = w;
+          orig.height = h;
+          if (resizeBaseTexture) {
+            baseTexture.width = w;
+            baseTexture.height = h;
+          }
         },
         destroy: () => {
           live.renderTextures--;
@@ -175,6 +191,13 @@ const neonChunk = (
   neonTriangles = 1
 ): ChunkGeometry => ({ ...chunk(id, boundsPx, triangleCount), neon: buffers(neonTriangles) });
 
+const detailChunk = (
+  id: string,
+  boundsPx: Rect,
+  triangleCount = 1,
+  detailTriangles = 1
+): ChunkGeometry => ({ ...chunk(id, boundsPx, triangleCount), detail: buffers(detailTriangles) });
+
 const NEAR: Rect = { x: -100, y: -100, width: 200, height: 200 };
 const FAR: Rect = { x: 100_000, y: 100_000, width: 200, height: 200 };
 
@@ -193,6 +216,20 @@ const hostRenderer = {
     renderCalls++;
     renderLog.push({ content, options });
     if (content instanceof StubContainer) renderedContent = content;
+    const target = options.renderTexture as {
+      width?: number;
+      height?: number;
+      noFrame?: boolean;
+      frame?: { width: number; height: number };
+      orig?: { width: number; height: number };
+      baseTexture?: { width: number; height: number };
+    };
+    if (target.noFrame && target.baseTexture) {
+      target.width = target.baseTexture.width;
+      target.height = target.baseTexture.height;
+      if (target.frame) Object.assign(target.frame, target.baseTexture);
+      if (target.orig) Object.assign(target.orig, target.baseTexture);
+    }
   }
 };
 
@@ -570,6 +607,49 @@ describe("CityRenderer bloom", () => {
     expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
   });
 
+  it("reuses settled-frame capacity while post-processing the smaller moving frame", () => {
+    const r = raw();
+    r.supersample = 2;
+    const camera = cam();
+
+    r.update(camera, FRAME_QUALITY.MOTION);
+
+    const scene = renderLog[0]?.options.renderTexture as {
+      width: number;
+      height: number;
+      noFrame: boolean;
+      baseTexture: { width: number; height: number };
+    };
+    const output = renderLog[9]?.options.renderTexture as typeof scene;
+    const threshold = (renderLog[3]?.content as StubMesh).shader.uniforms;
+    const composite = (renderLog[9]?.content as StubMesh).shader.uniforms;
+    expect(scene).toMatchObject({ width: 3440, height: 1440 });
+    expect(scene.baseTexture).toEqual({ width: 6880, height: 2880 });
+    expect(output).toMatchObject({ width: 3440, height: 1440 });
+    expect(output.baseTexture).toEqual({ width: 6880, height: 2880 });
+    expect(scene.noFrame).toBe(false);
+    expect(output.noFrame).toBe(false);
+    expect(Array.from(threshold.uSceneUvScale as Float32Array)).toEqual([0.5, 0.5]);
+    expect(Array.from(composite.uBloomUvScale as Float32Array)).toEqual([0.5, 0.5]);
+    expect(Array.from(composite.uWideUvScale as Float32Array)).toEqual([0.5, 0.5]);
+    expect(live.renderTextures).toBe(CITY_RENDER_TEXTURES + BLOOM_RENDER_TEXTURES);
+
+    const afterMotion = renderCalls;
+    r.update(camera, FRAME_QUALITY.SETTLED);
+
+    const settledScene = renderLog[afterMotion]?.options.renderTexture as typeof scene;
+    const settledOutput = renderLog[afterMotion + 9]?.options.renderTexture as typeof scene;
+    const settledComposite = (renderLog[afterMotion + 9]?.content as StubMesh).shader.uniforms;
+    expect(settledScene).toBe(scene);
+    expect(settledOutput).toBe(output);
+    expect(settledScene).toMatchObject({ width: 6880, height: 2880 });
+    expect(Array.from(settledComposite.uSceneUvScale as Float32Array)).toEqual([1, 1]);
+    expect(Array.from(settledComposite.uShadowUvScale as Float32Array)).toEqual([1, 1]);
+    expect(Array.from(settledComposite.uMaskUvScale as Float32Array)).toEqual([1, 1]);
+    expect(live.renderTextures).toBe(CITY_RENDER_TEXTURES + BLOOM_RENDER_TEXTURES);
+    r.destroy();
+  });
+
   it("bloomStrength redraws only when it actually changes", () => {
     const r = raw();
     r.update(cam());
@@ -634,6 +714,90 @@ describe("CityRenderer supersampling", () => {
     r.supersample = 2;
     r.update(camera);
     expect(renderCalls).toBe(afterSecond);
+    r.destroy();
+  });
+});
+
+describe("CityRenderer frame quality", () => {
+  it("uses the base target while moving and fills its reserved supersampled frame once settled", () => {
+    const r = make();
+    r.renderScale = 0.75;
+    r.supersample = 2;
+    r.setChunks([detailChunk("0,0", NEAR, 3, 5)]);
+    const camera = cam({ scale: 4 });
+
+    r.update(camera, FRAME_QUALITY.MOTION);
+
+    const target = renderLog[0]?.options.renderTexture as {
+      width: number;
+      height: number;
+      noFrame: boolean;
+      baseTexture: { width: number; height: number };
+    };
+    const shadow = renderLog[4]?.options.renderTexture as typeof target;
+    const movingUniforms = (renderLog[0]?.content as StubContainer).children[0]?.shader.uniforms;
+    expect(target).toMatchObject({ width: 2580, height: 1080 });
+    expect(target.baseTexture).toEqual({ width: 5160, height: 2160 });
+    expect(target.noFrame).toBe(false);
+    expect(shadow).toMatchObject({ width: 645, height: 270 });
+    expect(shadow.baseTexture).toEqual({ width: 1290, height: 540 });
+    expect(renderLog[4]?.content).toBe(renderLog[0]?.content);
+    expect(movingUniforms?.uDetailQuality).toBe(1);
+    expect(r.stats()).toMatchObject({
+      frameQuality: FRAME_QUALITY.MOTION,
+      activeRenderScale: 0.75,
+      detailTriangles: 5,
+      targetCapacity: [5160, 2160]
+    });
+
+    const afterMotion = renderCalls;
+    r.update(camera, FRAME_QUALITY.MOTION);
+    expect(renderCalls).toBe(afterMotion);
+
+    r.update(camera, FRAME_QUALITY.SETTLED);
+
+    const settledUniforms = (renderLog[afterMotion]?.content as StubContainer).children[0]?.shader
+      .uniforms;
+    expect(renderCalls).toBe(afterMotion + 6);
+    expect(renderLog[afterMotion]?.options.renderTexture).toBe(target);
+    expect(target).toMatchObject({ width: 5160, height: 2160 });
+    expect(settledUniforms?.uDetailQuality).toBe(1);
+    expect(r.stats()).toMatchObject({
+      frameQuality: FRAME_QUALITY.SETTLED,
+      activeRenderScale: 1.5,
+      detailTriangles: 5,
+      targetSize: [5160, 2160]
+    });
+
+    const afterSettled = renderCalls;
+    r.update(camera, FRAME_QUALITY.SETTLED);
+    expect(renderCalls).toBe(afterSettled);
+    r.destroy();
+  });
+
+  it("culls moving detail below 3 screen pixels per metre and forces it when settled", () => {
+    const r = make();
+    r.setChunks([detailChunk("0,0", NEAR, 3, 5)]);
+    const camera = cam({ scale: 0.1 });
+
+    r.update(camera, FRAME_QUALITY.MOTION);
+    expect(r.stats()).toMatchObject({ detailTriangles: 0 });
+
+    r.update(camera, FRAME_QUALITY.SETTLED);
+    expect(r.stats()).toMatchObject({ detailTriangles: 5 });
+    r.destroy();
+  });
+
+  it("owns and releases optional detail meshes independently from base geometry", () => {
+    const r = make();
+    r.setChunks([detailChunk("0,0", NEAR, 3, 5)]);
+
+    expect(live.meshes).toBe(2 + OVERLAY_QUAD);
+    expect(r.stats()).toMatchObject({ trianglesTotal: 8, detailTrianglesTotal: 5 });
+
+    r.removeChunk("0,0");
+    expect(live.meshes).toBe(OVERLAY_QUAD);
+    expect(live.geometries).toBe(OVERLAY_QUAD);
     r.destroy();
   });
 });

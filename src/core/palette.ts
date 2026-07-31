@@ -157,6 +157,17 @@ export const CITY_SURFACES: Material[] = [
 
 const district = (name: string, materials: Material[]): DistrictPalette => ({ name, materials });
 
+const LEGACY_NEON_SPRAWL = district("Neon Sprawl", [
+  lit(rgb(0.165, 0.12, 0.275), rgb(0.62, 0.34, 0.95), 0.26),
+  lit(rgb(0.24, 0.105, 0.19), rgb(1, 0.28, 0.58), 0.32),
+  lit(rgb(0.085, 0.19, 0.22), rgb(0.22, 0.9, 1), 0.28),
+  lit(rgb(0.12, 0.095, 0.195), rgb(0.5, 0.3, 0.9), 0.05),
+  lit(rgb(0.075, 0.16, 0.18), rgb(0.2, 0.85, 0.95), 0.06),
+  lit(rgb(0.19, 0.085, 0.16), rgb(0.95, 0.3, 0.6), 0.06),
+  lit(rgb(0.025, 0.008, 0.015), rgb(1, 0.24, 0.6), 1.6),
+  lit(rgb(0.008, 0.02, 0.022), rgb(0.28, 0.95, 1), 1.5)
+]);
+
 /**
  * Warm-shifted and lifted from the S1-S5 palette.
  *
@@ -166,14 +177,14 @@ const district = (name: string, materials: Material[]): DistrictPalette => ({ na
  * hue of its own, and the shared road sits at a visible violet rather than 0.04 grey.
  */
 export const PRESET_NEON_SPRAWL = district("Neon Sprawl", [
-  lit(rgb(0.165, 0.12, 0.275), rgb(0.62, 0.34, 0.95), 0.26),
-  lit(rgb(0.24, 0.105, 0.19), rgb(1, 0.28, 0.58), 0.32),
-  lit(rgb(0.085, 0.19, 0.22), rgb(0.22, 0.9, 1), 0.28),
-  lit(rgb(0.12, 0.095, 0.195), rgb(0.5, 0.3, 0.9), 0.05),
-  lit(rgb(0.075, 0.16, 0.18), rgb(0.2, 0.85, 0.95), 0.06),
-  lit(rgb(0.19, 0.085, 0.16), rgb(0.95, 0.3, 0.6), 0.06),
-  lit(rgb(0.025, 0.008, 0.015), rgb(1, 0.24, 0.6), 1.6),
-  lit(rgb(0.008, 0.02, 0.022), rgb(0.28, 0.95, 1), 1.5)
+  lit(rgb(0.17, 0.105, 0.3), rgb(0.18, 1, 0.78), 0.34),
+  lit(rgb(0.22, 0.085, 0.19), rgb(1, 0.2, 0.62), 0.36),
+  lit(rgb(0.095, 0.145, 0.25), rgb(0.18, 0.78, 1), 0.34),
+  lit(rgb(0.14, 0.09, 0.24), rgb(0.48, 0.3, 0.95), 0.05),
+  lit(rgb(0.07, 0.18, 0.19), rgb(0.18, 0.92, 0.88), 0.06),
+  lit(rgb(0.19, 0.075, 0.17), rgb(1, 0.24, 0.62), 0.06),
+  lit(rgb(0.025, 0.008, 0.015), rgb(1, 0.18, 0.58), 1.65),
+  lit(rgb(0.008, 0.02, 0.022), rgb(0.18, 1, 0.82), 1.55)
 ]);
 
 export const PALETTE_PRESETS: DistrictPalette[] = [
@@ -236,9 +247,33 @@ export function presetByName(name: string): DistrictPalette | null {
   return PALETTE_PRESETS.find((p) => p.name === name) ?? null;
 }
 
+function sameMaterial(a: Material, b: Material): boolean {
+  return (
+    a.base.r === b.base.r &&
+    a.base.g === b.base.g &&
+    a.base.b === b.base.b &&
+    a.emissive.r === b.emissive.r &&
+    a.emissive.g === b.emissive.g &&
+    a.emissive.b === b.emissive.b &&
+    a.emissiveStrength === b.emissiveStrength
+  );
+}
+
+function isLegacyNeonSprawl(palette: Partial<DistrictPalette> | null | undefined): boolean {
+  return (
+    palette?.name === LEGACY_NEON_SPRAWL.name &&
+    palette.materials?.length === BANK_SIZE &&
+    palette.materials.every((material, slot) =>
+      sameMaterial(material, LEGACY_NEON_SPRAWL.materials[slot]!)
+    )
+  );
+}
+
 /** Clones a palette, padding short banks from the default so a stored palette can grow. */
 export function normalizePalette(palette: Partial<DistrictPalette> | null | undefined): DistrictPalette {
-  const source = palette?.materials ?? [];
+  const source = isLegacyNeonSprawl(palette)
+    ? DEFAULT_DISTRICT_PALETTE.materials
+    : (palette?.materials ?? []);
   const materials: Material[] = [];
   for (let slot = 0; slot < BANK_SIZE; slot++) {
     const m = source[slot] ?? DEFAULT_DISTRICT_PALETTE.materials[slot]!;

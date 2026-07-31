@@ -1,14 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { intersection } from "../geom/boolean.js";
-import { LIGHT_DIRECTION, SHADOW_LENGTH, type BuildingSpec } from "../geom/extrude.js";
-import { VERTEX_FLOATS } from "../geom/mesh.js";
+import {
+  LIGHT_DIRECTION,
+  SHADOW_LENGTH,
+  extrudeBuilding,
+  type BuildingSpec
+} from "../geom/extrude.js";
+import { VERTEX_FLOATS, mergeMeshes } from "../geom/mesh.js";
 import { ringArea, ringCentroid, type MultiPolygon, type Rect } from "../geom/types.js";
 import { FIRST_ZONE_BANK } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { buildingDetailMesh } from "./building-detail.js";
 import { parkedCars } from "./cars.js";
 import { chunkRect } from "./chunks.js";
 import { buildChunk, chunkMarginM, cityChunks } from "./chunked.js";
-import { CLUTTER_MAX_HEIGHT_M, CLUTTER_MIN_BUILDING_M } from "./clutter.js";
+import {
+  CLUTTER_MAX_HEIGHT_M,
+  CLUTTER_MIN_BUILDING_M,
+  clutterMesh
+} from "./clutter.js";
 import { MARKING_REACH_M, buildRoadDetails } from "./markings.js";
 import {
   buildCity,
@@ -180,6 +190,25 @@ describe("partition equivalence", () => {
     expect(carsFromChunks.map(carKey).sort()).toEqual(wholeCars.map(carKey).sort());
   });
 
+  it("keeps cars and rooftop clutter in the baseline mesh", () => {
+    for (const chunk of CHUNKS) {
+      const expectedTail = mergeMeshes([
+        ...chunk.cars.map((car) => extrudeBuilding(car, PPM)),
+        clutterMesh(chunk.buildings, PPM)
+      ]);
+      const vertexOffset = chunk.mesh.vertexCount - expectedTail.vertexCount;
+      const indexOffset = chunk.mesh.indices.length - expectedTail.indices.length;
+
+      expect(chunk.mesh.vertices.slice(vertexOffset * VERTEX_FLOATS)).toEqual(
+        expectedTail.vertices
+      );
+      expect(
+        chunk.mesh.indices.slice(indexOffset).map((index) => index - vertexOffset)
+      ).toEqual(expectedTail.indices);
+      expect(chunk.detail).toEqual(buildingDetailMesh(chunk.buildings, PPM));
+    }
+  });
+
   it("places every vertex bit-identically", () => {
     expect(worstDeviation(fromChunks, whole)).toBe(0);
   });
@@ -332,19 +361,21 @@ describe("overhang", () => {
           });
         }
       }
-      for (let i = 0; i < c.mesh.vertexCount; i++) {
-        const metres = pixelsToMetres(
-          { x: c.mesh.vertices[i * VERTEX_FLOATS]!, y: c.mesh.vertices[i * VERTEX_FLOATS + 1]! },
-          ORIGIN,
-          PPM
-        );
-        inside(metres);
-        if (c.mesh.vertices[i * VERTEX_FLOATS + 5] === 4) {
-          const height = c.mesh.vertices[i * VERTEX_FLOATS + 2]!;
-          inside({
-            x: metres.x - LIGHT_DIRECTION.x * height * SHADOW_LENGTH,
-            y: metres.y - LIGHT_DIRECTION.y * height * SHADOW_LENGTH
-          });
+      for (const mesh of [c.mesh, c.detail]) {
+        for (let i = 0; i < mesh.vertexCount; i++) {
+          const metres = pixelsToMetres(
+            { x: mesh.vertices[i * VERTEX_FLOATS]!, y: mesh.vertices[i * VERTEX_FLOATS + 1]! },
+            ORIGIN,
+            PPM
+          );
+          inside(metres);
+          if (mesh.vertices[i * VERTEX_FLOATS + 5] === 4) {
+            const height = mesh.vertices[i * VERTEX_FLOATS + 2]!;
+            inside({
+              x: metres.x - LIGHT_DIRECTION.x * height * SHADOW_LENGTH,
+              y: metres.y - LIGHT_DIRECTION.y * height * SHADOW_LENGTH
+            });
+          }
         }
       }
     }
@@ -381,6 +412,8 @@ describe("empty chunk", () => {
     expect(far.carCount).toBe(0);
     expect(far.mesh.vertexCount).toBe(0);
     expect(far.mesh.triangleCount).toBe(0);
+    expect(far.detail.vertexCount).toBe(0);
+    expect(far.detail.triangleCount).toBe(0);
     expect(far.surfaces.road).toEqual([]);
     expect(far.surfaces.blocks).toEqual([]);
     expect(far.boundsM).toEqual(chunkRect(key));

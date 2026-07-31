@@ -13,10 +13,12 @@ const KNEE = 0.25;
 const LUMA = "vec3(0.299, 0.587, 0.114)";
 
 /** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG. */
-const BODY_CHROMA = 0.55;
+const BODY_CHROMA = 0.93;
 const NEON_CHROMA = 1.15;
 /** Darkening at the far edge of the depth falloff. */
-const DEPTH_FALLOFF = 0.25;
+const DEPTH_FALLOFF = 0.16;
+/** WHY: saturation must not lift black surfaces into purple fog. */
+const BLACK_FLOOR = 0.012;
 
 /**
  * Unit quad. The mesh transform scales it to the target, so `aCorner` is also the UV.
@@ -52,15 +54,19 @@ precision highp float;
 
 uniform sampler2D uScene;
 uniform vec2 uSrcTexel;
+uniform vec2 uSceneUvScale;
 
 varying vec2 vUv;
 
 void main() {
+  vec2 uv = vUv * uSceneUvScale;
+  vec2 edge = 0.5 * uSrcTexel;
+  vec2 limit = uSceneUvScale - edge;
   vec3 c = 0.25 * (
-    texture2D(uScene, vUv + uSrcTexel * vec2(-1.0, -1.0)).rgb +
-    texture2D(uScene, vUv + uSrcTexel * vec2( 1.0, -1.0)).rgb +
-    texture2D(uScene, vUv + uSrcTexel * vec2(-1.0,  1.0)).rgb +
-    texture2D(uScene, vUv + uSrcTexel * vec2( 1.0,  1.0)).rgb);
+    texture2D(uScene, clamp(uv + uSrcTexel * vec2(-1.0, -1.0), edge, limit)).rgb +
+    texture2D(uScene, clamp(uv + uSrcTexel * vec2( 1.0, -1.0), edge, limit)).rgb +
+    texture2D(uScene, clamp(uv + uSrcTexel * vec2(-1.0,  1.0), edge, limit)).rgb +
+    texture2D(uScene, clamp(uv + uSrcTexel * vec2( 1.0,  1.0), edge, limit)).rgb);
 
   float l = dot(c, ${LUMA});
   float soft = clamp(l - ${THRESHOLD.toFixed(3)} + ${KNEE.toFixed(3)}, 0.0, ${(2 * KNEE).toFixed(3)});
@@ -76,15 +82,19 @@ precision highp float;
 
 uniform sampler2D uTex;
 uniform vec2 uSrcTexel;
+uniform vec2 uTexUvScale;
 
 varying vec2 vUv;
 
 void main() {
+  vec2 uv = vUv * uTexUvScale;
+  vec2 edge = 0.5 * uSrcTexel;
+  vec2 limit = uTexUvScale - edge;
   vec3 c = 0.25 * (
-    texture2D(uTex, vUv + uSrcTexel * vec2(-1.0, -1.0)).rgb +
-    texture2D(uTex, vUv + uSrcTexel * vec2( 1.0, -1.0)).rgb +
-    texture2D(uTex, vUv + uSrcTexel * vec2(-1.0,  1.0)).rgb +
-    texture2D(uTex, vUv + uSrcTexel * vec2( 1.0,  1.0)).rgb);
+    texture2D(uTex, clamp(uv + uSrcTexel * vec2(-1.0, -1.0), edge, limit)).rgb +
+    texture2D(uTex, clamp(uv + uSrcTexel * vec2( 1.0, -1.0), edge, limit)).rgb +
+    texture2D(uTex, clamp(uv + uSrcTexel * vec2(-1.0,  1.0), edge, limit)).rgb +
+    texture2D(uTex, clamp(uv + uSrcTexel * vec2( 1.0,  1.0), edge, limit)).rgb);
 
   gl_FragColor = vec4(c, 1.0);
 }
@@ -101,17 +111,25 @@ precision highp float;
 
 uniform sampler2D uTex;
 uniform vec2 uTexel;
+uniform vec2 uTexUvScale;
 uniform vec2 uDir;
 
 varying vec2 vUv;
 
 void main() {
+  vec2 uv = vUv * uTexUvScale;
+  vec2 edge = 0.5 * uTexel;
+  vec2 limit = uTexUvScale - edge;
   vec2 o1 = uDir * uTexel * 1.3846153846;
   vec2 o2 = uDir * uTexel * 3.2307692308;
 
-  vec3 s = texture2D(uTex, vUv).rgb * 0.2270270270;
-  s += (texture2D(uTex, vUv + o1).rgb + texture2D(uTex, vUv - o1).rgb) * 0.3162162162;
-  s += (texture2D(uTex, vUv + o2).rgb + texture2D(uTex, vUv - o2).rgb) * 0.0702702703;
+  vec3 s = texture2D(uTex, clamp(uv, edge, limit)).rgb * 0.2270270270;
+  s += (
+    texture2D(uTex, clamp(uv + o1, edge, limit)).rgb
+    + texture2D(uTex, clamp(uv - o1, edge, limit)).rgb) * 0.3162162162;
+  s += (
+    texture2D(uTex, clamp(uv + o2, edge, limit)).rgb
+    + texture2D(uTex, clamp(uv - o2, edge, limit)).rgb) * 0.0702702703;
 
   gl_FragColor = vec4(s, 1.0);
 }
@@ -128,14 +146,20 @@ uniform sampler2D uBuildingMask;
 uniform float uNarrowStrength;
 uniform float uWideStrength;
 uniform vec2 uPivotUv;
+uniform vec2 uSceneUvScale;
+uniform vec2 uBloomUvScale;
+uniform vec2 uWideUvScale;
+uniform vec2 uShadowUvScale;
+uniform vec2 uMaskUvScale;
 
 varying vec2 vUv;
 
 void main() {
-  vec3 c = texture2D(uScene, vUv).rgb
-    + texture2D(uBloomNarrow, vUv).rgb * uNarrowStrength
-    + texture2D(uBloomWide, vUv).rgb * uWideStrength;
-  float castShadow = texture2D(uShadow, vUv).r * (1.0 - texture2D(uBuildingMask, vUv).a);
+  vec3 c = texture2D(uScene, vUv * uSceneUvScale).rgb
+    + texture2D(uBloomNarrow, vUv * uBloomUvScale).rgb * uNarrowStrength
+    + texture2D(uBloomWide, vUv * uWideUvScale).rgb * uWideStrength;
+  float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
+    * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
   c *= 1.0 - 0.38 * castShadow;
 
   // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
@@ -144,11 +168,10 @@ void main() {
   // screen-circular falloff reaches the top and bottom edges and never the left and right.
   c *= 1.0 - ${DEPTH_FALLOFF} * smoothstep(0.20, 0.72, length(vUv - uPivotUv));
 
-  // Chroma as a function of luma: dark masses go near-neutral, bright things keep and gain
-  // saturation. Full chroma on the bases is what makes every roof compete with the signage.
+  // WHY: body chroma carries the palette; the toe keeps that saturation from lifting black.
   float l = dot(c, ${LUMA});
   float chroma = mix(${BODY_CHROMA}, ${NEON_CHROMA}, smoothstep(0.18, 0.62, l));
-  c = max(mix(vec3(l), c, chroma), vec3(0.0));
+  c = max(mix(vec3(l), c, chroma) - vec3(${BLACK_FLOOR}), vec3(0.0));
 
   float m = max(max(c.r, c.g), c.b);
   c *= 1.0 / (1.0 + max(m - 1.0, 0.0));

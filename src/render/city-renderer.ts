@@ -17,6 +17,11 @@ import {
   type ChunkGeometry
 } from "./chunk-culling.js";
 import { CityMesh } from "./city-mesh.js";
+import {
+  FRAME_QUALITY,
+  frameQualityProfile,
+  type FrameQuality
+} from "./frame-quality.js";
 import { NeonMesh } from "./neon-mesh.js";
 import type { MaskFrame } from "./foot-probe.js";
 import { PaletteTexture } from "./palette-texture.js";
@@ -26,6 +31,7 @@ import { CITY_OVERLAY_FRAG } from "./shaders/occlusion.js";
 export type { ChunkGeometry } from "./chunk-culling.js";
 
 const SHADOW_DOWNSAMPLE = 4;
+const DETAIL_MIN_SCREEN_PX_PER_METRE = 3;
 
 export interface CityRendererOptions {
   pixelsPerMetre: number;
@@ -50,6 +56,7 @@ interface LiveChunk {
   id: string;
   boundsPx: Rect;
   mesh: CityMesh;
+  detail: CityMesh | null;
   neon: NeonMesh | null;
 }
 
@@ -80,20 +87,26 @@ export class CityRenderer {
   #shadowTarget: any = null;
   #overlay: ScreenQuad;
   #content: any;
+  #detailContent: any;
   #neonContent: any;
+  #blankContent: any;
   #chunks = new Map<string, LiveChunk>();
   #palette: PaletteTexture;
   #bloom: BloomChain | null;
   #bloomStrength = 1.3;
   #lastCamera: CameraState | null = null;
+  #lastQuality: FrameQuality | null = null;
   #contentDirty = true;
   #renderCount = 0;
   #chunksDrawn = 0;
   #visibleTriangles = 0;
+  #visibleDetailTriangles = 0;
   #visibleNeonTriangles = 0;
   #renderScale = 1;
   #supersample = 1;
   #pivotUv = new Float32Array([0.5, 0.5]);
+  #overlayUvScale = new Float32Array([1, 1]);
+  #activeRenderScale = 1;
   #pixelsPerMetre: number;
   #cameraHeightMetres: number;
   #cameraZoomMode: CameraZoomMode;
@@ -117,7 +130,9 @@ export class CityRenderer {
     this.#bloom = new BloomChain(renderer);
 
     this.#content = new PIXI.Container();
+    this.#detailContent = new PIXI.Container();
     this.#neonContent = new PIXI.Container();
+    this.#blankContent = new PIXI.Container();
     this.setGeometry(buffers);
 
     this.display = new PIXI.Sprite(PIXI.Texture.EMPTY);
@@ -125,7 +140,8 @@ export class CityRenderer {
 
     this.#overlay = new ScreenQuad(CITY_OVERLAY_FRAG, {
       uCity: PIXI.Texture.EMPTY,
-      uMask: PIXI.Texture.EMPTY
+      uMask: PIXI.Texture.EMPTY,
+      uUvScale: this.#overlayUvScale
     });
     // Unlike the post chain this one lands on top of foreign content, so it must blend.
     this.#overlay.display.state.blend = true;
@@ -271,13 +287,19 @@ export class CityRenderer {
     const mesh = new CityMesh(chunk.mesh, this.#palette);
     this.#content.addChild(mesh.display);
 
+    let detail: CityMesh | null = null;
+    if (chunk.detail !== undefined && chunk.detail.triangleCount > 0) {
+      detail = new CityMesh(chunk.detail, this.#palette);
+      this.#detailContent.addChild(detail.display);
+    }
+
     let neon: NeonMesh | null = null;
     if (chunk.neon !== undefined && chunk.neon.triangleCount > 0) {
       neon = new NeonMesh(chunk.neon, this.#palette);
       this.#neonContent.addChild(neon.display);
     }
 
-    this.#chunks.set(chunk.id, { id: chunk.id, boundsPx: chunk.boundsPx, mesh, neon });
+    this.#chunks.set(chunk.id, { id: chunk.id, boundsPx: chunk.boundsPx, mesh, detail, neon });
     this.#contentDirty = true;
   }
 
@@ -287,6 +309,10 @@ export class CityRenderer {
     this.#chunks.delete(id);
     this.#content.removeChild(chunk.mesh.display);
     chunk.mesh.destroy();
+    if (chunk.detail !== null) {
+      this.#detailContent.removeChild(chunk.detail.display);
+      chunk.detail.destroy();
+    }
     if (chunk.neon !== null) {
       this.#neonContent.removeChild(chunk.neon.display);
       chunk.neon.destroy();
@@ -317,13 +343,22 @@ export class CityRenderer {
     };
   }
 
-  update(camera: CameraState): void {
+  update(camera: CameraState, quality: FrameQuality = FRAME_QUALITY.SETTLED): void {
     if (camera.screenWidth <= 0 || camera.screenHeight <= 0) return;
-    const resized = this.#ensureTarget(camera);
-    if (!resized && !this.#contentDirty && cameraEquals(this.#lastCamera, camera)) return;
+    const targetChanged = this.#ensureTarget(camera, quality);
+    const qualityChanged = this.#lastQuality !== quality;
+    if (
+      !targetChanged &&
+      !qualityChanged &&
+      !this.#contentDirty &&
+      cameraEquals(this.#lastCamera, camera)
+    ) {
+      return;
+    }
 
+    const profile = frameQualityProfile(quality);
     const view = visibleWorldRect(camera);
-    const t = offscreenTransform(camera, this.#effectiveRenderScale());
+    const t = offscreenTransform(camera, this.#activeRenderScale);
     // The pivot lands on target pixel stage * effectiveScale of a target that is
     // screen * effectiveScale wide, so the scale cancels and this is just the stage fraction.
     this.#pivotUv[0] = camera.stageX / camera.screenWidth;
@@ -347,20 +382,30 @@ export class CityRenderer {
       // Generous, because geometry outside the view still leans into it. Depth is
       // 24-bit, so the slack costs no meaningful precision.
       depthFar: 2 * Math.hypot(0.5 * Math.hypot(view.width, view.height), cameraHeightPx),
-      screenPxPerMetre: this.#pixelsPerMetre * t.scale
+      screenPxPerMetre: this.#pixelsPerMetre * t.scale,
+      detailQuality: profile.shaderDetail
     };
 
     const drawn = new Set(visibleChunkIds(this.#chunks.values(), view));
+    const showDetail =
+      profile.geometryDetail === "all" ||
+      this.#pixelsPerMetre * zoom >= DETAIL_MIN_SCREEN_PX_PER_METRE;
     this.#chunksDrawn = drawn.size;
     this.#visibleTriangles = 0;
+    this.#visibleDetailTriangles = 0;
     this.#visibleNeonTriangles = 0;
     for (const chunk of this.#chunks.values()) {
       const draw = drawn.has(chunk.id);
       chunk.mesh.display.visible = draw;
+      if (chunk.detail !== null) chunk.detail.display.visible = draw && showDetail;
       if (chunk.neon !== null) chunk.neon.display.visible = draw;
       if (!draw) continue;
       chunk.mesh.setCamera(uniforms);
       this.#visibleTriangles += chunk.mesh.triangleCount;
+      if (chunk.detail !== null && showDetail) {
+        chunk.detail.setCamera(uniforms);
+        this.#visibleDetailTriangles += chunk.detail.triangleCount;
+      }
       if (chunk.neon !== null) {
         chunk.neon.setCamera(uniforms);
         this.#visibleNeonTriangles += chunk.neon.triangleCount;
@@ -369,10 +414,15 @@ export class CityRenderer {
 
     this.#content.position.set(t.x, t.y);
     this.#content.scale.set(t.scale);
+    this.#detailContent.position.set(t.x, t.y);
+    this.#detailContent.scale.set(t.scale);
     this.#neonContent.position.set(t.x, t.y);
     this.#neonContent.scale.set(t.scale);
 
     this.#renderer.render(this.#content, { renderTexture: this.#target, clear: true });
+    if (this.#visibleDetailTriangles > 0) {
+      this.#renderer.render(this.#detailContent, { renderTexture: this.#target, clear: false });
+    }
     // WHY: neon depth-tests against the opaque pass, so every chunk's buildings must have
     // written depth first — drawing a chunk's glow before a later chunk's walls shows it
     // through them. `clear:false` skips the clear entirely, so that depth survives.
@@ -380,22 +430,57 @@ export class CityRenderer {
       this.#renderer.render(this.#neonContent, { renderTexture: this.#target, clear: false });
     }
 
-    for (const chunk of this.#chunks.values()) chunk.mesh.setMaskPass(true);
+    for (const chunk of this.#chunks.values()) {
+      chunk.mesh.setMaskPass(true);
+      chunk.detail?.setMaskPass(true);
+    }
     try {
       this.#renderer.render(this.#content, { renderTexture: this.#maskTarget, clear: true });
+      if (this.#visibleDetailTriangles > 0) {
+        this.#renderer.render(this.#detailContent, {
+          renderTexture: this.#maskTarget,
+          clear: false
+        });
+      }
     } finally {
-      for (const chunk of this.#chunks.values()) chunk.mesh.setMaskPass(false);
+      for (const chunk of this.#chunks.values()) {
+        chunk.mesh.setMaskPass(false);
+        chunk.detail?.setMaskPass(false);
+      }
     }
 
-    this.#content.position.set(t.x / SHADOW_DOWNSAMPLE, t.y / SHADOW_DOWNSAMPLE);
-    this.#content.scale.set(t.scale / SHADOW_DOWNSAMPLE);
-    for (const chunk of this.#chunks.values()) chunk.mesh.setShadowPass(true);
-    try {
-      this.#renderer.render(this.#content, { renderTexture: this.#shadowTarget, clear: true });
-    } finally {
-      for (const chunk of this.#chunks.values()) chunk.mesh.setShadowPass(false);
-      this.#content.position.set(t.x, t.y);
-      this.#content.scale.set(t.scale);
+    if (profile.shadows) {
+      this.#content.position.set(t.x / SHADOW_DOWNSAMPLE, t.y / SHADOW_DOWNSAMPLE);
+      this.#content.scale.set(t.scale / SHADOW_DOWNSAMPLE);
+      this.#detailContent.position.set(t.x / SHADOW_DOWNSAMPLE, t.y / SHADOW_DOWNSAMPLE);
+      this.#detailContent.scale.set(t.scale / SHADOW_DOWNSAMPLE);
+      for (const chunk of this.#chunks.values()) {
+        chunk.mesh.setShadowPass(true);
+        chunk.detail?.setShadowPass(true);
+      }
+      try {
+        this.#renderer.render(this.#content, { renderTexture: this.#shadowTarget, clear: true });
+        if (this.#visibleDetailTriangles > 0) {
+          this.#renderer.render(this.#detailContent, {
+            renderTexture: this.#shadowTarget,
+            clear: false
+          });
+        }
+      } finally {
+        for (const chunk of this.#chunks.values()) {
+          chunk.mesh.setShadowPass(false);
+          chunk.detail?.setShadowPass(false);
+        }
+        this.#content.position.set(t.x, t.y);
+        this.#content.scale.set(t.scale);
+        this.#detailContent.position.set(t.x, t.y);
+        this.#detailContent.scale.set(t.scale);
+      }
+    } else {
+      this.#renderer.render(this.#blankContent, {
+        renderTexture: this.#shadowTarget,
+        clear: true
+      });
     }
 
     this.display.texture =
@@ -411,6 +496,7 @@ export class CityRenderer {
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;
     this.display.height = view.height;
+    this.#setUvScale(this.#overlayUvScale, this.display.texture);
 
     this.#overlay.uniforms.uCity = this.display.texture;
     this.#overlay.uniforms.uMask = this.#maskTarget;
@@ -419,18 +505,25 @@ export class CityRenderer {
     this.#overlay.display.visible = this.#chunksDrawn > 0;
 
     this.#lastCamera = cloneCamera(camera);
+    this.#lastQuality = quality;
     this.#contentDirty = false;
     this.#renderCount++;
   }
 
   stats(): Record<string, unknown> {
     let trianglesTotal = 0;
-    for (const chunk of this.#chunks.values()) trianglesTotal += chunk.mesh.triangleCount;
+    let detailTrianglesTotal = 0;
+    for (const chunk of this.#chunks.values()) {
+      trianglesTotal += chunk.mesh.triangleCount;
+      detailTrianglesTotal += chunk.detail?.triangleCount ?? 0;
+    }
     return {
       renderCount: this.#renderCount,
       renderScale: this.#renderScale,
       supersample: this.#supersample,
-      effectiveRenderScale: this.#effectiveRenderScale(),
+      effectiveRenderScale: this.#settledRenderScale(),
+      activeRenderScale: this.#activeRenderScale,
+      frameQuality: this.#lastQuality,
       cameraHeightMetres: this.#cameraHeightMetres,
       cameraZoomMode: this.#cameraZoomMode,
       cameraZoom: this.#cameraZoom,
@@ -441,11 +534,19 @@ export class CityRenderer {
       chunks: this.#chunks.size,
       chunksDrawn: this.#chunksDrawn,
       triangles: this.#visibleTriangles,
+      detailTriangles: this.#visibleDetailTriangles,
       neonTriangles: this.#visibleNeonTriangles,
-      trianglesTotal,
+      trianglesTotal: trianglesTotal + detailTrianglesTotal,
+      detailTrianglesTotal,
       bloom: this.#bloom !== null,
       bloomStrength: this.#bloomStrength,
       targetSize: this.#target ? [this.#target.width, this.#target.height] : null,
+      targetCapacity: this.#target
+        ? [
+            this.#target.baseTexture?.width ?? this.#target.width,
+            this.#target.baseTexture?.height ?? this.#target.height
+          ]
+        : null,
       shadowTargetSize: this.#shadowTarget
         ? [this.#shadowTarget.width, this.#shadowTarget.height]
         : null
@@ -460,20 +561,31 @@ export class CityRenderer {
     this.#overlay.destroy();
     this.#palette.destroy();
     this.#content.destroy({ children: true });
+    this.#detailContent.destroy({ children: true });
     this.#neonContent.destroy({ children: true });
+    this.#blankContent.destroy({ children: true });
     this.display.destroy();
     this.#lastCamera = null;
+    this.#lastQuality = null;
   }
 
-  #ensureTarget(camera: CameraState): boolean {
-    const effectiveScale = this.#effectiveRenderScale();
-    const w = Math.ceil(camera.screenWidth * effectiveScale);
-    const h = Math.ceil(camera.screenHeight * effectiveScale);
+  #ensureTarget(camera: CameraState, quality: FrameQuality): boolean {
+    const capacityScale = this.#settledRenderScale();
+    this.#activeRenderScale = this.#renderScaleFor(quality);
+    const capacityWidth = Math.ceil(camera.screenWidth * capacityScale);
+    const capacityHeight = Math.ceil(camera.screenHeight * capacityScale);
+    const width = Math.ceil(camera.screenWidth * this.#activeRenderScale);
+    const height = Math.ceil(camera.screenHeight * this.#activeRenderScale);
+    const capacityShadowWidth = Math.max(1, Math.ceil(capacityWidth / SHADOW_DOWNSAMPLE));
+    const capacityShadowHeight = Math.max(1, Math.ceil(capacityHeight / SHADOW_DOWNSAMPLE));
+    const shadowWidth = Math.max(1, Math.ceil(width / SHADOW_DOWNSAMPLE));
+    const shadowHeight = Math.max(1, Math.ceil(height / SHADOW_DOWNSAMPLE));
+    let changed = false;
 
     if (this.#target === null) {
       this.#target = PIXI.RenderTexture.create({
-        width: w,
-        height: h,
+        width: capacityWidth,
+        height: capacityHeight,
         resolution: this.#renderer.resolution,
         format: PIXI.FORMATS.RGBA,
         type: PIXI.TYPES.HALF_FLOAT,
@@ -481,37 +593,56 @@ export class CityRenderer {
       });
       this.#target.framebuffer.enableDepth();
       this.#maskTarget = PIXI.RenderTexture.create({
-        width: w,
-        height: h,
+        width: capacityWidth,
+        height: capacityHeight,
         resolution: this.#renderer.resolution,
         scaleMode: PIXI.SCALE_MODES.LINEAR
       });
       this.#shadowTarget = PIXI.RenderTexture.create({
-        width: Math.max(1, Math.ceil(w / SHADOW_DOWNSAMPLE)),
-        height: Math.max(1, Math.ceil(h / SHADOW_DOWNSAMPLE)),
+        width: capacityShadowWidth,
+        height: capacityShadowHeight,
         resolution: this.#renderer.resolution,
         format: PIXI.FORMATS.RED,
         type: PIXI.TYPES.UNSIGNED_BYTE,
         scaleMode: PIXI.SCALE_MODES.LINEAR
       });
       this.display.texture = this.#target;
-      return true;
+      changed = true;
+    } else if (
+      (this.#target.baseTexture?.width ?? this.#target.width) !== capacityWidth ||
+      (this.#target.baseTexture?.height ?? this.#target.height) !== capacityHeight
+    ) {
+      this.#target.resize(capacityWidth, capacityHeight);
+      this.#maskTarget.resize(capacityWidth, capacityHeight);
+      this.#shadowTarget.resize(capacityShadowWidth, capacityShadowHeight);
+      changed = true;
     }
 
-    if (this.#target.width !== w || this.#target.height !== h) {
-      this.#target.resize(w, h);
-      this.#maskTarget.resize(w, h);
-      this.#shadowTarget.resize(
-        Math.max(1, Math.ceil(w / SHADOW_DOWNSAMPLE)),
-        Math.max(1, Math.ceil(h / SHADOW_DOWNSAMPLE))
-      );
-      return true;
-    }
-    return false;
+    changed = this.#resizeFrame(this.#target, width, height) || changed;
+    changed = this.#resizeFrame(this.#maskTarget, width, height) || changed;
+    changed = this.#resizeFrame(this.#shadowTarget, shadowWidth, shadowHeight) || changed;
+    return changed;
   }
 
-  #effectiveRenderScale(): number {
+  #settledRenderScale(): number {
     return Math.min(2, this.#renderScale * this.#supersample);
+  }
+
+  #renderScaleFor(quality: FrameQuality): number {
+    return quality === FRAME_QUALITY.SETTLED ? this.#settledRenderScale() : this.#renderScale;
+  }
+
+  #resizeFrame(target: any, width: number, height: number): boolean {
+    if (target.width === width && target.height === height) return false;
+    // WHY: Pixi resets frameless targets to capacity after rendering. Keep an explicit active frame while reusing the allocation.
+    target.noFrame = false;
+    target.resize(width, height, false);
+    return true;
+  }
+
+  #setUvScale(out: Float32Array, texture: any): void {
+    out[0] = texture.width / (texture.baseTexture?.width ?? texture.width);
+    out[1] = texture.height / (texture.baseTexture?.height ?? texture.height);
   }
 
   #releaseTarget(): void {
@@ -522,6 +653,8 @@ export class CityRenderer {
     this.#maskTarget?.destroy(true);
     this.#shadowTarget?.destroy(true);
     this.#overlay.display.visible = false;
+    this.#overlay.uniforms.uCity = PIXI.Texture.EMPTY;
+    this.#overlay.uniforms.uMask = PIXI.Texture.EMPTY;
     this.#target = null;
     this.#maskTarget = null;
     this.#shadowTarget = null;

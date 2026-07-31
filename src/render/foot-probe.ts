@@ -29,6 +29,7 @@ export class FootProbe {
   #footUv: Float32Array;
   #footBuffer: any;
   #verdicts: Uint8Array;
+  #maskUvScale = new Float32Array([1, 1]);
   #pending = 0;
 
   constructor(renderer: any, capacity = 256) {
@@ -49,7 +50,8 @@ export class FootProbe {
       .addAttribute("aFootUv", this.#footBuffer, 2);
 
     const shader = PIXI.Shader.from(FOOT_PROBE_VERT, FOOT_PROBE_FRAG, {
-      uMask: PIXI.Texture.EMPTY
+      uMask: PIXI.Texture.EMPTY,
+      uMaskUvScale: this.#maskUvScale
     });
     this.#mesh = new PIXI.Mesh(this.#geometry, shader, undefined, PIXI.DRAW_MODES.POINTS);
     this.#mesh.state.depthTest = false;
@@ -85,6 +87,10 @@ export class FootProbe {
     this.#footBuffer.update(this.#footUv);
 
     this.#mesh.shader.uniforms.uMask = frame.texture;
+    this.#maskUvScale[0] =
+      frame.texture.width / (frame.texture.baseTexture?.width ?? frame.texture.width);
+    this.#maskUvScale[1] =
+      frame.texture.height / (frame.texture.baseTexture?.height ?? frame.texture.height);
     this.#mesh.size = n;
     this.#renderer.render(this.#mesh, { renderTexture: this.#target, clear: true });
   }

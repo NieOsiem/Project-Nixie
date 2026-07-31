@@ -59,11 +59,13 @@ varying vec2 vUv;
 
 uniform sampler2D uCity;
 uniform sampler2D uMask;
+uniform vec2 uUvScale;
 
 void main() {
-  float coverage = texture2D(uMask, vUv).a;
+  vec2 uv = vUv * uUvScale;
+  float coverage = texture2D(uMask, uv).a;
   if (coverage <= 0.0) discard;
-  gl_FragColor = texture2D(uCity, vUv) * coverage;
+  gl_FragColor = texture2D(uCity, uv) * coverage;
 }
 `;
 
@@ -98,9 +100,10 @@ precision highp float;
 varying vec2 vFootUv;
 
 uniform sampler2D uMask;
+uniform vec2 uMaskUvScale;
 
 void main() {
   bool offScreen = vFootUv.x < 0.0 || vFootUv.x > 1.0 || vFootUv.y < 0.0 || vFootUv.y > 1.0;
-  gl_FragColor = vec4(offScreen ? 0.0 : texture2D(uMask, vFootUv).a);
+  gl_FragColor = vec4(offScreen ? 0.0 : texture2D(uMask, vFootUv * uMaskUvScale).a);
 }
 `;

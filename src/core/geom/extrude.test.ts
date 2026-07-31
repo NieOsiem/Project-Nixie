@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { KIND, VERTEX_FLOATS, type MeshBuffers } from "./mesh.js";
 import {
+  DETAILED_MASSING_MIN_HEIGHT_M,
   ROOF_SHADE,
   SHADE_MAX,
   SHADE_MIN,
+  describeBuildingMassing,
   extrudeBuilding,
   wallShade,
   withPositiveArea,
   type BuildingSpec
 } from "./extrude.js";
-import { rectRing, ringArea, type Ring } from "./types.js";
+import { rectRing, ringArea, ringCentroid, type Ring } from "./types.js";
 
 const square = (size = 10): Ring => rectRing({ x: 0, y: 0, width: size, height: size });
 
@@ -218,5 +220,115 @@ describe("extrudeBuilding", () => {
     const shadesOf = (m: MeshBuffers) =>
       Array.from({ length: m.vertexCount }, (_, i) => vertexAt(m, i).shade).sort();
     expect(shadesOf(b)).toEqual(shadesOf(a));
+  });
+
+  it("keeps unmarked high-rise specs as one simple volume", () => {
+    const building = spec({
+      height: DETAILED_MASSING_MIN_HEIGHT_M * 2,
+      footprint: rectRing({ x: 0, y: 0, width: 30 * PPM, height: 24 * PPM })
+    });
+    expect(describeBuildingMassing(building, PPM).volumes).toHaveLength(1);
+    expect(extrudeBuilding(building, PPM)).toMatchObject({ vertexCount: 20, triangleCount: 10 });
+  });
+
+  it("describes deterministic contained two-tier massing for marked orthogonal towers", () => {
+    const building = spec({
+      detailedMassing: true,
+      height: 80,
+      seed: 0.5,
+      footprint: rectRing({ x: 100, y: 200, width: 30 * PPM, height: 24 * PPM })
+    });
+    const a = describeBuildingMassing(building, PPM);
+    const b = describeBuildingMassing(building, PPM);
+    expect(b).toEqual(a);
+    expect(a.volumes).toHaveLength(2);
+
+    const lower = a.volumes[0]!;
+    const upper = a.volumes[1]!;
+    expect(lower.baseHeight).toBe(0);
+    expect(lower.topHeight).toBeGreaterThan(0);
+    expect(lower.topHeight).toBeLessThan(building.height);
+    expect(upper.baseHeight).toBe(lower.topHeight);
+    expect(upper.topHeight).toBe(building.height);
+    const lowerCentre = ringCentroid(lower.footprint);
+    const upperCentre = ringCentroid(upper.footprint);
+    expect(Math.hypot(upperCentre.x - lowerCentre.x, upperCentre.y - lowerCentre.y)).toBeGreaterThan(1);
+
+    const outer = rectRing({ x: 100, y: 200, width: 30 * PPM, height: 24 * PPM });
+    const bounds = {
+      minX: Math.min(...outer.map((p) => p.x)),
+      minY: Math.min(...outer.map((p) => p.y)),
+      maxX: Math.max(...outer.map((p) => p.x)),
+      maxY: Math.max(...outer.map((p) => p.y))
+    };
+    for (const p of upper.footprint) {
+      expect(p.x).toBeGreaterThan(bounds.minX);
+      expect(p.x).toBeLessThan(bounds.maxX);
+      expect(p.y).toBeGreaterThan(bounds.minY);
+      expect(p.y).toBeLessThan(bounds.maxY);
+    }
+  });
+
+  it("extrudes marked towers from each tier's base without exceeding the configured height", () => {
+    const building = spec({
+      detailedMassing: true,
+      height: 80,
+      footprint: rectRing({ x: 0, y: 0, width: 30 * PPM, height: 24 * PPM })
+    });
+    const massing = describeBuildingMassing(building, PPM);
+    const mesh = extrudeBuilding(building, PPM);
+    expect(mesh).toMatchObject({ vertexCount: 40, triangleCount: 20 });
+
+    const join = massing.volumes[0]!.topHeight;
+    expect(vertexAt(mesh, 0).height).toBeCloseTo(join, 5);
+    expect(vertexAt(mesh, 20).height).toBe(building.height);
+    expect(vertexAt(mesh, 24).height).toBeCloseTo(join, 5);
+    expect(vertexAt(mesh, 20).seed).not.toBe(vertexAt(mesh, 0).seed);
+    for (let i = 0; i < mesh.vertexCount; i++) {
+      const vertex = vertexAt(mesh, i);
+      expect(vertex.height).toBeGreaterThanOrEqual(0);
+      expect(vertex.height).toBeLessThanOrEqual(building.height);
+      expect(vertex.material).toBe(vertex.kind === KIND.ROOF ? 1 : 2);
+    }
+  });
+
+  it("falls back to one volume below the height gate or on an irregular footprint", () => {
+    const low = spec({ detailedMassing: true, height: DETAILED_MASSING_MIN_HEIGHT_M - 0.01 });
+    const irregular = spec({
+      detailedMassing: true,
+      height: 80,
+      footprint: [
+        { x: 0, y: 0 },
+        { x: 20 * PPM, y: 0 },
+        { x: 12 * PPM, y: 8 * PPM },
+        { x: 0, y: 8 * PPM }
+      ]
+    });
+    expect(describeBuildingMassing(low, PPM).volumes).toHaveLength(1);
+    expect(describeBuildingMassing(irregular, PPM).volumes).toHaveLength(1);
+  });
+
+  it("keeps detailed massing fixed in metres across a scene regrid", () => {
+    const atScale = (ppm: number) =>
+      describeBuildingMassing(
+        spec({
+          detailedMassing: true,
+          height: 80,
+          seed: 0.5,
+          footprint: rectRing({ x: 0, y: 0, width: 30 * ppm, height: 24 * ppm })
+        }),
+        ppm
+      );
+    const coarse = atScale(PPM);
+    const fine = atScale(PPM * 2);
+    expect(fine.volumes.map((volume) => [volume.baseHeight, volume.topHeight])).toEqual(
+      coarse.volumes.map((volume) => [volume.baseHeight, volume.topHeight])
+    );
+    for (let i = 0; i < coarse.volumes[1]!.footprint.length; i++) {
+      const a = coarse.volumes[1]!.footprint[i]!;
+      const b = fine.volumes[1]!.footprint[i]!;
+      expect(b.x / (PPM * 2)).toBeCloseTo(a.x / PPM, 6);
+      expect(b.y / (PPM * 2)).toBeCloseTo(a.y / PPM, 6);
+    }
   });
 });

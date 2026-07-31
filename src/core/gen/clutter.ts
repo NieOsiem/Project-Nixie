@@ -1,4 +1,8 @@
-import { wallShade, type BuildingSpec } from "../geom/extrude.js";
+import {
+  describeBuildingMassing,
+  wallShade,
+  type BuildingSpec
+} from "../geom/extrude.js";
 import { KIND, MeshBuilder, type MeshBuffers } from "../geom/mesh.js";
 import { ringCentroid, type Ring, type Vec2 } from "../geom/types.js";
 import { hash2 } from "./hash.js";
@@ -17,6 +21,7 @@ interface ClutterBox {
   centreV: number;
   halfU: number;
   halfV: number;
+  base: number;
   top: number;
   wallMaterial: number;
 }
@@ -48,14 +53,16 @@ function overlaps(a: ClutterBox, b: ClutterBox): boolean {
 
 function boxesFor(spec: BuildingSpec, pixelsPerMetre: number): ClutterBox[] {
   if (spec.height < CLUTTER_MIN_BUILDING_M || spec.footprint.length < 3) return [];
+  const roof = describeBuildingMassing(spec, pixelsPerMetre).volumes.at(-1)!;
+  const footprint = roof.footprint;
 
-  const centre = ringCentroid(spec.footprint);
+  const centre = ringCentroid(footprint);
   let ux = 1;
   let uy = 0;
   let longest = 0;
-  for (let i = 0; i < spec.footprint.length; i++) {
-    const a = spec.footprint[i]!;
-    const b = spec.footprint[(i + 1) % spec.footprint.length]!;
+  for (let i = 0; i < footprint.length; i++) {
+    const a = footprint[i]!;
+    const b = footprint[(i + 1) % footprint.length]!;
     const length = Math.hypot(b.x - a.x, b.y - a.y);
     if (length <= longest) continue;
     longest = length;
@@ -66,7 +73,7 @@ function boxesFor(spec: BuildingSpec, pixelsPerMetre: number): ClutterBox[] {
 
   let extentU = 0;
   let extentV = 0;
-  for (const p of spec.footprint) {
+  for (const p of footprint) {
     const dx = (p.x - centre.x) / pixelsPerMetre;
     const dy = (p.y - centre.y) / pixelsPerMetre;
     extentU = Math.max(extentU, Math.abs(dx * ux + dy * uy));
@@ -101,7 +108,7 @@ function boxesFor(spec: BuildingSpec, pixelsPerMetre: number): ClutterBox[] {
         };
       };
       const corners = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)];
-      if (!corners.every((p) => pointInRing(p, spec.footprint))) continue;
+      if (!corners.every((p) => pointInRing(p, footprint))) continue;
 
       const box: ClutterBox = {
         corners,
@@ -109,8 +116,9 @@ function boxesFor(spec: BuildingSpec, pixelsPerMetre: number): ClutterBox[] {
         centreV,
         halfU,
         halfV,
+        base: roof.topHeight,
         top:
-          spec.height +
+          roof.topHeight +
           CLUTTER_MIN_HEIGHT_M +
           roll(spec.seed, salt + 2) * (CLUTTER_MAX_HEIGHT_M - CLUTTER_MIN_HEIGHT_M),
         wallMaterial: spec.wallMaterial
@@ -125,12 +133,10 @@ function boxesFor(spec: BuildingSpec, pixelsPerMetre: number): ClutterBox[] {
 
 /** Deterministic 10-triangle rooftop boxes, already clipped by corner containment. */
 export function clutterMesh(buildings: BuildingSpec[], pixelsPerMetre: number): MeshBuffers {
-  const entries = buildings.flatMap((spec) =>
-    boxesFor(spec, pixelsPerMetre).map((box) => ({ spec, box }))
-  );
-  const builder = new MeshBuilder(entries.length * 20, entries.length * 10);
+  const boxes = buildings.flatMap((spec) => boxesFor(spec, pixelsPerMetre));
+  const builder = new MeshBuilder(boxes.length * 20, boxes.length * 10);
 
-  for (const { spec, box } of entries) {
+  for (const box of boxes) {
     const roof = builder.vertexCount;
     for (let i = 0; i < box.corners.length; i++) {
       const p = box.corners[i]!;
@@ -153,8 +159,8 @@ export function clutterMesh(buildings: BuildingSpec[], pixelsPerMetre: number): 
       const b = box.corners[(i + 1) % 4]!;
       const shade = wallShade(a, b);
       const wall = builder.vertexCount;
-      builder.vertex(a.x, a.y, spec.height, box.wallMaterial, shade, KIND.CLUTTER);
-      builder.vertex(b.x, b.y, spec.height, box.wallMaterial, shade, KIND.CLUTTER);
+      builder.vertex(a.x, a.y, box.base, box.wallMaterial, shade, KIND.CLUTTER);
+      builder.vertex(b.x, b.y, box.base, box.wallMaterial, shade, KIND.CLUTTER);
       builder.vertex(b.x, b.y, box.top, box.wallMaterial, shade, KIND.CLUTTER);
       builder.vertex(a.x, a.y, box.top, box.wallMaterial, shade, KIND.CLUTTER);
       builder.triangle(wall, wall + 1, wall + 2);

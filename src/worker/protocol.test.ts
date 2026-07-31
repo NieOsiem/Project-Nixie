@@ -89,6 +89,16 @@ describe("handleRequest buildChunk", () => {
     );
   });
 
+  it("returns non-empty, internally consistent architectural detail", () => {
+    expect(result.detailVertexCount).toBeGreaterThan(0);
+    expect(result.detailTriangleCount).toBeGreaterThan(0);
+    expect(result.detailIndices.length).toBe(result.detailTriangleCount * 3);
+    expect(result.detailVertices.length).toBe(result.detailVertexCount * VERTEX_FLOATS);
+    expect(result.detailIndices.reduce((max, i) => (i > max ? i : max), 0)).toBeLessThan(
+      result.detailVertexCount
+    );
+  });
+
   it("returns bounds in metres covering at least the chunk rect", () => {
     const rect = chunkRect(KEY);
     expect(result.boundsM.x).toBeLessThanOrEqual(rect.x);
@@ -107,14 +117,16 @@ describe("handleRequest buildChunk", () => {
     );
   });
 
-  it("declares exactly the four mesh ArrayBuffers as transferables", () => {
+  it("declares exactly the six mesh ArrayBuffers as transferables", () => {
     expect(response.transfer).toEqual([
       result.vertices.buffer,
       result.indices.buffer,
+      result.detailVertices.buffer,
+      result.detailIndices.buffer,
       result.neonVertices.buffer,
       result.neonIndices.buffer
     ]);
-    expect(response.transfer).toHaveLength(4);
+    expect(response.transfer).toHaveLength(6);
     for (const buffer of response.transfer!) expect(buffer).toBeInstanceOf(ArrayBuffer);
   });
 

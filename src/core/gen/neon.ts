@@ -1,4 +1,8 @@
-import type { BuildingSpec } from "../geom/extrude.js";
+import {
+  describeBuildingMassing,
+  type BuildingMassing,
+  type BuildingSpec
+} from "../geom/extrude.js";
 import { KIND, MeshBuilder, type MeshBuffers } from "../geom/mesh.js";
 import { ringCentroid } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, materialIndex } from "../palette.js";
@@ -76,16 +80,21 @@ function neonMaterial(spec: BuildingSpec, salt: number): number {
 }
 
 /** A glowing bar mounted on one wall edge, clamped to fit that edge. */
-function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null {
+function facadeSign(
+  spec: BuildingSpec,
+  massing: BuildingMassing,
+  pixelsPerMetre: number
+): NeonQuad | null {
   if (roll(spec.seed, 1) >= FACADE_RATE) return null;
-  if (spec.height < FACADE_MIN_BUILDING_M) return null;
+  const facadeHeight = massing.volumes[0]!.topHeight;
+  if (facadeHeight < FACADE_MIN_BUILDING_M) return null;
 
-  const ring = spec.footprint;
+  const ring = massing.volumes[0]!.footprint;
   const n = ring.length;
   if (n < 3) return null;
 
   let billboard =
-    spec.height >= BILLBOARD_MIN_BUILDING_M && roll(spec.seed, 14) < BILLBOARD_RATE;
+    facadeHeight >= BILLBOARD_MIN_BUILDING_M && roll(spec.seed, 14) < BILLBOARD_RATE;
   let minWidthM = billboard ? BILLBOARD_MIN_W_M : SIGN_MIN_W_M;
   let candidates: number[] = [];
   for (let i = 0; i < n; i++) {
@@ -144,10 +153,10 @@ function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null
 
   // Clamped so the padded quad stays between ground and roof.
   const centreH = Math.min(
-    spec.height - halfHM,
+    facadeHeight - halfHM,
     Math.max(
       halfHM,
-      (SIGN_LOW_M + roll(spec.seed, 6) * (SIGN_HIGH_M - SIGN_LOW_M)) * spec.height
+      (SIGN_LOW_M + roll(spec.seed, 6) * (SIGN_HIGH_M - SIGN_LOW_M)) * facadeHeight
     )
   );
 
@@ -192,11 +201,16 @@ function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number):
  * a glowing sticker pasted on the roof because it ignored the building underneath it
  * entirely. Following the footprint makes it read as rooftop signage.
  */
-function rooftopStrip(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null {
+function rooftopStrip(
+  spec: BuildingSpec,
+  massing: BuildingMassing,
+  pixelsPerMetre: number
+): NeonQuad | null {
   if (spec.height < BEACON_MIN_BUILDING_M) return null;
   if (roll(spec.seed, 10) >= BEACON_RATE) return null;
 
-  const ring = spec.footprint;
+  const top = massing.volumes[massing.volumes.length - 1]!;
+  const ring = top.footprint;
   const n = ring.length;
   if (n < 3) return null;
 
@@ -223,7 +237,7 @@ function rooftopStrip(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | nu
   const corner = (s: number, t: number): Corner => ({
     x: c.x + ux * alongPx * s - uy * acrossPx * t,
     y: c.y + uy * alongPx * s + ux * acrossPx * t,
-    h: spec.height
+    h: top.topHeight
   });
 
   return {
@@ -238,13 +252,14 @@ function rooftopStrip(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | nu
 export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): MeshBuffers {
   const quads: NeonQuad[] = [];
   for (const spec of buildings) {
-    const facade = facadeSign(spec, pixelsPerMetre);
+    const massing = describeBuildingMassing(spec, pixelsPerMetre);
+    const facade = facadeSign(spec, massing, pixelsPerMetre);
     if (facade !== null) {
       quads.push(facade);
       const pool = groundPool(facade, spec, pixelsPerMetre);
       if (pool !== null) quads.push(pool);
     }
-    const strip = rooftopStrip(spec, pixelsPerMetre);
+    const strip = rooftopStrip(spec, massing, pixelsPerMetre);
     if (strip !== null) quads.push(strip);
   }
 
