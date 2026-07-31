@@ -3,7 +3,6 @@ import { intersection } from "../geom/boolean.js";
 import {
   LIGHT_DIRECTION,
   SHADOW_LENGTH,
-  extrudeBuilding,
   type BuildingSpec
 } from "../geom/extrude.js";
 import { VERTEX_FLOATS, mergeMeshes } from "../geom/mesh.js";
@@ -12,6 +11,7 @@ import { FIRST_ZONE_BANK } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { buildingDetailMesh } from "./building-detail.js";
 import { parkedCars } from "./cars.js";
+import { carBodyMesh, carDetailMesh } from "./car-geometry.js";
 import { chunkRect } from "./chunks.js";
 import { buildChunk, chunkMarginM, cityChunks } from "./chunked.js";
 import {
@@ -193,7 +193,7 @@ describe("partition equivalence", () => {
   it("keeps cars and rooftop clutter in the baseline mesh", () => {
     for (const chunk of CHUNKS) {
       const expectedTail = mergeMeshes([
-        ...chunk.cars.map((car) => extrudeBuilding(car, PPM)),
+        carBodyMesh(chunk.cars, PPM),
         clutterMesh(chunk.buildings, PPM)
       ]);
       const vertexOffset = chunk.mesh.vertexCount - expectedTail.vertexCount;
@@ -205,7 +205,10 @@ describe("partition equivalence", () => {
       expect(
         chunk.mesh.indices.slice(indexOffset).map((index) => index - vertexOffset)
       ).toEqual(expectedTail.indices);
-      expect(chunk.detail).toEqual(buildingDetailMesh(chunk.buildings, PPM));
+      expect(chunk.detail).toEqual(mergeMeshes([
+        buildingDetailMesh(chunk.buildings, PPM),
+        carDetailMesh(chunk.cars, PPM)
+      ]));
     }
   });
 

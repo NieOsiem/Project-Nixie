@@ -4,7 +4,6 @@ import {
   type BuildingSpec
 } from "../geom/extrude.js";
 import { KIND, MeshBuilder, type MeshBuffers } from "../geom/mesh.js";
-import { ringCentroid } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, materialIndex } from "../palette.js";
 import { hash2 } from "./hash.js";
 
@@ -16,8 +15,6 @@ import { hash2 } from "./hash.js";
  * (HANDOFF §3 rule 1), so every metre added here is paid on every sign in the city.
  */
 export const GLOW_MARGIN_M = 2;
-/** Largest half-extent a rooftop strip's bright core reaches from the roof centroid. */
-export const BEACON_CORE_MAX_M = 4;
 export const POOL_RADIUS_M = 14;
 export const POOL_RATE = 1;
 
@@ -39,15 +36,8 @@ const POOL_MAX_SIGN_HEIGHT_M = 15;
 const POOL_HEIGHT_M = 0.03;
 const POOL_STRENGTH = 0.22;
 
-const BEACON_RATE = 0.45;
-const BEACON_MIN_BUILDING_M = 30;
-/** Fraction of the roof's long axis the lit bar spans. */
-const STRIP_SPAN = 0.55;
-const STRIP_HALF_WIDTH_M = 0.9;
-
 const STRENGTH_SPREAD = 0.6;
 const FACADE_STRENGTH = 0.7;
-const BEACON_STRENGTH = 1;
 
 /** Local quad coords, one per corner: (-1,-1) (1,-1) (1,1) (-1,1). */
 const LOCAL_U = [-1, 1, 1, -1];
@@ -194,60 +184,6 @@ function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number):
   };
 }
 
-/**
- * A lit bar lying on the roof, aligned to the building's longest footprint edge.
- *
- * WHY oriented rather than axis-aligned: this used to be a world-axis square, which read as
- * a glowing sticker pasted on the roof because it ignored the building underneath it
- * entirely. Following the footprint makes it read as rooftop signage.
- */
-function rooftopStrip(
-  spec: BuildingSpec,
-  massing: BuildingMassing,
-  pixelsPerMetre: number
-): NeonQuad | null {
-  if (spec.height < BEACON_MIN_BUILDING_M) return null;
-  if (roll(spec.seed, 10) >= BEACON_RATE) return null;
-
-  const top = massing.volumes[massing.volumes.length - 1]!;
-  const ring = top.footprint;
-  const n = ring.length;
-  if (n < 3) return null;
-
-  let ux = 1;
-  let uy = 0;
-  let longest = 0;
-  for (let i = 0; i < n; i++) {
-    const a = ring[i]!;
-    const b = ring[(i + 1) % n]!;
-    const len = Math.hypot(b.x - a.x, b.y - a.y);
-    if (len <= longest) continue;
-    longest = len;
-    ux = (b.x - a.x) / len;
-    uy = (b.y - a.y) / len;
-  }
-  if (longest <= 0) return null;
-
-  const halfLenM = Math.min(BEACON_CORE_MAX_M, (longest * STRIP_SPAN) / (2 * pixelsPerMetre));
-  if (halfLenM <= 0) return null;
-
-  const alongPx = (halfLenM + GLOW_MARGIN_M) * pixelsPerMetre;
-  const acrossPx = (STRIP_HALF_WIDTH_M + GLOW_MARGIN_M) * pixelsPerMetre;
-  const c = ringCentroid(ring);
-  const corner = (s: number, t: number): Corner => ({
-    x: c.x + ux * alongPx * s - uy * acrossPx * t,
-    y: c.y + uy * alongPx * s + ux * acrossPx * t,
-    h: top.topHeight
-  });
-
-  return {
-    corners: [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)],
-    material: neonMaterial(spec, 11),
-    strength: BEACON_STRENGTH + roll(spec.seed, 12) * STRENGTH_SPREAD,
-    radial: 0
-  };
-}
-
 /** Emits KIND.NEON quads for the buildings a chunk owns. Footprints are world pixels. */
 export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): MeshBuffers {
   const quads: NeonQuad[] = [];
@@ -259,8 +195,6 @@ export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): Mes
       const pool = groundPool(facade, spec, pixelsPerMetre);
       if (pool !== null) quads.push(pool);
     }
-    const strip = rooftopStrip(spec, massing, pixelsPerMetre);
-    if (strip !== null) quads.push(strip);
   }
 
   const builder = new MeshBuilder(quads.length * 4, quads.length * 2);

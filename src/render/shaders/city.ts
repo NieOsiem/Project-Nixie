@@ -1,4 +1,5 @@
 import { BANK_SIZE, DISTRICT_SLOT, PALETTE_SIZE } from "../../core/palette.js";
+import { CAR_SURFACE } from "../../core/geom/mesh.js";
 
 /**
  * Fake-3D extrusion.
@@ -332,12 +333,26 @@ vec3 architectureDetail() {
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
 
+vec3 car() {
+  if (vShade > -0.5) return vBase * vShade * 0.92;
+  if (vShade > ${CAR_SURFACE.CAP - 0.5}) return vBase * 1.08;
+  if (vShade > ${CAR_SURFACE.GLASS - 0.5}) {
+    return mix(vec3(0.018, 0.026, 0.055), vBase * 0.22, 0.35);
+  }
+  if (vShade > ${CAR_SURFACE.FRONT_LIGHT - 0.5}) return vec3(0.30, 0.24, 0.12);
+  if (vShade > ${CAR_SURFACE.REAR_LIGHT - 0.5}) return vec3(0.25, 0.018, 0.035);
+  if (vShade > ${CAR_SURFACE.TIRE - 0.5}) return vec3(0.012, 0.011, 0.020);
+  if (vShade > ${CAR_SURFACE.TRIM - 0.5}) return vBase * 0.20 + vec3(0.025);
+  return vec3(0.018, 0.016, 0.028);
+}
+
 void main() {
   vec3 colour = vBase * vShade + vEmissive;
   if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
   else if (vKind > 4.5 && vKind < 5.5) colour = architectureDetail();
+  else if (vKind > 5.5 && vKind < 6.5) colour = car();
   gl_FragColor = vec4(colour + vec3(0.020, 0.014, 0.035), 1.0);
 }
 `;

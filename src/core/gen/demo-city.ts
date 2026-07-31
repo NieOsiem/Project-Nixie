@@ -13,6 +13,7 @@ import {
   type Material
 } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { carBodyMesh } from "./car-geometry.js";
 import { parkedCars } from "./cars.js";
 import { clutterMesh } from "./clutter.js";
 import { buildRoadDetails } from "./markings.js";
@@ -249,7 +250,7 @@ export function buildCity(params: CityParams, boundsM: Rect, pixelsPerMetre: num
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
-    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
+    carBodyMesh(cars, pixelsPerMetre),
     ...buildings.map((b) => extrudeBuilding(b, pixelsPerMetre)),
     clutterMesh(buildings, pixelsPerMetre)
   ]);

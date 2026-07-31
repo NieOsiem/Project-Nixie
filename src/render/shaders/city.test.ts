@@ -100,4 +100,13 @@ describe("city fragment shader", () => {
       "else if (vKind > 4.5 && vKind < 5.5) colour = architectureDetail();"
     );
   });
+
+  it("shades car bodies, glass and dim parked lights without emissive bloom", () => {
+    const car = CITY_FRAG.slice(CITY_FRAG.indexOf("vec3 car()"), CITY_FRAG.indexOf("void main()"));
+    expect(car).toContain("return vBase * vShade * 0.92;");
+    expect(car).toContain("vec3(0.30, 0.24, 0.12)");
+    expect(car).toContain("vec3(0.25, 0.018, 0.035)");
+    expect(car).not.toContain("vEmissive");
+    expect(CITY_FRAG).toContain("else if (vKind > 5.5 && vKind < 6.5) colour = car();");
+  });
 });

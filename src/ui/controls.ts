@@ -66,6 +66,7 @@ function tools(): NixieTool[] {
       icon: "fa-solid fa-arrows-up-down-left-right"
     },
     { name: TOOL.WALKWAY, title: "Toggle a Road's Walkways", icon: "fa-solid fa-shoe-prints" },
+    { name: TOOL.PARKING, title: "Toggle a Road's Parked Cars", icon: "fa-solid fa-car-side" },
     { name: TOOL.ZONE, title: "Zone — drag to add, click to reseed", icon: "fa-solid fa-vector-square" },
     { name: TOOL.ERASE, title: "Erase Road or Zone", icon: "fa-solid fa-eraser" },
     {

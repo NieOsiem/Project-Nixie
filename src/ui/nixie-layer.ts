@@ -12,6 +12,7 @@ import {
   setCityListener,
   snapRoadPoint,
   snapWorldPoint,
+  toggleParkedCarsAt,
   toggleWalkwayAt
 } from "../adapter/canvas.js";
 import type { Vec2 } from "../core/geom/types.js";
@@ -24,12 +25,14 @@ export const LAYER_NAME = "nixie";
 export const TOOL = {
   EDIT: "edit",
   WALKWAY: "walkway",
+  PARKING: "parking",
   ZONE: "zone",
   ERASE: "erase"
 } as const;
 
 const COLOR_ROAD = 0x63ccff;
 const COLOR_PAVEMENT = 0x9a8cff;
+const COLOR_PARKING_OFF = 0xff5c6a;
 const COLOR_NODE = 0xffc94a;
 const COLOR_ZONE = 0xff5c9d;
 const COLOR_PREVIEW = 0x74ffa8;
@@ -164,6 +167,11 @@ export function nixieLayerClass(): any {
         g.lineStyle({ width: grid * 0.035, color: COLOR_ROAD, alpha: 0.8 });
         g.moveTo(a.x, a.y);
         g.lineTo(b.x, b.y);
+        if (game.activeTool === TOOL.PARKING && edge.parkedCars === false) {
+          g.lineStyle({ width: grid * 0.08, color: COLOR_PARKING_OFF, alpha: 0.9 });
+          g.moveTo(a.x, a.y);
+          g.lineTo(b.x, b.y);
+        }
       }
 
       // Fatter handles while the edit tool is out, because they become grab targets.
@@ -317,6 +325,11 @@ export function nixieLayerClass(): any {
           return;
         case TOOL.WALKWAY:
           report("walkway toggle", toggleWalkwayAt(point), (hit) => {
+            if (!hit) ui.notifications?.info("Nixie: no road under the cursor.");
+          });
+          return;
+        case TOOL.PARKING:
+          report("parked-car toggle", toggleParkedCarsAt(point), (hit) => {
             if (!hit) ui.notifications?.info("Nixie: no road under the cursor.");
           });
           return;

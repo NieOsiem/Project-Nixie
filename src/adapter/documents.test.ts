@@ -105,6 +105,13 @@ describe("loadCityState", () => {
     expect(loadCityState()!.zones.map((z) => z.bank)).toEqual([11, 5]);
   });
 
+  it("preserves a stored per-road parked-car toggle", () => {
+    const stored = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION };
+    (stored.graph.edges[0] as any).parkedCars = false;
+    storeCity(stored);
+    expect(loadCityState()!.graph.edges[0]!.parkedCars).toBe(false);
+  });
+
   it("pads a short or half-written stored palette up to a full bank", () => {
     const stored: any = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION };
     stored.base.palette = { name: "Half", materials: DEFAULT_DISTRICT_PALETTE.materials.slice(0, 3) };

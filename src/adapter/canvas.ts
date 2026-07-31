@@ -40,6 +40,7 @@ import {
   nearestNode,
   removeRoad,
   snapToGraph,
+  toggleParkedCars,
   toggleSidewalks
 } from "../core/graph/edit.js";
 import {
@@ -438,6 +439,17 @@ export async function toggleWalkwayAt(p: Vec2): Promise<boolean> {
   if (edge === null) return false;
   await commit(
     { ...city, graph: toggleSidewalks(city.graph, edge.id) },
+    edgeRect(city.graph, edge)
+  );
+  return true;
+}
+
+export async function toggleParkedCarsAt(p: Vec2): Promise<boolean> {
+  const city = requireCity();
+  const edge = nearestEdge(city.graph, worldToMetres(p), eraseReachM(city.graph));
+  if (edge === null) return false;
+  await commit(
+    { ...city, graph: toggleParkedCars(city.graph, edge.id) },
     edgeRect(city.graph, edge)
   );
   return true;

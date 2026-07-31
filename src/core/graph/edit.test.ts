@@ -9,6 +9,7 @@ import {
   pruneOrphanNodes,
   removeRoad,
   snapToGraph,
+  toggleParkedCars,
   toggleSidewalks
 } from "./edit.js";
 import { validateGraph, type RoadGraph } from "./road-graph.js";
@@ -96,6 +97,18 @@ describe("insertRoad", () => {
     expect(g.edges).toHaveLength(3);
     expect(g.nodes).toHaveLength(4);
     expect(validateGraph(g)).toEqual([]);
+  });
+
+  it("preserves per-road overrides across a split", () => {
+    const start = horizontal();
+    start.edges[0] = { ...start.edges[0]!, sidewalks: false, parkedCars: false };
+    const g = draw(start, [50, 50], [50, 0], 1);
+    const horizontalPieces = g.edges.filter((edge) => edge.parkedCars === false);
+    expect(horizontalPieces).toHaveLength(2);
+    for (const edge of horizontalPieces) {
+      expect(edge.sidewalks).toBe(false);
+      expect(edge.parkedCars).toBe(false);
+    }
   });
 
   it("splits one road twice when crossed twice", () => {
@@ -229,6 +242,19 @@ describe("toggleSidewalks", () => {
   it("returns the same graph for an unknown road", () => {
     const start = horizontal();
     expect(toggleSidewalks(start, "nope")).toBe(start);
+  });
+});
+
+describe("toggleParkedCars", () => {
+  it("flips the default on state off and back on", () => {
+    const off = toggleParkedCars(horizontal(), "ab");
+    expect(off.edges[0]!.parkedCars).toBe(false);
+    expect(toggleParkedCars(off, "ab").edges[0]!.parkedCars).toBe(true);
+  });
+
+  it("returns the same graph for an unknown road", () => {
+    const start = horizontal();
+    expect(toggleParkedCars(start, "nope")).toBe(start);
   });
 });
 

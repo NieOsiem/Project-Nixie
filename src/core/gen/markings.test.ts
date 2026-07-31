@@ -416,6 +416,17 @@ describe("class gating", () => {
     // The untouched arm still has its kerbs, so the switch is per-road and not global.
     expect(byMaterial(quads, MATERIAL.KERB).length).toBeGreaterThan(0);
   });
+
+  it("can disable parked cars without changing any road marking", () => {
+    const graph = cross("street");
+    const before = buildRoadDetails(toPixels(graph), PPM);
+    for (const edge of graph.edges) edge.parkedCars = false;
+    const after = buildRoadDetails(toPixels(graph), PPM);
+
+    expect(before.parkingSpans.length).toBeGreaterThan(0);
+    expect(after.parkingSpans).toEqual([]);
+    expect(after.markings).toEqual(before.markings);
+  });
 });
 
 describe("crossings", () => {

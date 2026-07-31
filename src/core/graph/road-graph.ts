@@ -21,6 +21,8 @@ export interface RoadEdge {
   classId: string;
   /** Per-road override of the class pavement. Absent means "use the class". */
   sidewalks?: boolean;
+  /** Per-road parked-car toggle. Absent means enabled. */
+  parkedCars?: boolean;
 }
 
 export interface RoadGraph {

@@ -21,7 +21,8 @@ import { nodeMap, type RoadGraph } from "../graph/road-graph.js";
 import { MATERIAL } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { buildingDetailMesh } from "./building-detail.js";
-import { parkedCars } from "./cars.js";
+import { carBodyMesh, carDetailMesh } from "./car-geometry.js";
+import { parkedCars, type ParkedCar } from "./cars.js";
 import { CLUTTER_MAX_HEIGHT_M, CLUTTER_MIN_BUILDING_M, clutterMesh } from "./clutter.js";
 import { chunkId, chunkQueryRect, chunkRect, chunksCovering, type ChunkKey } from "./chunks.js";
 import { cityToPixels, pixelsToMetres, rectToPixels, type CityParams } from "./demo-city.js";
@@ -49,7 +50,7 @@ export interface ChunkBuild {
   /** Buildings this chunk owns, uncut — a kept building may overhang the chunk rect. */
   buildings: BuildingSpec[];
   /** Parked-car props this chunk owns, separate from buildings used for Foundry walls. */
-  cars: BuildingSpec[];
+  cars: ParkedCar[];
   /** Real extent in METRES, including everything overhanging the chunk rect. */
   boundsM: Rect;
   buildingCount: number;
@@ -279,7 +280,7 @@ export function buildChunk(
     );
   }
 
-  const cars: BuildingSpec[] = [];
+  const cars: ParkedCar[] = [];
   for (const car of parkedCars(
     roadDetails.parkingSpans,
     params.origin,
@@ -302,16 +303,33 @@ export function buildChunk(
     });
   }
 
+  const carBody = carBodyMesh(cars, pixelsPerMetre);
+  const carDetail = carDetailMesh(cars, pixelsPerMetre);
+  for (const carPart of [carBody, carDetail]) {
+    const carPartBounds = meshBoundsM(carPart, params.origin, pixelsPerMetre);
+    if (carPartBounds === null) continue;
+    boundsM = unionRect(boundsM, carPartBounds);
+    const carPartHeight = meshMaxHeightM(carPart);
+    boundsM = unionRect(boundsM, {
+      ...carPartBounds,
+      x: carPartBounds.x - LIGHT_DIRECTION.x * carPartHeight * SHADOW_LENGTH,
+      y: carPartBounds.y - LIGHT_DIRECTION.y * carPartHeight * SHADOW_LENGTH
+    });
+  }
+
   const mesh = mergeMeshes([
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
     ...markingMeshes(markings),
     ...kept.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
-    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
+    carBody,
     clutterMesh(kept, pixelsPerMetre)
   ]);
-  const detail = buildingDetailMesh(kept, pixelsPerMetre);
+  const detail = mergeMeshes([
+    buildingDetailMesh(kept, pixelsPerMetre),
+    carDetail
+  ]);
   const detailBounds = meshBoundsM(detail, params.origin, pixelsPerMetre);
   if (detailBounds !== null) {
     boundsM = unionRect(boundsM, detailBounds);

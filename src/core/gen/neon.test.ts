@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { describeBuildingMassing, type BuildingSpec } from "../geom/extrude.js";
 import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
-import { rectRing, ringBounds, ringCentroid } from "../geom/types.js";
+import { rectRing, ringBounds } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
 import { hash2 } from "./hash.js";
 import {
-  BEACON_CORE_MAX_M,
   BILLBOARD_MAX_W_M,
   BILLBOARD_MIN_W_M,
   GLOW_MARGIN_M,
@@ -152,7 +151,7 @@ describe("neonMesh", () => {
   });
 
   it("keeps every quad inside its own building's footprint plus the glow margin", () => {
-    const slack = Math.max(GLOW_MARGIN_M + BEACON_CORE_MAX_M, POOL_RADIUS_M) * PPM;
+    const slack = POOL_RADIUS_M * PPM;
     const epsilon = 1e-3;
     for (const spec of cityOf(250)) {
       const m = neonMesh([spec], PPM);
@@ -200,14 +199,12 @@ describe("neonMesh", () => {
     }
   });
 
-  it("signs 35-55% of a realistic city", () => {
-    // Raised from the original 30-40% band: the 780M runs the city at vsync with headroom
-    // to spare, and the reference art is far denser with signage than one-in-three.
+  it("signs 25-40% of a realistic city", () => {
     const specs = cityOf(1400);
     const signed = specs.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
     const rate = signed / specs.length;
-    expect(rate).toBeGreaterThan(0.35);
-    expect(rate).toBeLessThan(0.55);
+    expect(rate).toBeGreaterThan(0.25);
+    expect(rate).toBeLessThan(0.4);
   });
 
   it("stays inside the 800-visible-sign budget for a 1400-building city", () => {
@@ -236,29 +233,4 @@ describe("neonMesh", () => {
     expect(facades).toBeGreaterThan(20);
   });
 
-  it("centres rooftop strips on the actual offset top footprint", () => {
-    let checked = false;
-    for (let i = 0; i < 500 && !checked; i++) {
-      const spec = detailedTower(hash2(i, 81, 17));
-      const massing = describeBuildingMassing(spec, PPM);
-      const outerCentre = ringCentroid(massing.volumes[0]!.footprint);
-      const top = massing.volumes[massing.volumes.length - 1]!;
-      const topCentre = ringCentroid(top.footprint);
-      if (Math.hypot(topCentre.x - outerCentre.x, topCentre.y - outerCentre.y) < 0.01) continue;
-
-      const mesh = neonMesh([spec], PPM);
-      for (let q = 0; q < mesh.vertexCount; q += 4) {
-        const vertices = [0, 1, 2, 3].map((corner) => vertexAt(mesh, q + corner));
-        if (vertices[0]!.radial !== 0) continue;
-        if (!vertices.every((vertex) => Math.abs(vertex.height - top.topHeight) < 1e-5)) continue;
-        const cx = vertices.reduce((sum, vertex) => sum + vertex.x, 0) / vertices.length;
-        const cy = vertices.reduce((sum, vertex) => sum + vertex.y, 0) / vertices.length;
-        expect(cx).toBeCloseTo(topCentre.x, 4);
-        expect(cy).toBeCloseTo(topCentre.y, 4);
-        checked = true;
-        break;
-      }
-    }
-    expect(checked).toBe(true);
-  });
 });

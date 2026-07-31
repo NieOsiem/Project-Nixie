@@ -173,7 +173,7 @@ export function insertRoad(
       if (proj.u <= 0 || proj.u >= 1 || dist(proj.point, point) > ON_EDGE_M) continue;
       const tailId = freshId("e", edgeIds);
       edgeIds.add(tailId);
-      edges.splice(i + 1, 0, { id: tailId, a: id, b: e.b, classId: e.classId });
+      edges.splice(i + 1, 0, { ...e, id: tailId, a: id });
       edges[i] = { ...e, b: id };
       break;
     }
@@ -270,6 +270,17 @@ export function toggleSidewalks(graph: RoadGraph, edgeId: string): RoadGraph {
     if (e.id !== edgeId) return e;
     found = true;
     return { ...e, sidewalks: e.sidewalks === false };
+  });
+  return found ? { ...graph, edges } : graph;
+}
+
+/** Flip parked cars on a single road without changing its kerbs or markings. */
+export function toggleParkedCars(graph: RoadGraph, edgeId: string): RoadGraph {
+  let found = false;
+  const edges = graph.edges.map((e) => {
+    if (e.id !== edgeId) return e;
+    found = true;
+    return { ...e, parkedCars: e.parkedCars === false };
   });
   return found ? { ...graph, edges } : graph;
 }

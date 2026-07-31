@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { extrudeBuilding } from "../geom/extrude.js";
-import { ringArea } from "../geom/types.js";
+import { ringArea, ringCentroid } from "../geom/types.js";
 import { BANK_SIZE } from "../palette.js";
 import {
-  CAR_HEIGHT_M,
-  CAR_LENGTH_M,
+  CAR_FAMILIES,
   CAR_RATE,
-  CAR_WIDTH_M,
+  MAX_PARKING_ANGLE_DEG,
+  WRONG_WAY_RATE,
   parkedCars
 } from "./cars.js";
 import { cityToPixels, demoCity } from "./demo-city.js";
@@ -28,40 +27,36 @@ const carsAt = (pixelsPerMetre: number, zones: Zone[] = []) => {
   );
 };
 
-const shaderRoofStyle = (seed: number): number => {
-  const value = Math.sin((seed + 12.59) * 78.233) * 43758.5453;
-  return value - Math.floor(value);
-};
-
 describe("parkedCars", () => {
-  it("is deterministic and emits 4 x 2 x 1.5 m specs", () => {
+  it("is deterministic and emits varied, dimensionally correct vehicle specs", () => {
     const a = carsAt(PPM);
     const b = carsAt(PPM);
     expect(b).toEqual(a);
     expect(a.length).toBeGreaterThan(20);
+    expect(new Set(a.map((car) => car.family)).size).toBeGreaterThanOrEqual(5);
     for (const car of a) {
       expect(car.footprint).toHaveLength(4);
       expect(Math.hypot(
         car.footprint[1]!.x - car.footprint[0]!.x,
         car.footprint[1]!.y - car.footprint[0]!.y
-      ) / PPM).toBeCloseTo(CAR_LENGTH_M, 6);
+      ) / PPM).toBeCloseTo(car.lengthM, 6);
       expect(Math.hypot(
         car.footprint[2]!.x - car.footprint[1]!.x,
         car.footprint[2]!.y - car.footprint[1]!.y
-      ) / PPM).toBeCloseTo(CAR_WIDTH_M, 6);
+      ) / PPM).toBeCloseTo(car.widthM, 6);
       expect(Math.abs(ringArea(car.footprint)) / (PPM * PPM)).toBeCloseTo(
-        CAR_LENGTH_M * CAR_WIDTH_M,
+        car.lengthM * car.widthM,
         6
       );
-      expect(car.height).toBe(CAR_HEIGHT_M);
-      expect(extrudeBuilding(car, PPM).triangleCount).toBe(10);
+      expect(car.height).toBe(CAR_FAMILIES.find((family) => family.id === car.family)!.heightM);
+      expect(Math.hypot(car.forward.x, car.forward.y)).toBeCloseTo(1, 9);
     }
   });
 
   it("occupies roughly two thirds of eligible kerb segments", () => {
     const px = cityToPixels(CITY, PPM);
     const spans = buildRoadDetails(px.graph, PPM).parkingSpans.filter(
-      (span) => span.to - span.from >= CAR_LENGTH_M * PPM && span.roadHalf * 2 >= 9 * PPM
+      (span) => span.to - span.from >= CAR_FAMILIES[0].lengthM * PPM && span.roadHalf * 2 >= 9 * PPM
     );
     const rate = carsAt(PPM).length / spans.length;
     expect(CAR_RATE).toBeCloseTo(2 / 3, 9);
@@ -69,7 +64,7 @@ describe("parkedCars", () => {
     expect(rate).toBeLessThan(0.8);
   });
 
-  it("uses the local district bank and forces the roof's lit-strip variant", () => {
+  it("uses the local district bank for both body materials", () => {
     const zone: Zone = {
       ...DEFAULT_ZONE_PARAMS,
       id: "z1",
@@ -81,9 +76,35 @@ describe("parkedCars", () => {
     for (const car of cars) {
       expect(Math.floor(car.wallMaterial / BANK_SIZE)).toBe(7);
       expect(Math.floor(car.roofMaterial / BANK_SIZE)).toBe(7);
-      expect(shaderRoofStyle(car.seed)).toBeGreaterThanOrEqual(0.42);
-      expect(shaderRoofStyle(car.seed)).toBeLessThan(0.78);
     }
+  });
+
+  it("follows right-hand traffic with a small deterministic wrong-way minority", () => {
+    const spans = Array.from({ length: 2000 }, (_, i) => ({
+      origin: { x: i * 12 * PPM, y: 0 },
+      dir: { x: 1, y: 0 },
+      normal: { x: 0, y: 1 },
+      from: 0,
+      to: 8 * PPM,
+      side: (i % 2 === 0 ? 1 : -1) as 1 | -1,
+      roadHalf: 4.5 * PPM
+    }));
+    const cars = parkedCars(spans, { x: 0, y: 0 }, PPM, []);
+    expect(cars.length).toBeGreaterThan(1000);
+
+    for (const car of cars) {
+      const side = Math.sign(ringCentroid(car.footprint).y) || 1;
+      const withTraffic = car.forward.x * side;
+      expect(withTraffic > 0).toBe(!car.wrongWay);
+      expect(Math.abs(car.parkingAngleRad)).toBeLessThanOrEqual(
+        MAX_PARKING_ANGLE_DEG * Math.PI / 180
+      );
+    }
+    const wrongWayRate = cars.filter((car) => car.wrongWay).length / cars.length;
+    expect(WRONG_WAY_RATE).toBe(0.075);
+    expect(wrongWayRate).toBeGreaterThan(0.05);
+    expect(wrongWayRate).toBeLessThan(0.1);
+    expect(cars.some((car) => Math.abs(car.parkingAngleRad) > Math.PI / 180)).toBe(true);
   });
 
   it("survives a scene regrid without moving or rerolling", () => {
@@ -97,7 +118,12 @@ describe("parkedCars", () => {
           ),
           car.wallMaterial,
           car.roofMaterial,
-          car.seed.toFixed(8)
+          car.seed.toFixed(8),
+          car.family,
+          car.forward.x.toFixed(8),
+          car.forward.y.toFixed(8),
+          car.wrongWay,
+          car.parkingAngleRad.toFixed(8)
         ].join("|")
       );
     expect(key(fine, PPM * 2)).toEqual(key(coarse, PPM));

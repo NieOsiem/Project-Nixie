@@ -87,6 +87,7 @@ interface EdgeMarking {
   pavedHalf: number;
   marked: boolean;
   kerbed: boolean;
+  parkedCars: boolean;
 }
 
 /** One road leaving a junction. `dir` points away from the node. */
@@ -212,7 +213,8 @@ export function buildRoadDetails(graph: RoadGraph, pixelsPerMetre: number): Road
       roadHalf: px(roadClass.widthM / 2),
       pavedHalf,
       marked: roadClass.widthM >= MARKED_WIDTH_M,
-      kerbed: sidewalkM > 0
+      kerbed: sidewalkM > 0,
+      parkedCars: edge.parkedCars !== false
     });
 
     addArm(edge.a, { edge: index, dir, pavedHalf });
@@ -296,15 +298,17 @@ export function buildRoadDetails(graph: RoadGraph, pixelsPerMetre: number): Road
           ring: quad(e.axis, t0, t1, Math.min(outer, inner), Math.max(outer, inner)),
           material: MATERIAL.KERB,
           edge: index,
-          parking: {
-            origin: e.axis.origin,
-            dir: e.axis.dir,
-            normal: e.axis.normal,
-            from: t0,
-            to: t1,
-            side,
-            roadHalf: e.roadHalf
-          }
+          parking: e.parkedCars
+            ? {
+                origin: e.axis.origin,
+                dir: e.axis.dir,
+                normal: e.axis.normal,
+                from: t0,
+                to: t1,
+                side,
+                roadHalf: e.roadHalf
+              }
+            : undefined
         });
       }
     }
