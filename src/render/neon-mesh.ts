@@ -1,3 +1,4 @@
+import { GLOW_MARGIN_M } from "../core/gen/neon.js";
 import { ATTRIBUTE_OFFSETS, VERTEX_STRIDE_BYTES, type MeshBuffers } from "../core/geom/mesh.js";
 import { EMISSIVE_MAX } from "../core/palette.js";
 import type { CameraUniforms } from "./city-mesh.js";
@@ -30,15 +31,19 @@ export class NeonMesh {
       .addAttribute("aU", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.u)
       .addAttribute("aTop", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.top)
       .addAttribute("aSeed", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.seed)
+      // Roof-only on the city mesh, so NEON borrows it for the panel's own half-extents.
+      .addAttribute("aRoofCentre", vertexBuffer, 2, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.roofCentre)
       .addIndex(buffers.indices);
 
     const shader = PIXI.Shader.from(NEON_VERT, NEON_FRAG, {
       uPivot: this.#pivot,
       uPixelsPerMetre: 25,
+      uScreenPxPerMetre: 25,
       uCamHeight: 8750,
       uLeanStrength: 1,
       uDepthFar: 20000,
       uEmissiveMax: EMISSIVE_MAX,
+      uGlowMarginM: GLOW_MARGIN_M,
       uPalette: palette.texture
     });
 
@@ -56,6 +61,7 @@ export class NeonMesh {
     this.#pivot[0] = c.pivotX;
     this.#pivot[1] = c.pivotY;
     u.uPixelsPerMetre = c.pixelsPerMetre;
+    u.uScreenPxPerMetre = c.screenPxPerMetre;
     u.uCamHeight = c.cameraHeightPx;
     u.uLeanStrength = c.leanStrength;
     u.uDepthFar = c.depthFar;

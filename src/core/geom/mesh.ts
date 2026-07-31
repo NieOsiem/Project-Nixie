@@ -2,17 +2,18 @@
  * Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1) aKind(1) aU(1) aTop(1)
  * aSeed(1) aRoofCentre(2).
  *
- * The facade attributes carry different meanings per kind; `aRoofCentre` is roof-only:
+ * The facade attributes carry different meanings per kind; `aRoofCentre` is used by ROOF
+ * and NEON only:
  *
- * | kind   | aU                      | aTop            | aSeed          |
- * |--------|-------------------------|-----------------|----------------|
- * | FLAT   | unused                  | unused          | unused         |
- * | WALL   | metres along the wall   | building height | building hash  |
- * | ROOF   | half-width, metres      | longest-edge angle | building hash |
- * | NEON   | local quad u, -1..1     | local quad v    | glow strength  |
- * | CLUTTER| cap local u, -1..1      | cap local v     | unused         |
- * | DETAIL | cap local u, -1..1      | cap local v     | detail hash    |
- * | CAR    | unused                  | unused          | car hash       |
+ * | kind   | aU                      | aTop            | aSeed          | aRoofCentre     |
+ * |--------|-------------------------|-----------------|----------------|-----------------|
+ * | FLAT   | unused                  | unused          | unused         | unused          |
+ * | WALL   | metres along the wall   | building height | building hash  | unused          |
+ * | ROOF   | half-width, metres      | longest-edge angle | building hash | centroid, px   |
+ * | NEON   | local quad u, -1..1     | local quad v    | glow strength  | panel half-extents, m |
+ * | CLUTTER| cap local u, -1..1      | cap local v     | unused         | unused          |
+ * | DETAIL | cap local u, -1..1      | cap local v     | detail hash    | unused          |
+ * | CAR    | unused                  | unused          | car hash       | unused          |
  *
  * `aShade` is surface shade except on ROOF (signed half-height; negative disables structures)
  * and NEON (0 selects sign falloff, 1 radial). CLUTTER uses negative shade for its cap.

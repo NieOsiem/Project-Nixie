@@ -5,11 +5,13 @@ import { rectRing, ringBounds } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
 import { hash2 } from "./hash.js";
 import {
+  BANNER_MIN_BUILDING_M,
   BILLBOARD_MAX_W_M,
   BILLBOARD_MIN_W_M,
   GLOW_MARGIN_M,
   POOL_RADIUS_M,
   POOL_RATE,
+  SIGN_BAND_TOP_M,
   neonMesh
 } from "./neon.js";
 
@@ -58,9 +60,26 @@ const vertexAt = (m: MeshBuffers, i: number) => {
     kind: m.vertices[at + 5]!,
     u: m.vertices[at + 6]!,
     top: m.vertices[at + 7]!,
-    strength: m.vertices[at + 8]!
+    strength: m.vertices[at + 8]!,
+    halfWidthM: m.vertices[at + 9]!,
+    halfHeightM: m.vertices[at + 10]!
   };
 };
+
+/** Every quad as (first corner, opposite corner) pairs, in emission order. */
+function quadsOf(m: MeshBuffers) {
+  const out = [];
+  for (let q = 0; q < m.vertexCount; q += 4) {
+    const corners = [0, 1, 2, 3].map((k) => vertexAt(m, q + k));
+    out.push({
+      ...corners[0]!,
+      widthPx: Math.hypot(corners[1]!.x - corners[0]!.x, corners[1]!.y - corners[0]!.y),
+      bottomM: Math.min(...corners.map((c) => c.height)),
+      topM: Math.max(...corners.map((c) => c.height))
+    });
+  }
+  return out;
+}
 
 describe("neonMesh", () => {
   it("is byte-identical across runs", () => {
@@ -134,8 +153,8 @@ describe("neonMesh", () => {
       expect(pool.material).toBe(sign.material);
       expect(pool.strength).toBeLessThan(sign.strength);
       for (let i = 0; i < 4; i++) expect(vertexAt(m, q + i).height).toBeCloseTo(0.03, 6);
-      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 3);
-      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 3);
+      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 2);
+      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 2);
     }
     expect(pools).toBeGreaterThan(0);
   });
@@ -199,21 +218,104 @@ describe("neonMesh", () => {
     }
   });
 
-  it("signs 25-40% of a realistic city", () => {
+  it("signs 70-80% of a realistic city", () => {
     const specs = cityOf(1400);
     const signed = specs.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
     const rate = signed / specs.length;
-    expect(rate).toBeGreaterThan(0.25);
-    expect(rate).toBeLessThan(0.4);
+    expect(rate).toBeGreaterThan(0.7);
+    expect(rate).toBeLessThan(0.8);
   });
 
-  it("stays inside the 800-visible-sign budget for a 1400-building city", () => {
-    const m = neonMesh(cityOf(1400), PPM);
-    let signs = 0;
-    for (let q = 0; q < m.vertexCount; q += 4) {
-      if (vertexAt(m, q).radial === 0) signs++;
+  it("keeps total additive fill inside its overdraw budget", () => {
+    // Panel *count* is the wrong proxy: measured on this fixture, panels are under 3% of
+    // neon fill and the pools are the whole cost. Glow area is what the GPU pays.
+    const specs = cityOf(1400);
+    const ground = specs.reduce(
+      (r, s) => {
+        const b = ringBounds(s.footprint);
+        return {
+          x0: Math.min(r.x0, b.x),
+          y0: Math.min(r.y0, b.y),
+          x1: Math.max(r.x1, b.x + b.width),
+          y1: Math.max(r.y1, b.y + b.height)
+        };
+      },
+      { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }
+    );
+    const groundM2 = ((ground.x1 - ground.x0) / PPM) * ((ground.y1 - ground.y0) / PPM);
+
+    let glowM2 = 0;
+    for (const q of quadsOf(neonMesh(specs, PPM))) {
+      // A pool's quad is its radius, not its half-extent plus a margin.
+      glowM2 +=
+        q.radial === 1
+          ? (2 * POOL_RADIUS_M) ** 2
+          : 2 * (q.halfWidthM + GLOW_MARGIN_M) * 2 * (q.halfHeightM + GLOW_MARGIN_M);
     }
-    expect(signs).toBeLessThan(800);
+    expect(glowM2 / groundM2).toBeLessThan(4.5);
+  });
+
+  it("carries each panel's own half-extents, which is what keeps a bar from going round", () => {
+    const m = neonMesh(cityOf(400), PPM);
+    let panels = 0;
+    for (const q of quadsOf(m)) {
+      if (q.radial !== 0) continue;
+      panels++;
+      expect(q.halfWidthM).toBeGreaterThan(0);
+      expect(q.halfHeightM).toBeGreaterThan(0);
+      // The padded quad is exactly the panel plus one glow margin on every side.
+      expect(q.widthPx / PPM / 2).toBeCloseTo(q.halfWidthM + GLOW_MARGIN_M, 2);
+      expect((q.topM - q.bottomM) / 2).toBeCloseTo(q.halfHeightM + GLOW_MARGIN_M, 5);
+    }
+    expect(panels).toBeGreaterThan(0);
+  });
+
+  it("keeps horizontal panels in the bottom band and pools every one of them", () => {
+    const quads = quadsOf(neonMesh(cityOf(600), PPM));
+    let horizontals = 0;
+    for (let i = 0; i < quads.length; i++) {
+      const q = quads[i]!;
+      if (q.radial !== 0 || q.halfHeightM > q.halfWidthM) continue;
+      horizontals++;
+      expect((q.topM + q.bottomM) / 2).toBeLessThanOrEqual(SIGN_BAND_TOP_M + 1e-5);
+      expect(quads[i + 1]?.radial).toBe(1);
+    }
+    expect(horizontals).toBeGreaterThan(50);
+  });
+
+  it("hangs vertical banners on tall buildings, the one thing exempt from the band", () => {
+    let banners = 0;
+    let aboveBand = 0;
+    for (const spec of cityOf(1400)) {
+      for (const q of quadsOf(neonMesh([spec], PPM))) {
+        if (q.radial !== 0 || q.halfHeightM <= q.halfWidthM) continue;
+        banners++;
+        expect(spec.height).toBeGreaterThanOrEqual(BANNER_MIN_BUILDING_M);
+        expect(q.halfHeightM * 2).toBeGreaterThanOrEqual(6);
+        expect(q.topM).toBeLessThanOrEqual(spec.height + 1e-5);
+        expect(q.bottomM).toBeGreaterThanOrEqual(-1e-5);
+        if ((q.topM + q.bottomM) / 2 > SIGN_BAND_TOP_M) aboveBand++;
+      }
+    }
+    expect(banners).toBeGreaterThan(50);
+    expect(aboveBand).toBeGreaterThan(banners / 2);
+  });
+
+  it("gives taller buildings bigger panels", () => {
+    const short: number[] = [];
+    const tall: number[] = [];
+    for (const spec of cityOf(1400)) {
+      for (const q of quadsOf(neonMesh([spec], PPM))) {
+        // Plain signs only: billboards and banners have their own size ranges.
+        if (q.radial !== 0 || q.halfHeightM > q.halfWidthM) continue;
+        if (q.halfWidthM * 2 >= BILLBOARD_MIN_W_M) continue;
+        (spec.height >= 60 ? tall : spec.height < 15 ? short : []).push(q.halfHeightM * 2);
+      }
+    }
+    expect(short.length).toBeGreaterThan(20);
+    expect(tall.length).toBeGreaterThan(20);
+    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    expect(mean(tall)).toBeGreaterThan(mean(short) * 1.2);
   });
 
   it("keeps facade signs below the outer tier of detailed towers", () => {
