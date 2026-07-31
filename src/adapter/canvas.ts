@@ -228,6 +228,13 @@ export function mount(): void {
   cityRenderer.display.sortLayer = 0;
   cityRenderer.display.sort = 0;
   canvas.primary.addChild(cityRenderer.display);
+
+  // Buildings again, above every ground-level token. SORT_LAYERS.TOKENS is 700 and weather
+  // is 1000, and elevation outranks both, so a token that flies clears the roofs.
+  cityRenderer.overlay.elevation = 0;
+  cityRenderer.overlay.sortLayer = 900;
+  cityRenderer.overlay.sort = 0;
+  canvas.primary.addChild(cityRenderer.overlay);
   canvas.primary.sortDirty = true;
 
   // HIGH outruns PIXI.Application's own render, which sits at LOW; the offscreen
@@ -253,6 +260,7 @@ export function unmount(): void {
   workerClient?.terminate();
   workerClient = null;
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
+  cityRenderer.overlay.parent?.removeChild(cityRenderer.overlay);
   cityRenderer.destroy();
   cityRenderer = null;
   currentCity = null;

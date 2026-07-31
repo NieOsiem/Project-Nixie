@@ -19,6 +19,8 @@ import {
 import { CityMesh } from "./city-mesh.js";
 import { NeonMesh } from "./neon-mesh.js";
 import { PaletteTexture } from "./palette-texture.js";
+import { ScreenQuad } from "./screen-quad.js";
+import { CITY_OVERLAY_FRAG } from "./shaders/occlusion.js";
 
 export type { ChunkGeometry } from "./chunk-culling.js";
 
@@ -60,9 +62,19 @@ interface LiveChunk {
  */
 export class CityRenderer {
   readonly display: any;
+  /**
+   * The buildings again, over whatever the host draws between this and `display`.
+   *
+   * Kept as a second display object rather than a filter on each token: it is the same
+   * quad, texture and transform as `display`, so it cannot drift out of alignment, and
+   * the host decides what it covers purely by where it is inserted.
+   */
+  readonly overlay: any;
 
   #renderer: any;
   #target: any = null;
+  #maskTarget: any = null;
+  #overlay: ScreenQuad;
   #content: any;
   #neonContent: any;
   #chunks = new Map<string, LiveChunk>();
@@ -104,6 +116,16 @@ export class CityRenderer {
 
     this.display = new PIXI.Sprite(PIXI.Texture.EMPTY);
     this.display.eventMode = "none";
+
+    this.#overlay = new ScreenQuad(CITY_OVERLAY_FRAG, {
+      uCity: PIXI.Texture.EMPTY,
+      uMask: PIXI.Texture.EMPTY
+    });
+    // Unlike the post chain this one lands on top of foreign content, so it must blend.
+    this.#overlay.display.state.blend = true;
+    this.#overlay.display.visible = false;
+    this.#overlay.display.eventMode = "none";
+    this.overlay = this.#overlay.display;
   }
 
   /** Resolution multiplier for the offscreen pass. Lower trades sharpness for frame time. */
@@ -322,11 +344,24 @@ export class CityRenderer {
       this.#renderer.render(this.#neonContent, { renderTexture: this.#target, clear: false });
     }
 
+    for (const chunk of this.#chunks.values()) chunk.mesh.setMaskPass(true);
+    try {
+      this.#renderer.render(this.#content, { renderTexture: this.#maskTarget, clear: true });
+    } finally {
+      for (const chunk of this.#chunks.values()) chunk.mesh.setMaskPass(false);
+    }
+
     this.display.texture =
       this.#bloom === null ? this.#target : this.#bloom.render(this.#target, this.#bloomStrength);
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;
     this.display.height = view.height;
+
+    this.#overlay.uniforms.uCity = this.display.texture;
+    this.#overlay.uniforms.uMask = this.#maskTarget;
+    this.#overlay.display.position.set(view.x, view.y);
+    this.#overlay.display.scale.set(view.width, view.height);
+    this.#overlay.display.visible = this.#chunksDrawn > 0;
 
     this.#lastCamera = cloneCamera(camera);
     this.#contentDirty = false;
@@ -362,6 +397,7 @@ export class CityRenderer {
     this.#bloom = null;
     this.#releaseTarget();
     this.clearChunks();
+    this.#overlay.destroy();
     this.#palette.destroy();
     this.#content.destroy({ children: true });
     this.#neonContent.destroy({ children: true });
@@ -380,21 +416,32 @@ export class CityRenderer {
         resolution: this.#renderer.resolution
       });
       this.#target.framebuffer.enableDepth();
+      this.#maskTarget = PIXI.RenderTexture.create({
+        width: w,
+        height: h,
+        resolution: this.#renderer.resolution,
+        scaleMode: PIXI.SCALE_MODES.LINEAR
+      });
       this.display.texture = this.#target;
       return true;
     }
 
     if (this.#target.width !== w || this.#target.height !== h) {
       this.#target.resize(w, h);
+      this.#maskTarget.resize(w, h);
       return true;
     }
     return false;
   }
 
   #releaseTarget(): void {
-    if (this.#target === null) return;
-    this.display.texture = PIXI.Texture.EMPTY;
-    this.#target.destroy(true);
+    if (this.#target !== null) {
+      this.display.texture = PIXI.Texture.EMPTY;
+      this.#target.destroy(true);
+    }
+    this.#maskTarget?.destroy(true);
+    this.#overlay.display.visible = false;
     this.#target = null;
+    this.#maskTarget = null;
   }
 }
