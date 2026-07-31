@@ -93,6 +93,7 @@ export class CityRenderer {
   #visibleNeonTriangles = 0;
   #renderScale = 1;
   #supersample = 1;
+  #pivotUv = new Float32Array([0.5, 0.5]);
   #pixelsPerMetre: number;
   #cameraHeightMetres: number;
   #cameraZoomMode: CameraZoomMode;
@@ -323,6 +324,10 @@ export class CityRenderer {
 
     const view = visibleWorldRect(camera);
     const t = offscreenTransform(camera, this.#effectiveRenderScale());
+    // The pivot lands on target pixel stage * effectiveScale of a target that is
+    // screen * effectiveScale wide, so the scale cancels and this is just the stage fraction.
+    this.#pivotUv[0] = camera.stageX / camera.screenWidth;
+    this.#pivotUv[1] = camera.stageY / camera.screenHeight;
     const zoom = camera.scale > 0 ? camera.scale : 1;
     const automaticLeanStrength = dollyLeanStrength(zoom);
     const leanStrength =
@@ -400,7 +405,8 @@ export class CityRenderer {
             this.#target,
             this.#bloomStrength,
             this.#shadowTarget,
-            this.#maskTarget
+            this.#maskTarget,
+            this.#pivotUv
           );
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;

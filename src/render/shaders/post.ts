@@ -12,6 +12,12 @@ const KNEE = 0.25;
 
 const LUMA = "vec3(0.299, 0.587, 0.114)";
 
+/** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG. */
+const BODY_CHROMA = 0.42;
+const NEON_CHROMA = 1.15;
+/** Darkening at the far edge of the depth falloff. */
+const DEPTH_FALLOFF = 0.42;
+
 /**
  * Unit quad. The mesh transform scales it to the target, so `aCorner` is also the UV.
  *
@@ -121,6 +127,7 @@ uniform sampler2D uShadow;
 uniform sampler2D uBuildingMask;
 uniform float uNarrowStrength;
 uniform float uWideStrength;
+uniform vec2 uPivotUv;
 
 varying vec2 vUv;
 
@@ -130,11 +137,19 @@ void main() {
     + texture2D(uBloomWide, vUv).rgb * uWideStrength;
   float castShadow = texture2D(uShadow, vUv).r * (1.0 - texture2D(uBuildingMask, vUv).a);
   c *= 1.0 - 0.38 * castShadow;
+
+  // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
+  // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
+  // rather than the frame centre. Deliberately not aspect-corrected: on a 2.39:1 panel a
+  // screen-circular falloff reaches the top and bottom edges and never the left and right.
+  c *= 1.0 - ${DEPTH_FALLOFF} * smoothstep(0.20, 0.72, length(vUv - uPivotUv));
+
+  // Chroma as a function of luma: dark masses go near-neutral, bright things keep and gain
+  // saturation. Full chroma on the bases is what makes every roof compete with the signage.
   float l = dot(c, ${LUMA});
-  float shadow = 1.0 - smoothstep(0.0, 0.55, l);
-  c += vec3(0.018, 0.012, 0.045) * shadow;
-  l = dot(c, ${LUMA});
-  c = max(mix(vec3(l), c, 1.12), vec3(0.0));
+  float chroma = mix(${BODY_CHROMA}, ${NEON_CHROMA}, smoothstep(0.10, 0.55, l));
+  c = max(mix(vec3(l), c, chroma), vec3(0.0));
+
   float m = max(max(c.r, c.g), c.b);
   c *= 1.0 / (1.0 + max(m - 1.0, 0.0));
   gl_FragColor = vec4(c, 1.0);

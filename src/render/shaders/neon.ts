@@ -72,7 +72,9 @@ void main() {
   float core = (1.0 - smoothstep(0.30, 0.55, d.x)) * (1.0 - smoothstep(0.30, 0.55, d.y));
   float halo = (1.0 - smoothstep(0.0, 1.0, d.x)) * (1.0 - smoothstep(0.0, 1.0, d.y));
   float signGlow = halo * 0.55 + core * 0.45;
-  float poolGlow = 1.0 - smoothstep(0.0, 1.0, length(vLocal));
+  // Cubic, not smoothstep: the pool quad is sized for the glow's full reach, and a linear-ish
+  // falloff over that radius reads as a painted disc rather than light. Still zero at |v| = 1.
+  float poolGlow = pow(max(0.0, 1.0 - length(vLocal)), 3.0);
   float g = mix(signGlow, poolGlow, step(0.5, vRadial));
 
   // Alpha 0, not g: BLEND_MODES.ADD is blendFunc(ONE, ONE), so alpha accumulates too and

@@ -11,8 +11,24 @@ describe("composite shader", () => {
     expect(DOWNSAMPLE_FRAG.match(/texture2D/g)).toHaveLength(4);
     expect(COMPOSITE_FRAG).toContain("texture2D(uBloomNarrow,");
     expect(COMPOSITE_FRAG).toContain("texture2D(uBloomWide,");
-    expect(COMPOSITE_FRAG).toContain("vec3(0.018, 0.012, 0.045) * shadow");
-    expect(COMPOSITE_FRAG).toContain("mix(vec3(l), c, 1.12)");
+  });
+
+  it("grades chroma by luma so dark masses desaturate and bright signage does not", () => {
+    expect(COMPOSITE_FRAG).toContain(
+      "float chroma = mix(0.42, 1.15, smoothstep(0.10, 0.55, l));"
+    );
+    expect(COMPOSITE_FRAG).toContain("c = max(mix(vec3(l), c, chroma), vec3(0.0));");
+  });
+
+  it("falls off with screen distance from the projection pivot, not the frame centre", () => {
+    expect(COMPOSITE_FRAG).toContain("uniform vec2 uPivotUv;");
+    expect(COMPOSITE_FRAG).toContain(
+      "c *= 1.0 - 0.42 * smoothstep(0.20, 0.72, length(vUv - uPivotUv));"
+    );
+  });
+
+  it("lifts ambient exactly once, in the city shader rather than here", () => {
+    expect(COMPOSITE_FRAG).not.toContain("* shadow");
   });
 
   it("darkens only ground covered by the roof-shadow target", () => {

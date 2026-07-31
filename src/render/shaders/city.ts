@@ -177,7 +177,7 @@ vec3 roof() {
   float aa = 0.75 / max(min(extentM.x, extentM.y) * uScreenPxPerMetre, 1.0);
   float detailLod = lod(min(extentM.x, extentM.y), uScreenPxPerMetre) * structured;
   float slope = clamp(0.5 + 0.5 * dot(fromCentre / max(length(extentM), 0.0001), vec2(0.5547, 0.8321)), 0.0, 1.0);
-  float plane = mix(1.06, 0.90, slope);
+  float plane = mix(1.0, 0.84, slope);
   float inside = slab(local.x, -0.72, 0.72, aa) * slab(local.y, -0.72, 0.72, aa);
 
   float padX = (hash11(vSeed + 5.31) - 0.5) * 0.24;
@@ -230,6 +230,6 @@ void main() {
   if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
-  gl_FragColor = vec4(colour + vec3(0.02, 0.015, 0.05), 1.0);
+  gl_FragColor = vec4(colour + vec3(0.012, 0.009, 0.03), 1.0);
 }
 `;

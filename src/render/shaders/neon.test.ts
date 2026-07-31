@@ -4,7 +4,7 @@ import { NEON_FRAG, NEON_VERT } from "./neon.js";
 describe("neon shaders", () => {
   it("selects radial falloff for ground pools", () => {
     expect(NEON_VERT).toContain("vRadial = aShade;");
-    expect(NEON_FRAG).toContain("length(vLocal)");
+    expect(NEON_FRAG).toContain("pow(max(0.0, 1.0 - length(vLocal)), 3.0)");
     expect(NEON_FRAG).toContain("mix(signGlow, poolGlow, step(0.5, vRadial))");
   });
 

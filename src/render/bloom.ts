@@ -76,12 +76,19 @@ export class BloomChain {
       uShadow: PIXI.Texture.EMPTY,
       uBuildingMask: PIXI.Texture.EMPTY,
       uNarrowStrength: 1,
-      uWideStrength: WIDE_STRENGTH
+      uWideStrength: WIDE_STRENGTH,
+      uPivotUv: new Float32Array([0.5, 0.5])
     });
   }
 
   /** Runs the chain and returns the composite target, ready to present. */
-  render(scene: any, strength: number, shadow: any, buildingMask: any): any {
+  render(
+    scene: any,
+    strength: number,
+    shadow: any,
+    buildingMask: any,
+    pivotUv: Float32Array
+  ): any {
     this.#ensureTargets(scene);
     const renderer = this.#renderer;
 
@@ -111,6 +118,7 @@ export class BloomChain {
     composite.uBuildingMask = buildingMask;
     composite.uNarrowStrength = strength;
     composite.uWideStrength = strength * WIDE_STRENGTH;
+    composite.uPivotUv = pivotUv;
     renderer.render(this.#composite.display, { renderTexture: this.#out, clear: true });
 
     return this.#out;
