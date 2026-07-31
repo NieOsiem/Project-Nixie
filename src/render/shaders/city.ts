@@ -1,5 +1,6 @@
 import { BANK_SIZE, DISTRICT_SLOT, PALETTE_SIZE } from "../../core/palette.js";
 import { CAR_SURFACE } from "../../core/geom/mesh.js";
+import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 /**
  * Fake-3D extrusion.
@@ -133,6 +134,12 @@ const float SHOPFRONT_M = 4.0;
 const float BAY_M = 5.0;
 const float PARAPET_M = 0.8;
 const float ARCHITECTURE_MIN_M = 6.0;
+const float GROUND_COARSE_M = 34.0;
+const float GROUND_FINE_M = 8.5;
+const float GROUND_COARSE_AMP = 0.107;
+const float GROUND_FINE_AMP = 0.053;
+const float SCENE_HEIGHT_NORM_M = ${SCENE_HEIGHT_NORM_M}.0;
+const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};
 
 float hash11(float x) {
   return fract(sin(x * 78.233) * 43758.5453);
@@ -140,6 +147,17 @@ float hash11(float x) {
 
 float hash21(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float valueNoise(vec2 p) {
+  vec2 cell = floor(p);
+  vec2 f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  float a = hash21(cell);
+  float b = hash21(cell + vec2(1.0, 0.0));
+  float c = hash21(cell + vec2(0.0, 1.0));
+  float d = hash21(cell + vec2(1.0, 1.0));
+  return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
 // 1 inside [lo, hi], ramped over half-width w. Collapses toward 0 once w swallows the
@@ -151,6 +169,21 @@ float slab(float t, float lo, float hi, float w) {
 // A pattern of this period, seen at this many px/metre: full at 4 px, gone under 1.5.
 float lod(float metres, float pxPerMetre) {
   return smoothstep(1.5, 4.0, metres * pxPerMetre);
+}
+
+// Roads, pavements and ground blocks are ~40% of the screen and share a handful of flat
+// palette entries, so untouched they read as one poured violet sheet.
+//
+// WHY: modulates vBase only. CITY_SURFACES hold to max(emissive) * strength * EMISSIVE_MAX
+// < 0.55 so broad ground never clears the bloom threshold; a noise term on vEmissive would
+// push part of that area over it and bloom the whole city into mush.
+vec3 flatGround() {
+  float coarse = (valueNoise(vWorldM / GROUND_COARSE_M) - 0.5)
+    * lod(GROUND_COARSE_M, uScreenPxPerMetre);
+  float fine = (valueNoise(vWorldM / GROUND_FINE_M) - 0.5)
+    * lod(GROUND_FINE_M, uScreenPxPerMetre);
+  float mottle = 1.0 + GROUND_COARSE_AMP * coarse + GROUND_FINE_AMP * fine;
+  return vBase * vShade * mottle + vEmissive;
 }
 
 vec3 facade() {
@@ -348,11 +381,14 @@ vec3 car() {
 
 void main() {
   vec3 colour = vBase * vShade + vEmissive;
-  if (vKind > 0.5 && vKind < 1.5) colour = facade();
+  if (vKind < 0.5) colour = flatGround();
+  else if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
   else if (vKind > 4.5 && vKind < 5.5) colour = architectureDetail();
   else if (vKind > 5.5 && vKind < 6.5) colour = car();
-  gl_FragColor = vec4(colour + vec3(0.020, 0.014, 0.035), 1.0);
+  float sceneAlpha = SCENE_ALPHA_FLOOR
+    + (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);
+  gl_FragColor = vec4(colour + vec3(0.020, 0.014, 0.035), sceneAlpha);
 }
 `;

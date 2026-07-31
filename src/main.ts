@@ -17,6 +17,7 @@ import {
   getLeanCalibrationReport,
   isSceneEnabled,
   listDistricts,
+  lookDials,
   rebuildGeometry,
   redo,
   registerHooks,
@@ -27,6 +28,7 @@ import {
   setAutoWalls,
   setBaseParams,
   setLeanAtCurrentZoom,
+  setLookDials,
   setSceneEnabled,
   setZoneParams,
   stats,
@@ -116,6 +118,9 @@ Hooks.once("init", () => {
       await setSettingValue(SETTING_CAMERA_ZOOM_MODE, mode);
       return settingValue<CameraZoomMode>(SETTING_CAMERA_ZOOM_MODE);
     },
+
+    lookDials,
+    setLookDials,
 
     setLeanAtCurrentZoom,
     adjustLeanAtCurrentZoom,

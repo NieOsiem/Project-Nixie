@@ -58,6 +58,7 @@ import {
   type DistrictPalette,
   type Material
 } from "../core/palette.js";
+import type { LookDials } from "../render/bloom.js";
 import {
   CityRenderer,
   type ChunkGeometry,
@@ -702,6 +703,32 @@ export function setBloom(enabled: boolean, strength?: number): void {
   if (cityRenderer === null) return;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
+}
+
+/**
+ * Live look tuning for the post chain. In-memory only, like the lean calibration API — these
+ * are iterated on in the console and then written into the shader defaults, not persisted.
+ */
+export function setLookDials(partial: Partial<LookDials>): LookDials {
+  const renderer = cityRenderer;
+  if (renderer === null) throw new Error("No city renderer is mounted.");
+  const dials = renderer.lookDials as unknown as Record<string, number>;
+  for (const [key, value] of Object.entries(partial)) {
+    if (!(key in dials)) continue;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`Look dial "${key}" must be a finite number.`);
+    }
+  }
+  for (const [key, value] of Object.entries(partial)) {
+    if (key in dials && typeof value === "number") dials[key] = value;
+  }
+  // WHY: the settled frame is cached, so a dial change is invisible until the camera moves.
+  renderer.markContentDirty();
+  return { ...renderer.lookDials };
+}
+
+export function lookDials(): LookDials | null {
+  return cityRenderer === null ? null : { ...cityRenderer.lookDials };
 }
 
 /**

@@ -9,7 +9,7 @@ import {
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
 import { dollyLeanStrength } from "../core/lean-curve.js";
-import { BloomChain } from "./bloom.js";
+import { BloomChain, type LookDials } from "./bloom.js";
 import {
   UNCULLED_BOUNDS,
   WHOLE_CITY_CHUNK_ID,
@@ -92,7 +92,7 @@ export class CityRenderer {
   #blankContent: any;
   #chunks = new Map<string, LiveChunk>();
   #palette: PaletteTexture;
-  #bloom: BloomChain | null;
+  #bloom: BloomChain;
   #bloomStrength = 1.3;
   #lastCamera: CameraState | null = null;
   #lastQuality: FrameQuality | null = null;
@@ -231,22 +231,20 @@ export class CityRenderer {
     };
   }
 
+  /** Off skips the blur passes only — the composite always runs, so the chain always exists. */
   get bloomEnabled(): boolean {
-    return this.#bloom !== null;
+    return this.#bloom.bloomEnabled;
   }
 
   set bloomEnabled(value: boolean) {
-    const bloom = this.#bloom;
-    if (value === (bloom !== null)) return;
-    if (bloom === null) {
-      this.#bloom = new BloomChain(this.#renderer);
-    } else {
-      bloom.destroy();
-      this.#bloom = null;
-      // WHY: display.texture is the composite target that destroy just released.
-      this.display.texture = this.#target ?? PIXI.Texture.EMPTY;
-    }
+    if (value === this.#bloom.bloomEnabled) return;
+    this.#bloom.bloomEnabled = value;
     this.#contentDirty = true;
+  }
+
+  /** Live look dials, mutated in place. Call `markContentDirty` after touching them. */
+  get lookDials(): LookDials {
+    return this.#bloom.dials;
   }
 
   get bloomStrength(): number {
@@ -483,16 +481,13 @@ export class CityRenderer {
       });
     }
 
-    this.display.texture =
-      this.#bloom === null
-        ? this.#target
-        : this.#bloom.render(
-            this.#target,
-            this.#bloomStrength,
-            this.#shadowTarget,
-            this.#maskTarget,
-            this.#pivotUv
-          );
+    this.display.texture = this.#bloom.render(
+      this.#target,
+      this.#bloomStrength,
+      this.#shadowTarget,
+      this.#maskTarget,
+      this.#pivotUv
+    );
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;
     this.display.height = view.height;
@@ -538,8 +533,9 @@ export class CityRenderer {
       neonTriangles: this.#visibleNeonTriangles,
       trianglesTotal: trianglesTotal + detailTrianglesTotal,
       detailTrianglesTotal,
-      bloom: this.#bloom !== null,
+      bloom: this.#bloom.bloomEnabled,
       bloomStrength: this.#bloomStrength,
+      lookDials: { ...this.#bloom.dials },
       targetSize: this.#target ? [this.#target.width, this.#target.height] : null,
       targetCapacity: this.#target
         ? [
@@ -554,8 +550,7 @@ export class CityRenderer {
   }
 
   destroy(): void {
-    this.#bloom?.destroy();
-    this.#bloom = null;
+    this.#bloom.destroy();
     this.#releaseTarget();
     this.clearChunks();
     this.#overlay.destroy();
@@ -606,7 +601,9 @@ export class CityRenderer {
         type: PIXI.TYPES.UNSIGNED_BYTE,
         scaleMode: PIXI.SCALE_MODES.LINEAR
       });
-      this.display.texture = this.#target;
+      // WHY: the scene target's alpha carries surface height for the composite to decode, so
+      // presenting it directly renders the city translucent. Only the composite may be shown.
+      this.display.texture = PIXI.Texture.EMPTY;
       changed = true;
     } else if (
       (this.#target.baseTexture?.width ?? this.#target.width) !== capacityWidth ||

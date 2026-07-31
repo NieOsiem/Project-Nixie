@@ -6,6 +6,8 @@
  * materials, which is what makes lit windows and neon the only things that glow. The
  * composite tone maps once into its RGBA8 output.
  */
+import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
+
 const THRESHOLD = 0.55;
 /** Half-width of the quadratic knee below the threshold. Softens the cut-in. */
 const KNEE = 0.25;
@@ -19,6 +21,11 @@ const NEON_CHROMA = 1.15;
 const DEPTH_FALLOFF = 0.16;
 /** WHY: saturation must not lift black surfaces into purple fog. */
 const BLACK_FLOOR = 0.012;
+
+const ALPHA_FLOOR = SCENE_ALPHA_FLOOR.toFixed(6);
+/** Half the floor: anything below it is cleared background, not geometry. */
+const ALPHA_BACKGROUND = (SCENE_ALPHA_FLOOR * 0.5).toFixed(7);
+const HEIGHT_NORM = SCENE_HEIGHT_NORM_M.toFixed(1);
 
 /**
  * Unit quad. The mesh transform scales it to the target, so `aCorner` is also the UV.
@@ -135,38 +142,132 @@ void main() {
 }
 `;
 
+/** Taps per side of one streak pass. Also the stride multiplier between passes — see below. */
+export const STREAK_TAPS = 8;
+/** Per-texel falloff of the streak. 0.94^64 ≈ 0.02, so the tail dies just as the reach runs out. */
+const STREAK_ATTENUATION = 0.94;
+
+/**
+ * One directional streak pass: uniformly spaced taps with geometric falloff.
+ *
+ * **Not `BLUR_FRAG` with an inflated `uTexel`.** That shader's offsets (1.3846 / 3.2308) are the
+ * linear-sampling ones, which only work at unit texel steps — each is meant to be a bilinear
+ * blend of two *adjacent* texels. Scaled up they become isolated point samples with several
+ * unsampled texels between them, so a bright source resolves as five discrete ghost copies
+ * rather than a streak. It hides on horizontal lines, because smearing a horizontal bar along x
+ * lands on more bar, and is glaring on points and vertical bars, which have no x extent.
+ *
+ * Contiguity here is structural: taps are one `uStep` apart, so a pass covers `STREAK_TAPS`
+ * strides with no gaps, and the next pass uses a stride of exactly `STREAK_TAPS` texels — each
+ * of its taps carries the previous pass's full contiguous smear. Two passes therefore cover
+ * `STREAK_TAPS²` texels at single-texel resolution.
+ *
+ * Geometric weights compose exactly across passes: `a^t1 · a^t2 = a^(t1+t2)`, so the two-pass
+ * kernel is `a^t` over the whole reach, not an approximation of one.
+ */
+export const STREAK_FRAG = `
+precision highp float;
+
+uniform sampler2D uTex;
+uniform vec2 uTexel;
+uniform vec2 uTexUvScale;
+uniform vec2 uStep;
+uniform float uSpan;
+
+varying vec2 vUv;
+
+void main() {
+  vec2 uv = vUv * uTexUvScale;
+  vec2 edge = 0.5 * uTexel;
+  vec2 limit = uTexUvScale - edge;
+
+  vec3 sum = texture2D(uTex, clamp(uv, edge, limit)).rgb;
+  float weight = 1.0;
+
+  for (int i = 1; i <= ${STREAK_TAPS}; i++) {
+    float t = float(i);
+    float w = pow(${STREAK_ATTENUATION}, t * uSpan);
+    vec2 o = uStep * t;
+    sum += (
+      texture2D(uTex, clamp(uv + o, edge, limit)).rgb
+      + texture2D(uTex, clamp(uv - o, edge, limit)).rgb) * w;
+    weight += 2.0 * w;
+  }
+
+  // Normalised: a streak may spread a highlight but never invent energy, so a long bright line
+  // stays bright while a point spreads faint. That asymmetry is the physics, and uStreakStrength
+  // is the dial for it.
+  gl_FragColor = vec4(sum / weight, 1.0);
+}
+`;
+
 export const COMPOSITE_FRAG = `
 precision highp float;
 
 uniform sampler2D uScene;
 uniform sampler2D uBloomNarrow;
 uniform sampler2D uBloomWide;
+uniform sampler2D uStreak;
 uniform sampler2D uShadow;
 uniform sampler2D uBuildingMask;
+uniform sampler2D uAo;
 uniform float uNarrowStrength;
 uniform float uWideStrength;
+uniform float uStreakStrength;
+uniform float uAoStrength;
+uniform float uAoHeightM;
+uniform float uFogStrength;
+uniform float uFogDensity;
+uniform float uFogHeightM;
+uniform float uFogInscatter;
+uniform float uFogTintR;
+uniform float uFogTintG;
+uniform float uFogTintB;
 uniform vec2 uPivotUv;
 uniform vec2 uSceneUvScale;
 uniform vec2 uBloomUvScale;
 uniform vec2 uWideUvScale;
+uniform vec2 uStreakUvScale;
 uniform vec2 uShadowUvScale;
 uniform vec2 uMaskUvScale;
+uniform vec2 uAoUvScale;
 
 varying vec2 vUv;
 
 void main() {
-  vec3 c = texture2D(uScene, vUv * uSceneUvScale).rgb
+  vec4 sceneSample = texture2D(uScene, vUv * uSceneUvScale);
+  float covered = step(${ALPHA_BACKGROUND}, sceneSample.a);
+  float heightM = max(sceneSample.a - ${ALPHA_FLOOR}, 0.0)
+    / (1.0 - ${ALPHA_FLOOR}) * ${HEIGHT_NORM};
+
+  vec3 wideBloom = texture2D(uBloomWide, vUv * uWideUvScale).rgb;
+  vec3 c = sceneSample.rgb
     + texture2D(uBloomNarrow, vUv * uBloomUvScale).rgb * uNarrowStrength
-    + texture2D(uBloomWide, vUv * uWideUvScale).rgb * uWideStrength;
+    + wideBloom * uWideStrength
+    + texture2D(uStreak, vUv * uStreakUvScale).rgb * uStreakStrength;
   float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
     * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
   c *= 1.0 - 0.38 * castShadow;
+
+  float ao = texture2D(uAo, vUv * uAoUvScale).r;
+  float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);
+  c *= 1.0 - uAoStrength * ao * lowness * covered;
 
   // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
   // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
   // rather than the frame centre. Deliberately not aspect-corrected: on a 2.39:1 panel a
   // screen-circular falloff reaches the top and bottom edges and never the left and right.
   c *= 1.0 - ${DEPTH_FALLOFF} * smoothstep(0.20, 0.72, length(vUv - uPivotUv));
+
+  // WHY: fog keys off the same radial term the depth falloff darkens with, so the two stack
+  // at the frame edge. Tune them together, never one alone.
+  // Bounded mix toward a haze already carrying the wide bloom: the tone map is an exact clamp
+  // at 1.0, so an additive inscatter would vanish instead of reading as aerial perspective.
+  float radial = length(vUv - uPivotUv);
+  float density = exp(-heightM / max(uFogHeightM, 0.001));
+  float fog = (1.0 - exp(-uFogDensity * radial)) * density * covered * uFogStrength;
+  vec3 haze = vec3(uFogTintR, uFogTintG, uFogTintB) + wideBloom * uFogInscatter;
+  c = mix(c, haze, clamp(fog, 0.0, 1.0));
 
   // WHY: body chroma carries the palette; the toe keeps that saturation from lifting black.
   float l = dot(c, ${LUMA});

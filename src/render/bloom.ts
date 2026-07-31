@@ -3,20 +3,64 @@ import {
   BLUR_FRAG,
   COMPOSITE_FRAG,
   DOWNSAMPLE_FRAG,
+  STREAK_FRAG,
+  STREAK_TAPS,
   THRESHOLD_FRAG
 } from "./shaders/post.js";
 
 const NARROW_DOWNSAMPLE = 4;
 const WIDE_DOWNSAMPLE = 16;
 const WIDE_STRENGTH = 0.55;
+/**
+ * Tap strides of the two horizontal streak passes, in wide-target texels.
+ *
+ * The second is `STREAK_TAPS`, not a free choice: pass A covers `STREAK_TAPS` texels contiguously,
+ * so pass B's taps must sit exactly that far apart to tile it without gaps. Reach is
+ * `STREAK_TAPS²` = 64 wide texels, ~1024 screen pixels at the 1/16 target.
+ */
+const STREAK_STRIDE_A = 1;
+const STREAK_STRIDE_B = STREAK_TAPS;
+
+/** Live look dials. Plain mutable object; `render` pushes it into uniforms every call. */
+export interface LookDials {
+  fogStrength: number;
+  fogDensity: number;
+  fogHeightM: number;
+  fogInscatter: number;
+  fogTintR: number;
+  fogTintG: number;
+  fogTintB: number;
+  aoStrength: number;
+  aoHeightM: number;
+  streakStrength: number;
+}
+
+/** User-tuned in Foundry, 2026-07-31. Grain lives in FX Master's filter stack, not here. */
+export const DEFAULT_LOOK_DIALS: LookDials = {
+  fogStrength: 0.35,
+  fogDensity: 3.2,
+  fogHeightM: 36,
+  fogInscatter: 32,
+  fogTintR: 0.055,
+  fogTintG: 0.045,
+  fogTintB: 0.085,
+  aoStrength: 0.45,
+  aoHeightM: 18,
+  streakStrength: 1.3
+};
 
 /**
- * Threshold + downsample -> narrow and wide separable blurs -> composite.
+ * Threshold + downsample -> narrow and wide separable blurs + horizontal streak -> composite,
+ * plus a blurred building mask for ground AO.
  *
  * Owns its render targets and sizes them from whatever scene texture it is handed, so the
  * caller only has to hand back the same texture each frame.
  */
 export class BloomChain {
+  /** False skips the blur, streak and threshold passes only. The composite always runs. */
+  bloomEnabled = true;
+  readonly dials: LookDials = { ...DEFAULT_LOOK_DIALS };
+
   #renderer: any;
   #threshold: ScreenQuad;
   #blurH: ScreenQuad;
@@ -24,12 +68,22 @@ export class BloomChain {
   #downsampleWide: ScreenQuad;
   #wideBlurH: ScreenQuad;
   #wideBlurV: ScreenQuad;
+  #streakPassA: ScreenQuad;
+  #streakPassB: ScreenQuad;
+  #aoDownsample: ScreenQuad;
+  #aoBlurH: ScreenQuad;
+  #aoBlurV: ScreenQuad;
   #composite: ScreenQuad;
+  #blank: any;
 
   #bloomA: any = null;
   #bloomB: any = null;
   #wideA: any = null;
   #wideB: any = null;
+  #streakA: any = null;
+  #streakB: any = null;
+  #aoA: any = null;
+  #aoB: any = null;
   #out: any = null;
   #capacityWidth = 0;
   #capacityHeight = 0;
@@ -39,9 +93,14 @@ export class BloomChain {
   #srcTexel = new Float32Array(2);
   #bloomTexel = new Float32Array(2);
   #wideTexel = new Float32Array(2);
+  #streakStepA = new Float32Array(2);
+  #streakStepB = new Float32Array(2);
+  #aoTexel = new Float32Array(2);
   #sceneUvScale = new Float32Array([1, 1]);
   #bloomUvScale = new Float32Array([1, 1]);
   #wideUvScale = new Float32Array([1, 1]);
+  #streakUvScale = new Float32Array([1, 1]);
+  #aoUvScale = new Float32Array([1, 1]);
   #shadowUvScale = new Float32Array([1, 1]);
   #maskUvScale = new Float32Array([1, 1]);
 
@@ -82,21 +141,69 @@ export class BloomChain {
       uTexUvScale: this.#wideUvScale,
       uDir: new Float32Array([0, 1])
     });
+    // uTexel is the real wide texel, used only for the clamp window; tap spacing rides in uStep,
+    // so the two are never conflated the way an inflated uTexel forced them to be.
+    this.#streakPassA = new ScreenQuad(STREAK_FRAG, {
+      uTex: PIXI.Texture.EMPTY,
+      uTexel: this.#wideTexel,
+      uTexUvScale: this.#wideUvScale,
+      uStep: this.#streakStepA,
+      uSpan: STREAK_STRIDE_A
+    });
+    this.#streakPassB = new ScreenQuad(STREAK_FRAG, {
+      uTex: PIXI.Texture.EMPTY,
+      uTexel: this.#wideTexel,
+      uTexUvScale: this.#streakUvScale,
+      uStep: this.#streakStepB,
+      uSpan: STREAK_STRIDE_B
+    });
+    this.#aoDownsample = new ScreenQuad(DOWNSAMPLE_FRAG, {
+      uTex: PIXI.Texture.EMPTY,
+      uSrcTexel: this.#srcTexel,
+      uTexUvScale: this.#maskUvScale
+    });
+    this.#aoBlurH = new ScreenQuad(BLUR_FRAG, {
+      uTex: PIXI.Texture.EMPTY,
+      uTexel: this.#aoTexel,
+      uTexUvScale: this.#aoUvScale,
+      uDir: new Float32Array([1, 0])
+    });
+    this.#aoBlurV = new ScreenQuad(BLUR_FRAG, {
+      uTex: PIXI.Texture.EMPTY,
+      uTexel: this.#aoTexel,
+      uTexUvScale: this.#aoUvScale,
+      uDir: new Float32Array([0, 1])
+    });
     this.#composite = new ScreenQuad(COMPOSITE_FRAG, {
       uScene: PIXI.Texture.EMPTY,
       uBloomNarrow: PIXI.Texture.EMPTY,
       uBloomWide: PIXI.Texture.EMPTY,
+      uStreak: PIXI.Texture.EMPTY,
       uShadow: PIXI.Texture.EMPTY,
       uBuildingMask: PIXI.Texture.EMPTY,
+      uAo: PIXI.Texture.EMPTY,
       uNarrowStrength: 1,
       uWideStrength: WIDE_STRENGTH,
+      uStreakStrength: DEFAULT_LOOK_DIALS.streakStrength,
+      uAoStrength: DEFAULT_LOOK_DIALS.aoStrength,
+      uAoHeightM: DEFAULT_LOOK_DIALS.aoHeightM,
+      uFogStrength: DEFAULT_LOOK_DIALS.fogStrength,
+      uFogDensity: DEFAULT_LOOK_DIALS.fogDensity,
+      uFogHeightM: DEFAULT_LOOK_DIALS.fogHeightM,
+      uFogInscatter: DEFAULT_LOOK_DIALS.fogInscatter,
+      uFogTintR: DEFAULT_LOOK_DIALS.fogTintR,
+      uFogTintG: DEFAULT_LOOK_DIALS.fogTintG,
+      uFogTintB: DEFAULT_LOOK_DIALS.fogTintB,
       uPivotUv: new Float32Array([0.5, 0.5]),
       uSceneUvScale: this.#sceneUvScale,
       uBloomUvScale: this.#bloomUvScale,
       uWideUvScale: this.#wideUvScale,
+      uStreakUvScale: this.#streakUvScale,
       uShadowUvScale: this.#shadowUvScale,
-      uMaskUvScale: this.#maskUvScale
+      uMaskUvScale: this.#maskUvScale,
+      uAoUvScale: this.#aoUvScale
     });
+    this.#blank = new PIXI.Container();
   }
 
   /** Runs the chain and returns the composite target, ready to present. */
@@ -113,32 +220,72 @@ export class BloomChain {
     this.#setUvScale(this.#shadowUvScale, shadow);
     this.#setUvScale(this.#maskUvScale, buildingMask);
 
-    this.#threshold.uniforms.uScene = scene;
-    renderer.render(this.#threshold.display, { renderTexture: this.#bloomA, clear: true });
+    if (this.bloomEnabled) {
+      this.#threshold.uniforms.uScene = scene;
+      renderer.render(this.#threshold.display, { renderTexture: this.#bloomA, clear: true });
 
-    this.#downsampleWide.uniforms.uTex = this.#bloomA;
-    renderer.render(this.#downsampleWide.display, { renderTexture: this.#wideA, clear: true });
+      this.#downsampleWide.uniforms.uTex = this.#bloomA;
+      renderer.render(this.#downsampleWide.display, { renderTexture: this.#wideA, clear: true });
 
-    this.#blurH.uniforms.uTex = this.#bloomA;
-    renderer.render(this.#blurH.display, { renderTexture: this.#bloomB, clear: true });
+      this.#streakPassA.uniforms.uTex = this.#wideA;
+      renderer.render(this.#streakPassA.display, { renderTexture: this.#streakB, clear: true });
 
-    this.#blurV.uniforms.uTex = this.#bloomB;
-    renderer.render(this.#blurV.display, { renderTexture: this.#bloomA, clear: true });
+      this.#streakPassB.uniforms.uTex = this.#streakB;
+      renderer.render(this.#streakPassB.display, { renderTexture: this.#streakA, clear: true });
 
-    this.#wideBlurH.uniforms.uTex = this.#wideA;
-    renderer.render(this.#wideBlurH.display, { renderTexture: this.#wideB, clear: true });
+      this.#blurH.uniforms.uTex = this.#bloomA;
+      renderer.render(this.#blurH.display, { renderTexture: this.#bloomB, clear: true });
 
-    this.#wideBlurV.uniforms.uTex = this.#wideB;
-    renderer.render(this.#wideBlurV.display, { renderTexture: this.#wideA, clear: true });
+      this.#blurV.uniforms.uTex = this.#bloomB;
+      renderer.render(this.#blurV.display, { renderTexture: this.#bloomA, clear: true });
 
+      this.#wideBlurH.uniforms.uTex = this.#wideA;
+      renderer.render(this.#wideBlurH.display, { renderTexture: this.#wideB, clear: true });
+
+      this.#wideBlurV.uniforms.uTex = this.#wideB;
+      renderer.render(this.#wideBlurV.display, { renderTexture: this.#wideA, clear: true });
+    } else {
+      // WHY: the fog inscatters uBloomWide even with bloom off, so a stale wide target would
+      // leak the last lit frame into the haze. Cleared every frame on purpose — guarding this
+      // behind a dirty flag made the pass count frame-dependent and put the leak one missed
+      // invalidation away, to save three clears of quarter- and sixteenth-res targets.
+      renderer.render(this.#blank, { renderTexture: this.#bloomA, clear: true });
+      renderer.render(this.#blank, { renderTexture: this.#wideA, clear: true });
+      renderer.render(this.#blank, { renderTexture: this.#streakA, clear: true });
+    }
+
+    this.#aoDownsample.uniforms.uTex = buildingMask;
+    renderer.render(this.#aoDownsample.display, { renderTexture: this.#aoA, clear: true });
+
+    this.#aoBlurH.uniforms.uTex = this.#aoA;
+    renderer.render(this.#aoBlurH.display, { renderTexture: this.#aoB, clear: true });
+
+    this.#aoBlurV.uniforms.uTex = this.#aoB;
+    renderer.render(this.#aoBlurV.display, { renderTexture: this.#aoA, clear: true });
+
+    const dials = this.dials;
     const composite = this.#composite.uniforms;
     composite.uScene = scene;
     composite.uBloomNarrow = this.#bloomA;
     composite.uBloomWide = this.#wideA;
+    composite.uStreak = this.#streakA;
     composite.uShadow = shadow;
     composite.uBuildingMask = buildingMask;
-    composite.uNarrowStrength = strength;
-    composite.uWideStrength = strength * WIDE_STRENGTH;
+    composite.uAo = this.#aoA;
+    composite.uNarrowStrength = this.bloomEnabled ? strength : 0;
+    composite.uWideStrength = this.bloomEnabled ? strength * WIDE_STRENGTH : 0;
+    // Scaled by bloomStrength like the other two: the streak is a lens artefact off the same
+    // thresholded highlights, so the world slider at 0 must not leave streaks behind.
+    composite.uStreakStrength = this.bloomEnabled ? strength * dials.streakStrength : 0;
+    composite.uAoStrength = dials.aoStrength;
+    composite.uAoHeightM = dials.aoHeightM;
+    composite.uFogStrength = dials.fogStrength;
+    composite.uFogDensity = dials.fogDensity;
+    composite.uFogHeightM = dials.fogHeightM;
+    composite.uFogInscatter = dials.fogInscatter;
+    composite.uFogTintR = dials.fogTintR;
+    composite.uFogTintG = dials.fogTintG;
+    composite.uFogTintB = dials.fogTintB;
     composite.uPivotUv = pivotUv;
     renderer.render(this.#composite.display, { renderTexture: this.#out, clear: true });
 
@@ -153,7 +300,13 @@ export class BloomChain {
     this.#downsampleWide.destroy();
     this.#wideBlurH.destroy();
     this.#wideBlurV.destroy();
+    this.#streakPassA.destroy();
+    this.#streakPassB.destroy();
+    this.#aoDownsample.destroy();
+    this.#aoBlurH.destroy();
+    this.#aoBlurV.destroy();
     this.#composite.destroy();
+    this.#blank.destroy({ children: true });
   }
 
   #ensureTargets(scene: any): void {
@@ -192,6 +345,26 @@ export class BloomChain {
         capacityWideHeight,
         PIXI.TYPES.HALF_FLOAT
       );
+      this.#streakA = this.#createTarget(
+        capacityWideWidth,
+        capacityWideHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#streakB = this.#createTarget(
+        capacityWideWidth,
+        capacityWideHeight,
+        PIXI.TYPES.HALF_FLOAT
+      );
+      this.#aoA = this.#createTarget(
+        capacityBloomWidth,
+        capacityBloomHeight,
+        PIXI.TYPES.UNSIGNED_BYTE
+      );
+      this.#aoB = this.#createTarget(
+        capacityBloomWidth,
+        capacityBloomHeight,
+        PIXI.TYPES.UNSIGNED_BYTE
+      );
       this.#out = this.#createTarget(capacityWidth, capacityHeight, PIXI.TYPES.UNSIGNED_BYTE);
     }
 
@@ -207,9 +380,15 @@ export class BloomChain {
     this.#resizeFrame(this.#bloomB, bw, bh);
     this.#resizeFrame(this.#wideA, ww, wh);
     this.#resizeFrame(this.#wideB, ww, wh);
+    this.#resizeFrame(this.#streakA, ww, wh);
+    this.#resizeFrame(this.#streakB, ww, wh);
+    this.#resizeFrame(this.#aoA, bw, bh);
+    this.#resizeFrame(this.#aoB, bw, bh);
     this.#resizeFrame(this.#out, this.#width, this.#height);
     this.#setUvScale(this.#bloomUvScale, this.#bloomA);
     this.#setUvScale(this.#wideUvScale, this.#wideA);
+    this.#setUvScale(this.#streakUvScale, this.#streakA);
+    this.#setUvScale(this.#aoUvScale, this.#aoA);
 
     const resolution = this.#renderer.resolution;
     this.#srcTexel[0] = 1 / (capacityWidth * resolution);
@@ -218,6 +397,11 @@ export class BloomChain {
     this.#bloomTexel[1] = 1 / ((this.#bloomA.baseTexture?.height ?? bh) * resolution);
     this.#wideTexel[0] = 1 / ((this.#wideA.baseTexture?.width ?? ww) * resolution);
     this.#wideTexel[1] = 1 / ((this.#wideA.baseTexture?.height ?? wh) * resolution);
+    // Horizontal only: y stays 0 so the streak never walks off its own row.
+    this.#streakStepA[0] = this.#wideTexel[0] * STREAK_STRIDE_A;
+    this.#streakStepB[0] = this.#wideTexel[0] * STREAK_STRIDE_B;
+    this.#aoTexel[0] = 1 / ((this.#aoA.baseTexture?.width ?? bw) * resolution);
+    this.#aoTexel[1] = 1 / ((this.#aoA.baseTexture?.height ?? bh) * resolution);
 
     this.#threshold.sizeTo(this.#bloomA);
     this.#blurH.sizeTo(this.#bloomB);
@@ -225,6 +409,11 @@ export class BloomChain {
     this.#downsampleWide.sizeTo(this.#wideA);
     this.#wideBlurH.sizeTo(this.#wideB);
     this.#wideBlurV.sizeTo(this.#wideA);
+    this.#streakPassA.sizeTo(this.#streakB);
+    this.#streakPassB.sizeTo(this.#streakA);
+    this.#aoDownsample.sizeTo(this.#aoA);
+    this.#aoBlurH.sizeTo(this.#aoB);
+    this.#aoBlurV.sizeTo(this.#aoA);
     this.#composite.sizeTo(this.#out);
   }
 
@@ -254,13 +443,27 @@ export class BloomChain {
   }
 
   #releaseTargets(): void {
-    for (const target of [this.#bloomA, this.#bloomB, this.#wideA, this.#wideB, this.#out]) {
+    for (const target of [
+      this.#bloomA,
+      this.#bloomB,
+      this.#wideA,
+      this.#wideB,
+      this.#streakA,
+      this.#streakB,
+      this.#aoA,
+      this.#aoB,
+      this.#out
+    ]) {
       target?.destroy(true);
     }
     this.#bloomA = null;
     this.#bloomB = null;
     this.#wideA = null;
     this.#wideB = null;
+    this.#streakA = null;
+    this.#streakB = null;
+    this.#aoA = null;
+    this.#aoB = null;
     this.#out = null;
     this.#capacityWidth = 0;
     this.#capacityHeight = 0;

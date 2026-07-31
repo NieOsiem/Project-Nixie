@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CITY_FRAG, CITY_VERT } from "./city.js";
+import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 describe("city fragment shader", () => {
   it("keeps architectural emission outside the wall canyon falloff", () => {
@@ -58,6 +59,44 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG.match(/float parapetGlow = /g)).toHaveLength(1);
     expect(CITY_FRAG.match(/parapet \* parapetGlow/g)).toHaveLength(2);
     expect(CITY_FRAG.match(/1\.0 \+ 0\.30 \* coping/g)).toHaveLength(2);
+  });
+
+  it("encodes surface height into scene alpha from the shared constants", () => {
+    expect(CITY_FRAG).toContain(`const float SCENE_HEIGHT_NORM_M = ${SCENE_HEIGHT_NORM_M}.0;`);
+    expect(CITY_FRAG).toContain(`const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};`);
+    expect(CITY_FRAG).toContain("float sceneAlpha = SCENE_ALPHA_FLOOR");
+    expect(CITY_FRAG).toContain(
+      "+ (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);"
+    );
+    expect(CITY_FRAG).toContain("colour + vec3(0.020, 0.014, 0.035), sceneAlpha);");
+    // The floor is what separates "ground at height 0" from "nothing drawn", so it cannot
+    // be an integer literal the interpolation would emit without a decimal point.
+    expect(CITY_FRAG).toMatch(/const float SCENE_ALPHA_FLOOR = 0\.\d+;/);
+  });
+
+  it("breaks up flat ground with two LOD-gated octaves of world-space value noise", () => {
+    expect(CITY_FRAG).toContain("if (vKind < 0.5) colour = flatGround();");
+    expect(CITY_FRAG).toContain("const float GROUND_COARSE_M = 34.0;");
+    expect(CITY_FRAG).toContain("const float GROUND_FINE_M = 8.5;");
+    // Fine octave at half the coarse amplitude, +/-8% peak into vBase.
+    expect(CITY_FRAG).toContain("const float GROUND_COARSE_AMP = 0.107;");
+    expect(CITY_FRAG).toContain("const float GROUND_FINE_AMP = 0.053;");
+    expect(CITY_FRAG).toContain("vec2 w = f * f * (3.0 - 2.0 * f);");
+    expect(CITY_FRAG.match(/hash21\(cell/g)).toHaveLength(4);
+
+    const flat = CITY_FRAG.slice(
+      CITY_FRAG.indexOf("vec3 flatGround()"),
+      CITY_FRAG.indexOf("vec3 facade()")
+    );
+    expect(flat).toContain("valueNoise(vWorldM / GROUND_COARSE_M)");
+    expect(flat).toContain("valueNoise(vWorldM / GROUND_FINE_M)");
+    expect(flat).toContain("lod(GROUND_COARSE_M, uScreenPxPerMetre)");
+    expect(flat).toContain("lod(GROUND_FINE_M, uScreenPxPerMetre)");
+    // Broad surfaces must keep max(emissive) * strength * EMISSIVE_MAX < 0.55, so the noise
+    // multiplies vBase and vEmissive is passed through untouched.
+    expect(flat).toContain("return vBase * vShade * mottle + vEmissive;");
+    expect(flat.match(/vEmissive/g)).toHaveLength(1);
+    expect(flat).not.toMatch(/vEmissive\s*\*|\*\s*vEmissive/);
   });
 
   it("uses neither discard nor unavailable derivatives", () => {
