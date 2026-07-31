@@ -1,0 +1,157 @@
+import { describe, expect, it } from "vitest";
+import type { BuildingSpec } from "../geom/extrude.js";
+import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
+import { rectRing, ringBounds } from "../geom/types.js";
+import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
+import { hash2 } from "./hash.js";
+import { BEACON_CORE_MAX_M, GLOW_MARGIN_M, neonMesh } from "./neon.js";
+
+const PPM = 25;
+
+/** Lot sizes, heights and banks in the ranges DEFAULT_ZONE_PARAMS actually produces. */
+function cityOf(count: number): BuildingSpec[] {
+  const specs: BuildingSpec[] = [];
+  for (let i = 0; i < count; i++) {
+    const t = hash2(i, 1, 7);
+    const sizeM = 8 + hash2(i, 2, 7) * 14;
+    const bank = FIRST_ZONE_BANK + (i % 4);
+    specs.push({
+      footprint: rectRing({
+        x: (i % 40) * 26 * PPM,
+        y: Math.floor(i / 40) * 26 * PPM,
+        width: sizeM * PPM,
+        height: sizeM * 0.8 * PPM
+      }),
+      height: 8 + t * t * 132,
+      roofMaterial: materialIndex(bank, DISTRICT_SLOT.ROOF_A),
+      wallMaterial: materialIndex(bank, DISTRICT_SLOT.WALL_A + (i % 3)),
+      seed: hash2(i, 3, 7)
+    });
+  }
+  return specs;
+}
+
+const vertexAt = (m: MeshBuffers, i: number) => {
+  const at = i * VERTEX_FLOATS;
+  return {
+    x: m.vertices[at]!,
+    y: m.vertices[at + 1]!,
+    height: m.vertices[at + 2]!,
+    material: m.vertices[at + 3]!,
+    kind: m.vertices[at + 5]!,
+    u: m.vertices[at + 6]!,
+    top: m.vertices[at + 7]!,
+    strength: m.vertices[at + 8]!
+  };
+};
+
+describe("neonMesh", () => {
+  it("is byte-identical across runs", () => {
+    const specs = cityOf(400);
+    const a = neonMesh(specs, PPM);
+    const b = neonMesh(specs, PPM);
+    expect([...a.vertices]).toEqual([...b.vertices]);
+    expect([...a.indices]).toEqual([...b.indices]);
+  });
+
+  it("reorders output without changing any building's sign", () => {
+    const specs = cityOf(200);
+    const perBuilding = specs.map((s) => neonMesh([s], PPM));
+    const reversed = neonMesh([...specs].reverse(), PPM);
+
+    const expected: number[] = [];
+    for (let i = specs.length - 1; i >= 0; i--) expected.push(...perBuilding[i]!.vertices);
+    expect([...reversed.vertices]).toEqual(expected);
+  });
+
+  it("returns an empty mesh for a chunk that owns no buildings", () => {
+    const m = neonMesh([], PPM);
+    expect(m.vertexCount).toBe(0);
+    expect(m.triangleCount).toBe(0);
+    expect(m.vertices.length).toBe(0);
+    expect(m.indices.length).toBe(0);
+  });
+
+  it("returns exclusively-owned exact-sized buffers, so the worker can transfer them", () => {
+    for (const m of [neonMesh(cityOf(300), PPM), neonMesh([], PPM)]) {
+      for (const view of [m.vertices, m.indices]) {
+        expect(view.byteOffset).toBe(0);
+        expect(view.buffer.byteLength).toBe(view.byteLength);
+      }
+      expect(m.vertices.buffer).not.toBe(m.indices.buffer);
+    }
+  });
+
+  it("emits exactly 4 vertices and 2 triangles per sign", () => {
+    const m = neonMesh(cityOf(300), PPM);
+    expect(m.vertexCount % 4).toBe(0);
+    expect(m.triangleCount).toBe((m.vertexCount / 4) * 2);
+    expect(m.indices.length).toBe(m.triangleCount * 3);
+    for (const i of m.indices) expect(i).toBeLessThan(m.vertexCount);
+  });
+
+  it("tags every vertex NEON with in-range local coords and a positive strength", () => {
+    const m = neonMesh(cityOf(300), PPM);
+    expect(m.vertexCount).toBeGreaterThan(0);
+    for (let i = 0; i < m.vertexCount; i++) {
+      const v = vertexAt(m, i);
+      expect(v.kind).toBe(KIND.NEON);
+      expect(Math.abs(v.u)).toBeLessThanOrEqual(1);
+      expect(Math.abs(v.top)).toBeLessThanOrEqual(1);
+      expect(v.strength).toBeGreaterThan(0);
+      expect(v.height).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("spans the padded quad in local coords", () => {
+    const m = neonMesh(cityOf(60), PPM);
+    for (let q = 0; q < m.vertexCount; q += 4) {
+      const us = [0, 1, 2, 3].map((k) => vertexAt(m, q + k).u);
+      const vs = [0, 1, 2, 3].map((k) => vertexAt(m, q + k).top);
+      expect(us).toEqual([-1, 1, 1, -1]);
+      expect(vs).toEqual([-1, -1, 1, 1]);
+    }
+  });
+
+  it("keeps every quad inside its own building's footprint plus the glow margin", () => {
+    const slack = (GLOW_MARGIN_M + BEACON_CORE_MAX_M) * PPM;
+    for (const spec of cityOf(250)) {
+      const m = neonMesh([spec], PPM);
+      const b = ringBounds(spec.footprint);
+      for (let i = 0; i < m.vertexCount; i++) {
+        const v = vertexAt(m, i);
+        expect(v.x).toBeGreaterThanOrEqual(b.x - slack);
+        expect(v.x).toBeLessThanOrEqual(b.x + b.width + slack);
+        expect(v.y).toBeGreaterThanOrEqual(b.y - slack);
+        expect(v.y).toBeLessThanOrEqual(b.y + b.height + slack);
+      }
+    }
+  });
+
+  it("resolves to a neon slot of the building's own bank", () => {
+    for (const spec of cityOf(250)) {
+      const m = neonMesh([spec], PPM);
+      const wallBank = Math.floor(spec.wallMaterial / BANK_SIZE);
+      for (let i = 0; i < m.vertexCount; i++) {
+        const material = vertexAt(m, i).material;
+        expect(Math.floor(material / BANK_SIZE)).toBe(wallBank);
+        expect([DISTRICT_SLOT.NEON_A, DISTRICT_SLOT.NEON_B]).toContain(material % BANK_SIZE);
+      }
+    }
+  });
+
+  it("signs 35-55% of a realistic city", () => {
+    // Raised from the original 30-40% band: the 780M runs the city at vsync with headroom
+    // to spare, and the reference art is far denser with signage than one-in-three.
+    const specs = cityOf(1400);
+    const signed = specs.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
+    const rate = signed / specs.length;
+    expect(rate).toBeGreaterThan(0.35);
+    expect(rate).toBeLessThan(0.55);
+  });
+
+  it("stays inside the 800-visible-sign budget for a 1400-building city", () => {
+    const m = neonMesh(cityOf(1400), PPM);
+    expect(m.vertexCount / 4).toBeLessThan(800);
+  });
+});

@@ -1,14 +1,26 @@
 import { describe, expect, it } from "vitest";
 import { VERTEX_FLOATS } from "../geom/mesh.js";
 import { nodeDegree, validateGraph } from "../graph/road-graph.js";
-import { ringBounds } from "../geom/types.js";
+import { ringBounds, type Rect } from "../geom/types.js";
 import { insertRoad } from "../graph/edit.js";
+import {
+  BANK_COUNT,
+  BANK_SIZE,
+  BASE_BANK,
+  CITY_BANK,
+  CITY_SURFACES,
+  DEFAULT_DISTRICT_PALETTE,
+  materialIndex,
+  packPalette,
+  PALETTE_PRESETS
+} from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { buildRoadSurfaces } from "./roads.js";
-import { lotRegions } from "./zones.js";
+import { DEFAULT_ZONE_PARAMS, lotRegions, type Zone } from "./zones.js";
 import {
   buildCity,
   cityBounds,
+  cityPaletteBanks,
   cityToPixels,
   demoCity,
   demoGraph,
@@ -68,7 +80,7 @@ describe("cityBounds", () => {
     const city = demoCity(ORIGIN);
     const roadsOnly = cityBounds(city, 0)!;
     const far = { x: roadsOnly.x + roadsOnly.width + 1000, y: roadsOnly.y, width: 500, height: 500 };
-    const withZone = cityBounds({ ...city, zones: [{ ...city.base, id: "z1", rect: far }] }, 0)!;
+    const withZone = cityBounds({ ...city, zones: [{ ...city.base, id: "z1", bank: 2, rect: far }] }, 0)!;
     expect(withZone.x + withZone.width).toBeCloseTo(far.x + far.width, 6);
   });
 
@@ -124,6 +136,104 @@ describe("buildCity", () => {
     expect(again.buildingCount).toBe(build.buildingCount);
     expect(again.mesh.triangleCount).toBe(build.mesh.triangleCount);
     expect(Array.from(again.mesh.vertices)).toEqual(Array.from(build.mesh.vertices));
+  });
+});
+
+describe("demoCity", () => {
+  it("starts the unzoned remainder on the default district palette", () => {
+    expect(demoCity(ORIGIN).base.palette).toBe(DEFAULT_DISTRICT_PALETTE);
+  });
+});
+
+describe("cityPaletteBanks", () => {
+  const zone = (id: string, bank: number, palette = DEFAULT_DISTRICT_PALETTE): Zone => ({
+    ...DEFAULT_ZONE_PARAMS,
+    id,
+    bank,
+    palette,
+    rect: { x: 0, y: 0, width: 10, height: 10 }
+  });
+
+  it("puts the shared surfaces in bank 0 and the base palette in bank 1", () => {
+    const banks = cityPaletteBanks(demoCity(ORIGIN));
+    expect(banks[CITY_BANK]).toBe(CITY_SURFACES);
+    expect(banks[BASE_BANK]).toBe(DEFAULT_DISTRICT_PALETTE.materials);
+  });
+
+  it("puts each zone's palette at its own bank", () => {
+    const preset = PALETTE_PRESETS[2]!;
+    const city = { ...demoCity(ORIGIN), zones: [zone("z1", 7, preset), zone("z2", 3)] };
+    const banks = cityPaletteBanks(city);
+    expect(banks[7]).toBe(preset.materials);
+    expect(banks[3]).toBe(DEFAULT_DISTRICT_PALETTE.materials);
+  });
+
+  it("fills every bank, so no chunk can sample a hole or read past the end", () => {
+    const city = { ...demoCity(ORIGIN), zones: [zone("z1", 7, PALETTE_PRESETS[2]!)] };
+    const banks = cityPaletteBanks(city);
+    expect(banks).toHaveLength(BANK_COUNT);
+    for (let bank = 0; bank < BANK_COUNT; bank++) expect(banks[bank]).toBeDefined();
+
+    // Base-row alpha is written only for a material `packPalette` actually saw, so this
+    // catches a hole the `toBeDefined` loop above would miss if the fill ever shortens.
+    const data = packPalette(banks);
+    for (let bank = 0; bank < BANK_COUNT; bank++) {
+      expect(data[materialIndex(bank, 0) * 4 + 3]).toBe(255);
+    }
+  });
+});
+
+describe("district banks", () => {
+  const zone = (id: string, bank: number, rect: Rect, seed: number): Zone => ({
+    ...DEFAULT_ZONE_PARAMS,
+    id,
+    bank,
+    rect,
+    seed
+  });
+
+  const WEST: Rect = { x: -110, y: -80, width: 110, height: 160 };
+  const EAST: Rect = { x: 0, y: -80, width: 110, height: 160 };
+  const EAST_MOVED: Rect = { x: 30, y: -80, width: 110, height: 160 };
+  /** Fixed, so the only thing changing between runs is the zone under test. */
+  const BOUNDS_M: Rect = { x: -140, y: -100, width: 300, height: 200 };
+
+  const specsFor = (zones: Zone[]) => {
+    const params: CityParams = { ...demoCity(ORIGIN), zones };
+    const bounds = rectToPixels(BOUNDS_M, ORIGIN, PPM);
+    const px = cityToPixels(params, PPM);
+    const surfaces = buildRoadSurfaces(px.graph, bounds, PPM);
+    return buildingsForBlocks(
+      surfaces.blocks,
+      lotRegions(params.base, px.zones, bounds, PPM, params.origin),
+      { originPx: ORIGIN, pixelsPerMetre: PPM }
+    );
+  };
+
+  const inBank = (specs: ReturnType<typeof specsFor>, bank: number): string[] =>
+    specs
+      .filter((s) => Math.floor(s.wallMaterial / BANK_SIZE) === bank)
+      .map((s) => {
+        const b = ringBounds(s.footprint);
+        return `${Math.round(b.x)},${Math.round(b.y)}:${s.wallMaterial}/${s.roofMaterial}`;
+      })
+      .sort();
+
+  it("bands each district into its own bank and leaves the remainder on the base bank", () => {
+    const specs = specsFor([zone("z1", 4, WEST, 1), zone("z2", 9, EAST, 2)]);
+    const banks = new Set(specs.map((s) => Math.floor(s.wallMaterial / BANK_SIZE)));
+    expect(banks).toEqual(new Set([BASE_BANK, 4, 9]));
+  });
+
+  it("cannot let one district's reseed or move reach another's material indices", () => {
+    const before = specsFor([zone("z1", 4, WEST, 1), zone("z2", 9, EAST, 2)]);
+    const reseeded = specsFor([zone("z1", 4, WEST, 1), zone("z2", 9, EAST, 55)]);
+    const moved = specsFor([zone("z1", 4, WEST, 1), zone("z2", 9, EAST_MOVED, 2)]);
+
+    expect(inBank(before, 4).length).toBeGreaterThan(5);
+    expect(inBank(reseeded, 4)).toEqual(inBank(before, 4));
+    expect(inBank(moved, 4)).toEqual(inBank(before, 4));
+    expect(inBank(reseeded, 9)).not.toEqual(inBank(before, 9));
   });
 });
 

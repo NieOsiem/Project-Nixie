@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CameraState } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
-import { WHOLE_CITY_CHUNK_ID, type ChunkGeometry } from "./chunk-culling.js";
-import { CityRenderer } from "./city-renderer.js";
+import { WHOLE_CITY_CHUNK_ID } from "./chunk-culling.js";
+import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
 
 /**
  * A stub PIXI, not a GL context. It exists to count live GPU-backed objects, which is
@@ -40,6 +40,7 @@ class StubPaletteTexture {
 class StubMesh {
   state: Record<string, unknown> = {};
   visible = true;
+  scale = { set: () => {} };
   shader: { uniforms: Record<string, unknown> };
   constructor(_geometry: unknown, shader: { uniforms: Record<string, unknown> }) {
     live.meshes++;
@@ -106,13 +107,19 @@ const PIXI_STUB = {
   },
   TYPES: { FLOAT: 0, UNSIGNED_BYTE: 1 },
   FORMATS: { RGBA: 0 },
-  SCALE_MODES: { NEAREST: 0 },
+  BLEND_MODES: { NORMAL: 0, ADD: 1 },
+  SCALE_MODES: { NEAREST: 0, LINEAR: 1 },
   MIPMAP_MODES: { OFF: 0 },
   WRAP_MODES: { CLAMP: 0 }
 };
 
 const SCREEN_W = 3440;
 const SCREEN_H = 1440;
+
+/** Scene target plus the bloom chain's two blur targets and its composite. */
+const BLOOM_RENDER_TEXTURES = 3;
+/** One PIXI.Mesh + Geometry per post pass: threshold, blur H, blur V, composite. */
+const BLOOM_QUADS = 4;
 
 const cam = (over: Partial<CameraState> = {}): CameraState => ({
   stageX: SCREEN_W / 2,
@@ -138,25 +145,46 @@ const chunk = (id: string, boundsPx: Rect, triangleCount = 1): ChunkGeometry => 
   boundsPx
 });
 
+const neonChunk = (
+  id: string,
+  boundsPx: Rect,
+  triangleCount = 1,
+  neonTriangles = 1
+): ChunkGeometry => ({ ...chunk(id, boundsPx, triangleCount), neon: buffers(neonTriangles) });
+
 const NEAR: Rect = { x: -100, y: -100, width: 200, height: 200 };
 const FAR: Rect = { x: 100_000, y: 100_000, width: 200, height: 200 };
 
+interface RenderCall {
+  content: StubContainer | StubMesh;
+  options: { renderTexture: unknown; clear: boolean };
+}
+
 let renderCalls = 0;
+let renderLog: RenderCall[] = [];
 let renderedContent: StubContainer | null = null;
 
 const hostRenderer = {
   resolution: 1,
-  render: (content: StubContainer) => {
+  render: (content: StubContainer | StubMesh, options: RenderCall["options"]) => {
     renderCalls++;
-    renderedContent = content;
+    renderLog.push({ content, options });
+    if (content instanceof StubContainer) renderedContent = content;
   }
 };
 
-const make = (initial = buffers(4)): CityRenderer =>
+const raw = (initial = buffers(4)): CityRenderer =>
   new CityRenderer(hostRenderer, initial, new Uint8Array(512), {
     pixelsPerMetre: 25,
     cameraHeightMetres: 900
   });
+
+/** Bloom is on by default; the chunk tests count meshes, and its quads are not the subject. */
+const make = (initial = buffers(4)): CityRenderer => {
+  const renderer = raw(initial);
+  renderer.bloomEnabled = false;
+  return renderer;
+};
 
 beforeEach(() => {
   (globalThis as { PIXI?: unknown }).PIXI = PIXI_STUB;
@@ -165,6 +193,7 @@ beforeEach(() => {
   live.textures = 0;
   live.renderTextures = 0;
   renderCalls = 0;
+  renderLog = [];
   renderedContent = null;
 });
 
@@ -188,7 +217,6 @@ describe("CityRenderer chunk map", () => {
 
     expect(live.meshes).toBe(1);
     expect(live.geometries).toBe(1);
-    expect(live.textures).toBe(1);
     expect(r.stats()).toMatchObject({ chunks: 1, trianglesTotal: 9 });
     r.destroy();
   });
@@ -210,7 +238,6 @@ describe("CityRenderer chunk map", () => {
     expect(r.stats()).toMatchObject({ chunks: 1, trianglesTotal: 11 });
     expect(live.meshes).toBe(1);
     expect(live.geometries).toBe(1);
-    expect(live.textures).toBe(1);
     r.destroy();
   });
 
@@ -226,7 +253,6 @@ describe("CityRenderer chunk map", () => {
     r.clearChunks();
     expect(live.meshes).toBe(0);
     expect(live.geometries).toBe(0);
-    expect(live.textures).toBe(0);
     expect(r.stats()).toMatchObject({ chunks: 0 });
     r.destroy();
   });
@@ -239,6 +265,191 @@ describe("CityRenderer chunk map", () => {
 
     r.destroy();
     expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
+  });
+});
+
+describe("CityRenderer palette", () => {
+  it("allocates exactly one palette texture however many chunks there are", () => {
+    const r = make();
+    r.setChunks([chunk("0,0", NEAR), chunk("1,0", NEAR), chunk("2,0", NEAR), chunk("3,0", NEAR)]);
+    expect(live.textures).toBe(1);
+
+    r.updatePalette(new Uint8Array(512));
+    expect(live.textures).toBe(1);
+
+    r.destroy();
+    expect(live.textures).toBe(0);
+  });
+
+  it("retinting redraws without touching the chunk set", () => {
+    const r = make();
+    r.update(cam());
+    const before = renderCalls;
+
+    r.updatePalette(new Uint8Array(512));
+    r.update(cam());
+
+    expect(renderCalls).toBe(before + 1);
+    expect(r.stats()).toMatchObject({ chunks: 1 });
+    r.destroy();
+  });
+});
+
+describe("CityRenderer neon pass", () => {
+  it("draws neon after every opaque chunk, into the same target, without clearing", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(neonChunk("0,0", NEAR, 3, 2));
+    r.update(cam());
+
+    expect(renderLog).toHaveLength(2);
+    expect(renderLog[0]?.options.clear).toBe(true);
+    expect(renderLog[1]?.options.clear).toBe(false);
+    expect(renderLog[1]?.options.renderTexture).toBe(renderLog[0]?.options.renderTexture);
+    expect((renderLog[1]?.content as StubContainer).children).toHaveLength(1);
+    r.destroy();
+  });
+
+  it("skips the second pass entirely when no chunk has neon", () => {
+    const r = make();
+    r.update(cam());
+
+    expect(renderLog).toHaveLength(1);
+    expect(r.stats()).toMatchObject({ neonTriangles: 0 });
+    r.destroy();
+  });
+
+  it("culls neon with its chunk, by visibility not by reparenting", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunks([neonChunk("near", NEAR, 3, 2), neonChunk("far", FAR, 5, 4)]);
+    r.update(cam());
+
+    const neon = renderLog[1]?.content as StubContainer;
+    expect(neon.children.map((c) => c.visible)).toEqual([true, false]);
+    expect(r.stats()).toMatchObject({ triangles: 3, neonTriangles: 2 });
+    r.destroy();
+  });
+
+  it("destroys a chunk's neon mesh with the chunk", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(neonChunk("0,0", NEAR, 3, 2));
+    expect(live.meshes).toBe(2);
+    expect(live.geometries).toBe(2);
+
+    r.removeChunk("0,0");
+    expect(live.meshes).toBe(0);
+    expect(live.geometries).toBe(0);
+    r.destroy();
+  });
+
+  it("allocates no neon mesh for an empty neon buffer", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(neonChunk("0,0", NEAR, 3, 0));
+
+    expect(live.meshes).toBe(1);
+    expect(renderLog).toHaveLength(0);
+    r.destroy();
+  });
+
+  it("gives neon the same camera uniforms as the opaque geometry", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(neonChunk("0,0", NEAR, 3, 2));
+    r.update(cam({ pivotX: 12, pivotY: 34 }));
+
+    const opaque = (renderLog[0]?.content as StubContainer).children[0]?.shader.uniforms;
+    const neon = (renderLog[1]?.content as StubContainer).children[0]?.shader.uniforms;
+    expect(neon?.uCamHeight).toBe(opaque?.uCamHeight);
+    expect(neon?.uDepthFar).toBe(opaque?.uDepthFar);
+    r.destroy();
+  });
+});
+
+describe("CityRenderer bloom", () => {
+  it("is on by default and presents the composite instead of the scene target", () => {
+    const r = raw();
+    expect(r.stats()).toMatchObject({ bloom: true, bloomStrength: 1.3 });
+
+    r.update(cam());
+    const scene = renderLog[0]?.options.renderTexture;
+    const presented = renderLog[renderLog.length - 1]?.options.renderTexture;
+    expect(presented).not.toBe(scene);
+    expect((r.display as StubSprite).texture).toBe(presented);
+    r.destroy();
+  });
+
+  it("runs four post passes and releases every target on destroy", () => {
+    const r = raw();
+    r.update(cam());
+
+    expect(renderCalls).toBe(1 + BLOOM_QUADS);
+    expect(live.renderTextures).toBe(1 + BLOOM_RENDER_TEXTURES);
+
+    r.destroy();
+    expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
+  });
+
+  it("disabling releases the post quads and targets and does no post work", () => {
+    const r = raw();
+    r.update(cam());
+    expect(live.meshes).toBe(1 + BLOOM_QUADS);
+
+    r.bloomEnabled = false;
+    expect(live.meshes).toBe(1);
+    expect(live.geometries).toBe(1);
+    expect(live.renderTextures).toBe(1);
+
+    renderCalls = 0;
+    r.update(cam());
+    expect(renderCalls).toBe(1);
+    expect(r.stats()).toMatchObject({ bloom: false });
+    expect((r.display as StubSprite).texture).toBe(renderLog[renderLog.length - 1]?.options.renderTexture);
+
+    r.destroy();
+    expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
+  });
+
+  it("re-enabling rebuilds the chain without leaking the old one", () => {
+    const r = raw();
+    r.update(cam());
+    r.bloomEnabled = false;
+    r.bloomEnabled = true;
+    r.update(cam());
+
+    expect(live.meshes).toBe(1 + BLOOM_QUADS);
+    expect(live.renderTextures).toBe(1 + BLOOM_RENDER_TEXTURES);
+    r.destroy();
+    expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
+  });
+
+  it("resizes its targets with the scene target rather than accumulating them", () => {
+    const r = raw();
+    r.update(cam());
+    r.renderScale = 0.5;
+    r.update(cam());
+
+    expect(live.renderTextures).toBe(1 + BLOOM_RENDER_TEXTURES);
+    r.destroy();
+    expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
+  });
+
+  it("bloomStrength redraws only when it actually changes", () => {
+    const r = raw();
+    r.update(cam());
+    const before = renderCalls;
+
+    r.bloomStrength = r.bloomStrength;
+    r.update(cam());
+    expect(renderCalls).toBe(before);
+
+    r.bloomStrength = 0.4;
+    r.update(cam());
+    expect(renderCalls).toBe(before + 1 + BLOOM_QUADS);
+    expect(r.stats()).toMatchObject({ bloomStrength: 0.4 });
+    r.destroy();
   });
 });
 
@@ -318,6 +529,17 @@ describe("CityRenderer culling", () => {
       expect(u.uPixelsPerMetre).toBe(25);
     }
     expect(uniforms[2]?.uCamHeight).toBe(8750);
+    r.destroy();
+  });
+
+  it("feeds screen pixels per metre, which follows zoom and render scale", () => {
+    const r = make();
+    r.renderScale = 0.5;
+    r.update(cam({ scale: 4 }));
+
+    const u = renderedContent?.children[0]?.shader.uniforms;
+    expect(u?.uPixelsPerMetre).toBe(25);
+    expect(u?.uScreenPxPerMetre).toBe(25 * 4 * 0.5);
     r.destroy();
   });
 });

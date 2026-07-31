@@ -3,9 +3,11 @@ import { intersection } from "../geom/boolean.js";
 import type { BuildingSpec } from "../geom/extrude.js";
 import { VERTEX_FLOATS } from "../geom/mesh.js";
 import { ringArea, ringCentroid, type MultiPolygon, type Rect } from "../geom/types.js";
+import { FIRST_ZONE_BANK } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { chunkRect } from "./chunks.js";
 import { buildChunk, chunkMarginM, cityChunks } from "./chunked.js";
+import { MARKING_REACH_M } from "./markings.js";
 import {
   buildCity,
   cityBounds,
@@ -95,14 +97,29 @@ const multiArea = (mp: MultiPolygon): number =>
     0
   );
 
+const WIDEST_PAVED_M = Math.max(...ROAD_CLASSES.map((c) => c.widthM / 2 + c.sidewalkM));
+
 describe("chunkMarginM", () => {
-  it("covers the widest paved half-width and the largest lot", () => {
-    expect(chunkMarginM(CITY)).toBe(DEFAULT_ZONE_PARAMS.lotSizeM);
+  it("takes the road term when it beats every lot size", () => {
+    expect(chunkMarginM(CITY)).toBe(WIDEST_PAVED_M + MARKING_REACH_M);
   });
 
-  it("takes the road term when it beats every lot size", () => {
-    const widest = Math.max(...ROAD_CLASSES.map((c) => c.widthM / 2 + c.sidewalkM));
-    expect(chunkMarginM({ ...CITY, base: { ...CITY.base, lotSizeM: 4 } })).toBe(widest);
+  /**
+   * WHY this bound and not the bare paved half-width: markings key off node degree and
+   * junction radius, both of which a clipped subgraph understates for a node outside the
+   * query rect. Reaching this far puts every node that can place a marking in this chunk
+   * inside the query rect, where all its incident edges survive and its degree is honest.
+   * Shrink the margin to the paved half-width and crossings flicker at chunk seams.
+   */
+  it("reaches far enough for a junction's markings to be generated against a full degree", () => {
+    for (const c of ROAD_CLASSES) {
+      expect(chunkMarginM(CITY)).toBeGreaterThanOrEqual(c.widthM / 2 + c.sidewalkM + MARKING_REACH_M);
+    }
+  });
+
+  it("takes a lot size when it beats the road term", () => {
+    const big = WIDEST_PAVED_M + MARKING_REACH_M + 10;
+    expect(chunkMarginM({ ...CITY, base: { ...CITY.base, lotSizeM: big } })).toBe(big);
   });
 
   it("takes a zone's lot size when it beats the base", () => {
@@ -112,6 +129,7 @@ describe("chunkMarginM", () => {
         {
           ...DEFAULT_ZONE_PARAMS,
           id: "z1",
+          bank: FIRST_ZONE_BANK,
           lotSizeM: 90,
           rect: { x: 0, y: 0, width: 50, height: 50 }
         }

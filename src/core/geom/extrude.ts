@@ -1,4 +1,4 @@
-import { MeshBuilder, type MeshBuffers } from "./mesh.js";
+import { KIND, MeshBuilder, type MeshBuffers } from "./mesh.js";
 import { triangulate } from "./tessellate.js";
 import { ringArea, type Ring, type Vec2 } from "./types.js";
 
@@ -9,6 +9,8 @@ export interface BuildingSpec {
   height: number;
   roofMaterial: number;
   wallMaterial: number;
+  /** 0..1 building hash. Picks the facade style and seeds its per-cell hashes. */
+  seed: number;
 }
 
 /** Direction the key light arrives from, in world space (y grows downward). */
@@ -39,17 +41,19 @@ export function wallShade(edgeStart: Vec2, edgeEnd: Vec2): number {
   return SHADE_MIN + (SHADE_MAX - SHADE_MIN) * facing;
 }
 
-export function extrudeBuilding(spec: BuildingSpec): MeshBuffers {
+/** Footprint is world pixels, height is metres, so wall-U needs the scene's scale. */
+export function extrudeBuilding(spec: BuildingSpec, pixelsPerMetre: number): MeshBuffers {
   const poly = withPositiveArea(spec.footprint);
   const n = poly.length;
   if (n < 3) throw new Error(`Footprint needs at least 3 points, got ${n}.`);
 
   const builder = new MeshBuilder(n * 5, n * 3 - 2);
+  const { height, seed } = spec;
 
   const roof = triangulate([poly]);
   const roofBase = builder.vertexCount;
   for (const p of roof.positions) {
-    builder.vertex(p.x, p.y, spec.height, spec.roofMaterial, ROOF_SHADE);
+    builder.vertex(p.x, p.y, height, spec.roofMaterial, ROOF_SHADE, KIND.ROOF, 0, height, seed);
   }
   for (let i = 0; i < roof.indices.length; i += 3) {
     builder.triangle(
@@ -63,11 +67,13 @@ export function extrudeBuilding(spec: BuildingSpec): MeshBuffers {
     const a = poly[i]!;
     const b = poly[(i + 1) % n]!;
     const shade = wallShade(a, b);
+    const w = spec.wallMaterial;
+    const end = Math.hypot(b.x - a.x, b.y - a.y) / pixelsPerMetre;
 
-    const base = builder.vertex(a.x, a.y, 0, spec.wallMaterial, shade);
-    builder.vertex(b.x, b.y, 0, spec.wallMaterial, shade);
-    builder.vertex(b.x, b.y, spec.height, spec.wallMaterial, shade);
-    builder.vertex(a.x, a.y, spec.height, spec.wallMaterial, shade);
+    const base = builder.vertex(a.x, a.y, 0, w, shade, KIND.WALL, 0, height, seed);
+    builder.vertex(b.x, b.y, 0, w, shade, KIND.WALL, end, height, seed);
+    builder.vertex(b.x, b.y, height, w, shade, KIND.WALL, end, height, seed);
+    builder.vertex(a.x, a.y, height, w, shade, KIND.WALL, 0, height, seed);
 
     builder.triangle(base, base + 1, base + 2);
     builder.triangle(base, base + 2, base + 3);

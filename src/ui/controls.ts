@@ -10,6 +10,7 @@ import {
 } from "../adapter/canvas.js";
 import { DEFAULT_ROAD_CLASS, ROAD_CLASSES } from "../core/gen/demo-city.js";
 import { LAYER_NAME, TOOL } from "./nixie-layer.js";
+import { openPaletteApp } from "./palette-app.js";
 
 interface NixieTool {
   name: string;
@@ -74,6 +75,13 @@ function tools(): NixieTool[] {
       toggle: true,
       isActive: autoWallsEnabled,
       onSelect: (active) => setAutoWalls(active)
+    },
+    {
+      name: "palette",
+      title: "District Palette",
+      icon: "fa-solid fa-palette",
+      button: true,
+      onSelect: () => openPaletteApp()
     },
     {
       name: "reseed",

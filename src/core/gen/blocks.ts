@@ -9,7 +9,7 @@ import {
   type Polygon,
   type Vec2
 } from "../geom/types.js";
-import { MATERIAL } from "../palette.js";
+import { DISTRICT_SLOT, materialIndex } from "../palette.js";
 import { hash2, hashPick } from "./hash.js";
 
 export interface LotOptions {
@@ -28,6 +28,8 @@ export interface LotOptions {
 /** A slice of the city generated from one seed with one set of lot params. */
 export interface LotRegion {
   seed: number;
+  /** Palette bank its buildings take wall and roof materials from. */
+  bank: number;
   options: LotOptions;
   /** Area this region governs, or null for "wherever no other region reaches". */
   clip: MultiPolygon | null;
@@ -47,8 +49,12 @@ export interface HashFrame {
   pixelsPerMetre: number;
 }
 
-const WALL_MATERIALS = [MATERIAL.WALL_VIOLET, MATERIAL.WALL_MAGENTA, MATERIAL.WALL_TEAL] as const;
-const ROOF_MATERIALS = [MATERIAL.ROOF_DARK, MATERIAL.ROOF_WARM, MATERIAL.ROOF_ACCENT] as const;
+const WALL_SLOTS = [DISTRICT_SLOT.WALL_A, DISTRICT_SLOT.WALL_B, DISTRICT_SLOT.WALL_C] as const;
+const ROOF_SLOTS = [DISTRICT_SLOT.ROOF_A, DISTRICT_SLOT.ROOF_B, DISTRICT_SLOT.ROOF_C] as const;
+
+/** Salt 3, matching `hashPick`'s offsets — 0 is height, 1 and 2 are the material picks. */
+const facadeSeed = (x: number, y: number, seed: number): number =>
+  hash2(x + 3 * 7919, y - 3 * 104729, seed);
 
 /**
  * Cut a block into buildable lots.
@@ -102,7 +108,7 @@ export function buildingsForBlocks(
   const specs: BuildingSpec[] = [];
   for (const region of regions) {
     const area = region.clip === null ? blocks : intersection(blocks, region.clip);
-    const { seed, options } = region;
+    const { seed, options, bank } = region;
 
     for (const block of area) {
       for (const lot of subdivideBlock(block, options)) {
@@ -117,8 +123,9 @@ export function buildingsForBlocks(
         specs.push({
           footprint: ring,
           height: options.minHeightM + t * t * (options.maxHeightM - options.minHeightM),
-          roofMaterial: hashPick(ROOF_MATERIALS, cx, cy, 1, seed),
-          wallMaterial: hashPick(WALL_MATERIALS, cx, cy, 2, seed)
+          roofMaterial: materialIndex(bank, hashPick(ROOF_SLOTS, cx, cy, 1, seed)),
+          wallMaterial: materialIndex(bank, hashPick(WALL_SLOTS, cx, cy, 2, seed)),
+          seed: facadeSeed(cx, cy, seed)
         });
       }
     }

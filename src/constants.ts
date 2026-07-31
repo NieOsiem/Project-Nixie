@@ -5,10 +5,16 @@ export const FLAG_CITY = "city";
 export const FLAG_GENERATED = "generated";
 
 /** Shape of the persisted scene flag. Bump when the stored structure changes. */
-export const CITY_FORMAT_VERSION = 3;
+export const CITY_FORMAT_VERSION = 4;
 
 /**
  * Identifies the generation algorithm. Never change the output of an existing version —
  * bump this instead, so an in-progress campaign's city survives a module update.
  */
-export const GENERATOR_VERSION = 2;
+export const GENERATOR_VERSION = 3;
+
+/** Client and world settings, registered in `settings.ts`. */
+export const SETTING_CAMERA_HEIGHT = "cameraHeightM";
+export const SETTING_RENDER_SCALE = "renderScale";
+export const SETTING_BLOOM = "bloom";
+export const SETTING_BLOOM_STRENGTH = "bloomStrength";

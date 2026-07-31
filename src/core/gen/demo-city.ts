@@ -3,7 +3,15 @@ import { mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
 import { flatMesh } from "../geom/tessellate.js";
 import type { Rect, Vec2 } from "../geom/types.js";
 import type { RoadClass, RoadGraph } from "../graph/road-graph.js";
-import { MATERIAL } from "../palette.js";
+import {
+  BANK_COUNT,
+  BASE_BANK,
+  CITY_BANK,
+  CITY_SURFACES,
+  DEFAULT_DISTRICT_PALETTE,
+  MATERIAL,
+  type Material
+} from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { buildRoadSurfaces, type RoadSurfaces } from "./roads.js";
 import { DEFAULT_ZONE_PARAMS, lotRegions, type Zone, type ZoneParams } from "./zones.js";
@@ -94,6 +102,23 @@ export function demoGraph(): RoadGraph {
 
 export function demoCity(origin: Vec2): CityParams {
   return { origin, graph: demoGraph(), base: { ...DEFAULT_ZONE_PARAMS }, zones: [] };
+}
+
+/** Palette banks for the whole city, indexed by bank number, ready for packPalette. */
+export function cityPaletteBanks(params: CityParams): Material[][] {
+  const banks: Material[][] = [];
+  banks[CITY_BANK] = CITY_SURFACES;
+  banks[BASE_BANK] = params.base.palette.materials;
+  for (const zone of params.zones) banks[zone.bank] = zone.palette.materials;
+
+  // Banks are stored per zone, so deleting one leaves a hole that `packPalette` would skip
+  // and the shader would then sample as black. Filled to BANK_COUNT rather than to the
+  // highest live bank, so geometry still baked against a since-deleted zone samples a real
+  // colour instead of reading past the end. Costs nothing: the texture is allocated in full.
+  for (let bank = 0; bank < BANK_COUNT; bank++) {
+    banks[bank] ??= DEFAULT_DISTRICT_PALETTE.materials;
+  }
+  return banks;
 }
 
 /* -------------------------------------------- */
@@ -214,7 +239,7 @@ export function buildCity(params: CityParams, boundsM: Rect, pixelsPerMetre: num
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
-    ...buildings.map(extrudeBuilding)
+    ...buildings.map((b) => extrudeBuilding(b, pixelsPerMetre))
   ]);
 
   return { mesh, surfaces, buildingCount: buildings.length, blockCount: surfaces.blocks.length };

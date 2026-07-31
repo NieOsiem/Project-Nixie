@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   ATTRIBUTE_OFFSETS,
+  KIND,
   MeshBuilder,
   VERTEX_FLOATS,
+  VERTEX_STRIDE_BYTES,
   emptyMesh,
   mergeMeshes,
   type MeshBuffers
@@ -22,16 +24,30 @@ const vertexAt = (m: MeshBuffers, i: number) => ({
   y: m.vertices[i * VERTEX_FLOATS + 1]!,
   height: m.vertices[i * VERTEX_FLOATS + 2]!,
   material: m.vertices[i * VERTEX_FLOATS + 3]!,
-  shade: m.vertices[i * VERTEX_FLOATS + 4]!
+  shade: m.vertices[i * VERTEX_FLOATS + 4]!,
+  kind: m.vertices[i * VERTEX_FLOATS + 5]!,
+  u: m.vertices[i * VERTEX_FLOATS + 6]!,
+  top: m.vertices[i * VERTEX_FLOATS + 7]!,
+  seed: m.vertices[i * VERTEX_FLOATS + 8]!
 });
 
 describe("layout constants", () => {
   it("keeps byte offsets consistent with the float layout", () => {
-    expect(VERTEX_FLOATS).toBe(5);
+    expect(VERTEX_FLOATS).toBe(9);
+    expect(VERTEX_STRIDE_BYTES).toBe(36);
     expect(ATTRIBUTE_OFFSETS.pos).toBe(0);
     expect(ATTRIBUTE_OFFSETS.height).toBe(2 * 4);
     expect(ATTRIBUTE_OFFSETS.material).toBe(3 * 4);
     expect(ATTRIBUTE_OFFSETS.shade).toBe(4 * 4);
+    expect(ATTRIBUTE_OFFSETS.kind).toBe(5 * 4);
+    expect(ATTRIBUTE_OFFSETS.u).toBe(6 * 4);
+    expect(ATTRIBUTE_OFFSETS.top).toBe(7 * 4);
+    expect(ATTRIBUTE_OFFSETS.seed).toBe(8 * 4);
+  });
+
+  it("gives every kind a distinct value", () => {
+    const values = Object.values(KIND);
+    expect(new Set(values).size).toBe(values.length);
   });
 });
 
@@ -44,8 +60,24 @@ describe("MeshBuilder", () => {
   });
 
   it("writes every attribute", () => {
-    const m = triangleMesh();
-    expect(vertexAt(m, 2)).toEqual({ x: 0, y: 10, height: 5, material: 1, shade: 0.5 });
+    const b = new MeshBuilder(1, 0);
+    b.vertex(3, 4, 5, 17, 0.5, KIND.WALL, 6.5, 42, 0.25);
+    expect(vertexAt(b.build(), 0)).toEqual({
+      x: 3,
+      y: 4,
+      height: 5,
+      material: 17,
+      shade: 0.5,
+      kind: KIND.WALL,
+      u: 6.5,
+      top: 42,
+      seed: 0.25
+    });
+  });
+
+  it("defaults the facade attributes to a flat surface", () => {
+    const v = vertexAt(triangleMesh(), 2);
+    expect(v).toMatchObject({ kind: KIND.FLAT, u: 0, top: 0, seed: 0 });
   });
 
   it("trims unused capacity", () => {

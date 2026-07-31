@@ -4,6 +4,7 @@ import { buildChunk, chunkMarginM, cityChunks } from "../core/gen/chunked.js";
 import { chunkId, chunksCovering, type ChunkKey } from "../core/gen/chunks.js";
 import {
   cityBounds,
+  cityPaletteBanks,
   cityToPixels,
   demoCity,
   metresToPixels,
@@ -13,7 +14,13 @@ import {
 } from "../core/gen/demo-city.js";
 import { buildRoadSurfaces } from "../core/gen/roads.js";
 import { totalWallLength, wallSegmentsFromBlocks } from "../core/gen/walls.js";
-import { nextZoneId, zoneAt, type Zone, type ZoneParams } from "../core/gen/zones.js";
+import {
+  nextZoneBank,
+  nextZoneId,
+  zoneAt,
+  type Zone,
+  type ZoneParams
+} from "../core/gen/zones.js";
 import { emptyMesh, type MeshBuffers } from "../core/geom/mesh.js";
 import {
   normalizeRect,
@@ -39,7 +46,13 @@ import {
   type RoadNode
 } from "../core/graph/road-graph.js";
 import { History } from "../core/history.js";
-import { DEFAULT_MATERIALS, packPalette } from "../core/palette.js";
+import {
+  BASE_BANK,
+  normalizePalette,
+  packPalette,
+  type DistrictPalette,
+  type Material
+} from "../core/palette.js";
 import { CityRenderer, type ChunkGeometry } from "../render/city-renderer.js";
 import { WorkerClient } from "../worker/client.js";
 import type { BuildChunkResult } from "../worker/protocol.js";
@@ -54,9 +67,9 @@ import {
 } from "./documents.js";
 
 // Screen-space lean is height/(camHeight-height) times the on-screen distance from the
-// pivot, independent of zoom. 900 m puts a 130 m tower at ~0.18, which matches the
-// reference art; drop it toward 400 for a much harder lean.
-const DEFAULT_CAMERA_HEIGHT_M = 900;
+// pivot, independent of zoom. 500 m puts a 130 m tower at ~0.35; drop it toward 350 for a
+// harder lean, raise it toward 2000 for near-flat. Overridden by the world setting.
+const DEFAULT_CAMERA_HEIGHT_M = 500;
 /** One metre of slack collapses junction-disc arcs without visibly moving a wall. */
 const WALL_TOLERANCE_M = 1;
 /** Ten grid squares on the 2 m/square scene contract. Metres, so a regrid cannot move it. */
@@ -80,6 +93,7 @@ export interface RebuildResult {
 interface ChunkRecord {
   id: string;
   mesh: MeshBuffers;
+  neon: MeshBuffers;
   boundsM: Rect;
   buildingCount: number;
 }
@@ -92,6 +106,19 @@ let currentBounds: Rect | null = null;
 let cityListener: (() => void) | null = null;
 let autoWalls = true;
 let wallTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Look dials. Held here rather than read from `game.settings` so this module never imports
+ * the settings module, which imports this one — `settings.ts` pushes values in instead.
+ * All four tolerate being set before a renderer exists.
+ */
+let cameraHeightM = DEFAULT_CAMERA_HEIGHT_M;
+let renderScale = 1;
+let bloomEnabled = true;
+let bloomStrength = 1;
+
+/** Unsaved palette being dragged in the editor. Cleared on commit or cancel. */
+let palettePreview: { id: string; palette: DistrictPalette } | null = null;
 
 let workerClient: WorkerClient | null = null;
 /** Latched: a Worker that could not be constructed once will not construct on a retry either. */
@@ -168,9 +195,12 @@ export function mount(): void {
   cityRenderer = new CityRenderer(
     canvas.app.renderer,
     emptyMesh(),
-    packPalette(DEFAULT_MATERIALS),
-    { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: DEFAULT_CAMERA_HEIGHT_M }
+    packPalette(paletteBanks(currentCity)),
+    { pixelsPerMetre: pixelsPerMetre(), cameraHeightMetres: cameraHeightM }
   );
+  cityRenderer.renderScale = renderScale;
+  cityRenderer.bloomEnabled = bloomEnabled;
+  cityRenderer.bloomStrength = bloomStrength;
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
   // renderer's chunk set now, and nothing else drops that placeholder any more.
   cityRenderer.clearChunks();
@@ -216,6 +246,7 @@ export function unmount(): void {
   chunkSetComplete = false;
   chunks.clear();
   history.clear();
+  palettePreview = null;
 
   cityListener?.();
   console.log(`${MODULE_ID} | unmounted`);
@@ -382,6 +413,7 @@ export async function createZone(rect: Rect, params?: Partial<ZoneParams>): Prom
     ...city.base,
     ...params,
     id: nextZoneId(city.zones),
+    bank: nextZoneBank(city.zones),
     rect: area,
     seed: params?.seed ?? randomSeed()
   };
@@ -462,6 +494,124 @@ export function setCityListener(listener: (() => void) | null): void {
 }
 
 /* -------------------------------------------- */
+/*  Palette and look                            */
+/* -------------------------------------------- */
+
+export interface DistrictRef {
+  /** "base" for the unzoned remainder, otherwise the zone id. */
+  id: string;
+  label: string;
+  bank: number;
+  palette: DistrictPalette;
+}
+
+const BASE_DISTRICT = "base";
+
+export function listDistricts(): DistrictRef[] {
+  const city = currentCity;
+  if (city === null) return [];
+  return [
+    { id: BASE_DISTRICT, label: "Unzoned City", bank: BASE_BANK, palette: city.base.palette },
+    ...city.zones.map((z) => ({
+      id: z.id,
+      label: `Zone ${z.id}`,
+      bank: z.bank,
+      palette: z.palette
+    }))
+  ];
+}
+
+function districtBank(city: CityParams, id: string): number | null {
+  if (id === BASE_DISTRICT) return BASE_BANK;
+  return city.zones.find((z) => z.id === id)?.bank ?? null;
+}
+
+/** City banks with any live preview substituted in. */
+function paletteBanks(city: CityParams): Material[][] {
+  const banks = cityPaletteBanks(city);
+  if (palettePreview !== null) {
+    const bank = districtBank(city, palettePreview.id);
+    if (bank !== null) banks[bank] = normalizePalette(palettePreview.palette).materials;
+  }
+  return banks;
+}
+
+function pushPalette(): void {
+  if (currentCity === null || cityRenderer === null) return;
+  cityRenderer.updatePalette(packPalette(paletteBanks(currentCity)));
+}
+
+/** Retint without persisting. One texture upload; no geometry is touched. */
+export function previewDistrictPalette(id: string, palette: DistrictPalette): void {
+  palettePreview = { id, palette };
+  pushPalette();
+}
+
+export function cancelPalettePreview(): void {
+  if (palettePreview === null) return;
+  palettePreview = null;
+  pushPalette();
+}
+
+/**
+ * WHY no rebuild: vertices carry a material *index*, and a palette edit changes only the
+ * colours that index resolves to. Reassigning a district's bank would need one; recolouring
+ * it never does. That is what the bank layout buys.
+ */
+export async function commitDistrictPalette(id: string, palette: DistrictPalette): Promise<void> {
+  const city = requireCity();
+  const next = normalizePalette(palette);
+  const updated: CityParams =
+    id === BASE_DISTRICT
+      ? { ...city, base: { ...city.base, palette: next } }
+      : { ...city, zones: city.zones.map((z) => (z.id === id ? { ...z, palette: next } : z)) };
+
+  palettePreview = null;
+  history.push(city);
+  currentCity = updated;
+  await saveCityState(updated);
+  pushPalette();
+  cityListener?.();
+}
+
+export function setCameraHeightM(metres: number): number {
+  cameraHeightM = Math.max(50, metres);
+  if (cityRenderer !== null) cityRenderer.cameraHeightMetres = cameraHeightM;
+  return cameraHeightM;
+}
+
+export function setRenderScale(value: number): number {
+  renderScale = Math.min(1, Math.max(0.25, value));
+  if (cityRenderer !== null) cityRenderer.renderScale = renderScale;
+  return renderScale;
+}
+
+export function setBloom(enabled: boolean, strength?: number): void {
+  bloomEnabled = enabled;
+  if (strength !== undefined) bloomStrength = Math.max(0, strength);
+  if (cityRenderer === null) return;
+  cityRenderer.bloomEnabled = bloomEnabled;
+  cityRenderer.bloomStrength = bloomStrength;
+}
+
+/**
+ * Foundry's fog overlay sits above our render target, so its default grey mutes an already
+ * low-contrast palette into mud. These lean the explored tint violet and darken the
+ * unexplored one instead. Canonical paths since v12; the flat `fogExploredColor` alias is
+ * deprecated and gone in v14 (`common/documents/scene.mjs:185`).
+ */
+export async function applyRecommendedFog(): Promise<void> {
+  const scene = canvas?.scene;
+  if (!scene) throw new Error("No active scene.");
+  if (!game.user?.isGM) throw new Error("Only a GM may modify scene documents.");
+  await scene.update({
+    "fog.colors.explored": "#2a1f42",
+    "fog.colors.unexplored": "#07060d",
+    backgroundColor: "#07060d"
+  });
+}
+
+/* -------------------------------------------- */
 /*  Build and query                             */
 /* -------------------------------------------- */
 
@@ -495,6 +645,7 @@ function chunkGeometry(city: CityParams, build: ChunkRecord, ppm: number): Chunk
   return {
     id: build.id,
     mesh: build.mesh,
+    neon: build.neon,
     boundsPx: rectToPixels(build.boundsM, city.origin, ppm)
   };
 }
@@ -525,6 +676,12 @@ function chunkRecord(result: BuildChunkResult): ChunkRecord {
       indices: result.indices,
       vertexCount: result.vertexCount,
       triangleCount: result.triangleCount
+    },
+    neon: {
+      vertices: result.neonVertices,
+      indices: result.neonIndices,
+      vertexCount: result.neonVertexCount,
+      triangleCount: result.neonTriangleCount
     },
     boundsM: result.boundsM,
     buildingCount: result.buildingCount
@@ -727,6 +884,8 @@ export function stats(): Record<string, unknown> | null {
     undoDepth: history.depth,
     worker: workerClient !== null,
     autoWalls,
+    districts: currentCity === null ? 0 : currentCity.zones.length + 1,
+    palettePreview: palettePreview?.id ?? null,
     generatedWalls: generatedWallIds().length
   };
 }

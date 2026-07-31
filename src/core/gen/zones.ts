@@ -1,5 +1,13 @@
 import { difference, ringAsMulti } from "../geom/boolean.js";
 import { rectContains, rectRing, type MultiPolygon, type Rect, type Vec2 } from "../geom/types.js";
+import {
+  BASE_BANK,
+  DEFAULT_DISTRICT_PALETTE,
+  FIRST_ZONE_BANK,
+  LAST_ZONE_BANK,
+  zoneBank,
+  type DistrictPalette
+} from "../palette.js";
 import type { LotOptions, LotRegion } from "./blocks.js";
 
 /** Everything about a district's buildings except the buildings themselves. */
@@ -10,10 +18,17 @@ export interface ZoneParams {
   gapM: number;
   minHeightM: number;
   maxHeightM: number;
+  palette: DistrictPalette;
 }
 
 export interface Zone extends ZoneParams {
   id: string;
+  /**
+   * WHY: stored, never derived from array position. Deleting a zone rebuilds only its own
+   * rect, so a shifting bank would leave every other district's baked material indices
+   * pointing at the wrong palette entries without their chunks ever regenerating.
+   */
+  bank: number;
   /** The area this zone governs, in metres relative to the city origin. */
   rect: Rect;
 }
@@ -23,8 +38,11 @@ export const DEFAULT_ZONE_PARAMS: ZoneParams = {
   lotSizeM: 26,
   gapM: 4,
   minHeightM: 8,
-  maxHeightM: 140
+  maxHeightM: 140,
+  palette: DEFAULT_DISTRICT_PALETTE
 };
+
+const ZONE_BANK_COUNT = LAST_ZONE_BANK - FIRST_ZONE_BANK + 1;
 
 /** Lots below this are slivers left by a block edge clipping a lot cell. */
 const MIN_LOT_AREA_M2 = 40;
@@ -72,6 +90,7 @@ export function lotRegions(
     if (own.length === 0) continue;
     regions.push({
       seed: zone.seed,
+      bank: zone.bank,
       clip: own,
       options: lotOptions(zone, { x: zone.rect.x, y: zone.rect.y }, pixelsPerMetre)
     });
@@ -81,6 +100,7 @@ export function lotRegions(
   if (rest === null || rest.length > 0) {
     regions.push({
       seed: base.seed,
+      bank: BASE_BANK,
       clip: rest,
       options: lotOptions(base, originPx, pixelsPerMetre)
     });
@@ -103,4 +123,15 @@ export function nextZoneId(zones: Zone[]): string {
     const id = `z${i}`;
     if (!used.has(id)) return id;
   }
+}
+
+/** Lowest district bank no live zone holds, so a deleted zone's bank comes back. */
+export function nextZoneBank(zones: Zone[]): number {
+  const used = new Set(zones.map((z) => z.bank));
+  for (let i = 0; i < ZONE_BANK_COUNT; i++) {
+    const bank = zoneBank(i);
+    if (!used.has(bank)) return bank;
+  }
+  // Every district bank is live. Sharing a tint beats refusing the zone.
+  return zoneBank(zones.length);
 }

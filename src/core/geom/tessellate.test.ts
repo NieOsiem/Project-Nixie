@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { VERTEX_FLOATS } from "./mesh.js";
+import { KIND, VERTEX_FLOATS } from "./mesh.js";
 import { flatMesh, triangulate } from "./tessellate.js";
 import { rectRing, ringArea, type Polygon, type Ring } from "./types.js";
 
@@ -80,6 +80,7 @@ describe("flatMesh", () => {
       expect(m.vertices[i * VERTEX_FLOATS + 2]).toBe(0);
       expect(m.vertices[i * VERTEX_FLOATS + 3]).toBe(7);
       expect(m.vertices[i * VERTEX_FLOATS + 4]).toBeCloseTo(0.8, 6);
+      expect(m.vertices[i * VERTEX_FLOATS + 5]).toBe(KIND.FLAT);
     }
   });
 

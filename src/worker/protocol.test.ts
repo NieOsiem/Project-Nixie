@@ -99,10 +99,27 @@ describe("handleRequest buildChunk", () => {
     expect(Number.isFinite(result.boundsM.height)).toBe(true);
   });
 
-  it("declares exactly the two mesh ArrayBuffers as transferables", () => {
-    expect(response.transfer).toEqual([result.vertices.buffer, result.indices.buffer]);
-    expect(response.transfer).toHaveLength(2);
+  it("returns an internally consistent neon mesh", () => {
+    expect(result.neonIndices.length).toBe(result.neonTriangleCount * 3);
+    expect(result.neonVertices.length).toBe(result.neonVertexCount * VERTEX_FLOATS);
+    expect(result.neonIndices.reduce((max, i) => (i > max ? i : max), 0)).toBeLessThanOrEqual(
+      Math.max(0, result.neonVertexCount - 1)
+    );
+  });
+
+  it("declares exactly the four mesh ArrayBuffers as transferables", () => {
+    expect(response.transfer).toEqual([
+      result.vertices.buffer,
+      result.indices.buffer,
+      result.neonVertices.buffer,
+      result.neonIndices.buffer
+    ]);
+    expect(response.transfer).toHaveLength(4);
     for (const buffer of response.transfer!) expect(buffer).toBeInstanceOf(ArrayBuffer);
+  });
+
+  it("gives every transferable its own buffer, or postMessage would throw on the duplicate", () => {
+    expect(new Set(response.transfer!).size).toBe(response.transfer!.length);
   });
 
   it("drops the surfaces and buildings the renderer does not need", () => {

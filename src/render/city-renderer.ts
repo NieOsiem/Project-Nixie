@@ -7,6 +7,7 @@ import {
 } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
+import { BloomChain } from "./bloom.js";
 import {
   UNCULLED_BOUNDS,
   WHOLE_CITY_CHUNK_ID,
@@ -14,6 +15,8 @@ import {
   type ChunkGeometry
 } from "./chunk-culling.js";
 import { CityMesh } from "./city-mesh.js";
+import { NeonMesh } from "./neon-mesh.js";
+import { PaletteTexture } from "./palette-texture.js";
 
 export type { ChunkGeometry } from "./chunk-culling.js";
 
@@ -26,6 +29,7 @@ interface LiveChunk {
   id: string;
   boundsPx: Rect;
   mesh: CityMesh;
+  neon: NeonMesh | null;
 }
 
 /**
@@ -44,13 +48,17 @@ export class CityRenderer {
   #renderer: any;
   #target: any = null;
   #content: any;
+  #neonContent: any;
   #chunks = new Map<string, LiveChunk>();
-  #palette: Uint8Array;
+  #palette: PaletteTexture;
+  #bloom: BloomChain | null;
+  #bloomStrength = 1.3;
   #lastCamera: CameraState | null = null;
   #contentDirty = true;
   #renderCount = 0;
   #chunksDrawn = 0;
   #visibleTriangles = 0;
+  #visibleNeonTriangles = 0;
   #renderScale = 1;
   #pixelsPerMetre: number;
   #cameraHeightMetres: number;
@@ -64,9 +72,12 @@ export class CityRenderer {
     this.#renderer = renderer;
     this.#pixelsPerMetre = options.pixelsPerMetre;
     this.#cameraHeightMetres = options.cameraHeightMetres;
-    this.#palette = palette;
+    // One texture for every chunk: retinting a district must not mean an upload per chunk.
+    this.#palette = new PaletteTexture(palette);
+    this.#bloom = new BloomChain(renderer);
 
     this.#content = new PIXI.Container();
+    this.#neonContent = new PIXI.Container();
     this.setGeometry(buffers);
 
     this.display = new PIXI.Sprite(PIXI.Texture.EMPTY);
@@ -98,6 +109,35 @@ export class CityRenderer {
     this.#contentDirty = true;
   }
 
+  get bloomEnabled(): boolean {
+    return this.#bloom !== null;
+  }
+
+  set bloomEnabled(value: boolean) {
+    const bloom = this.#bloom;
+    if (value === (bloom !== null)) return;
+    if (bloom === null) {
+      this.#bloom = new BloomChain(this.#renderer);
+    } else {
+      bloom.destroy();
+      this.#bloom = null;
+      // WHY: display.texture is the composite target that destroy just released.
+      this.display.texture = this.#target ?? PIXI.Texture.EMPTY;
+    }
+    this.#contentDirty = true;
+  }
+
+  get bloomStrength(): number {
+    return this.#bloomStrength;
+  }
+
+  set bloomStrength(value: number) {
+    const clamped = Math.max(0, value);
+    if (clamped === this.#bloomStrength) return;
+    this.#bloomStrength = clamped;
+    this.#contentDirty = true;
+  }
+
   markContentDirty(): void {
     this.#contentDirty = true;
   }
@@ -121,11 +161,17 @@ export class CityRenderer {
   /** Add a chunk, or replace the one already under that id. */
   setChunk(chunk: ChunkGeometry): void {
     this.removeChunk(chunk.id);
-    this.#chunks.set(chunk.id, {
-      id: chunk.id,
-      boundsPx: chunk.boundsPx,
-      mesh: this.#addMesh(chunk.mesh)
-    });
+
+    const mesh = new CityMesh(chunk.mesh, this.#palette);
+    this.#content.addChild(mesh.display);
+
+    let neon: NeonMesh | null = null;
+    if (chunk.neon !== undefined && chunk.neon.triangleCount > 0) {
+      neon = new NeonMesh(chunk.neon, this.#palette);
+      this.#neonContent.addChild(neon.display);
+    }
+
+    this.#chunks.set(chunk.id, { id: chunk.id, boundsPx: chunk.boundsPx, mesh, neon });
     this.#contentDirty = true;
   }
 
@@ -135,6 +181,10 @@ export class CityRenderer {
     this.#chunks.delete(id);
     this.#content.removeChild(chunk.mesh.display);
     chunk.mesh.destroy();
+    if (chunk.neon !== null) {
+      this.#neonContent.removeChild(chunk.neon.display);
+      chunk.neon.destroy();
+    }
     this.#contentDirty = true;
   }
 
@@ -143,8 +193,7 @@ export class CityRenderer {
   }
 
   updatePalette(palette: Uint8Array): void {
-    this.#palette = palette;
-    for (const chunk of this.#chunks.values()) chunk.mesh.updatePalette(palette);
+    this.#palette.update(palette);
     this.#contentDirty = true;
   }
 
@@ -154,6 +203,7 @@ export class CityRenderer {
     if (!resized && !this.#contentDirty && cameraEquals(this.#lastCamera, camera)) return;
 
     const view = visibleWorldRect(camera);
+    const t = offscreenTransform(camera, this.#renderScale);
     const cameraHeightPx = this.#cameraHeightMetres * this.#pixelsPerMetre;
     const uniforms = {
       pivotX: camera.pivotX,
@@ -162,25 +212,42 @@ export class CityRenderer {
       cameraHeightPx,
       // Generous, because geometry outside the view still leans into it. Depth is
       // 24-bit, so the slack costs no meaningful precision.
-      depthFar: 2 * Math.hypot(0.5 * Math.hypot(view.width, view.height), cameraHeightPx)
+      depthFar: 2 * Math.hypot(0.5 * Math.hypot(view.width, view.height), cameraHeightPx),
+      screenPxPerMetre: this.#pixelsPerMetre * t.scale
     };
 
     const drawn = new Set(visibleChunkIds(this.#chunks.values(), view));
     this.#chunksDrawn = drawn.size;
     this.#visibleTriangles = 0;
+    this.#visibleNeonTriangles = 0;
     for (const chunk of this.#chunks.values()) {
       const draw = drawn.has(chunk.id);
       chunk.mesh.display.visible = draw;
+      if (chunk.neon !== null) chunk.neon.display.visible = draw;
       if (!draw) continue;
       chunk.mesh.setCamera(uniforms);
       this.#visibleTriangles += chunk.mesh.triangleCount;
+      if (chunk.neon !== null) {
+        chunk.neon.setCamera(uniforms);
+        this.#visibleNeonTriangles += chunk.neon.triangleCount;
+      }
     }
 
-    const t = offscreenTransform(camera, this.#renderScale);
     this.#content.position.set(t.x, t.y);
     this.#content.scale.set(t.scale);
-    this.#renderer.render(this.#content, { renderTexture: this.#target, clear: true });
+    this.#neonContent.position.set(t.x, t.y);
+    this.#neonContent.scale.set(t.scale);
 
+    this.#renderer.render(this.#content, { renderTexture: this.#target, clear: true });
+    // WHY: neon depth-tests against the opaque pass, so every chunk's buildings must have
+    // written depth first — drawing a chunk's glow before a later chunk's walls shows it
+    // through them. `clear:false` skips the clear entirely, so that depth survives.
+    if (this.#neonContent.children.length > 0) {
+      this.#renderer.render(this.#neonContent, { renderTexture: this.#target, clear: false });
+    }
+
+    this.display.texture =
+      this.#bloom === null ? this.#target : this.#bloom.render(this.#target, this.#bloomStrength);
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;
     this.display.height = view.height;
@@ -201,23 +268,24 @@ export class CityRenderer {
       chunks: this.#chunks.size,
       chunksDrawn: this.#chunksDrawn,
       triangles: this.#visibleTriangles,
+      neonTriangles: this.#visibleNeonTriangles,
       trianglesTotal,
+      bloom: this.#bloom !== null,
+      bloomStrength: this.#bloomStrength,
       targetSize: this.#target ? [this.#target.width, this.#target.height] : null
     };
   }
 
   destroy(): void {
+    this.#bloom?.destroy();
+    this.#bloom = null;
     this.#releaseTarget();
     this.clearChunks();
+    this.#palette.destroy();
     this.#content.destroy({ children: true });
+    this.#neonContent.destroy({ children: true });
     this.display.destroy();
     this.#lastCamera = null;
-  }
-
-  #addMesh(buffers: MeshBuffers): CityMesh {
-    const mesh = new CityMesh(buffers, this.#palette);
-    this.#content.addChild(mesh.display);
-    return mesh;
   }
 
   #ensureTarget(camera: CameraState): boolean {

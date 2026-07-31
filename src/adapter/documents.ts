@@ -9,6 +9,7 @@ import {
 import { withRoadClasses, type CityParams } from "../core/gen/demo-city.js";
 import type { WallSegment } from "../core/gen/walls.js";
 import { DEFAULT_ZONE_PARAMS } from "../core/gen/zones.js";
+import { normalizePalette, zoneBank } from "../core/palette.js";
 
 export interface CityState extends CityParams {
   formatVersion: number;
@@ -34,22 +35,45 @@ export async function setSceneEnabledFlag(enabled: boolean): Promise<void> {
   await requireScene().setFlag(MODULE_ID, FLAG_ENABLED, enabled);
 }
 
+/**
+ * Format 3 knew nothing of palette banks. Ignoring it would throw away a hand-drawn city,
+ * so it is upgraded instead: banks in stored order, palettes filled in by the load below.
+ */
+function migrateV3toV4(raw: any): any {
+  const zones = Array.isArray(raw.zones) ? raw.zones : [];
+  return {
+    ...raw,
+    formatVersion: 4,
+    zones: zones.map((z: any, i: number) => ({ ...z, bank: zoneBank(i) }))
+  };
+}
+
 export function loadCityState(): CityState | null {
   const raw = canvas?.scene?.getFlag(MODULE_ID, FLAG_CITY);
   if (!raw || typeof raw !== "object") return null;
-  if (raw.formatVersion !== CITY_FORMAT_VERSION) {
+
+  const stored = raw.formatVersion === 3 ? migrateV3toV4(raw) : raw;
+  if (stored.formatVersion !== CITY_FORMAT_VERSION) {
     console.warn(
       `${MODULE_ID} | ignoring stored city in format ${raw.formatVersion}, expected ${CITY_FORMAT_VERSION}`
     );
     return null;
   }
+
+  const zones = Array.isArray(stored.zones) ? stored.zones : [];
   return {
-    ...raw,
+    ...stored,
     // Road classes are module presets, so a stored city adopts the current list instead
     // of keeping its own — otherwise adding a class strands old cities without it.
-    graph: withRoadClasses(raw.graph),
-    base: { ...DEFAULT_ZONE_PARAMS, ...raw.base },
-    zones: Array.isArray(raw.zones) ? raw.zones : []
+    graph: withRoadClasses(stored.graph),
+    // A stored palette that is short, absent or half-written still has to yield a full
+    // bank, or the shader samples slots that were never packed.
+    base: { ...DEFAULT_ZONE_PARAMS, ...stored.base, palette: normalizePalette(stored.base?.palette) },
+    zones: zones.map((z: any, i: number) => ({
+      ...z,
+      bank: typeof z.bank === "number" ? z.bank : zoneBank(i),
+      palette: normalizePalette(z.palette)
+    }))
   } as CityState;
 }
 

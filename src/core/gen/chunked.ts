@@ -1,6 +1,6 @@
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { extrudeBuilding, type BuildingSpec } from "../geom/extrude.js";
-import { emptyMesh, mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
+import { VERTEX_FLOATS, emptyMesh, mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
 import { flatMesh } from "../geom/tessellate.js";
 import {
   rectRing,
@@ -8,6 +8,7 @@ import {
   ringBounds,
   ringCentroid,
   unionRect,
+  type MultiPolygon,
   type Rect,
   type Vec2
 } from "../geom/types.js";
@@ -16,6 +17,8 @@ import { MATERIAL } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
 import { chunkId, chunkQueryRect, chunkRect, chunksCovering, type ChunkKey } from "./chunks.js";
 import { cityToPixels, pixelsToMetres, rectToPixels, type CityParams } from "./demo-city.js";
+import { MARKING_HEIGHT_M, MARKING_REACH_M, buildMarkings, type MarkingQuad } from "./markings.js";
+import { neonMesh } from "./neon.js";
 import { buildRoadSurfaces, type RoadSurfaces } from "./roads.js";
 import { lotRegions } from "./zones.js";
 
@@ -23,13 +26,16 @@ export interface ChunkBuild {
   key: ChunkKey;
   id: string;
   mesh: MeshBuffers;
+  /** Additive neon quads. A separate mesh because it needs its own blend and depth state. */
+  neon: MeshBuffers;
   /** Flat surfaces already clipped to the chunk rect. Disjoint between chunks. */
   surfaces: RoadSurfaces;
   /** Buildings this chunk owns, uncut — a kept building may overhang the chunk rect. */
   buildings: BuildingSpec[];
-  /** Real extent in METRES, including buildings overhanging the chunk rect. */
+  /** Real extent in METRES, including everything overhanging the chunk rect. */
   boundsM: Rect;
   buildingCount: number;
+  markingCount: number;
 }
 
 /**
@@ -37,10 +43,17 @@ export interface ChunkBuild {
  *
  * The lot term is the one that is easy to get wrong: lots are owned by centroid, and a lot
  * centred on the chunk edge reaches up to half a lot outside it, so a full lot size is safe.
+ *
+ * WHY the marking term: crossings key off node degree, and a node outside the query rect
+ * loses the incident edges that point away from it, so it would present a lower degree here
+ * than in the chunk next door. Reaching far enough that any node able to place a marking
+ * inside this chunk is itself inside the query rect keeps every degree honest.
  */
 export function chunkMarginM(params: CityParams): number {
   let margin = 0;
-  for (const c of params.graph.classes) margin = Math.max(margin, c.widthM / 2 + c.sidewalkM);
+  for (const c of params.graph.classes) {
+    margin = Math.max(margin, c.widthM / 2 + c.sidewalkM + MARKING_REACH_M);
+  }
   margin = Math.max(margin, params.base.lotSizeM);
   for (const z of params.zones) margin = Math.max(margin, z.lotSizeM);
   return margin;
@@ -109,6 +122,46 @@ function ownsCentroid(chunkM: Rect, p: Vec2): boolean {
   );
 }
 
+/**
+ * One flat mesh per marking material.
+ *
+ * WHY grouped rather than one mesh per quad: `flatMesh` bakes the material into every
+ * vertex, so a merge per material is the only way to keep the whole chunk in one draw.
+ */
+function markingMeshes(quads: MarkingQuad[]): MeshBuffers[] {
+  const byMaterial = new Map<number, MultiPolygon>();
+  for (const q of quads) {
+    const polys = byMaterial.get(q.material);
+    if (polys === undefined) byMaterial.set(q.material, [[q.ring]]);
+    else polys.push([q.ring]);
+  }
+  return [...byMaterial].map(([material, polys]) =>
+    flatMesh(polys, MARKING_HEIGHT_M, material, 1)
+  );
+}
+
+/** Positional extent of a mesh, in metres. Neon quads reach past the footprints they sit on. */
+function meshBoundsM(mesh: MeshBuffers, origin: Vec2, pixelsPerMetre: number): Rect | null {
+  if (mesh.vertexCount === 0) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < mesh.vertexCount; i++) {
+    const x = mesh.vertices[i * VERTEX_FLOATS]!;
+    const y = mesh.vertices[i * VERTEX_FLOATS + 1]!;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return boundsToMetres(
+    { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
+    origin,
+    pixelsPerMetre
+  );
+}
+
 export function buildChunk(
   params: CityParams,
   key: ChunkKey,
@@ -127,10 +180,12 @@ export function buildChunk(
       key,
       id,
       mesh: emptyMesh(),
+      neon: emptyMesh(),
       surfaces: { road: [], sidewalk: [], blocks: [] },
       buildings: [],
       boundsM: chunkRect(key),
-      buildingCount: 0
+      buildingCount: 0,
+      markingCount: 0
     };
   }
 
@@ -171,14 +226,42 @@ export function buildChunk(
     );
   }
 
+  // Markings are owned by centroid like buildings, and for the same reason: clipping them
+  // to the chunk rect would cut a dash in half and lose the coordinate its stripe runs on.
+  const markings: MarkingQuad[] = [];
+  for (const quad of buildMarkings(px.graph, pixelsPerMetre)) {
+    const centroid = pixelsToMetres(ringCentroid(quad.ring), params.origin, pixelsPerMetre);
+    if (!ownsCentroid(chunkM, centroid)) continue;
+    markings.push(quad);
+    boundsM = unionRect(
+      boundsM,
+      boundsToMetres(ringBounds(quad.ring), params.origin, pixelsPerMetre)
+    );
+  }
+
   const mesh = mergeMeshes([
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
-    ...kept.map(extrudeBuilding)
+    ...markingMeshes(markings),
+    ...kept.map((spec) => extrudeBuilding(spec, pixelsPerMetre))
   ]);
 
-  return { key, id, mesh, surfaces, buildings: kept, boundsM, buildingCount: kept.length };
+  const neon = neonMesh(kept, pixelsPerMetre);
+  const neonBounds = meshBoundsM(neon, params.origin, pixelsPerMetre);
+  if (neonBounds !== null) boundsM = unionRect(boundsM, neonBounds);
+
+  return {
+    key,
+    id,
+    mesh,
+    neon,
+    surfaces,
+    buildings: kept,
+    boundsM,
+    buildingCount: kept.length,
+    markingCount: markings.length
+  };
 }
 
 export function cityChunks(cityBoundsM: Rect): ChunkKey[] {

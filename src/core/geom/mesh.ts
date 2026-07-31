@@ -1,7 +1,30 @@
-/** Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1). */
-export const VERTEX_FLOATS = 5;
+/**
+ * Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1) aKind(1) aU(1) aTop(1) aSeed(1).
+ *
+ * The last four exist for the facade shader and carry different meanings per kind:
+ *
+ * | kind   | aU                      | aTop            | aSeed          |
+ * |--------|-------------------------|-----------------|----------------|
+ * | FLAT   | unused                  | unused          | unused         |
+ * | WALL   | metres along the wall   | building height | building hash  |
+ * | ROOF   | unused                  | building height | building hash  |
+ * | NEON   | local quad u, -1..1     | local quad v    | glow strength  |
+ */
+export const VERTEX_FLOATS = 9;
 export const VERTEX_STRIDE_BYTES = VERTEX_FLOATS * 4;
-export const ATTRIBUTE_OFFSETS = { pos: 0, height: 8, material: 12, shade: 16 } as const;
+export const ATTRIBUTE_OFFSETS = {
+  pos: 0,
+  height: 8,
+  material: 12,
+  shade: 16,
+  kind: 20,
+  u: 24,
+  top: 28,
+  seed: 32
+} as const;
+
+/** What the fragment shader should draw on a vertex. Values are read in `city.ts`. */
+export const KIND = { FLAT: 0, WALL: 1, ROOF: 2, NEON: 3 } as const;
 
 export interface MeshBuffers {
   vertices: Float32Array;
@@ -35,13 +58,27 @@ export class MeshBuilder {
     return this.#vertexCount;
   }
 
-  vertex(x: number, y: number, height: number, material: number, shade: number): number {
+  vertex(
+    x: number,
+    y: number,
+    height: number,
+    material: number,
+    shade: number,
+    kind: number = KIND.FLAT,
+    u = 0,
+    top = 0,
+    seed = 0
+  ): number {
     const at = this.#vertexCount * VERTEX_FLOATS;
     this.#vertices[at] = x;
     this.#vertices[at + 1] = y;
     this.#vertices[at + 2] = height;
     this.#vertices[at + 3] = material;
     this.#vertices[at + 4] = shade;
+    this.#vertices[at + 5] = kind;
+    this.#vertices[at + 6] = u;
+    this.#vertices[at + 7] = top;
+    this.#vertices[at + 8] = seed;
     return this.#vertexCount++;
   }
 

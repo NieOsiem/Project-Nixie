@@ -1,12 +1,13 @@
-import { MODULE_ID } from "./constants.js";
+import { MODULE_ID, SETTING_CAMERA_HEIGHT, SETTING_RENDER_SCALE } from "./constants.js";
 import {
   autoWallsEnabled,
   buildWalls,
   clearWalls,
+  commitDistrictPalette,
   getCity,
   getGraph,
-  getRenderer,
   isSceneEnabled,
+  listDistricts,
   rebuildGeometry,
   redo,
   registerHooks,
@@ -20,8 +21,11 @@ import {
   stats,
   undo
 } from "./adapter/canvas.js";
+import { PALETTE_PRESETS, normalizePalette, type DistrictPalette } from "./core/palette.js";
+import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerSceneControls } from "./ui/controls.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
+import { openPaletteApp } from "./ui/palette-app.js";
 
 // KeyboardManager.MODIFIER_KEYS values, identical in v12 and v14. Hardcoded because the
 // class moved namespace between the two and the strings did not.
@@ -53,6 +57,7 @@ function registerKeybindings(): void {
 
 Hooks.once("init", () => {
   CONFIG.Canvas.layers[LAYER_NAME] = { layerClass: nixieLayerClass(), group: "interface" };
+  registerSettings();
   registerSceneControls();
   registerKeybindings();
   registerHooks();
@@ -80,15 +85,21 @@ Hooks.once("init", () => {
     setAutoWalls,
     autoWallsEnabled,
 
-    setRenderScale: (value: number) => {
-      const r = getRenderer();
-      if (r) r.renderScale = value;
-      return r?.renderScale ?? null;
+    listDistricts,
+    palettePresets: () => PALETTE_PRESETS,
+    setDistrictPalette: (id: string, palette: Partial<DistrictPalette>) =>
+      commitDistrictPalette(id, normalizePalette(palette)),
+    openPaletteApp,
+
+    // Through the settings, not the renderer, so the console and the settings sheet cannot
+    // disagree about what the dial is currently set to.
+    setRenderScale: async (value: number) => {
+      await setSettingValue(SETTING_RENDER_SCALE, value);
+      return settingValue<number>(SETTING_RENDER_SCALE);
     },
-    setCameraHeight: (metres: number) => {
-      const r = getRenderer();
-      if (r) r.cameraHeightMetres = metres;
-      return r?.cameraHeightMetres ?? null;
+    setCameraHeight: async (metres: number) => {
+      await setSettingValue(SETTING_CAMERA_HEIGHT, metres);
+      return settingValue<number>(SETTING_CAMERA_HEIGHT);
     }
   };
 

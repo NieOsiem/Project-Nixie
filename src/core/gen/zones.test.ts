@@ -1,13 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { intersection } from "../geom/boolean.js";
 import { ringArea, type Rect } from "../geom/types.js";
-import { DEFAULT_ZONE_PARAMS, lotOptions, lotRegions, nextZoneId, zoneAt, type Zone } from "./zones.js";
+import { BASE_BANK, FIRST_ZONE_BANK, LAST_ZONE_BANK } from "../palette.js";
+import {
+  DEFAULT_ZONE_PARAMS,
+  lotOptions,
+  lotRegions,
+  nextZoneBank,
+  nextZoneId,
+  zoneAt,
+  type Zone
+} from "./zones.js";
 
 const BOUNDS: Rect = { x: 0, y: 0, width: 1000, height: 1000 };
 /** Where metre coordinate (0, 0) sits. Zones and bounds arrive already converted. */
 const ORIGIN = { x: 0, y: 0 };
+const ZONE_BANK_COUNT = LAST_ZONE_BANK - FIRST_ZONE_BANK + 1;
 
-const zone = (id: string, rect: Rect, seed = 0): Zone => ({ ...DEFAULT_ZONE_PARAMS, id, rect, seed });
+const zone = (id: string, rect: Rect, seed = 0, bank = FIRST_ZONE_BANK): Zone => ({
+  ...DEFAULT_ZONE_PARAMS,
+  id,
+  rect,
+  seed,
+  bank
+});
 
 const area = (regionIndex: number, regions: ReturnType<typeof lotRegions>): number =>
   (regions[regionIndex]!.clip ?? []).reduce(
@@ -98,6 +114,31 @@ describe("lotRegions", () => {
     expect(regions[0]!.options.originPx).toEqual({ x: 250, y: 375 });
   });
 
+  it("gives the leftover the base bank and each zone its own stored bank", () => {
+    const regions = lotRegions(
+      DEFAULT_ZONE_PARAMS,
+      [
+        zone("z1", { x: 0, y: 0, width: 300, height: 1000 }, 1, 9),
+        zone("z2", { x: 400, y: 0, width: 300, height: 1000 }, 2, 4)
+      ],
+      BOUNDS,
+      25,
+      ORIGIN
+    );
+    // Reverse order, last zone first, then the leftover.
+    expect(regions.map((r) => r.bank)).toEqual([4, 9, BASE_BANK]);
+  });
+
+  it("takes the stored bank, not the zone's position in the array", () => {
+    const a = zone("z1", { x: 0, y: 0, width: 300, height: 1000 }, 1, 17);
+    const b = zone("z2", { x: 400, y: 0, width: 300, height: 1000 }, 2, 5);
+    const kept = lotRegions(DEFAULT_ZONE_PARAMS, [a, b], BOUNDS, 25, ORIGIN);
+    // Dropping the zone in front of it must not renumber the survivor's bank.
+    const alone = lotRegions(DEFAULT_ZONE_PARAMS, [b], BOUNDS, 25, ORIGIN);
+    expect(kept[1]!.bank).toBe(17);
+    expect(alone[0]!.bank).toBe(5);
+  });
+
   it("anchors the unzoned grid to the city origin, not to the bounds", () => {
     // Bounds move on every edit; anchoring there would reshuffle the whole city the
     // moment a road extends past the old edge. The origin is metre (0, 0) and never moves.
@@ -130,5 +171,37 @@ describe("nextZoneId", () => {
   it("fills the first free slot", () => {
     expect(nextZoneId([])).toBe("z1");
     expect(nextZoneId([zone("z1", BOUNDS), zone("z3", BOUNDS)])).toBe("z2");
+  });
+});
+
+describe("nextZoneBank", () => {
+  it("starts at the first district bank", () => {
+    expect(nextZoneBank([])).toBe(FIRST_ZONE_BANK);
+  });
+
+  it("never collides with a live bank", () => {
+    const zones: Zone[] = [];
+    for (let i = 0; i < ZONE_BANK_COUNT; i++) {
+      const bank = nextZoneBank(zones);
+      expect(zones.some((z) => z.bank === bank)).toBe(false);
+      expect(bank).toBeGreaterThanOrEqual(FIRST_ZONE_BANK);
+      expect(bank).toBeLessThanOrEqual(LAST_ZONE_BANK);
+      zones.push(zone(`z${i}`, BOUNDS, 0, bank));
+    }
+  });
+
+  it("reuses a bank a deleted zone freed without touching the survivors", () => {
+    const survivor = zone("z2", BOUNDS, 0, FIRST_ZONE_BANK + 1);
+    expect(nextZoneBank([survivor])).toBe(FIRST_ZONE_BANK);
+    expect(survivor.bank).toBe(FIRST_ZONE_BANK + 1);
+  });
+
+  it("wraps into the district range once every bank is live", () => {
+    const zones = Array.from({ length: ZONE_BANK_COUNT }, (_, i) =>
+      zone(`z${i}`, BOUNDS, 0, FIRST_ZONE_BANK + i)
+    );
+    const bank = nextZoneBank(zones);
+    expect(bank).toBeGreaterThanOrEqual(FIRST_ZONE_BANK);
+    expect(bank).toBeLessThanOrEqual(LAST_ZONE_BANK);
   });
 });

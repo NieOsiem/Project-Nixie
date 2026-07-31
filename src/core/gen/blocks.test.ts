@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, type Polygon } from "../geom/types.js";
+import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK } from "../palette.js";
 import {
   buildingsForBlocks,
   subdivideBlock,
@@ -22,9 +23,12 @@ const options = (over: Partial<LotOptions> = {}): LotOptions => ({
   ...over
 });
 
-const region = (over: Partial<LotOptions> = {}, seed = 0): LotRegion[] => [
-  { seed, options: options(over), clip: null }
+const region = (over: Partial<LotOptions> = {}, seed = 0, bank = FIRST_ZONE_BANK): LotRegion[] => [
+  { seed, bank, options: options(over), clip: null }
 ];
+
+const bankOf = (material: number): number => Math.floor(material / BANK_SIZE);
+const slotOf = (material: number): number => material % BANK_SIZE;
 
 const block = (x: number, y: number, w: number, h: number): Polygon => [
   rectRing({ x, y, width: w, height: h })
@@ -103,6 +107,14 @@ describe("subdivideBlock", () => {
 });
 
 describe("buildingsForBlocks", () => {
+  /** One half of a 900-wide block, as its own district. */
+  const half = (x: number, seed: number, bank = FIRST_ZONE_BANK): LotRegion => ({
+    seed,
+    bank,
+    options: options(),
+    clip: [[rectRing({ x, y: 0, width: 450, height: 300 })]]
+  });
+
   it("produces one spec per lot", () => {
     const blocks = [block(0, 0, 300, 300)];
     expect(buildingsForBlocks(blocks, region(), FRAME)).toHaveLength(9);
@@ -149,11 +161,6 @@ describe("buildingsForBlocks", () => {
 
   it("keeps one region's reseed out of its neighbour", () => {
     const blocks = [block(0, 0, 900, 300)];
-    const half = (x: number, seed: number): LotRegion => ({
-      seed,
-      options: options(),
-      clip: [[rectRing({ x, y: 0, width: 450, height: 300 })]]
-    });
     const before = buildingsForBlocks(blocks, [half(0, 1), half(450, 2)], FRAME);
     const after = buildingsForBlocks(blocks, [half(0, 1), half(450, 3)], FRAME);
 
@@ -161,5 +168,68 @@ describe("buildingsForBlocks", () => {
     expect(after).toHaveLength(before.length);
     expect(west(after)).toEqual(west(before));
     expect(after.map((s) => s.height)).not.toEqual(before.map((s) => s.height));
+  });
+
+  it("takes wall and roof materials from the region's bank", () => {
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region({}, 0, 5), FRAME);
+    expect(specs.length).toBeGreaterThan(20);
+    for (const s of specs) {
+      expect(bankOf(s.wallMaterial)).toBe(5);
+      expect(bankOf(s.roofMaterial)).toBe(5);
+      expect(slotOf(s.wallMaterial)).toBeLessThanOrEqual(DISTRICT_SLOT.WALL_C);
+      expect(slotOf(s.roofMaterial)).toBeGreaterThanOrEqual(DISTRICT_SLOT.ROOF_A);
+      expect(slotOf(s.roofMaterial)).toBeLessThanOrEqual(DISTRICT_SLOT.ROOF_C);
+    }
+  });
+
+  it("puts two districts' materials in disjoint banks", () => {
+    const blocks = [block(0, 0, 900, 300)];
+    const specs = buildingsForBlocks(blocks, [half(0, 1, 4), half(450, 2, 9)], FRAME);
+    const banks = (side: (x: number) => boolean) =>
+      new Set(specs.filter((s) => side(ringBounds(s.footprint).x)).flatMap((s) => [bankOf(s.wallMaterial), bankOf(s.roofMaterial)]));
+    expect(banks((x) => x < 450)).toEqual(new Set([4]));
+    expect(banks((x) => x >= 450)).toEqual(new Set([9]));
+  });
+
+  it("cannot let one district's reseed or move touch another's material indices", () => {
+    const blocks = [block(0, 0, 900, 300)];
+    const materials = (specs: ReturnType<typeof buildingsForBlocks>) =>
+      specs
+        .filter((s) => bankOf(s.wallMaterial) === 4)
+        .map((s) => `${Math.round(ringBounds(s.footprint).x)}:${s.wallMaterial}/${s.roofMaterial}`)
+        .sort();
+
+    const before = materials(buildingsForBlocks(blocks, [half(0, 1, 4), half(450, 2, 9)], FRAME));
+    const reseeded = materials(buildingsForBlocks(blocks, [half(0, 1, 4), half(450, 77, 9)], FRAME));
+    // Moving the east district off its old span leaves that ground to the base region.
+    const moved = materials(buildingsForBlocks(blocks, [half(0, 1, 4), half(600, 2, 9)], FRAME));
+
+    expect(before.length).toBeGreaterThan(5);
+    expect(reseeded).toEqual(before);
+    expect(moved).toEqual(before);
+  });
+
+  it("gives every lot a facade seed independent of its height and materials", () => {
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region(), FRAME);
+    expect(specs.length).toBeGreaterThan(20);
+    for (const s of specs) {
+      expect(s.seed).toBeGreaterThanOrEqual(0);
+      expect(s.seed).toBeLessThan(1);
+    }
+    expect(new Set(specs.map((s) => Math.round(s.seed * 1000))).size).toBeGreaterThan(5);
+
+    // height = min + t^2 * span, so reusing the height hash would show up as exactly t.
+    const t = specs.map((s) => Math.sqrt((s.height - 10) / 90).toFixed(6));
+    expect(specs.map((s) => s.seed.toFixed(6))).not.toEqual(t);
+    // The bank only picks the palette slot, so it must leave the facade seed alone.
+    const other = buildingsForBlocks([block(0, 0, 900, 900)], region({}, 0, 11), FRAME);
+    expect(other.map((s) => s.seed)).toEqual(specs.map((s) => s.seed));
+  });
+
+  it("keeps the facade seed deterministic per lot", () => {
+    const a = buildingsForBlocks([block(0, 0, 600, 600)], region(), FRAME);
+    const b = buildingsForBlocks([block(0, 0, 600, 600)], region(), FRAME);
+    expect(b.map((s) => s.seed)).toEqual(a.map((s) => s.seed));
+    expect(new Set(a.map((s) => s.seed)).size).toBeGreaterThan(1);
   });
 });
