@@ -83,6 +83,15 @@ function paletteAppClass(): any {
     #working: DistrictPalette = normalizePalette(null);
     #presetName: string = PALETTE_PRESETS[0]?.name ?? "";
 
+    selectDistrict(id: string): boolean {
+      const district = listDistricts().find((candidate) => candidate.id === id);
+      if (district === undefined) return false;
+      cancelPalettePreview();
+      this.#districtId = district.id;
+      this.#working = normalizePalette(district.palette);
+      return true;
+    }
+
     _canRender(): void {
       if (!game.user?.isGM) throw new Error("Nixie: the palette editor is GM-only.");
     }
@@ -256,19 +265,25 @@ function paletteAppClass(): any {
 
 let instance: any = null;
 
-export function openPaletteApp(): void {
+export function openPaletteApp(districtId?: string): void {
   if (!game.user?.isGM) {
     ui.notifications?.warn("Nixie: the palette editor is GM-only.");
     return;
   }
-  if (listDistricts().length === 0) {
+  const districts = listDistricts();
+  if (districts.length === 0) {
     ui.notifications?.warn("Nixie: enable the city on this scene first.");
     return;
   }
   // WHY one instance: the app takes a fixed DOM id, and `foundry.applications.instances` is
   // keyed on it — a second instance would deregister the first's entry when it closed.
   instance ??= new (paletteAppClass())();
+  if (districtId !== undefined && instance.selectDistrict(districtId) !== true) {
+    ui.notifications?.warn(`Nixie: district ${districtId} no longer exists.`);
+    return;
+  }
   if (instance.rendered === true) {
+    void instance.render({ force: true });
     instance.bringToFront();
     return;
   }

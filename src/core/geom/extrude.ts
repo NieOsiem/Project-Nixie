@@ -13,6 +13,12 @@ export interface BuildingSpec {
   seed: number;
   /** WHY: opt-in keeps ad-hoc specs such as cars on their existing simple extrusion. */
   detailedMassing?: boolean;
+  /** District-selected silhouette family. Omitted specs retain the existing podium/tower form. */
+  massingFamily?: "block" | "podiumTower" | "terraced";
+  /** District-controlled neon density, carried with the deterministic lot result. */
+  facadeRate?: number;
+  poolRate?: number;
+  neonWeights?: readonly [number, number];
 }
 
 export interface BuildingVolume {
@@ -57,6 +63,14 @@ function seedRoll(seed: number, salt: number): number {
   return (h >>> 0) / 4294967296;
 }
 
+function neonAccentWeight(weights: BuildingSpec["neonWeights"]): number {
+  if (weights === undefined) return 0.5;
+  const a = Number.isFinite(weights[0]) ? Math.max(0, weights[0]!) : 0;
+  const b = Number.isFinite(weights[1]) ? Math.max(0, weights[1]!) : 0;
+  const total = a + b;
+  return total > 0 ? a / total : 0.5;
+}
+
 function quadPoint(poly: Ring, u: number, v: number): Vec2 {
   const a = poly[0]!;
   const b = poly[1]!;
@@ -87,6 +101,9 @@ export function describeBuildingMassing(
     return simple();
   }
 
+  const family = spec.massingFamily ?? "podiumTower";
+  if (family === "block") return simple();
+
   const edgeU =
     (Math.hypot(footprint[1]!.x - footprint[0]!.x, footprint[1]!.y - footprint[0]!.y) +
       Math.hypot(footprint[2]!.x - footprint[3]!.x, footprint[2]!.y - footprint[3]!.y)) /
@@ -99,7 +116,7 @@ export function describeBuildingMassing(
 
   const scaleU = 0.58 + seedRoll(spec.seed, 101) * 0.18;
   const scaleV = 0.58 + seedRoll(spec.seed, 102) * 0.18;
-  const offset = seedRoll(spec.seed, 103) < 0.35 ? 0 : 1;
+  const offset = family === "terraced" ? 0 : seedRoll(spec.seed, 103) < 0.35 ? 0 : 1;
   const shiftU = (seedRoll(spec.seed, 104) * 2 - 1) * ((1 - scaleU) / 2) * 0.7 * offset;
   const shiftV = (seedRoll(spec.seed, 105) * 2 - 1) * ((1 - scaleV) / 2) * 0.7 * offset;
   const u0 = (1 - scaleU) / 2 + shiftU;
@@ -113,6 +130,28 @@ export function describeBuildingMassing(
     quadPoint(footprint, u0, v1)
   ];
   const baseHeight = spec.height * (0.55 + seedRoll(spec.seed, 106) * 0.17);
+
+  if (family === "terraced") {
+    // Keep every terrace strictly inside the tier below it: overhangs read as a second
+    // tower rather than one stepped silhouette at overview scale.
+    const middleScaleU = Math.max(scaleU + 0.08, 0.82 + seedRoll(spec.seed, 107) * 0.08);
+    const middleScaleV = Math.max(scaleV + 0.08, 0.82 + seedRoll(spec.seed, 108) * 0.08);
+    const middle = [
+      quadPoint(footprint, (1 - middleScaleU) / 2, (1 - middleScaleV) / 2),
+      quadPoint(footprint, (1 + middleScaleU) / 2, (1 - middleScaleV) / 2),
+      quadPoint(footprint, (1 + middleScaleU) / 2, (1 + middleScaleV) / 2),
+      quadPoint(footprint, (1 - middleScaleU) / 2, (1 + middleScaleV) / 2)
+    ];
+    const lowerTop = spec.height * (0.36 + seedRoll(spec.seed, 109) * 0.1);
+    const upperTop = spec.height * (0.68 + seedRoll(spec.seed, 110) * 0.12);
+    return {
+      volumes: [
+        { footprint, baseHeight: 0, topHeight: lowerTop },
+        { footprint: middle, baseHeight: lowerTop, topHeight: upperTop },
+        { footprint: upper, baseHeight: upperTop, topHeight: spec.height }
+      ]
+    };
+  }
 
   return {
     volumes: [
@@ -155,6 +194,7 @@ function appendVolume(
   const poly = volume.footprint;
   const n = poly.length;
   if (n < 3) throw new Error(`Footprint needs at least 3 points, got ${n}.`);
+  const accentWeight = neonAccentWeight(spec.neonWeights);
 
   const height = volume.topHeight;
   const centre = ringCentroid(poly);
@@ -225,11 +265,45 @@ function appendVolume(
       KIND.WALL,
       0,
       height,
-      seed
+      seed,
+      accentWeight
     );
-    builder.vertex(b.x, b.y, volume.baseHeight, w, shade, KIND.WALL, end, height, seed);
-    builder.vertex(b.x, b.y, height, w, shade, KIND.WALL, end, height, seed);
-    builder.vertex(a.x, a.y, height, w, shade, KIND.WALL, 0, height, seed);
+    builder.vertex(
+      b.x,
+      b.y,
+      volume.baseHeight,
+      w,
+      shade,
+      KIND.WALL,
+      end,
+      height,
+      seed,
+      accentWeight
+    );
+    builder.vertex(
+      b.x,
+      b.y,
+      height,
+      w,
+      shade,
+      KIND.WALL,
+      end,
+      height,
+      seed,
+      accentWeight
+    );
+    builder.vertex(
+      a.x,
+      a.y,
+      height,
+      w,
+      shade,
+      KIND.WALL,
+      0,
+      height,
+      seed,
+      accentWeight
+    );
 
     builder.triangle(base, base + 1, base + 2);
     builder.triangle(base, base + 2, base + 3);

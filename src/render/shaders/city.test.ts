@@ -29,6 +29,10 @@ describe("city fragment shader", () => {
     expect(CITY_VERT).toContain("float accentSlot = mix(");
     expect(CITY_VERT).toContain("6.0,");
     expect(CITY_VERT).toContain("7.0,");
+    expect(CITY_VERT).toContain("float neonWeightA = 0.5;");
+    expect(CITY_VERT).toContain("clamp(aRoofCentre.x, 0.0, 1.0)");
+    expect(CITY_VERT).toContain("step(neonWeightA, fract(aSeed * 17.0 + 0.13))");
+    expect(CITY_VERT).not.toContain("step(0.5, fract(aSeed * 17.0 + 0.13))");
     expect(CITY_VERT).toContain("vec4 accent = texture2DLod(uPalette,");
     expect(CITY_VERT).toContain(
       "vAccent = accent.rgb * (accent.a * uEmissiveMax) * 0.36;"

@@ -128,7 +128,39 @@ describe("loadCityState", () => {
   it("fills missing zone params from the defaults", () => {
     const stored: any = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION, base: { seed: 3 } };
     storeCity(stored);
-    expect(loadCityState()!.base.lotSizeM).toBe(DEFAULT_ZONE_PARAMS.lotSizeM);
+    const city = loadCityState()!;
+    expect(city.base.lotSizeM).toBe(DEFAULT_ZONE_PARAMS.lotSizeM);
+    expect(city.base.occupancy).toBe(DEFAULT_ZONE_PARAMS.occupancy);
+    expect(city.base.heightCluster).toBe(DEFAULT_ZONE_PARAMS.heightCluster);
+    expect(city.base.massingWeights).toEqual(DEFAULT_ZONE_PARAMS.massingWeights);
+    expect(city.base.wallWeights).toEqual(DEFAULT_ZONE_PARAMS.wallWeights);
+    expect(city.base.roofWeights).toEqual(DEFAULT_ZONE_PARAMS.roofWeights);
+    expect(city.base.neonWeights).toEqual(DEFAULT_ZONE_PARAMS.neonWeights);
+    expect(city.base.facadeRate).toBe(DEFAULT_ZONE_PARAMS.facadeRate);
+    expect(city.base.poolRate).toBe(DEFAULT_ZONE_PARAMS.poolRate);
+    expect(city.base.massingWeights).not.toBe(DEFAULT_ZONE_PARAMS.massingWeights);
+    expect(city.base.wallWeights).not.toBe(DEFAULT_ZONE_PARAMS.wallWeights);
+    expect(city.base.palette).not.toBe(DEFAULT_ZONE_PARAMS.palette);
+  });
+
+  it("normalizes identity fields on every legacy zone without sharing mutable defaults", () => {
+    storeCity(formatThreeCity());
+    const city = loadCityState()!;
+    expect(city.zones).toHaveLength(2);
+    for (const zone of city.zones) {
+      expect(zone.occupancy).toBe(DEFAULT_ZONE_PARAMS.occupancy);
+      expect(zone.heightCluster).toBe(DEFAULT_ZONE_PARAMS.heightCluster);
+      expect(zone.massingWeights).toEqual(DEFAULT_ZONE_PARAMS.massingWeights);
+      expect(zone.wallWeights).toEqual(DEFAULT_ZONE_PARAMS.wallWeights);
+      expect(zone.roofWeights).toEqual(DEFAULT_ZONE_PARAMS.roofWeights);
+      expect(zone.neonWeights).toEqual(DEFAULT_ZONE_PARAMS.neonWeights);
+      expect(zone.facadeRate).toBe(DEFAULT_ZONE_PARAMS.facadeRate);
+      expect(zone.poolRate).toBe(DEFAULT_ZONE_PARAMS.poolRate);
+      expect(zone.massingWeights).not.toBe(DEFAULT_ZONE_PARAMS.massingWeights);
+      expect(zone.palette).not.toBe(DEFAULT_ZONE_PARAMS.palette);
+    }
+    expect(city.zones[0]!.massingWeights).not.toBe(city.zones[1]!.massingWeights);
+    expect(city.zones[0]!.palette).not.toBe(city.zones[1]!.palette);
   });
 
   it("still warns and ignores a format older than 3", () => {

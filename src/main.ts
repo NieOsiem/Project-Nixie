@@ -38,6 +38,7 @@ import {
 import { PALETTE_PRESETS, normalizePalette, type DistrictPalette } from "./core/palette.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerSceneControls } from "./ui/controls.js";
+import { openDistrictApp } from "./ui/district-app.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
 import { openPaletteApp } from "./ui/palette-app.js";
 
@@ -103,6 +104,7 @@ Hooks.once("init", () => {
     palettePresets: () => PALETTE_PRESETS,
     setDistrictPalette: (id: string, palette: Partial<DistrictPalette>) =>
       commitDistrictPalette(id, normalizePalette(palette)),
+    openDistrictApp,
     openPaletteApp,
 
     // Through the settings, not the renderer, so the console and the settings sheet cannot

@@ -2,13 +2,13 @@
  * Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1) aKind(1) aU(1) aTop(1)
  * aSeed(1) aRoofCentre(2).
  *
- * The facade attributes carry different meanings per kind; `aRoofCentre` is used by ROOF
- * and NEON only:
+ * The facade attributes carry different meanings per kind; `aRoofCentre` carries roof
+ * coordinates for ROOF, panel extents for NEON, and district accent weight on WALL:
  *
  * | kind   | aU                      | aTop            | aSeed          | aRoofCentre     |
  * |--------|-------------------------|-----------------|----------------|-----------------|
  * | FLAT   | unused                  | unused          | unused         | unused          |
- * | WALL   | metres along the wall   | building height | building hash  | unused          |
+ * | WALL   | metres along the wall   | building height | building hash  | district NEON_A weight |
  * | ROOF   | half-width, metres      | longest-edge angle | building hash | centroid, px   |
  * | NEON   | local quad u, -1..1     | local quad v    | glow strength  | panel half-extents, m |
  * | CLUTTER| cap local u, -1..1      | cap local v     | unused         | unused          |

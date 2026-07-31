@@ -8,8 +8,8 @@ import {
 } from "../constants.js";
 import { withRoadClasses, type CityParams } from "../core/gen/demo-city.js";
 import type { WallSegment } from "../core/gen/walls.js";
-import { DEFAULT_ZONE_PARAMS } from "../core/gen/zones.js";
-import { normalizePalette, zoneBank } from "../core/palette.js";
+import { normalizeZoneParams } from "../core/gen/zones.js";
+import { zoneBank } from "../core/palette.js";
 
 export interface CityState extends CityParams {
   formatVersion: number;
@@ -68,11 +68,12 @@ export function loadCityState(): CityState | null {
     graph: withRoadClasses(stored.graph),
     // A stored palette that is short, absent or half-written still has to yield a full
     // bank, or the shader samples slots that were never packed.
-    base: { ...DEFAULT_ZONE_PARAMS, ...stored.base, palette: normalizePalette(stored.base?.palette) },
+    base: normalizeZoneParams(stored.base),
     zones: zones.map((z: any, i: number) => ({
       ...z,
       bank: typeof z.bank === "number" ? z.bank : zoneBank(i),
-      palette: normalizePalette(z.palette)
+      ...normalizeZoneParams(z),
+      ...(typeof z.name === "string" ? { name: z.name } : {})
     }))
   } as CityState;
 }

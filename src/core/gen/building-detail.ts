@@ -144,7 +144,12 @@ function scaledRing(ring: Ring, scale: number): Ring {
 
 function neonMaterial(spec: BuildingSpec, salt: number): number {
   const bank = Math.floor(spec.wallMaterial / BANK_SIZE) * BANK_SIZE;
-  return bank + (roll(spec.seed, salt) < 0.5 ? DISTRICT_SLOT.NEON_A : DISTRICT_SLOT.NEON_B);
+  const weights = spec.neonWeights ?? [0.5, 0.5];
+  const slot =
+    roll(spec.seed, salt) < weights[0]!
+      ? DISTRICT_SLOT.NEON_A
+      : DISTRICT_SLOT.NEON_B;
+  return bank + slot;
 }
 
 function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPrism[] {

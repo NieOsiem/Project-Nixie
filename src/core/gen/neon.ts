@@ -109,7 +109,11 @@ const roll = (seed: number, salt: number): number => hash2(Math.round(seed * 0x3
  */
 function neonMaterial(spec: BuildingSpec, salt: number): number {
   const bank = Math.floor(spec.wallMaterial / BANK_SIZE);
-  const slot = roll(spec.seed, salt) < 0.5 ? DISTRICT_SLOT.NEON_A : DISTRICT_SLOT.NEON_B;
+  const weights = spec.neonWeights ?? [0.5, 0.5];
+  const slot =
+    roll(spec.seed, salt) < weights[0]!
+      ? DISTRICT_SLOT.NEON_A
+      : DISTRICT_SLOT.NEON_B;
   return materialIndex(bank, slot);
 }
 
@@ -131,7 +135,11 @@ function facadeSign(
   massing: BuildingMassing,
   pixelsPerMetre: number
 ): NeonQuad | null {
-  if (roll(spec.seed, 1) >= FACADE_RATE) return null;
+  const facadeRate =
+    spec.facadeRate === undefined || !Number.isFinite(spec.facadeRate)
+      ? FACADE_RATE
+      : Math.max(0, Math.min(1, spec.facadeRate));
+  if (roll(spec.seed, 1) >= facadeRate) return null;
   const facadeHeight = massing.volumes[0]!.topHeight;
   if (facadeHeight < FACADE_MIN_BUILDING_M) return null;
 
@@ -240,7 +248,11 @@ function panelCentreH(
 }
 
 function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null {
-  if (roll(spec.seed, 13) >= POOL_RATE) return null;
+  const poolRate =
+    spec.poolRate === undefined || !Number.isFinite(spec.poolRate)
+      ? POOL_RATE
+      : Math.max(0, Math.min(1, spec.poolRate));
+  if (roll(spec.seed, 13) >= poolRate) return null;
   // Keyed off the panel's bottom, not its centre: a banner earns a pool by reaching down
   // to the street, and every bottom-band sign already does.
   const bottomH = Math.min(...sign.corners.map((c) => c.h));

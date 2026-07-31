@@ -161,6 +161,16 @@ describe("extrudeBuilding", () => {
     }
   });
 
+  it("carries the district neon family weight on wall vertices", () => {
+    for (const neonWeights of [[1, 0] as const, [0, 1] as const]) {
+      const m = extrudeBuilding(spec({ neonWeights }), PPM);
+      const wallWeights = new Set(
+        Array.from({ length: m.vertexCount - 4 }, (_, i) => vertexAt(m, i + 4).roofCentreX)
+      );
+      expect(wallWeights).toEqual(new Set([neonWeights[0]]));
+    }
+  });
+
   it("aligns roof detail to the longest footprint edge", () => {
     const m = extrudeBuilding(
       spec({ footprint: rectRing({ x: 0, y: 0, width: 10, height: 30 }) }),

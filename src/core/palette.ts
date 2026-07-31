@@ -259,12 +259,30 @@ function sameMaterial(a: Material, b: Material): boolean {
   );
 }
 
+function isMaterial(value: unknown): value is Material {
+  if (!value || typeof value !== "object") return false;
+  const material = value as Partial<Material>;
+  const base = material.base;
+  const emissive = material.emissive;
+  return (
+    !!base &&
+    !!emissive &&
+    Number.isFinite(base.r) &&
+    Number.isFinite(base.g) &&
+    Number.isFinite(base.b) &&
+    Number.isFinite(emissive.r) &&
+    Number.isFinite(emissive.g) &&
+    Number.isFinite(emissive.b) &&
+    Number.isFinite(material.emissiveStrength)
+  );
+}
+
 function isLegacyNeonSprawl(palette: Partial<DistrictPalette> | null | undefined): boolean {
   return (
     palette?.name === LEGACY_NEON_SPRAWL.name &&
     palette.materials?.length === BANK_SIZE &&
     palette.materials.every((material, slot) =>
-      sameMaterial(material, LEGACY_NEON_SPRAWL.materials[slot]!)
+      isMaterial(material) && sameMaterial(material, LEGACY_NEON_SPRAWL.materials[slot]!)
     )
   );
 }
@@ -276,7 +294,10 @@ export function normalizePalette(palette: Partial<DistrictPalette> | null | unde
     : (palette?.materials ?? []);
   const materials: Material[] = [];
   for (let slot = 0; slot < BANK_SIZE; slot++) {
-    const m = source[slot] ?? DEFAULT_DISTRICT_PALETTE.materials[slot]!;
+    const candidate = source[slot];
+    const m: Material = isMaterial(candidate)
+      ? candidate
+      : DEFAULT_DISTRICT_PALETTE.materials[slot]!;
     materials.push({
       base: { ...m.base },
       emissive: { ...m.emissive },

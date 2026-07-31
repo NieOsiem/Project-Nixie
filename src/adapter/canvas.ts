@@ -21,6 +21,7 @@ import { totalWallLength, wallSegmentsFromBlocks } from "../core/gen/walls.js";
 import {
   nextZoneBank,
   nextZoneId,
+  normalizeZoneParams,
   zoneAt,
   type Zone,
   type ZoneParams
@@ -346,6 +347,8 @@ async function apply(next: CityParams, dirtyM: Rect | null = null): Promise<Rebu
   currentBounds = cityBounds(next, BOUNDS_MARGIN_M);
   buildEpoch++;
   await saveCityState(next);
+  palettePreview = null;
+  pushPalette();
   // WHY: an incremental pass only touches chunks already in the set, so it cannot fill the
   // holes a superseded full rebuild left behind.
   const incremental =
@@ -470,7 +473,10 @@ export async function toggleParkedCarsAt(p: Vec2): Promise<boolean> {
 }
 
 /** `rect` arrives in world pixels from the drag; the zone stores it in metres. */
-export async function createZone(rect: Rect, params?: Partial<ZoneParams>): Promise<Zone | null> {
+export async function createZone(
+  rect: Rect,
+  params?: Partial<ZoneParams> & { name?: string }
+): Promise<Zone | null> {
   const city = requireCity();
   const topLeft = worldToMetres({ x: rect.x, y: rect.y });
   const ppm = pixelsPerMetre();
@@ -482,13 +488,13 @@ export async function createZone(rect: Rect, params?: Partial<ZoneParams>): Prom
   const min = gridMetres();
   if (area.width < min || area.height < min) return null;
 
+  const seed = params?.seed ?? randomSeed();
   const zone: Zone = {
-    ...city.base,
-    ...params,
+    ...normalizeZoneParams({ ...city.base, ...params, seed }),
     id: nextZoneId(city.zones),
     bank: nextZoneBank(city.zones),
     rect: area,
-    seed: params?.seed ?? randomSeed()
+    ...(typeof params?.name === "string" ? { name: params.name } : {})
   };
   await commit({ ...city, zones: [...city.zones, zone] }, area);
   return zone;
@@ -514,20 +520,78 @@ export async function reseedBase(): Promise<number> {
   return seed;
 }
 
+/** Reseed one district without changing its footprint or other districts. */
+export async function reseedDistrict(id: string): Promise<number> {
+  const city = requireCity();
+  const seed = randomSeed();
+  if (id === BASE_DISTRICT) {
+    await commit({ ...city, base: { ...city.base, seed } });
+    return seed;
+  }
+  const zone = city.zones.find((candidate) => candidate.id === id);
+  if (zone === undefined) {
+    throw new Error(`No district "${id}". Known: ${city.zones.map((candidate) => candidate.id).join(", ")}`);
+  }
+  await commit(
+    { ...city, zones: city.zones.map((candidate) => (candidate.id === id ? { ...candidate, seed } : candidate)) },
+    zone.rect
+  );
+  return seed;
+}
+
 export async function setZoneParams(zoneId: string, params: Partial<ZoneParams>): Promise<Zone> {
   const city = requireCity();
   const zone = city.zones.find((z) => z.id === zoneId);
   if (!zone) throw new Error(`No zone "${zoneId}". Known: ${city.zones.map((z) => z.id).join(", ")}`);
-  const updated: Zone = { ...zone, ...params };
-  await commit({ ...city, zones: city.zones.map((z) => (z.id === zoneId ? updated : z)) });
+  const updated: Zone = {
+    ...normalizeZoneParams({ ...zone, ...params }),
+    id: zone.id,
+    bank: zone.bank,
+    rect: zone.rect,
+    ...(typeof zone.name === "string" ? { name: zone.name } : {})
+  };
+  await commit(
+    { ...city, zones: city.zones.map((z) => (z.id === zoneId ? updated : z)) },
+    zone.rect
+  );
   return updated;
 }
 
 export async function setBaseParams(params: Partial<ZoneParams>): Promise<ZoneParams> {
   const city = requireCity();
-  const base = { ...city.base, ...params };
+  const base = normalizeZoneParams({ ...city.base, ...params });
   await commit({ ...city, base });
   return base;
+}
+
+/** Apply one district inspector edit as a single history snapshot. */
+export async function applyDistrictParams(
+  id: string,
+  params: Partial<ZoneParams> & { name?: string }
+): Promise<ZoneParams | Zone> {
+  const city = requireCity();
+  if (id === BASE_DISTRICT) {
+    const { name: _name, ...basePatch } = params;
+    const base = normalizeZoneParams({ ...city.base, ...basePatch });
+    await commit({ ...city, base });
+    return base;
+  }
+
+  const zone = city.zones.find((candidate) => candidate.id === id);
+  if (zone === undefined) {
+    throw new Error(`No district "${id}". Known: ${city.zones.map((candidate) => candidate.id).join(", ")}`);
+  }
+  const { name, ...zonePatch } = params;
+  const normalized = normalizeZoneParams({ ...zone, ...zonePatch });
+  const updated: Zone = {
+    ...normalized,
+    id: zone.id,
+    bank: zone.bank,
+    rect: zone.rect,
+    name: name === undefined ? zone.name : name
+  };
+  await commit({ ...city, zones: city.zones.map((candidate) => (candidate.id === id ? updated : candidate)) }, zone.rect);
+  return updated;
 }
 
 function randomSeed(): number {
@@ -587,7 +651,7 @@ export function listDistricts(): DistrictRef[] {
     { id: BASE_DISTRICT, label: "Unzoned City", bank: BASE_BANK, palette: city.base.palette },
     ...city.zones.map((z) => ({
       id: z.id,
-      label: `Zone ${z.id}`,
+      label: z.name?.trim() || `District ${z.id}`,
       bank: z.bank,
       palette: z.palette
     }))

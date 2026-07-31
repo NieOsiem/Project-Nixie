@@ -65,6 +65,17 @@ describe("buildingDetailMesh", () => {
     expect(vertices.some((v) => v.material === neonA || v.material === neonB)).toBe(true);
   });
 
+  it("uses the district neon weights for rooftop accents", () => {
+    const neonA = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_A;
+    const neonB = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_B;
+    const mesh = buildingDetailMesh([spec({ neonWeights: [1, 0] })], PPM);
+    const neonMaterials = Array.from({ length: mesh.vertexCount }, (_, i) => vertexAt(mesh, i).material)
+      .filter((material) => material === neonA || material === neonB);
+
+    expect(neonMaterials.length).toBeGreaterThan(0);
+    expect(new Set(neonMaterials)).toEqual(new Set([neonA]));
+  });
+
   it("covers irregular and concave footprints", () => {
     const footprint: Ring = [
       { x: 0, y: 0 },

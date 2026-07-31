@@ -3,14 +3,13 @@ import {
   buildWalls,
   isMounted,
   redo,
-  reseedBase,
   resetCity,
   setAutoWalls,
   undo
 } from "../adapter/canvas.js";
 import { DEFAULT_ROAD_CLASS, ROAD_CLASSES } from "../core/gen/demo-city.js";
 import { LAYER_NAME, TOOL } from "./nixie-layer.js";
-import { openPaletteApp } from "./palette-app.js";
+import { openDistrictApp } from "./district-app.js";
 
 interface NixieTool {
   name: string;
@@ -78,18 +77,11 @@ function tools(): NixieTool[] {
       onSelect: (active) => setAutoWalls(active)
     },
     {
-      name: "palette",
-      title: "District Palette",
-      icon: "fa-solid fa-palette",
+      name: "districts",
+      title: "Edit Districts",
+      icon: "fa-solid fa-city",
       button: true,
-      onSelect: () => openPaletteApp()
-    },
-    {
-      name: "reseed",
-      title: "Reseed Unzoned Buildings",
-      icon: "fa-solid fa-dice",
-      button: true,
-      onSelect: () => run("reseed", reseedBase)
+      onSelect: () => openDistrictApp()
     },
     {
       name: "undo",

@@ -61,10 +61,13 @@ void main() {
   vec4 base = texture2DLod(uPalette, vec2(u, 0.25), 0.0);
   vec4 emissive = texture2DLod(uPalette, vec2(u, 0.75), 0.0);
   float bank = floor(aMaterial / ${BANK_SIZE}.0) * ${BANK_SIZE}.0;
+  // WHY: wall vertices carry the district's NEON_A weight in their otherwise-unused roof centre.
+  float neonWeightA = 0.5;
+  if (aKind > 0.5 && aKind < 1.5) neonWeightA = clamp(aRoofCentre.x, 0.0, 1.0);
   float accentSlot = mix(
     ${DISTRICT_SLOT.NEON_A}.0,
     ${DISTRICT_SLOT.NEON_B}.0,
-    step(0.5, fract(aSeed * 17.0 + 0.13)));
+    step(neonWeightA, fract(aSeed * 17.0 + 0.13)));
   float accentU = (bank + accentSlot + 0.5) / ${PALETTE_SIZE}.0;
   vec4 accent = texture2DLod(uPalette, vec2(accentU, 0.75), 0.0);
 

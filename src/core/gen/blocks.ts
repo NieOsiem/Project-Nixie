@@ -10,7 +10,8 @@ import {
   type Vec2
 } from "../geom/types.js";
 import { DISTRICT_SLOT, materialIndex } from "../palette.js";
-import { hash2, hashPick } from "./hash.js";
+import { hash2 } from "./hash.js";
+import type { MassingFamily, MassingWeights, WeightPair, WeightTriple } from "./zones.js";
 
 export interface LotOptions {
   /** Anchor for the lot grid. Blocks sharing an anchor share a rhythm. */
@@ -23,6 +24,15 @@ export interface LotOptions {
   minAreaPx2: number;
   minHeightM: number;
   maxHeightM: number;
+  /** District identity dials. Optional keeps low-level fixtures source-compatible. */
+  occupancy?: number;
+  heightCluster?: number;
+  massingWeights?: MassingWeights;
+  facadeRate?: number;
+  poolRate?: number;
+  wallWeights?: WeightTriple;
+  roofWeights?: WeightTriple;
+  neonWeights?: WeightPair;
 }
 
 /** A slice of the city generated from one seed with one set of lot params. */
@@ -57,6 +67,53 @@ const facadeSeed = (x: number, y: number, seed: number): number =>
   hash2(x + 3 * 7919, y - 3 * 104729, seed);
 
 export const HEIGHT_EXPONENT = 1.55;
+
+const DEFAULT_WALL_WEIGHTS: WeightTriple = [0.62, 0.26, 0.12];
+const DEFAULT_ROOF_WEIGHTS: WeightTriple = [0.65, 0.25, 0.1];
+const DEFAULT_NEON_WEIGHTS: WeightPair = [0.58, 0.42];
+const DEFAULT_MASSING_WEIGHTS: MassingWeights = {
+  block: 0.48,
+  podiumTower: 0.4,
+  terraced: 0.12
+};
+
+function clamp01(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(1, value!));
+}
+
+function weightedPick<T>(items: readonly T[], weights: readonly number[], t: number): T {
+  let cursor = Math.max(0, Math.min(0.999999999, t));
+  for (let i = 0; i < items.length; i++) {
+    cursor -= Math.max(0, weights[i] ?? 0);
+    if (cursor < 0) return items[i]!;
+  }
+  return items[items.length - 1]!;
+}
+
+function weightedMaterial(
+  slots: readonly number[],
+  weights: readonly number[],
+  x: number,
+  y: number,
+  salt: number,
+  seed: number
+): number {
+  return weightedPick(slots, weights, hash2(x + salt * 7919, y - salt * 104729, seed));
+}
+
+function chooseMassing(
+  weights: MassingWeights,
+  x: number,
+  y: number,
+  seed: number
+): MassingFamily {
+  return weightedPick(
+    ["block", "podiumTower", "terraced"] as const,
+    [weights.block, weights.podiumTower, weights.terraced],
+    hash2(x + 47 * 7919, y - 47 * 104729, seed)
+  );
+}
 
 /**
  * Cut a block into buildable lots.
@@ -113,6 +170,10 @@ export function buildingsForBlocks(
     const { seed, options, bank } = region;
 
     for (const block of area) {
+      const outer = block[0];
+      if (!outer || outer.length < 3) continue;
+      const occupancy = clamp01(options.occupancy, 1);
+
       for (const lot of subdivideBlock(block, options)) {
         const ring = lot[0]!;
         const centre = ringCentroid(ring);
@@ -120,17 +181,51 @@ export function buildingsForBlocks(
         // one key; float noise here is ~1e-11 m, so the rounding is exact.
         const cx = Math.round(((centre.x - frame.originPx.x) / frame.pixelsPerMetre) * 10);
         const cy = Math.round(((centre.y - frame.originPx.y) / frame.pixelsPerMetre) * 10);
+        // One low-frequency decision per four-lot cell keeps open space coherent while
+        // anchoring to absolute lot centres, so chunk clipping cannot change the result.
+        const occupancySpanM = Math.max(1, (options.lotSizePx / frame.pixelsPerMetre) * 4);
+        const occupancyX = Math.floor(
+          (centre.x - frame.originPx.x) / (occupancySpanM * frame.pixelsPerMetre)
+        );
+        const occupancyY = Math.floor(
+          (centre.y - frame.originPx.y) / (occupancySpanM * frame.pixelsPerMetre)
+        );
+        if (hash2(occupancyX, occupancyY, seed + 17) >= occupancy) continue;
         const t = hash2(cx, cy, seed);
+        const cluster = clamp01(options.heightCluster, 0);
+        const clusterSpanM = Math.max(1, (options.lotSizePx / frame.pixelsPerMetre) * 4);
+        const clusterX = Math.floor((centre.x - frame.originPx.x) / (clusterSpanM * frame.pixelsPerMetre));
+        const clusterY = Math.floor((centre.y - frame.originPx.y) / (clusterSpanM * frame.pixelsPerMetre));
+        const clusterT = hash2(clusterX, clusterY, seed + 31);
+        const heightT = t * (1 - cluster) + clusterT * cluster;
+        const massing = chooseMassing(
+          options.massingWeights ?? DEFAULT_MASSING_WEIGHTS,
+          cx,
+          cy,
+          seed
+        );
+        const wallWeights = options.wallWeights ?? DEFAULT_WALL_WEIGHTS;
+        const roofWeights = options.roofWeights ?? DEFAULT_ROOF_WEIGHTS;
 
         specs.push({
           footprint: ring,
           height:
             options.minHeightM +
-            Math.pow(t, HEIGHT_EXPONENT) * (options.maxHeightM - options.minHeightM),
-          roofMaterial: materialIndex(bank, hashPick(ROOF_SLOTS, cx, cy, 1, seed)),
-          wallMaterial: materialIndex(bank, hashPick(WALL_SLOTS, cx, cy, 2, seed)),
+            Math.pow(heightT, HEIGHT_EXPONENT) * (options.maxHeightM - options.minHeightM),
+          roofMaterial: materialIndex(
+            bank,
+            weightedMaterial(ROOF_SLOTS, roofWeights, cx, cy, 1, seed)
+          ),
+          wallMaterial: materialIndex(
+            bank,
+            weightedMaterial(WALL_SLOTS, wallWeights, cx, cy, 2, seed)
+          ),
           seed: facadeSeed(cx, cy, seed),
-          detailedMassing: true
+          detailedMassing: true,
+          massingFamily: massing,
+          facadeRate: options.facadeRate,
+          poolRate: options.poolRate,
+          neonWeights: options.neonWeights ?? DEFAULT_NEON_WEIGHTS
         });
       }
     }
