@@ -14,10 +14,12 @@ import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
 const live = { meshes: 0, geometries: 0, textures: 0, renderTextures: 0 };
 
 class StubGeometry {
+  attributes: string[] = [];
   constructor() {
     live.geometries++;
   }
-  addAttribute(): this {
+  addAttribute(name: string): this {
+    this.attributes.push(name);
     return this;
   }
   addIndex(): this {
@@ -46,7 +48,10 @@ class StubMesh {
   position = { x: 0, y: 0, set(x: number, y: number) { this.x = x; this.y = y; } };
   scale = { x: 1, y: 1, set(x: number, y: number) { this.x = x; this.y = y; } };
   shader: { uniforms: Record<string, unknown> };
-  constructor(_geometry: unknown, shader: { uniforms: Record<string, unknown> }) {
+  constructor(
+    public geometry: StubGeometry,
+    shader: { uniforms: Record<string, unknown> }
+  ) {
     live.meshes++;
     this.shader = shader;
   }
@@ -93,11 +98,20 @@ const PIXI_STUB = {
     fromBuffer: (data: Uint8Array) => new StubPaletteTexture(data)
   },
   RenderTexture: {
-    create: ({ width, height }: { width: number; height: number }) => {
+    create: (options: {
+      width: number;
+      height: number;
+      format?: number;
+      type?: number;
+      scaleMode?: number;
+    }) => {
       live.renderTextures++;
       return {
-        width,
-        height,
+        width: options.width,
+        height: options.height,
+        format: options.format,
+        type: options.type,
+        scaleMode: options.scaleMode,
         framebuffer: { enableDepth: () => {} },
         resize(w: number, h: number) {
           this.width = w;
@@ -109,8 +123,8 @@ const PIXI_STUB = {
       };
     }
   },
-  TYPES: { FLOAT: 0, UNSIGNED_BYTE: 1 },
-  FORMATS: { RGBA: 0 },
+  TYPES: { FLOAT: 0, UNSIGNED_BYTE: 1, HALF_FLOAT: 2 },
+  FORMATS: { RGBA: 0, RED: 1 },
   BLEND_MODES: { NORMAL: 0, ADD: 1 },
   SCALE_MODES: { NEAREST: 0, LINEAR: 1 },
   MIPMAP_MODES: { OFF: 0 },
@@ -120,13 +134,13 @@ const PIXI_STUB = {
 const SCREEN_W = 3440;
 const SCREEN_H = 1440;
 
-/** Scene target plus the bloom chain's two blur targets and its composite. */
-const BLOOM_RENDER_TEXTURES = 3;
-/** One PIXI.Mesh + Geometry per post pass: threshold, blur H, blur V, composite. */
-const BLOOM_QUADS = 4;
-/** Opaque colour plus the building silhouette the overlay is masked with. */
-const CITY_PASSES = 2;
-const CITY_RENDER_TEXTURES = 2;
+/** Two targets per bloom level plus the composite. */
+const BLOOM_RENDER_TEXTURES = 5;
+/** Threshold, wide downsample, two blur pairs, and composite. */
+const BLOOM_QUADS = 7;
+/** Opaque colour, building silhouette, and quarter-resolution roof shadows. */
+const CITY_PASSES = 3;
+const CITY_RENDER_TEXTURES = 3;
 /** The overlay's screen quad, allocated once for the renderer's lifetime. */
 const OVERLAY_QUAD = 1;
 
@@ -212,6 +226,14 @@ afterEach(() => {
 });
 
 describe("CityRenderer chunk map", () => {
+  it("binds the roof centroid attribute", () => {
+    const r = make();
+    r.update(cam());
+    const city = (renderLog[0]?.content as StubContainer).children[0]!;
+    expect(city.geometry.attributes).toContain("aRoofCentre");
+    r.destroy();
+  });
+
   it("installs setGeometry as one reserved uncullable chunk", () => {
     const r = make(buffers(7));
     r.update(cam());
@@ -329,7 +351,7 @@ describe("CityRenderer building overlay", () => {
     r.setChunk(chunk("0,0", NEAR));
     r.update(cam());
 
-    const mask = renderLog[renderLog.length - 1];
+    const mask = renderLog[1];
     expect(mask?.options.clear).toBe(true);
     expect(mask?.options.renderTexture).not.toBe(renderLog[0]?.options.renderTexture);
     expect(mask?.options.renderTexture).toBe((r.overlay as StubMesh).shader.uniforms.uMask);
@@ -358,12 +380,14 @@ describe("CityRenderer neon pass", () => {
     r.setChunk(neonChunk("0,0", NEAR, 3, 2));
     r.update(cam({ scale: 4 }));
 
-    expect(renderLog).toHaveLength(3);
+    expect(renderLog).toHaveLength(4);
     expect(renderLog[0]?.options.clear).toBe(true);
     expect(renderLog[1]?.options.clear).toBe(false);
     expect(renderLog[1]?.options.renderTexture).toBe(renderLog[0]?.options.renderTexture);
     expect(renderLog[2]?.options.clear).toBe(true);
     expect(renderLog[2]?.options.renderTexture).not.toBe(renderLog[0]?.options.renderTexture);
+    expect(renderLog[3]?.options.clear).toBe(true);
+    expect(renderLog[3]?.options.renderTexture).not.toBe(renderLog[2]?.options.renderTexture);
     expect((renderLog[1]?.content as StubContainer).children).toHaveLength(1);
     expect(
       (renderLog[1]?.content as StubContainer).children[0]?.shader.uniforms.uLeanStrength
@@ -422,14 +446,63 @@ describe("CityRenderer neon pass", () => {
     r.update(cam({ pivotX: 12, pivotY: 34 }));
 
     const opaque = (renderLog[0]?.content as StubContainer).children[0]?.shader.uniforms;
-    const neon = (renderLog[1]?.content as StubContainer).children[0]?.shader.uniforms;
-    expect(neon?.uCamHeight).toBe(opaque?.uCamHeight);
-    expect(neon?.uDepthFar).toBe(opaque?.uDepthFar);
+    const neonMesh = (renderLog[1]?.content as StubContainer).children[0]!;
+    const neon = neonMesh.shader.uniforms;
+    expect(neon.uCamHeight).toBe(opaque?.uCamHeight);
+    expect(neon.uDepthFar).toBe(opaque?.uDepthFar);
+    expect(neonMesh.geometry.attributes).toContain("aShade");
     r.destroy();
   });
 });
 
 describe("CityRenderer bloom", () => {
+  it("keeps HDR through bloom and tone-maps into an RGBA8 composite", () => {
+    const r = raw();
+    r.update(cam());
+
+    const targets = renderLog.map((call) => call.options.renderTexture) as Array<{
+      width: number;
+      height: number;
+      format?: number;
+      type?: number;
+      scaleMode?: number;
+    }>;
+    expect(targets[0]).toMatchObject({
+      format: PIXI_STUB.FORMATS.RGBA,
+      type: PIXI_STUB.TYPES.HALF_FLOAT,
+      scaleMode: PIXI_STUB.SCALE_MODES.LINEAR
+    });
+    expect(targets[2]).toMatchObject({
+      width: 860,
+      height: 360,
+      format: PIXI_STUB.FORMATS.RED,
+      type: PIXI_STUB.TYPES.UNSIGNED_BYTE
+    });
+    for (const i of [3, 4, 5, 7]) {
+      expect(targets[i]).toMatchObject({
+        format: PIXI_STUB.FORMATS.RGBA,
+        type: PIXI_STUB.TYPES.HALF_FLOAT
+      });
+    }
+    expect(targets[3]).toMatchObject({ width: 860, height: 360 });
+    expect(targets[4]).toMatchObject({ width: 215, height: 90 });
+    expect(targets[9]).toMatchObject({
+      format: PIXI_STUB.FORMATS.RGBA,
+      type: PIXI_STUB.TYPES.UNSIGNED_BYTE
+    });
+
+    const composite = (renderLog[9]?.content as StubMesh).shader.uniforms;
+    expect(composite).toMatchObject({
+      uBloomNarrow: targets[6],
+      uBloomWide: targets[8],
+      uShadow: targets[2],
+      uBuildingMask: targets[1],
+      uNarrowStrength: 1.3,
+      uWideStrength: 1.3 * 0.55
+    });
+    r.destroy();
+  });
+
   it("is on by default and presents the composite instead of the scene target", () => {
     const r = raw();
     expect(r.stats()).toMatchObject({ bloom: true, bloomStrength: 1.3 });
@@ -442,7 +515,7 @@ describe("CityRenderer bloom", () => {
     r.destroy();
   });
 
-  it("runs four post passes and releases every target on destroy", () => {
+  it("runs both bloom levels and releases every target on destroy", () => {
     const r = raw();
     r.update(cam());
 
@@ -510,6 +583,57 @@ describe("CityRenderer bloom", () => {
     r.update(cam());
     expect(renderCalls).toBe(before + CITY_PASSES + BLOOM_QUADS);
     expect(r.stats()).toMatchObject({ bloomStrength: 0.4 });
+    r.destroy();
+  });
+});
+
+describe("CityRenderer supersampling", () => {
+  it("sizes every target from the effective scale and reports both dials", () => {
+    const r = make();
+    r.renderScale = 0.75;
+    r.supersample = 2;
+    r.update(cam({ scale: 4 }));
+
+    const scene = renderLog[0]?.options.renderTexture as { width: number; height: number };
+    const mask = renderLog[1]?.options.renderTexture as { width: number; height: number };
+    const shadow = renderLog[2]?.options.renderTexture as { width: number; height: number };
+    const uniforms = renderedContent?.children[0]?.shader.uniforms;
+    expect(scene).toMatchObject({ width: 5160, height: 2160 });
+    expect(mask).toMatchObject({ width: 5160, height: 2160 });
+    expect(shadow).toMatchObject({ width: 1290, height: 540 });
+    expect(uniforms?.uScreenPxPerMetre).toBe(25 * 4 * 1.5);
+    expect(r.stats()).toMatchObject({
+      renderScale: 0.75,
+      supersample: 2,
+      effectiveRenderScale: 1.5,
+      targetSize: [5160, 2160],
+      shadowTargetSize: [1290, 540]
+    });
+    r.destroy();
+  });
+
+  it("clamps supersampling at 2x and rebuilds targets only when it changes", () => {
+    const r = make();
+    const camera = cam();
+    r.update(camera);
+    const firstTarget = renderLog[0]?.options.renderTexture;
+    const afterFirst = renderCalls;
+
+    r.supersample = 3;
+    r.update(camera);
+    expect(r.supersample).toBe(2);
+    expect(renderCalls).toBe(afterFirst + CITY_PASSES);
+    expect(renderLog[afterFirst]?.options.renderTexture).not.toBe(firstTarget);
+    expect(r.stats()).toMatchObject({
+      effectiveRenderScale: 2,
+      targetSize: [6880, 2880]
+    });
+    expect(live.renderTextures).toBe(CITY_RENDER_TEXTURES);
+
+    const afterSecond = renderCalls;
+    r.supersample = 2;
+    r.update(camera);
+    expect(renderCalls).toBe(afterSecond);
     r.destroy();
   });
 });

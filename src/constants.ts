@@ -17,6 +17,8 @@ export const GENERATOR_VERSION = 3;
 export const SETTING_CAMERA_HEIGHT = "cameraHeightM";
 export const SETTING_CAMERA_ZOOM_MODE = "cameraZoomMode";
 export const SETTING_RENDER_SCALE = "renderScale";
+export const SETTING_ANTIALIAS = "antialias";
+export const SETTING_ANTIALIAS_FACTOR = "antialiasFactor";
 export const SETTING_BLOOM = "bloom";
 export const SETTING_BLOOM_STRENGTH = "bloomStrength";
 

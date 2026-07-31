@@ -13,6 +13,9 @@ import {
   type Material
 } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { parkedCars } from "./cars.js";
+import { clutterMesh } from "./clutter.js";
+import { buildRoadDetails } from "./markings.js";
 import { buildRoadSurfaces, type RoadSurfaces } from "./roads.js";
 import { DEFAULT_ZONE_PARAMS, lotRegions, type Zone, type ZoneParams } from "./zones.js";
 
@@ -219,6 +222,7 @@ export interface CityBuild {
   mesh: MeshBuffers;
   surfaces: RoadSurfaces;
   buildingCount: number;
+  carCount: number;
   blockCount: number;
 }
 
@@ -232,6 +236,12 @@ export function buildCity(params: CityParams, boundsM: Rect, pixelsPerMetre: num
     originPx: params.origin,
     pixelsPerMetre
   });
+  const cars = parkedCars(
+    buildRoadDetails(px.graph, pixelsPerMetre).parkingSpans,
+    params.origin,
+    pixelsPerMetre,
+    px.zones
+  );
 
   // Ground, carriageway and pavement are disjoint by construction, so sharing height 0
   // costs no depth fighting.
@@ -239,8 +249,16 @@ export function buildCity(params: CityParams, boundsM: Rect, pixelsPerMetre: num
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
-    ...buildings.map((b) => extrudeBuilding(b, pixelsPerMetre))
+    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
+    ...buildings.map((b) => extrudeBuilding(b, pixelsPerMetre)),
+    clutterMesh(buildings, pixelsPerMetre)
   ]);
 
-  return { mesh, surfaces, buildingCount: buildings.length, blockCount: surfaces.blocks.length };
+  return {
+    mesh,
+    surfaces,
+    buildingCount: buildings.length,
+    carCount: cars.length,
+    blockCount: surfaces.blocks.length
+  };
 }

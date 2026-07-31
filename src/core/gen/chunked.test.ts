@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { intersection } from "../geom/boolean.js";
-import type { BuildingSpec } from "../geom/extrude.js";
+import { LIGHT_DIRECTION, SHADOW_LENGTH, type BuildingSpec } from "../geom/extrude.js";
 import { VERTEX_FLOATS } from "../geom/mesh.js";
 import { ringArea, ringCentroid, type MultiPolygon, type Rect } from "../geom/types.js";
 import { FIRST_ZONE_BANK } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { parkedCars } from "./cars.js";
 import { chunkRect } from "./chunks.js";
 import { buildChunk, chunkMarginM, cityChunks } from "./chunked.js";
-import { MARKING_REACH_M } from "./markings.js";
+import { CLUTTER_MAX_HEIGHT_M, CLUTTER_MIN_BUILDING_M } from "./clutter.js";
+import { MARKING_REACH_M, buildRoadDetails } from "./markings.js";
 import {
   buildCity,
   cityBounds,
@@ -55,6 +57,16 @@ function wholeCitySpecs(params: CityParams, boundsM: Rect, ppm: number): Buildin
   );
 }
 
+function wholeCityCars(params: CityParams, ppm: number): BuildingSpec[] {
+  const px = cityToPixels(params, ppm);
+  return parkedCars(
+    buildRoadDetails(px.graph, ppm).parkingSpans,
+    params.origin,
+    ppm,
+    px.zones
+  );
+}
+
 /**
  * Points are sorted because chunk and city rings can start at different vertices.
  *
@@ -70,6 +82,8 @@ const specKey = (s: BuildingSpec): string =>
     s.wallMaterial,
     s.roofMaterial
   ].join("|");
+
+const carKey = (s: BuildingSpec): string => `${specKey(s)}|${s.seed.toFixed(9)}`;
 
 /** Every footprint coordinate on one axis, sorted, so two builds can be compared pairwise. */
 const coords = (specs: BuildingSpec[], axis: "x" | "y"): number[] =>
@@ -144,6 +158,8 @@ describe("chunkMarginM", () => {
 describe("partition equivalence", () => {
   const whole = wholeCitySpecs(CITY, CITY_BOUNDS_M, PPM);
   const fromChunks = CHUNKS.flatMap((c) => c.buildings);
+  const wholeCars = wholeCityCars(CITY, PPM);
+  const carsFromChunks = CHUNKS.flatMap((c) => c.cars);
 
   it("has an oracle that matches buildCity", () => {
     expect(whole).toHaveLength(buildCity(CITY, CITY_BOUNDS_M, PPM).buildingCount);
@@ -157,6 +173,11 @@ describe("partition equivalence", () => {
 
   it("reproduces the same set of footprints, heights and materials", () => {
     expect(fromChunks.map(specKey).sort()).toEqual(whole.map(specKey).sort());
+  });
+
+  it("reproduces every parked car exactly once", () => {
+    expect(wholeCars.length).toBeGreaterThan(20);
+    expect(carsFromChunks.map(carKey).sort()).toEqual(wholeCars.map(carKey).sort());
   });
 
   it("places every vertex bit-identically", () => {
@@ -179,6 +200,18 @@ describe("single ownership", () => {
       }
     }
     expect(owner.size).toBe(CHUNKS.reduce((n, c) => n + c.buildingCount, 0));
+  });
+
+  it("never places one parked car in two chunks", () => {
+    const owner = new Map<string, string>();
+    for (const chunk of CHUNKS) {
+      for (const car of chunk.cars) {
+        const key = carKey(car);
+        expect(owner.get(key)).toBeUndefined();
+        owner.set(key, chunk.id);
+      }
+    }
+    expect(owner.size).toBe(CHUNKS.reduce((sum, chunk) => sum + chunk.carCount, 0));
   });
 
   it("keeps only centroids inside its own chunk rect", () => {
@@ -220,10 +253,17 @@ describe("a city spanning several chunks", () => {
   const chunks = cityChunks(boundsM).map((k) => buildChunk(wide, k, boundsM, PPM));
   const fromChunks = chunks.flatMap((c) => c.buildings);
   const whole = wholeCitySpecs(wide, boundsM, PPM);
+  const wholeCars = wholeCityCars(wide, PPM);
 
   it("still reproduces the whole-city buildings", () => {
     expect(whole.length).toBeGreaterThan(200);
     expect(fromChunks.map(specKey).sort()).toEqual(whole.map(specKey).sort());
+  });
+
+  it("still reproduces the whole-city parked cars", () => {
+    expect(chunks.flatMap((c) => c.cars).map(carKey).sort()).toEqual(
+      wholeCars.map(carKey).sort()
+    );
   });
 
   it("stays within a thousandth of a world pixel on every vertex", () => {
@@ -244,8 +284,16 @@ describe("a city spanning several chunks", () => {
   });
 
   it("keeps the overhang inside a margin of the chunk rect", () => {
-    const margin = chunkMarginM(wide);
     for (const c of chunks) {
+      const shadowReach = Math.max(
+        0,
+        ...c.buildings.map(
+          (b) =>
+            (b.height + (b.height >= CLUTTER_MIN_BUILDING_M ? CLUTTER_MAX_HEIGHT_M : 0)) *
+            SHADOW_LENGTH
+        )
+      );
+      const margin = chunkMarginM(wide) + shadowReach;
       const r = chunkRect(c.key);
       expect(c.boundsM.x).toBeGreaterThanOrEqual(r.x - margin);
       expect(c.boundsM.y).toBeGreaterThanOrEqual(r.y - margin);
@@ -265,23 +313,54 @@ describe("overhang", () => {
         expect(p.y).toBeLessThanOrEqual(c.boundsM.y + c.boundsM.height + 1e-6);
       };
       for (const spec of c.buildings) {
-        for (const p of spec.footprint) inside(pixelsToMetres(p, ORIGIN, PPM));
+        for (const p of spec.footprint) {
+          const metres = pixelsToMetres(p, ORIGIN, PPM);
+          inside(metres);
+          inside({
+            x: metres.x - LIGHT_DIRECTION.x * spec.height * SHADOW_LENGTH,
+            y: metres.y - LIGHT_DIRECTION.y * spec.height * SHADOW_LENGTH
+          });
+        }
+      }
+      for (const car of c.cars) {
+        for (const p of car.footprint) {
+          const metres = pixelsToMetres(p, ORIGIN, PPM);
+          inside(metres);
+          inside({
+            x: metres.x - LIGHT_DIRECTION.x * car.height * SHADOW_LENGTH,
+            y: metres.y - LIGHT_DIRECTION.y * car.height * SHADOW_LENGTH
+          });
+        }
       }
       for (let i = 0; i < c.mesh.vertexCount; i++) {
-        inside(
-          pixelsToMetres(
-            { x: c.mesh.vertices[i * VERTEX_FLOATS]!, y: c.mesh.vertices[i * VERTEX_FLOATS + 1]! },
-            ORIGIN,
-            PPM
-          )
+        const metres = pixelsToMetres(
+          { x: c.mesh.vertices[i * VERTEX_FLOATS]!, y: c.mesh.vertices[i * VERTEX_FLOATS + 1]! },
+          ORIGIN,
+          PPM
         );
+        inside(metres);
+        if (c.mesh.vertices[i * VERTEX_FLOATS + 5] === 4) {
+          const height = c.mesh.vertices[i * VERTEX_FLOATS + 2]!;
+          inside({
+            x: metres.x - LIGHT_DIRECTION.x * height * SHADOW_LENGTH,
+            y: metres.y - LIGHT_DIRECTION.y * height * SHADOW_LENGTH
+          });
+        }
       }
     }
   });
 
   it("stays within a margin of the chunk rect", () => {
-    const margin = chunkMarginM(CITY);
     for (const c of CHUNKS) {
+      const shadowReach = Math.max(
+        0,
+        ...c.buildings.map(
+          (b) =>
+            (b.height + (b.height >= CLUTTER_MIN_BUILDING_M ? CLUTTER_MAX_HEIGHT_M : 0)) *
+            SHADOW_LENGTH
+        )
+      );
+      const margin = chunkMarginM(CITY) + shadowReach;
       const r = chunkRect(c.key);
       expect(c.boundsM.x).toBeGreaterThanOrEqual(r.x - margin);
       expect(c.boundsM.y).toBeGreaterThanOrEqual(r.y - margin);
@@ -298,6 +377,8 @@ describe("empty chunk", () => {
   it("returns nothing without throwing", () => {
     expect(far.buildingCount).toBe(0);
     expect(far.buildings).toEqual([]);
+    expect(far.cars).toEqual([]);
+    expect(far.carCount).toBe(0);
     expect(far.mesh.vertexCount).toBe(0);
     expect(far.mesh.triangleCount).toBe(0);
     expect(far.surfaces.road).toEqual([]);

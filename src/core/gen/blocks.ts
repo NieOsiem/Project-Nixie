@@ -56,6 +56,8 @@ const ROOF_SLOTS = [DISTRICT_SLOT.ROOF_A, DISTRICT_SLOT.ROOF_B, DISTRICT_SLOT.RO
 const facadeSeed = (x: number, y: number, seed: number): number =>
   hash2(x + 3 * 7919, y - 3 * 104729, seed);
 
+export const HEIGHT_EXPONENT = 1.55;
+
 /**
  * Cut a block into buildable lots.
  *
@@ -122,7 +124,9 @@ export function buildingsForBlocks(
 
         specs.push({
           footprint: ring,
-          height: options.minHeightM + t * t * (options.maxHeightM - options.minHeightM),
+          height:
+            options.minHeightM +
+            Math.pow(t, HEIGHT_EXPONENT) * (options.maxHeightM - options.minHeightM),
           roofMaterial: materialIndex(bank, hashPick(ROOF_SLOTS, cx, cy, 1, seed)),
           wallMaterial: materialIndex(bank, hashPick(WALL_SLOTS, cx, cy, 2, seed)),
           seed: facadeSeed(cx, cy, seed)

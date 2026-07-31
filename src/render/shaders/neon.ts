@@ -14,6 +14,7 @@ precision highp float;
 attribute vec2 aPos;
 attribute float aHeight;
 attribute float aMaterial;
+attribute float aShade;
 attribute float aU;
 attribute float aTop;
 attribute float aSeed;
@@ -30,6 +31,7 @@ uniform sampler2D uPalette;
 
 varying vec2 vLocal;
 varying vec3 vGlow;
+varying float vRadial;
 
 void main() {
   float hpx = aHeight * uPixelsPerMetre;
@@ -44,6 +46,7 @@ void main() {
 
   vLocal = vec2(aU, aTop);
   vGlow = emissive.rgb * (emissive.a * uEmissiveMax) * aSeed;
+  vRadial = aShade;
 
   // 1.5 m of bias: enough to clear the coplanar surface, far short of the nearest
   // occluder that should still hide the sign.
@@ -59,15 +62,18 @@ precision highp float;
 
 varying vec2 vLocal;
 varying vec3 vGlow;
+varying float vRadial;
 
 void main() {
   vec2 d = abs(vLocal);
 
   // Separable and zero at |d| = 1, so abutting quads cannot show a seam. No discard and
-  // no fwidth: neither is verified under PIXI 7's GLSL ES 1.00 (HANDOFF §8 item 11).
+  // no fwidth: the latter is unavailable under PIXI 7's GLSL ES 1.00.
   float core = (1.0 - smoothstep(0.30, 0.55, d.x)) * (1.0 - smoothstep(0.30, 0.55, d.y));
   float halo = (1.0 - smoothstep(0.0, 1.0, d.x)) * (1.0 - smoothstep(0.0, 1.0, d.y));
-  float g = halo * 0.55 + core * 0.45;
+  float signGlow = halo * 0.55 + core * 0.45;
+  float poolGlow = 1.0 - smoothstep(0.0, 1.0, length(vLocal));
+  float g = mix(signGlow, poolGlow, step(0.5, vRadial));
 
   // Alpha 0, not g: BLEND_MODES.ADD is blendFunc(ONE, ONE), so alpha accumulates too and
   // glow landing outside the city would make the offscreen target opaque there.

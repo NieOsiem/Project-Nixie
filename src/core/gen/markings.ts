@@ -21,6 +21,21 @@ export interface MarkingQuad {
   material: number;
 }
 
+export interface ParkingSpan {
+  origin: Vec2;
+  dir: Vec2;
+  normal: Vec2;
+  from: number;
+  to: number;
+  side: 1 | -1;
+  roadHalf: number;
+}
+
+export interface RoadDetails {
+  markings: MarkingQuad[];
+  parkingSpans: ParkingSpan[];
+}
+
 /** Narrower carriageways (narrow, lane, alley) get no centre line and no zebra. */
 const MARKED_WIDTH_M = 9;
 const JUNCTION_DEGREE = 3;
@@ -161,7 +176,7 @@ function onForeignPavement(ring: Ring, own: number, edges: EdgeMarking[]): boole
  * bounds or the iteration order. A chunk builds from a clipped subgraph and keeps quads by
  * centroid, so an anchor that moved with the subgraph would double or drop dashes at seams.
  */
-export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): MarkingQuad[] {
+export function buildRoadDetails(graph: RoadGraph, pixelsPerMetre: number): RoadDetails {
   const nodes = nodeMap(graph);
   const classes = classMap(graph);
   const px = (m: number): number => m * pixelsPerMetre;
@@ -217,7 +232,7 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
   const clear = px(CLEAR_M);
   const maxInset = px(MAX_INSET_M);
 
-  const quads: (MarkingQuad & { edge: number })[] = [];
+  const quads: (MarkingQuad & { edge: number; parking?: ParkingSpan })[] = [];
 
   edges.forEach((e, index) => {
     const otherArms = (id: string): Arm[] =>
@@ -274,19 +289,34 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
     const from = kerbA > 0 ? kerbA + clear : 0;
     const to = e.length - (kerbB > 0 ? kerbB + clear : 0);
     for (const [t0, t1] of segments(from, to, kerbStep)) {
-      for (const side of [1, -1]) {
+      for (const side of [1, -1] as const) {
         const outer = e.pavedHalf * side;
         const inner = outer - kerbWidth * side;
         quads.push({
           ring: quad(e.axis, t0, t1, Math.min(outer, inner), Math.max(outer, inner)),
           material: MATERIAL.KERB,
-          edge: index
+          edge: index,
+          parking: {
+            origin: e.axis.origin,
+            dir: e.axis.dir,
+            normal: e.axis.normal,
+            from: t0,
+            to: t1,
+            side,
+            roadHalf: e.roadHalf
+          }
         });
       }
     }
   });
 
-  return quads
-    .filter((q) => !onForeignPavement(q.ring, q.edge, edges))
-    .map(({ ring, material }) => ({ ring, material }));
+  const kept = quads.filter((q) => !onForeignPavement(q.ring, q.edge, edges));
+  return {
+    markings: kept.map(({ ring, material }) => ({ ring, material })),
+    parkingSpans: kept.flatMap((q) => (q.parking === undefined ? [] : [q.parking]))
+  };
+}
+
+export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): MarkingQuad[] {
+  return buildRoadDetails(graph, pixelsPerMetre).markings;
 }

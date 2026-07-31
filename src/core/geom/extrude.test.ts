@@ -35,7 +35,9 @@ const vertexAt = (m: MeshBuffers, i: number) => {
     kind: m.vertices[at + 5]!,
     u: m.vertices[at + 6]!,
     top: m.vertices[at + 7]!,
-    seed: m.vertices[at + 8]!
+    seed: m.vertices[at + 8]!,
+    roofCentreX: m.vertices[at + 9]!,
+    roofCentreY: m.vertices[at + 10]!
   };
 };
 
@@ -59,6 +61,10 @@ describe("wallShade", () => {
       expect(s).toBeGreaterThanOrEqual(SHADE_MIN);
       expect(s).toBeLessThanOrEqual(SHADE_MAX);
     }
+  });
+
+  it("keeps every wall darker than a roof", () => {
+    expect(SHADE_MAX).toBeLessThan(ROOF_SHADE);
   });
 
   it("lights opposing walls differently", () => {
@@ -111,13 +117,13 @@ describe("extrudeBuilding", () => {
     expect(() => extrudeBuilding(bad, PPM)).toThrow();
   });
 
-  it("puts the roof cap at full height with the roof material", () => {
+  it("puts the roof cap at full height with the roof material and positive extents", () => {
     const m = extrudeBuilding(spec(), PPM);
     for (let i = 0; i < 4; i++) {
       const v = vertexAt(m, i);
       expect(v.height).toBe(40);
       expect(v.material).toBe(1);
-      expect(v.shade).toBe(ROOF_SHADE);
+      expect(v.shade).toBe(2.5);
     }
   });
 
@@ -145,9 +151,38 @@ describe("extrudeBuilding", () => {
     for (let i = 0; i < 4; i++) {
       const v = vertexAt(m, i);
       expect(v.kind).toBe(KIND.ROOF);
-      expect(v.top).toBe(40);
+      expect(v.u).toBe(2.5);
+      expect(v.top).toBe(0);
       expect(v.seed).toBe(0.25);
+      expect(v.roofCentreX).toBe(5);
+      expect(v.roofCentreY).toBe(5);
     }
+  });
+
+  it("aligns roof detail to the longest footprint edge", () => {
+    const m = extrudeBuilding(
+      spec({ footprint: rectRing({ x: 0, y: 0, width: 10, height: 30 }) }),
+      PPM
+    );
+    for (let i = 0; i < 4; i++) {
+      const v = vertexAt(m, i);
+      expect(v.top).toBeCloseTo(Math.PI / 2, 6);
+      expect(v.u).toBe(7.5);
+      expect(v.shade).toBe(2.5);
+    }
+  });
+
+  it("disables rectangular roof structures on irregular footprints", () => {
+    const footprint: Ring = [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 8 },
+      { x: 8, y: 8 },
+      { x: 8, y: 20 },
+      { x: 0, y: 20 }
+    ];
+    const m = extrudeBuilding(spec({ footprint }), PPM);
+    for (let i = 0; i < footprint.length; i++) expect(vertexAt(m, i).shade).toBeLessThan(0);
   });
 
   it("measures wall u in metres along that wall from its own start", () => {

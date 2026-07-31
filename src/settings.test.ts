@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CAMERA_ZOOM_MODE,
   MODULE_ID,
+  SETTING_ANTIALIAS,
+  SETTING_ANTIALIAS_FACTOR,
   SETTING_CAMERA_ZOOM_MODE
 } from "./constants.js";
 import { registerSettings } from "./settings.js";
@@ -43,6 +45,24 @@ describe("camera zoom setting", () => {
         [CAMERA_ZOOM_MODE.DOLLY]: "Dolly",
         [CAMERA_ZOOM_MODE.FIXED]: "Fixed Altitude"
       }
+    });
+  });
+
+  it("registers client supersampling on at 1.5x by default", () => {
+    registerSettings();
+
+    expect(registered.get(`${MODULE_ID}.${SETTING_ANTIALIAS}`)).toMatchObject({
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true
+    });
+    expect(registered.get(`${MODULE_ID}.${SETTING_ANTIALIAS_FACTOR}`)).toMatchObject({
+      scope: "client",
+      config: true,
+      type: Number,
+      range: { min: 1.25, max: 2, step: 0.25 },
+      default: 1.5
     });
   });
 });

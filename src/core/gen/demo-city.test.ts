@@ -15,6 +15,7 @@ import {
   PALETTE_PRESETS
 } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { CLUTTER_MAX_HEIGHT_M } from "./clutter.js";
 import { buildRoadSurfaces } from "./roads.js";
 import { DEFAULT_ZONE_PARAMS, lotRegions, type Zone } from "./zones.js";
 import {
@@ -98,6 +99,7 @@ describe("buildCity", () => {
   it("produces blocks and buildings", () => {
     expect(build.blockCount).toBeGreaterThan(3);
     expect(build.buildingCount).toBeGreaterThan(20);
+    expect(build.carCount).toBeGreaterThan(20);
   });
 
   it("produces a well-formed mesh", () => {
@@ -123,7 +125,7 @@ describe("buildCity", () => {
     for (let i = 0; i < build.mesh.vertexCount; i++) {
       const h = build.mesh.vertices[i * VERTEX_FLOATS + 2]!;
       expect(h).toBeGreaterThanOrEqual(0);
-      expect(h).toBeLessThanOrEqual(140);
+      expect(h).toBeLessThanOrEqual(DEFAULT_ZONE_PARAMS.maxHeightM + CLUTTER_MAX_HEIGHT_M);
     }
   });
 
@@ -134,6 +136,7 @@ describe("buildCity", () => {
   it("is deterministic", () => {
     const again = buildCity(city, boundsM, PPM);
     expect(again.buildingCount).toBe(build.buildingCount);
+    expect(again.carCount).toBe(build.carCount);
     expect(again.mesh.triangleCount).toBe(build.mesh.triangleCount);
     expect(Array.from(again.mesh.vertices)).toEqual(Array.from(build.mesh.vertices));
   });

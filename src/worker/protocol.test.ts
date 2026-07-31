@@ -126,6 +126,7 @@ describe("handleRequest buildChunk", () => {
     expect(result).not.toHaveProperty("surfaces");
     expect(result).not.toHaveProperty("buildings");
     expect(result.buildingCount).toBeGreaterThan(0);
+    expect(result.carCount).toBeGreaterThan(0);
   });
 
   it("turns malformed params into a failure response instead of throwing", () => {

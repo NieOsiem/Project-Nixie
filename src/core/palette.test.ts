@@ -139,10 +139,9 @@ describe("shipped palettes", () => {
     }
   });
 
-  it("keeps the ground plane below the bloom threshold", () => {
-    // WHY: shared surfaces cover most of the screen. Any of them above the 0.55 threshold
-    // would put the whole ground plane into the bloom pass and wash the scene out.
-    for (const m of CITY_SURFACES.slice(0, 3)) {
+  it("keeps the ground plane and paint below the bloom threshold", () => {
+    // WHY: broad shared surfaces wash out the scene above 0.55; paint above it floats in a halo.
+    for (const m of CITY_SURFACES.slice(0, 5)) {
       const peak = Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength;
       expect(peak).toBeLessThan(0.55);
     }

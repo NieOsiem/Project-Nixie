@@ -14,6 +14,8 @@ import { hash2 } from "./hash.js";
 export const GLOW_MARGIN_M = 2;
 /** Largest half-extent a rooftop strip's bright core reaches from the roof centroid. */
 export const BEACON_CORE_MAX_M = 4;
+export const POOL_RADIUS_M = 14;
+export const POOL_RATE = 1;
 
 const FACADE_RATE = 0.3;
 const FACADE_MIN_BUILDING_M = 6;
@@ -21,8 +23,17 @@ const SIGN_MIN_W_M = 2;
 const SIGN_MAX_W_M = 4.5;
 const SIGN_MIN_H_M = 1;
 const SIGN_MAX_H_M = 2;
+export const BILLBOARD_MIN_W_M = 8;
+export const BILLBOARD_MAX_W_M = 15;
+export const BILLBOARD_RATE = 0.18;
+const BILLBOARD_MIN_BUILDING_M = 25;
+const BILLBOARD_MIN_H_M = 3;
+const BILLBOARD_MAX_H_M = 5;
 const SIGN_LOW_M = 0.35;
 const SIGN_HIGH_M = 0.85;
+const POOL_MAX_SIGN_HEIGHT_M = 15;
+const POOL_HEIGHT_M = 0.03;
+const POOL_STRENGTH = 0.22;
 
 const BEACON_RATE = 0.45;
 const BEACON_MIN_BUILDING_M = 30;
@@ -48,6 +59,7 @@ interface NeonQuad {
   corners: Corner[];
   material: number;
   strength: number;
+  radial: number;
 }
 
 /** Independent draws from one building's 0..1 seed. `hash2` wants integers. */
@@ -72,12 +84,34 @@ function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null
   const n = ring.length;
   if (n < 3) return null;
 
-  const minSpanM = SIGN_MIN_W_M + 2 * GLOW_MARGIN_M;
-  const candidates: number[] = [];
+  let billboard =
+    spec.height >= BILLBOARD_MIN_BUILDING_M && roll(spec.seed, 14) < BILLBOARD_RATE;
+  let minWidthM = billboard ? BILLBOARD_MIN_W_M : SIGN_MIN_W_M;
+  let candidates: number[] = [];
   for (let i = 0; i < n; i++) {
     const a = ring[i]!;
     const b = ring[(i + 1) % n]!;
-    if (Math.hypot(b.x - a.x, b.y - a.y) >= minSpanM * pixelsPerMetre) candidates.push(i);
+    if (
+      Math.hypot(b.x - a.x, b.y - a.y) >=
+      (minWidthM + 2 * GLOW_MARGIN_M) * pixelsPerMetre
+    ) {
+      candidates.push(i);
+    }
+  }
+  if (candidates.length === 0 && billboard) {
+    billboard = false;
+    minWidthM = SIGN_MIN_W_M;
+    candidates = [];
+    for (let i = 0; i < n; i++) {
+      const a = ring[i]!;
+      const b = ring[(i + 1) % n]!;
+      if (
+        Math.hypot(b.x - a.x, b.y - a.y) >=
+        (SIGN_MIN_W_M + 2 * GLOW_MARGIN_M) * pixelsPerMetre
+      ) {
+        candidates.push(i);
+      }
+    }
   }
   if (candidates.length === 0) return null;
 
@@ -88,11 +122,16 @@ function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null
   const lenM = lenPx / pixelsPerMetre;
 
   const widthM = Math.min(
-    SIGN_MIN_W_M + roll(spec.seed, 3) * (SIGN_MAX_W_M - SIGN_MIN_W_M),
+    minWidthM +
+      roll(spec.seed, 3) *
+        ((billboard ? BILLBOARD_MAX_W_M : SIGN_MAX_W_M) - minWidthM),
     lenM - 2 * GLOW_MARGIN_M
   );
   const halfWM = widthM / 2 + GLOW_MARGIN_M;
-  const halfHM = (SIGN_MIN_H_M + roll(spec.seed, 4) * (SIGN_MAX_H_M - SIGN_MIN_H_M)) / 2 + GLOW_MARGIN_M;
+  const minHeightM = billboard ? BILLBOARD_MIN_H_M : SIGN_MIN_H_M;
+  const maxHeightM = billboard ? BILLBOARD_MAX_H_M : SIGN_MAX_H_M;
+  const halfHM =
+    (minHeightM + roll(spec.seed, 4) * (maxHeightM - minHeightM)) / 2 + GLOW_MARGIN_M;
 
   const ux = (b.x - a.x) / lenPx;
   const uy = (b.y - a.y) / lenPx;
@@ -103,10 +142,13 @@ function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null
   const x1 = a.x + ux * (alongPx + halfWPx);
   const y1 = a.y + uy * (alongPx + halfWPx);
 
-  // Clamped so the padded quad never reaches below ground on a low building.
-  const centreH = Math.max(
-    halfHM,
-    (SIGN_LOW_M + roll(spec.seed, 6) * (SIGN_HIGH_M - SIGN_LOW_M)) * spec.height
+  // Clamped so the padded quad stays between ground and roof.
+  const centreH = Math.min(
+    spec.height - halfHM,
+    Math.max(
+      halfHM,
+      (SIGN_LOW_M + roll(spec.seed, 6) * (SIGN_HIGH_M - SIGN_LOW_M)) * spec.height
+    )
   );
 
   return {
@@ -117,7 +159,29 @@ function facadeSign(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null
       { x: x0, y: y0, h: centreH + halfHM }
     ],
     material: neonMaterial(spec, 8),
-    strength: FACADE_STRENGTH + roll(spec.seed, 9) * STRENGTH_SPREAD
+    strength: FACADE_STRENGTH + roll(spec.seed, 9) * STRENGTH_SPREAD,
+    radial: 0
+  };
+}
+
+function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | null {
+  if (roll(spec.seed, 13) >= POOL_RATE) return null;
+  const centreH = sign.corners.reduce((sum, c) => sum + c.h, 0) / sign.corners.length;
+  if (centreH > POOL_MAX_SIGN_HEIGHT_M) return null;
+
+  const cx = sign.corners.reduce((sum, c) => sum + c.x, 0) / sign.corners.length;
+  const cy = sign.corners.reduce((sum, c) => sum + c.y, 0) / sign.corners.length;
+  const r = POOL_RADIUS_M * pixelsPerMetre;
+  return {
+    corners: [
+      { x: cx - r, y: cy - r, h: POOL_HEIGHT_M },
+      { x: cx + r, y: cy - r, h: POOL_HEIGHT_M },
+      { x: cx + r, y: cy + r, h: POOL_HEIGHT_M },
+      { x: cx - r, y: cy + r, h: POOL_HEIGHT_M }
+    ],
+    material: sign.material,
+    strength: sign.strength * POOL_STRENGTH,
+    radial: 1
   };
 }
 
@@ -165,7 +229,8 @@ function rooftopStrip(spec: BuildingSpec, pixelsPerMetre: number): NeonQuad | nu
   return {
     corners: [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)],
     material: neonMaterial(spec, 11),
-    strength: BEACON_STRENGTH + roll(spec.seed, 12) * STRENGTH_SPREAD
+    strength: BEACON_STRENGTH + roll(spec.seed, 12) * STRENGTH_SPREAD,
+    radial: 0
   };
 }
 
@@ -174,7 +239,11 @@ export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): Mes
   const quads: NeonQuad[] = [];
   for (const spec of buildings) {
     const facade = facadeSign(spec, pixelsPerMetre);
-    if (facade !== null) quads.push(facade);
+    if (facade !== null) {
+      quads.push(facade);
+      const pool = groundPool(facade, spec, pixelsPerMetre);
+      if (pool !== null) quads.push(pool);
+    }
     const strip = rooftopStrip(spec, pixelsPerMetre);
     if (strip !== null) quads.push(strip);
   }
@@ -189,7 +258,7 @@ export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): Mes
         c.y,
         c.h,
         quad.material,
-        1,
+        quad.radial,
         KIND.NEON,
         LOCAL_U[i]!,
         LOCAL_V[i]!,

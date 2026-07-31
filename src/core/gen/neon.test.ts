@@ -4,7 +4,15 @@ import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
 import { rectRing, ringBounds } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
 import { hash2 } from "./hash.js";
-import { BEACON_CORE_MAX_M, GLOW_MARGIN_M, neonMesh } from "./neon.js";
+import {
+  BEACON_CORE_MAX_M,
+  BILLBOARD_MAX_W_M,
+  BILLBOARD_MIN_W_M,
+  GLOW_MARGIN_M,
+  POOL_RADIUS_M,
+  POOL_RATE,
+  neonMesh
+} from "./neon.js";
 
 const PPM = 25;
 
@@ -38,6 +46,7 @@ const vertexAt = (m: MeshBuffers, i: number) => {
     y: m.vertices[at + 1]!,
     height: m.vertices[at + 2]!,
     material: m.vertices[at + 3]!,
+    radial: m.vertices[at + 4]!,
     kind: m.vertices[at + 5]!,
     u: m.vertices[at + 6]!,
     top: m.vertices[at + 7]!,
@@ -96,11 +105,31 @@ describe("neonMesh", () => {
     for (let i = 0; i < m.vertexCount; i++) {
       const v = vertexAt(m, i);
       expect(v.kind).toBe(KIND.NEON);
+      expect([0, 1]).toContain(v.radial);
       expect(Math.abs(v.u)).toBeLessThanOrEqual(1);
       expect(Math.abs(v.top)).toBeLessThanOrEqual(1);
       expect(v.strength).toBeGreaterThan(0);
       expect(v.height).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it("pairs low facade signs with reduced radial pools", () => {
+    expect(POOL_RATE).toBe(1);
+    const m = neonMesh(cityOf(300), PPM);
+    let pools = 0;
+    for (let q = 0; q < m.vertexCount; q += 4) {
+      const pool = vertexAt(m, q);
+      if (pool.radial !== 1) continue;
+      pools++;
+      const sign = vertexAt(m, q - 4);
+      expect(sign.radial).toBe(0);
+      expect(pool.material).toBe(sign.material);
+      expect(pool.strength).toBeLessThan(sign.strength);
+      for (let i = 0; i < 4; i++) expect(vertexAt(m, q + i).height).toBeCloseTo(0.03, 6);
+      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 3);
+      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 3);
+    }
+    expect(pools).toBeGreaterThan(0);
   });
 
   it("spans the padded quad in local coords", () => {
@@ -114,18 +143,40 @@ describe("neonMesh", () => {
   });
 
   it("keeps every quad inside its own building's footprint plus the glow margin", () => {
-    const slack = (GLOW_MARGIN_M + BEACON_CORE_MAX_M) * PPM;
+    const slack = Math.max(GLOW_MARGIN_M + BEACON_CORE_MAX_M, POOL_RADIUS_M) * PPM;
+    const epsilon = 1e-3;
     for (const spec of cityOf(250)) {
       const m = neonMesh([spec], PPM);
       const b = ringBounds(spec.footprint);
       for (let i = 0; i < m.vertexCount; i++) {
         const v = vertexAt(m, i);
-        expect(v.x).toBeGreaterThanOrEqual(b.x - slack);
-        expect(v.x).toBeLessThanOrEqual(b.x + b.width + slack);
-        expect(v.y).toBeGreaterThanOrEqual(b.y - slack);
-        expect(v.y).toBeLessThanOrEqual(b.y + b.height + slack);
+        expect(v.x).toBeGreaterThanOrEqual(b.x - slack - epsilon);
+        expect(v.x).toBeLessThanOrEqual(b.x + b.width + slack + epsilon);
+        expect(v.y).toBeGreaterThanOrEqual(b.y - slack - epsilon);
+        expect(v.y).toBeLessThanOrEqual(b.y + b.height + slack + epsilon);
       }
     }
+  });
+
+  it("adds rare large facade billboards without crossing the roofline", () => {
+    let billboards = 0;
+    for (const spec of cityOf(1400)) {
+      const mesh = neonMesh([spec], PPM);
+      for (let q = 0; q < mesh.vertexCount; q += 4) {
+        const a = vertexAt(mesh, q);
+        const b = vertexAt(mesh, q + 1);
+        const top = vertexAt(mesh, q + 2);
+        if (a.radial !== 0 || top.height <= a.height) continue;
+        expect(top.height).toBeLessThanOrEqual(spec.height + 1e-5);
+        const paddedWidthM = Math.hypot(b.x - a.x, b.y - a.y) / PPM;
+        if (paddedWidthM < BILLBOARD_MIN_W_M + 2 * GLOW_MARGIN_M - 1e-5) continue;
+        billboards++;
+        expect(paddedWidthM).toBeLessThanOrEqual(BILLBOARD_MAX_W_M + 2 * GLOW_MARGIN_M);
+        expect(spec.height).toBeGreaterThanOrEqual(25);
+      }
+    }
+    expect(billboards).toBeGreaterThan(5);
+    expect(billboards).toBeLessThan(80);
   });
 
   it("resolves to a neon slot of the building's own bank", () => {
@@ -152,6 +203,10 @@ describe("neonMesh", () => {
 
   it("stays inside the 800-visible-sign budget for a 1400-building city", () => {
     const m = neonMesh(cityOf(1400), PPM);
-    expect(m.vertexCount / 4).toBeLessThan(800);
+    let signs = 0;
+    for (let q = 0; q < m.vertexCount; q += 4) {
+      if (vertexAt(m, q).radial === 0) signs++;
+    }
+    expect(signs).toBeLessThan(800);
   });
 });

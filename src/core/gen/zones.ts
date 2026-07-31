@@ -38,7 +38,7 @@ export const DEFAULT_ZONE_PARAMS: ZoneParams = {
   lotSizeM: 26,
   gapM: 4,
   minHeightM: 8,
-  maxHeightM: 140,
+  maxHeightM: 170,
   palette: DEFAULT_DISTRICT_PALETTE
 };
 

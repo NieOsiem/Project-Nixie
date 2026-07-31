@@ -1,5 +1,10 @@
 import { intersection, ringAsMulti } from "../geom/boolean.js";
-import { extrudeBuilding, type BuildingSpec } from "../geom/extrude.js";
+import {
+  LIGHT_DIRECTION,
+  SHADOW_LENGTH,
+  extrudeBuilding,
+  type BuildingSpec
+} from "../geom/extrude.js";
 import { VERTEX_FLOATS, emptyMesh, mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
 import { flatMesh } from "../geom/tessellate.js";
 import {
@@ -15,9 +20,16 @@ import {
 import { nodeMap, type RoadGraph } from "../graph/road-graph.js";
 import { MATERIAL } from "../palette.js";
 import { buildingsForBlocks } from "./blocks.js";
+import { parkedCars } from "./cars.js";
+import { CLUTTER_MAX_HEIGHT_M, CLUTTER_MIN_BUILDING_M, clutterMesh } from "./clutter.js";
 import { chunkId, chunkQueryRect, chunkRect, chunksCovering, type ChunkKey } from "./chunks.js";
 import { cityToPixels, pixelsToMetres, rectToPixels, type CityParams } from "./demo-city.js";
-import { MARKING_HEIGHT_M, MARKING_REACH_M, buildMarkings, type MarkingQuad } from "./markings.js";
+import {
+  MARKING_HEIGHT_M,
+  MARKING_REACH_M,
+  buildRoadDetails,
+  type MarkingQuad
+} from "./markings.js";
 import { neonMesh } from "./neon.js";
 import { buildRoadSurfaces, type RoadSurfaces } from "./roads.js";
 import { lotRegions } from "./zones.js";
@@ -32,9 +44,12 @@ export interface ChunkBuild {
   surfaces: RoadSurfaces;
   /** Buildings this chunk owns, uncut — a kept building may overhang the chunk rect. */
   buildings: BuildingSpec[];
+  /** Parked-car props this chunk owns, separate from buildings used for Foundry walls. */
+  cars: BuildingSpec[];
   /** Real extent in METRES, including everything overhanging the chunk rect. */
   boundsM: Rect;
   buildingCount: number;
+  carCount: number;
   markingCount: number;
 }
 
@@ -183,8 +198,10 @@ export function buildChunk(
       neon: emptyMesh(),
       surfaces: { road: [], sidewalk: [], blocks: [] },
       buildings: [],
+      cars: [],
       boundsM: chunkRect(key),
       buildingCount: 0,
+      carCount: 0,
       markingCount: 0
     };
   }
@@ -197,6 +214,7 @@ export function buildChunk(
   const chunkPx = rectToPixels(chunkM, params.origin, pixelsPerMetre);
 
   const query = buildRoadSurfaces(px.graph, queryPx, pixelsPerMetre);
+  const roadDetails = buildRoadDetails(px.graph, pixelsPerMetre);
 
   // Flat surfaces are seamless, so a hard clip at the chunk edge cannot show.
   const clip = ringAsMulti(rectRing(chunkPx));
@@ -220,16 +238,25 @@ export function buildChunk(
     const centroid = pixelsToMetres(ringCentroid(spec.footprint), params.origin, pixelsPerMetre);
     if (!ownsCentroid(chunkM, centroid)) continue;
     kept.push(spec);
-    boundsM = unionRect(
-      boundsM,
-      boundsToMetres(ringBounds(spec.footprint), params.origin, pixelsPerMetre)
+    const buildingBoundsM = boundsToMetres(
+      ringBounds(spec.footprint),
+      params.origin,
+      pixelsPerMetre
     );
+    boundsM = unionRect(boundsM, buildingBoundsM);
+    const shadowHeight =
+      spec.height + (spec.height >= CLUTTER_MIN_BUILDING_M ? CLUTTER_MAX_HEIGHT_M : 0);
+    boundsM = unionRect(boundsM, {
+      ...buildingBoundsM,
+      x: buildingBoundsM.x - LIGHT_DIRECTION.x * shadowHeight * SHADOW_LENGTH,
+      y: buildingBoundsM.y - LIGHT_DIRECTION.y * shadowHeight * SHADOW_LENGTH
+    });
   }
 
   // Markings are owned by centroid like buildings, and for the same reason: clipping them
   // to the chunk rect would cut a dash in half and lose the coordinate its stripe runs on.
   const markings: MarkingQuad[] = [];
-  for (const quad of buildMarkings(px.graph, pixelsPerMetre)) {
+  for (const quad of roadDetails.markings) {
     const centroid = pixelsToMetres(ringCentroid(quad.ring), params.origin, pixelsPerMetre);
     if (!ownsCentroid(chunkM, centroid)) continue;
     markings.push(quad);
@@ -239,12 +266,37 @@ export function buildChunk(
     );
   }
 
+  const cars: BuildingSpec[] = [];
+  for (const car of parkedCars(
+    roadDetails.parkingSpans,
+    params.origin,
+    pixelsPerMetre,
+    px.zones
+  )) {
+    const centroid = pixelsToMetres(ringCentroid(car.footprint), params.origin, pixelsPerMetre);
+    if (!ownsCentroid(chunkM, centroid)) continue;
+    cars.push(car);
+    const carBoundsM = boundsToMetres(
+      ringBounds(car.footprint),
+      params.origin,
+      pixelsPerMetre
+    );
+    boundsM = unionRect(boundsM, carBoundsM);
+    boundsM = unionRect(boundsM, {
+      ...carBoundsM,
+      x: carBoundsM.x - LIGHT_DIRECTION.x * car.height * SHADOW_LENGTH,
+      y: carBoundsM.y - LIGHT_DIRECTION.y * car.height * SHADOW_LENGTH
+    });
+  }
+
   const mesh = mergeMeshes([
     flatMesh(surfaces.blocks, 0, MATERIAL.GROUND, 1),
     flatMesh(surfaces.road, 0, MATERIAL.ROAD, 1),
     flatMesh(surfaces.sidewalk, 0, MATERIAL.SIDEWALK, 1),
     ...markingMeshes(markings),
-    ...kept.map((spec) => extrudeBuilding(spec, pixelsPerMetre))
+    ...cars.map((car) => extrudeBuilding(car, pixelsPerMetre)),
+    ...kept.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
+    clutterMesh(kept, pixelsPerMetre)
   ]);
 
   const neon = neonMesh(kept, pixelsPerMetre);
@@ -258,8 +310,10 @@ export function buildChunk(
     neon,
     surfaces,
     buildings: kept,
+    cars,
     boundsM,
     buildingCount: kept.length,
+    carCount: cars.length,
     markingCount: markings.length
   };
 }

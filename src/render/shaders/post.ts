@@ -1,9 +1,10 @@
 /**
  * Post chain shaders. GLSL ES 1.00, one screen quad per pass.
  *
- * The scene target is RGBA8, so anything emissive above 1.0 has already clamped. The
- * threshold sits above the base surface colours (0.03–0.2) and below the emissive
- * materials, which is what makes lit windows and neon the only things that glow.
+ * The scene and bloom targets are half-float, preserving emissive radiance above 1.0.
+ * The threshold sits above the base surface colours (0.03–0.2) and below the emissive
+ * materials, which is what makes lit windows and neon the only things that glow. The
+ * composite tone maps once into its RGBA8 output.
  */
 const THRESHOLD = 0.55;
 /** Half-width of the quadratic knee below the threshold. Softens the cut-in. */
@@ -64,6 +65,25 @@ void main() {
 }
 `;
 
+export const DOWNSAMPLE_FRAG = `
+precision highp float;
+
+uniform sampler2D uTex;
+uniform vec2 uSrcTexel;
+
+varying vec2 vUv;
+
+void main() {
+  vec3 c = 0.25 * (
+    texture2D(uTex, vUv + uSrcTexel * vec2(-1.0, -1.0)).rgb +
+    texture2D(uTex, vUv + uSrcTexel * vec2( 1.0, -1.0)).rgb +
+    texture2D(uTex, vUv + uSrcTexel * vec2(-1.0,  1.0)).rgb +
+    texture2D(uTex, vUv + uSrcTexel * vec2( 1.0,  1.0)).rgb);
+
+  gl_FragColor = vec4(c, 1.0);
+}
+`;
+
 /**
  * Separable gaussian, `uDir` picking the axis.
  *
@@ -95,13 +115,28 @@ export const COMPOSITE_FRAG = `
 precision highp float;
 
 uniform sampler2D uScene;
-uniform sampler2D uBloom;
-uniform float uStrength;
+uniform sampler2D uBloomNarrow;
+uniform sampler2D uBloomWide;
+uniform sampler2D uShadow;
+uniform sampler2D uBuildingMask;
+uniform float uNarrowStrength;
+uniform float uWideStrength;
 
 varying vec2 vUv;
 
 void main() {
-  vec3 c = texture2D(uScene, vUv).rgb + texture2D(uBloom, vUv).rgb * uStrength;
+  vec3 c = texture2D(uScene, vUv).rgb
+    + texture2D(uBloomNarrow, vUv).rgb * uNarrowStrength
+    + texture2D(uBloomWide, vUv).rgb * uWideStrength;
+  float castShadow = texture2D(uShadow, vUv).r * (1.0 - texture2D(uBuildingMask, vUv).a);
+  c *= 1.0 - 0.38 * castShadow;
+  float l = dot(c, ${LUMA});
+  float shadow = 1.0 - smoothstep(0.0, 0.55, l);
+  c += vec3(0.018, 0.012, 0.045) * shadow;
+  l = dot(c, ${LUMA});
+  c = max(mix(vec3(l), c, 1.12), vec3(0.0));
+  float m = max(max(c.r, c.g), c.b);
+  c *= 1.0 / (1.0 + max(m - 1.0, 0.0));
   gl_FragColor = vec4(c, 1.0);
 }
 `;

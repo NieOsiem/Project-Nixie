@@ -1,16 +1,21 @@
 /**
- * Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1) aKind(1) aU(1) aTop(1) aSeed(1).
+ * Interleaved layout: aPos(2) aHeight(1) aMaterial(1) aShade(1) aKind(1) aU(1) aTop(1)
+ * aSeed(1) aRoofCentre(2).
  *
- * The last four exist for the facade shader and carry different meanings per kind:
+ * The facade attributes carry different meanings per kind; `aRoofCentre` is roof-only:
  *
  * | kind   | aU                      | aTop            | aSeed          |
  * |--------|-------------------------|-----------------|----------------|
  * | FLAT   | unused                  | unused          | unused         |
  * | WALL   | metres along the wall   | building height | building hash  |
- * | ROOF   | unused                  | building height | building hash  |
+ * | ROOF   | half-width, metres      | longest-edge angle | building hash |
  * | NEON   | local quad u, -1..1     | local quad v    | glow strength  |
+ * | CLUTTER| cap local u, -1..1      | cap local v     | unused         |
+ *
+ * `aShade` is surface shade except on ROOF (signed half-height; negative disables structures)
+ * and NEON (0 selects sign falloff, 1 radial). CLUTTER uses negative shade for its cap.
  */
-export const VERTEX_FLOATS = 9;
+export const VERTEX_FLOATS = 11;
 export const VERTEX_STRIDE_BYTES = VERTEX_FLOATS * 4;
 export const ATTRIBUTE_OFFSETS = {
   pos: 0,
@@ -20,11 +25,12 @@ export const ATTRIBUTE_OFFSETS = {
   kind: 20,
   u: 24,
   top: 28,
-  seed: 32
+  seed: 32,
+  roofCentre: 36
 } as const;
 
 /** What the fragment shader should draw on a vertex. Values are read in `city.ts`. */
-export const KIND = { FLAT: 0, WALL: 1, ROOF: 2, NEON: 3 } as const;
+export const KIND = { FLAT: 0, WALL: 1, ROOF: 2, NEON: 3, CLUTTER: 4 } as const;
 
 export interface MeshBuffers {
   vertices: Float32Array;
@@ -67,7 +73,9 @@ export class MeshBuilder {
     kind: number = KIND.FLAT,
     u = 0,
     top = 0,
-    seed = 0
+    seed = 0,
+    roofCentreX = 0,
+    roofCentreY = 0
   ): number {
     const at = this.#vertexCount * VERTEX_FLOATS;
     this.#vertices[at] = x;
@@ -79,6 +87,8 @@ export class MeshBuilder {
     this.#vertices[at + 6] = u;
     this.#vertices[at + 7] = top;
     this.#vertices[at + 8] = seed;
+    this.#vertices[at + 9] = roofCentreX;
+    this.#vertices[at + 10] = roofCentreY;
     return this.#vertexCount++;
   }
 

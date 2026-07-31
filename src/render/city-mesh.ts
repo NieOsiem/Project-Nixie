@@ -1,8 +1,10 @@
 import { ATTRIBUTE_OFFSETS, VERTEX_STRIDE_BYTES, type MeshBuffers } from "../core/geom/mesh.js";
+import { LIGHT_DIRECTION, SHADOW_LENGTH } from "../core/geom/extrude.js";
 import { EMISSIVE_MAX } from "../core/palette.js";
 import type { PaletteTexture } from "./palette-texture.js";
 import { CITY_FRAG, CITY_VERT } from "./shaders/city.js";
 import { BUILDING_MASK_FRAG, BUILDING_MASK_VERT } from "./shaders/occlusion.js";
+import { SHADOW_FRAG, SHADOW_VERT } from "./shaders/shadow.js";
 
 export interface CameraUniforms {
   pivotX: number;
@@ -23,6 +25,7 @@ export class CityMesh {
   #geometry: any;
   #cityShader: any;
   #maskShader: any;
+  #shadowShader: any;
   #pivot = new Float32Array(2);
   #maskPivot = new Float32Array(2);
 
@@ -41,6 +44,7 @@ export class CityMesh {
       .addAttribute("aU", vertexBuffer, 1, false, F, S, ATTRIBUTE_OFFSETS.u)
       .addAttribute("aTop", vertexBuffer, 1, false, F, S, ATTRIBUTE_OFFSETS.top)
       .addAttribute("aSeed", vertexBuffer, 1, false, F, S, ATTRIBUTE_OFFSETS.seed)
+      .addAttribute("aRoofCentre", vertexBuffer, 2, false, F, S, ATTRIBUTE_OFFSETS.roofCentre)
       .addIndex(buffers.indices);
 
     this.#cityShader = PIXI.Shader.from(CITY_VERT, CITY_FRAG, {
@@ -58,6 +62,11 @@ export class CityMesh {
       uPixelsPerMetre: 25,
       uCamHeight: 8750,
       uLeanStrength: 1
+    });
+    this.#shadowShader = PIXI.Shader.from(SHADOW_VERT, SHADOW_FRAG, {
+      uPixelsPerMetre: 25,
+      uSunDir: new Float32Array([-LIGHT_DIRECTION.x, -LIGHT_DIRECTION.y]),
+      uSunLength: SHADOW_LENGTH
     });
 
     this.display = new PIXI.Mesh(this.#geometry, this.#cityShader);
@@ -83,11 +92,19 @@ export class CityMesh {
     m.uPixelsPerMetre = c.pixelsPerMetre;
     m.uCamHeight = c.cameraHeightPx;
     m.uLeanStrength = c.leanStrength;
+    this.#shadowShader.uniforms.uPixelsPerMetre = c.pixelsPerMetre;
   }
 
   /** The mask is a flat silhouette, so it neither reads nor writes depth. */
   setMaskPass(enabled: boolean): void {
     this.display.shader = enabled ? this.#maskShader : this.#cityShader;
+    this.display.state.depthTest = !enabled;
+    this.display.state.depthMask = !enabled;
+  }
+
+  /** The translated roof silhouettes neither read nor write the scene depth buffer. */
+  setShadowPass(enabled: boolean): void {
+    this.display.shader = enabled ? this.#shadowShader : this.#cityShader;
     this.display.state.depthTest = !enabled;
     this.display.state.depthMask = !enabled;
   }
@@ -98,5 +115,6 @@ export class CityMesh {
     this.#geometry.destroy();
     this.#cityShader.destroy?.();
     this.#maskShader.destroy?.();
+    this.#shadowShader.destroy?.();
   }
 }

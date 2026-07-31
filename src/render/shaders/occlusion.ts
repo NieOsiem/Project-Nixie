@@ -40,7 +40,8 @@ varying float vKind;
 
 void main() {
   // Ground is level with the tokens standing on it and must not mask them.
-  if (vKind < 0.5 || vKind > 2.5) discard;
+  bool building = (vKind > 0.5 && vKind < 2.5) || (vKind > 3.5 && vKind < 4.5);
+  if (!building) discard;
   gl_FragColor = vec4(1.0);
 }
 `;

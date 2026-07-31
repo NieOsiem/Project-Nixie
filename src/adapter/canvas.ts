@@ -130,6 +130,8 @@ let cameraZoomMode: CameraZoomMode = CAMERA_ZOOM_MODE.DOLLY;
 let leanOverride: number | null = null;
 const leanCalibrationPoints: LeanCalibrationPoint[] = [];
 let renderScale = 1;
+let antialias = true;
+let antialiasFactor = 1.5;
 let bloomEnabled = true;
 let bloomStrength = 1;
 
@@ -219,6 +221,7 @@ export function mount(): void {
     }
   );
   cityRenderer.renderScale = renderScale;
+  cityRenderer.supersample = antialias ? antialiasFactor : 1;
   cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
@@ -667,6 +670,12 @@ export function setRenderScale(value: number): number {
   renderScale = Math.min(1, Math.max(0.25, value));
   if (cityRenderer !== null) cityRenderer.renderScale = renderScale;
   return renderScale;
+}
+
+export function setAntialias(enabled: boolean, factor?: number): void {
+  antialias = enabled;
+  if (factor !== undefined) antialiasFactor = Math.min(2, Math.max(1.25, factor));
+  if (cityRenderer !== null) cityRenderer.supersample = antialias ? antialiasFactor : 1;
 }
 
 export function setBloom(enabled: boolean, strength?: number): void {

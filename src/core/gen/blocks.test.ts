@@ -4,6 +4,7 @@ import { rectRing, ringArea, ringBounds, type Polygon } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK } from "../palette.js";
 import {
   buildingsForBlocks,
+  HEIGHT_EXPONENT,
   subdivideBlock,
   type HashFrame,
   type LotOptions,
@@ -135,6 +136,14 @@ describe("buildingsForBlocks", () => {
     expect(distinct.size).toBeGreaterThan(5);
   });
 
+  it("keeps a larger tower population than the old quadratic curve", () => {
+    const specs = buildingsForBlocks([block(0, 0, 900, 900)], region(), FRAME);
+    const average =
+      specs.reduce((sum, s) => sum + (s.height - 10) / 90, 0) / specs.length;
+    expect(HEIGHT_EXPONENT).toBeLessThan(2);
+    expect(average).toBeGreaterThan(0.36);
+  });
+
   it("is deterministic", () => {
     const a = buildingsForBlocks([block(0, 0, 600, 600)], region(), FRAME);
     const b = buildingsForBlocks([block(0, 0, 600, 600)], region(), FRAME);
@@ -218,8 +227,9 @@ describe("buildingsForBlocks", () => {
     }
     expect(new Set(specs.map((s) => Math.round(s.seed * 1000))).size).toBeGreaterThan(5);
 
-    // height = min + t^2 * span, so reusing the height hash would show up as exactly t.
-    const t = specs.map((s) => Math.sqrt((s.height - 10) / 90).toFixed(6));
+    const t = specs.map((s) =>
+      Math.pow((s.height - 10) / 90, 1 / HEIGHT_EXPONENT).toFixed(6)
+    );
     expect(specs.map((s) => s.seed.toFixed(6))).not.toEqual(t);
     // The bank only picks the palette slot, so it must leave the facade seed alone.
     const other = buildingsForBlocks([block(0, 0, 900, 900)], region({}, 0, 11), FRAME);

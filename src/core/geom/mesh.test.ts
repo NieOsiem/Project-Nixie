@@ -28,13 +28,15 @@ const vertexAt = (m: MeshBuffers, i: number) => ({
   kind: m.vertices[i * VERTEX_FLOATS + 5]!,
   u: m.vertices[i * VERTEX_FLOATS + 6]!,
   top: m.vertices[i * VERTEX_FLOATS + 7]!,
-  seed: m.vertices[i * VERTEX_FLOATS + 8]!
+  seed: m.vertices[i * VERTEX_FLOATS + 8]!,
+  roofCentreX: m.vertices[i * VERTEX_FLOATS + 9]!,
+  roofCentreY: m.vertices[i * VERTEX_FLOATS + 10]!
 });
 
 describe("layout constants", () => {
   it("keeps byte offsets consistent with the float layout", () => {
-    expect(VERTEX_FLOATS).toBe(9);
-    expect(VERTEX_STRIDE_BYTES).toBe(36);
+    expect(VERTEX_FLOATS).toBe(11);
+    expect(VERTEX_STRIDE_BYTES).toBe(44);
     expect(ATTRIBUTE_OFFSETS.pos).toBe(0);
     expect(ATTRIBUTE_OFFSETS.height).toBe(2 * 4);
     expect(ATTRIBUTE_OFFSETS.material).toBe(3 * 4);
@@ -43,6 +45,7 @@ describe("layout constants", () => {
     expect(ATTRIBUTE_OFFSETS.u).toBe(6 * 4);
     expect(ATTRIBUTE_OFFSETS.top).toBe(7 * 4);
     expect(ATTRIBUTE_OFFSETS.seed).toBe(8 * 4);
+    expect(ATTRIBUTE_OFFSETS.roofCentre).toBe(9 * 4);
   });
 
   it("gives every kind a distinct value", () => {
@@ -61,7 +64,7 @@ describe("MeshBuilder", () => {
 
   it("writes every attribute", () => {
     const b = new MeshBuilder(1, 0);
-    b.vertex(3, 4, 5, 17, 0.5, KIND.WALL, 6.5, 42, 0.25);
+    b.vertex(3, 4, 5, 17, 0.5, KIND.WALL, 6.5, 42, 0.25, 100, 200);
     expect(vertexAt(b.build(), 0)).toEqual({
       x: 3,
       y: 4,
@@ -71,13 +74,22 @@ describe("MeshBuilder", () => {
       kind: KIND.WALL,
       u: 6.5,
       top: 42,
-      seed: 0.25
+      seed: 0.25,
+      roofCentreX: 100,
+      roofCentreY: 200
     });
   });
 
   it("defaults the facade attributes to a flat surface", () => {
     const v = vertexAt(triangleMesh(), 2);
-    expect(v).toMatchObject({ kind: KIND.FLAT, u: 0, top: 0, seed: 0 });
+    expect(v).toMatchObject({
+      kind: KIND.FLAT,
+      u: 0,
+      top: 0,
+      seed: 0,
+      roofCentreX: 0,
+      roofCentreY: 0
+    });
   });
 
   it("trims unused capacity", () => {

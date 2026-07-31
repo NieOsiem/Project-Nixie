@@ -11,7 +11,13 @@ import {
   ROAD_CLASSES,
   type CityParams
 } from "./demo-city.js";
-import { buildMarkings, MARKING_HEIGHT_M, MARKING_REACH_M, type MarkingQuad } from "./markings.js";
+import {
+  buildMarkings,
+  buildRoadDetails,
+  MARKING_HEIGHT_M,
+  MARKING_REACH_M,
+  type MarkingQuad
+} from "./markings.js";
 
 const ORIGIN = { x: 5000, y: 4000 };
 const PPM = 25;
@@ -159,6 +165,12 @@ function wideCity(factor: number): CityParams {
 /* -------------------------------------------- */
 
 describe("marking quads", () => {
+  it("shares the exact kept kerb segments with parked-car placement", () => {
+    const details = buildRoadDetails(GRAPH_PX, PPM);
+    expect(keys(details.markings)).toEqual(keys(QUADS));
+    expect(details.parkingSpans).toHaveLength(byMaterial(QUADS, MATERIAL.KERB).length);
+  });
+
   it("sits above the carriageway without reaching building height", () => {
     expect(MARKING_HEIGHT_M).toBeGreaterThan(0);
     expect(MARKING_HEIGHT_M).toBeLessThan(0.5);

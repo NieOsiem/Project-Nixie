@@ -45,6 +45,7 @@ export interface BuildChunkResult {
   neonTriangleCount: number;
   boundsM: Rect;
   buildingCount: number;
+  carCount: number;
 }
 
 export interface WorkerSuccess {
@@ -91,7 +92,8 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           neonVertexCount: build.neon.vertexCount,
           neonTriangleCount: build.neon.triangleCount,
           boundsM: build.boundsM,
-          buildingCount: build.buildingCount
+          buildingCount: build.buildingCount,
+          carCount: build.carCount
         };
         return {
           id: request.id,

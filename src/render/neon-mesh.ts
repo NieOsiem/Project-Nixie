@@ -26,6 +26,7 @@ export class NeonMesh {
       .addAttribute("aPos", vertexBuffer, 2, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.pos)
       .addAttribute("aHeight", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.height)
       .addAttribute("aMaterial", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.material)
+      .addAttribute("aShade", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.shade)
       .addAttribute("aU", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.u)
       .addAttribute("aTop", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.top)
       .addAttribute("aSeed", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, ATTRIBUTE_OFFSETS.seed)

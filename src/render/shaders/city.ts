@@ -21,6 +21,7 @@ attribute float aKind;
 attribute float aU;
 attribute float aTop;
 attribute float aSeed;
+attribute vec2 aRoofCentre;
 
 uniform mat3 projectionMatrix;
 uniform mat3 translationMatrix;
@@ -42,6 +43,7 @@ varying float vU;
 varying float vTop;
 varying float vSeed;
 varying vec2 vWorldM;
+varying vec2 vRoofCentreM;
 varying float vUpPxPerMetre;
 
 void main() {
@@ -65,6 +67,7 @@ void main() {
   vTop = aTop;
   vSeed = aSeed;
   vWorldM = aPos / uPixelsPerMetre;
+  vRoofCentreM = aRoofCentre / uPixelsPerMetre;
 
   // d(lean)/dh: screen pixels a metre of *height* covers. Falls to zero at the pivot, so
   // the facade must antialias against this, not against uScreenPxPerMetre.
@@ -81,7 +84,7 @@ void main() {
 /**
  * Facade detail is fragment maths on the wall quads that already exist — no extra
  * geometry, no `discard` (it would cost early-Z on the biggest draw in the frame), and
- * no derivatives (`fwidth` availability under PIXI 7's ES 1.00 shaders is unverified).
+ * no derivatives (`fwidth` is unavailable under PIXI 7's ES 1.00 shaders).
  * Every pattern width comes from `uScreenPxPerMetre`, so patterns fade to flat colour
  * as they go sub-pixel instead of aliasing into noise.
  */
@@ -97,17 +100,17 @@ varying float vU;
 varying float vTop;
 varying float vSeed;
 varying vec2 vWorldM;
+varying vec2 vRoofCentreM;
 varying float vUpPxPerMetre;
 
 uniform float uScreenPxPerMetre;
 
 const float FLOOR_M = 3.4;
-const float WINDOW_M = 2.0;
+const float WINDOW_M = 3.0;
 const float SHOPFRONT_M = 4.0;
 const float BAY_M = 5.0;
 const float BAND_M = 0.35;
 const float PARAPET_M = 0.8;
-const float ROOF_CELL_M = 7.5;
 
 float hash11(float x) {
   return fract(sin(x * 78.233) * 43758.5453);
@@ -136,7 +139,7 @@ vec3 facade() {
 
   float above = vHeight - SHOPFRONT_M;
   float upper = smoothstep(-wUp, wUp, above);
-  float style = step(0.5, hash11(vSeed + 0.37));
+  float style = step(0.35, hash11(vSeed + 0.37));
 
   float fx = fract(vU / WINDOW_M);
   float fy = fract(above / FLOOR_M);
@@ -157,32 +160,76 @@ vec3 facade() {
   float parapet = smoothstep(vTop - PARAPET_M - wUp, vTop - PARAPET_M + wUp, vHeight);
 
   // vEmissive already carries strength * EMISSIVE_MAX (~1.1 peak for a wall), so these
-  // are fractions of it: 0.9 clears the ~0.55 bloom threshold, 0.14 stays well under.
-  float light = 0.14 + max(max(0.9 * lit, 0.7 * parapet), shop);
-  return vBase * vShade * (1.0 - 0.45 * recess) + vEmissive * light;
+  // are fractions of it: 1.15 clears the ~0.55 bloom threshold, 0.14 stays well under.
+  float light = 0.14 + max(max(1.15 * lit, 0.7 * parapet), shop);
+  float canyon = mix(0.45, 1.0, smoothstep(0.0, 12.0, vHeight));
+  return vBase * vShade * canyon * (1.0 - 0.60 * recess) + vEmissive * light;
 }
 
 vec3 roof() {
-  float w = 0.6 / max(uScreenPxPerMetre, 0.0001) / ROOF_CELL_M;
-  vec2 cell = vWorldM / ROOF_CELL_M;
-  vec2 f = fract(cell);
-  // Wrapped before hashing: sin() of a city-sized coordinate is where drivers disagree.
-  float here = step(0.72, hash21(mod(floor(cell), 128.0) + vSeed * 53.0));
-  float outer = slab(f.x, 0.16, 0.84, w) * slab(f.y, 0.16, 0.84, w);
-  float inner = slab(f.x, 0.26, 0.74, w) * slab(f.y, 0.26, 0.74, w);
+  vec2 extentM = max(vec2(vU, abs(vShade)), vec2(0.0001));
+  float structured = step(0.0, vShade);
+  float angle = vTop;
+  float ca = cos(angle);
+  float sa = sin(angle);
+  vec2 fromCentre = vWorldM - vRoofCentreM;
+  vec2 local = mat2(ca, -sa, sa, ca) * fromCentre / extentM;
+  float aa = 0.75 / max(min(extentM.x, extentM.y) * uScreenPxPerMetre, 1.0);
+  float detailLod = lod(min(extentM.x, extentM.y), uScreenPxPerMetre) * structured;
+  float slope = clamp(0.5 + 0.5 * dot(fromCentre / max(length(extentM), 0.0001), vec2(0.5547, 0.8321)), 0.0, 1.0);
+  float plane = mix(1.06, 0.90, slope);
+  float inside = slab(local.x, -0.72, 0.72, aa) * slab(local.y, -0.72, 0.72, aa);
 
-  float fade = here * lod(ROOF_CELL_M, uScreenPxPerMetre);
-  float deck = inner * fade;
-  float rim = (outer - inner) * fade;
-  // Roofs are the largest visible area zoomed out, so the lift stays small: pushing one
-  // over the ~0.55 bloom threshold would bloom the whole city as one blob.
-  return vBase * vShade * (1.0 + 0.12 * deck - 0.16 * rim) + vEmissive * (1.0 + 0.45 * deck);
+  float padX = (hash11(vSeed + 5.31) - 0.5) * 0.24;
+  float padY = (hash11(vSeed + 6.17) - 0.5) * 0.24;
+  float padW = mix(0.26, 0.46, hash11(vSeed + 7.03));
+  float padH = mix(0.18, 0.34, hash11(vSeed + 8.11));
+  float padOuter = slab(local.x, padX - padW, padX + padW, aa)
+    * slab(local.y, padY - padH, padY + padH, aa);
+  float padInner = slab(local.x, padX - padW + 0.06, padX + padW - 0.06, aa)
+    * slab(local.y, padY - padH + 0.06, padY + padH - 0.06, aa);
+
+  float barW = mix(0.045, 0.08, hash11(vSeed + 9.23));
+  float barL = mix(0.30, 0.52, hash11(vSeed + 10.37));
+  float barGap = mix(0.10, 0.20, hash11(vSeed + 11.41));
+  float barsOuter = max(
+    slab(local.x, -barL, barL, aa) * slab(local.y, -barGap - barW - 0.04, -barGap + barW + 0.04, aa),
+    slab(local.x, -barL, barL, aa) * slab(local.y, barGap - barW - 0.04, barGap + barW + 0.04, aa));
+  float barsInner = max(
+    slab(local.x, -barL + 0.04, barL - 0.04, aa) * slab(local.y, -barGap - barW, -barGap + barW, aa),
+    slab(local.x, -barL + 0.04, barL - 0.04, aa) * slab(local.y, barGap - barW, barGap + barW, aa));
+
+  float style = hash11(vSeed + 12.59);
+  float padStyle = 1.0 - step(0.42, style);
+  float barsStyle = step(0.42, style) * (1.0 - step(0.78, style));
+  float pad = padInner * padStyle * inside * detailLod;
+  float padRim = (padOuter - padInner) * padStyle * inside * detailLod;
+  float skylight = barsInner * barsStyle * inside * detailLod;
+  float skylightRim = (barsOuter - barsInner) * barsStyle * inside * detailLod;
+  float frameOuter = slab(local.x, -0.92, 0.92, aa) * slab(local.y, -0.92, 0.92, aa);
+  float frameInner = slab(local.x, -0.78, 0.78, aa) * slab(local.y, -0.78, 0.78, aa);
+  float frame = (frameOuter - frameInner) * detailLod;
+
+  float structure = 1.0 + 0.16 * frame
+    - 0.10 * pad + 0.20 * padRim + 0.24 * skylight - 0.18 * skylightRim;
+  return vBase * plane * structure
+    + vEmissive * (1.0 + 0.25 * frame + 0.85 * skylight);
+}
+
+vec3 clutter() {
+  float cap = 1.0 - step(-0.5, vShade);
+  float edge = smoothstep(0.68, 0.84, max(abs(vU), abs(vTop))) * cap;
+  vec3 sideColour = vBase * vShade + vEmissive;
+  vec3 capColour = vBase * 0.55 + vEmissive * 0.12;
+  vec3 rimColour = vBase * 1.35 + vEmissive * 0.75 + vec3(0.025, 0.02, 0.06);
+  return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
 
 void main() {
   vec3 colour = vBase * vShade + vEmissive;
   if (vKind > 0.5 && vKind < 1.5) colour = facade();
   else if (vKind > 1.5 && vKind < 2.5) colour = roof();
-  gl_FragColor = vec4(colour, 1.0);
+  else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
+  gl_FragColor = vec4(colour + vec3(0.02, 0.015, 0.05), 1.0);
 }
 `;

@@ -1,4 +1,5 @@
 import {
+  setAntialias,
   setBloom,
   setCameraHeightM,
   setCameraZoomMode,
@@ -7,6 +8,8 @@ import {
 import {
   CAMERA_ZOOM_MODE,
   MODULE_ID,
+  SETTING_ANTIALIAS,
+  SETTING_ANTIALIAS_FACTOR,
   SETTING_BLOOM,
   SETTING_BLOOM_STRENGTH,
   SETTING_CAMERA_HEIGHT,
@@ -19,6 +22,8 @@ export type NixieSettingKey =
   | typeof SETTING_CAMERA_HEIGHT
   | typeof SETTING_CAMERA_ZOOM_MODE
   | typeof SETTING_RENDER_SCALE
+  | typeof SETTING_ANTIALIAS
+  | typeof SETTING_ANTIALIAS_FACTOR
   | typeof SETTING_BLOOM
   | typeof SETTING_BLOOM_STRENGTH;
 
@@ -31,6 +36,7 @@ interface SettingRange {
 const RANGES: Partial<Record<NixieSettingKey, SettingRange>> = {
   [SETTING_CAMERA_HEIGHT]: { min: 150, max: 2000, step: 25 },
   [SETTING_RENDER_SCALE]: { min: 0.25, max: 1, step: 0.05 },
+  [SETTING_ANTIALIAS_FACTOR]: { min: 1.25, max: 2, step: 0.25 },
   [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 }
 };
 
@@ -38,6 +44,8 @@ const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
   [SETTING_CAMERA_HEIGHT]: 500,
   [SETTING_CAMERA_ZOOM_MODE]: CAMERA_ZOOM_MODE.DOLLY,
   [SETTING_RENDER_SCALE]: 1,
+  [SETTING_ANTIALIAS]: true,
+  [SETTING_ANTIALIAS_FACTOR]: 1.5,
   [SETTING_BLOOM]: true,
   [SETTING_BLOOM_STRENGTH]: 1.35
 };
@@ -75,6 +83,10 @@ export function applySettings(): void {
   setCameraHeightM(settingValue<number>(SETTING_CAMERA_HEIGHT));
   setCameraZoomMode(settingValue<CameraZoomMode>(SETTING_CAMERA_ZOOM_MODE));
   setRenderScale(settingValue<number>(SETTING_RENDER_SCALE));
+  setAntialias(
+    settingValue<boolean>(SETTING_ANTIALIAS),
+    settingValue<number>(SETTING_ANTIALIAS_FACTOR)
+  );
   setBloom(settingValue<boolean>(SETTING_BLOOM), settingValue<number>(SETTING_BLOOM_STRENGTH));
 }
 
@@ -113,6 +125,29 @@ export function registerSettings(): void {
     range: RANGES[SETTING_RENDER_SCALE],
     default: DEFAULTS[SETTING_RENDER_SCALE],
     onChange: (value: number) => setRenderScale(value)
+  });
+
+  game.settings.register(MODULE_ID, SETTING_ANTIALIAS, {
+    name: "Antialiasing",
+    hint: "Supersample the city before presenting it. Disable this first on a weak client.",
+    scope: "client",
+    config: true,
+    type: Boolean,
+    default: DEFAULTS[SETTING_ANTIALIAS],
+    onChange: (value: boolean) =>
+      setAntialias(value, settingValue<number>(SETTING_ANTIALIAS_FACTOR))
+  });
+
+  game.settings.register(MODULE_ID, SETTING_ANTIALIAS_FACTOR, {
+    name: "Antialiasing Factor",
+    hint: "Supersampling resolution multiplier. Cost rises with the square of this value.",
+    scope: "client",
+    config: true,
+    type: Number,
+    range: RANGES[SETTING_ANTIALIAS_FACTOR],
+    default: DEFAULTS[SETTING_ANTIALIAS_FACTOR],
+    onChange: (value: number) =>
+      setAntialias(settingValue<boolean>(SETTING_ANTIALIAS), value)
   });
 
   game.settings.register(MODULE_ID, SETTING_BLOOM, {
