@@ -223,6 +223,74 @@ describe("junction clearance", () => {
     expect(byMaterial(quads, MATERIAL.CROSSING)).toEqual([]);
   });
 
+  it("keeps markings off a road they never meet at a node", () => {
+    const halfM = 9 / 2 + 2.5;
+    const tipM = halfM - 1;
+    const stray: RoadGraph = {
+      nodes: [
+        { id: "w", x: -200, y: 0 },
+        { id: "e", x: 200, y: 0 },
+        { id: "s", x: 0, y: 200 },
+        { id: "tip", x: 0, y: tipM }
+      ],
+      edges: [
+        { id: "we", a: "w", b: "e", classId: "street" },
+        { id: "stub", a: "s", b: "tip", classId: "street" }
+      ],
+      classes: ROAD_CLASSES.map((c) => ({ ...c }))
+    };
+    const px = toPixels(stray);
+    const quads = buildMarkings(px, PPM);
+    expect(quads.length).toBeGreaterThan(10);
+
+    const halfPx = halfM * PPM;
+    const distanceTo = (p: Vec2, a: Vec2, b: Vec2): number => {
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      const dx = (b.x - a.x) / len;
+      const dy = (b.y - a.y) / len;
+      const vx = p.x - a.x;
+      const vy = p.y - a.y;
+      const t = Math.min(len, Math.max(0, vx * dx + vy * dy));
+      return Math.hypot(vx - dx * t, vy - dy * t);
+    };
+    const through: [Vec2, Vec2] = [node(px, "w"), node(px, "e")];
+    const stub: [Vec2, Vec2] = [node(px, "s"), node(px, "tip")];
+
+    let checked = 0;
+    for (const q of quads) {
+      const alongX = Math.abs(q.ring[1]!.x - q.ring[0]!.x);
+      const alongY = Math.abs(q.ring[1]!.y - q.ring[0]!.y);
+      const foreign = alongX > alongY ? stub : through;
+      for (const p of q.ring) {
+        expect(distanceTo(p, foreign[0], foreign[1])).toBeGreaterThanOrEqual(halfPx - 1e-6);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+  });
+
+  it("does not treat two arms of the same road as foreign", () => {
+    const split: RoadGraph = {
+      nodes: [
+        { id: "a", x: -100, y: 0 },
+        { id: "b", x: 0, y: 0 },
+        { id: "c", x: 100, y: 0 }
+      ],
+      edges: [
+        { id: "ab", a: "a", b: "b", classId: "street" },
+        { id: "bc", a: "b", b: "c", classId: "street" }
+      ],
+      classes: ROAD_CLASSES.map((c) => ({ ...c }))
+    };
+    const px = toPixels(split);
+    const b = node(px, "b");
+    const nearby = byMaterial(buildMarkings(px, PPM), MATERIAL.LANE_MARK).filter(
+      (q) => Math.abs(ringCentroid(q.ring).x - b.x) < 10 * PPM
+    );
+
+    expect(nearby).toHaveLength(2);
+  });
+
   /**
    * The bug this file exists to prevent: kerb lines drawn straight across an open
    * junction. Insetting by the junction disc is not enough — two pavement strips meeting

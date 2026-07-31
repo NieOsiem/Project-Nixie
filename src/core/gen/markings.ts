@@ -53,6 +53,9 @@ const MAX_INSET_M = 30;
 /** Below this dot product two arms are one road passing through, not a turn. */
 const STRAIGHT_THROUGH_DOT = -0.998;
 
+/** Slack on the foreign-pavement test, in pixels. Matches the pipeline's own SNAP. */
+const PAVEMENT_EPS = 1e-3;
+
 interface Axis {
   /** Node `a` in world pixels. `t` runs along the edge from here, `c` across it. */
   origin: Vec2;
@@ -128,6 +131,28 @@ function pavementInset(dir: Vec2, others: Arm[], halfWidth: number, maxInset: nu
   return inset;
 }
 
+/** Distance from a point to an edge's centreline segment, capped at the endpoints. */
+function distanceToEdge(p: Vec2, e: EdgeMarking): number {
+  const vx = p.x - e.axis.origin.x;
+  const vy = p.y - e.axis.origin.y;
+  const t = Math.min(e.length, Math.max(0, vx * e.axis.dir.x + vy * e.axis.dir.y));
+  return Math.hypot(vx - e.axis.dir.x * t, vy - e.axis.dir.y * t);
+}
+
+// WHY: node-local insets cannot see roads that overlap without sharing a node.
+function onForeignPavement(ring: Ring, own: number, edges: EdgeMarking[]): boolean {
+  const source = edges[own]!;
+  for (let i = 0; i < edges.length; i++) {
+    if (i === own) continue;
+    const e = edges[i]!;
+    if (e.a === source.a || e.a === source.b || e.b === source.a || e.b === source.b) continue;
+    for (const p of ring) {
+      if (distanceToEdge(p, e) < e.pavedHalf - PAVEMENT_EPS) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Lane dashes, pedestrian crossings and kerb lines for a road graph already in world pixels.
  *
@@ -192,7 +217,7 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
   const clear = px(CLEAR_M);
   const maxInset = px(MAX_INSET_M);
 
-  const quads: MarkingQuad[] = [];
+  const quads: (MarkingQuad & { edge: number })[] = [];
 
   edges.forEach((e, index) => {
     const otherArms = (id: string): Arm[] =>
@@ -220,7 +245,8 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
         const t0 = k * dashPeriod;
         quads.push({
           ring: quad(e.axis, t0, t0 + dashLength, -dashHalf, dashHalf),
-          material: MATERIAL.LANE_MARK
+          material: MATERIAL.LANE_MARK,
+          edge: index
         });
       }
 
@@ -234,7 +260,8 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
             const c = k * stripePeriod;
             quads.push({
               ring: quad(e.axis, t0, t1, c - stripeHalf, c + stripeHalf),
-              material: MATERIAL.CROSSING
+              material: MATERIAL.CROSSING,
+              edge: index
             });
           }
         }
@@ -252,11 +279,14 @@ export function buildMarkings(graph: RoadGraph, pixelsPerMetre: number): Marking
         const inner = outer - kerbWidth * side;
         quads.push({
           ring: quad(e.axis, t0, t1, Math.min(outer, inner), Math.max(outer, inner)),
-          material: MATERIAL.KERB
+          material: MATERIAL.KERB,
+          edge: index
         });
       }
     }
   });
 
-  return quads;
+  return quads
+    .filter((q) => !onForeignPavement(q.ring, q.edge, edges))
+    .map(({ ring, material }) => ({ ring, material }));
 }
