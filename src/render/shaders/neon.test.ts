@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { MAX_PANEL_STRENGTH } from "../../core/gen/neon.js";
+import { DISTRICT_SLOT, PALETTE_PRESETS } from "../../core/palette.js";
 import { NEON_FRAG, NEON_VERT } from "./neon.js";
 
 describe("neon shaders", () => {
@@ -40,6 +42,27 @@ describe("neon shaders", () => {
       "vGlyphPxPerM = aRoofCentre.x >= aRoofCentre.y ? uScreenPxPerMetre : upPxPerMetre;"
     );
     expect(NEON_FRAG).toContain("smoothstep(1.5, 4.0, GLYPH_PERIOD_M * vGlyphPxPerM)");
+  });
+
+  it("keeps unlit glyph gaps under the composite's clamp", () => {
+    // post.ts ends in c *= 1/(1 + max(m-1, 0)), which for m >= 1 is an exact clamp to 1.0,
+    // not a shoulder. Everything at or above the clamp renders identically, so the panel's
+    // structure can only live in what stays below it. If a gap clips, the panel is a blob.
+    const mix = NEON_FRAG.match(/g = spill \* ([\d.]+) \+ lit \* ([\d.]+);/);
+    expect(mix).not.toBeNull();
+    const [gapCoefficient, litCoefficient] = [Number(mix![1]), Number(mix![2])];
+
+    const brightestNeon = Math.max(
+      ...PALETTE_PRESETS.flatMap((p) =>
+        [DISTRICT_SLOT.NEON_A, DISTRICT_SLOT.NEON_B].map(
+          (slot) => p.materials[slot]!.emissiveStrength
+        )
+      )
+    );
+    const peak = brightestNeon * MAX_PANEL_STRENGTH;
+
+    expect(gapCoefficient * peak).toBeLessThan(0.85);
+    expect((gapCoefficient + litCoefficient) * peak).toBeGreaterThan(1);
   });
 
   it("uses neither discard nor unavailable derivatives", () => {

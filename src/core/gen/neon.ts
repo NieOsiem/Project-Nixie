@@ -64,6 +64,9 @@ const POOL_STRENGTH = 0.22;
 const STRENGTH_SPREAD = 0.6;
 const FACADE_STRENGTH = 0.7;
 
+/** Brightest a panel can be, before the palette's own emissive strength. */
+export const MAX_PANEL_STRENGTH = FACADE_STRENGTH + STRENGTH_SPREAD;
+
 /** Local quad coords, one per corner: (-1,-1) (1,-1) (1,1) (-1,1). */
 const LOCAL_U = [-1, 1, 1, -1];
 const LOCAL_V = [-1, -1, 1, 1];

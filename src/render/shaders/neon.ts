@@ -99,9 +99,9 @@ varying float vSeed;
 
 uniform float uGlowMarginM;
 
-const float GLYPH_PERIOD_M = 1.1;
+// Coarse enough that the ¼-res bloom blur cannot smear the blocks across the gaps.
+const float GLYPH_PERIOD_M = 1.6;
 const float GLYPH_FILL = 0.62;
-const float GLYPH_DIM = 0.42;
 
 float hash11(float x) {
   return fract(sin(x * 78.233) * 43758.5453);
@@ -125,9 +125,6 @@ void main() {
     vec2 panel = vPanelM / max(vPanelM + uGlowMarginM, vec2(1e-4));
     float box = max(d.x / max(panel.x, 1e-4), d.y / max(panel.y, 1e-4));
 
-    float face = 1.0 - smoothstep(0.86, 1.0, box);
-    float frame = smoothstep(0.70, 0.86, box) * (1.0 - smoothstep(1.0, 1.14, box));
-
     // Blocks along the panel's long axis: reads as writing at a glance without being
     // writing, and keeps a 20 m banner from being one long smear.
     float alongM = vPanelM.x >= vPanelM.y
@@ -138,14 +135,24 @@ void main() {
     float halfFill = GLYPH_FILL * (0.45 + 0.55 * hash11(floor(cell) + vSeed * 37.0)) * 0.5;
     float aa = 0.5 / max(GLYPH_PERIOD_M * vGlyphPxPerM, 1.0);
     float block = 1.0 - smoothstep(halfFill - aa, halfFill + aa, abs(fract(cell) - 0.5));
-    // Sub-pixel glyphs would alias into noise, and there are no derivatives here, so the
-    // pattern LODs to flat against the vertex shader's px/metre instead.
-    float glyphs = mix(1.0, mix(GLYPH_DIM, 1.0, block),
-                       smoothstep(1.5, 4.0, GLYPH_PERIOD_M * vGlyphPxPerM));
 
-    // Zero on the whole |vLocal| = 1 boundary, so abutting quads cannot show a seam.
-    float halo = 1.0 - smoothstep(0.0, 1.0, max(d.x, d.y));
-    g = halo * 0.45 + face * glyphs * 0.55 + frame * 0.5;
+    // Sub-pixel detail would alias into noise and there are no derivatives here, so glyphs
+    // and frame both LOD out against the vertex shader's px/metre: a distant panel is a
+    // plain lit rectangle, which is what it should be.
+    float detail = smoothstep(1.5, 4.0, GLYPH_PERIOD_M * vGlyphPxPerM);
+
+    float inside = 1.0 - smoothstep(0.94, 1.02, box);
+    float frame = smoothstep(0.78, 0.90, box) * inside * detail;
+    float lit = max(frame, inside * mix(1.0, block, detail));
+
+    // WHY the shape is carved out of unlit gaps rather than piled on in highlights: the
+    // composite ends in c *= 1/(1 + max(m-1, 0)), which for m >= 1 is an exact clamp to 1.0,
+    // not a shoulder. Panels run at 1.65x strength, so a frame at g=1.35, a lit glyph at
+    // g=1.00 and a gap at g=0.68 all resolved to the identical pixel and the panel read as a
+    // featureless blob. Only what stays under the clamp can carry structure, so the gaps do.
+    // Keep spill * gap below ~0.47 or the gaps clip too and the blob comes back.
+    float spill = 1.0 - smoothstep(0.0, 1.0, max(d.x, d.y));
+    g = spill * 0.24 + lit * 0.85;
   }
 
   // Alpha 0, not g: BLEND_MODES.ADD is blendFunc(ONE, ONE), so alpha accumulates too and
