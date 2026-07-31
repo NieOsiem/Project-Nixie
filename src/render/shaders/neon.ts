@@ -68,7 +68,15 @@ void main() {
     length(fromPivot) * uCamHeight / (eye * eye) * uScreenPxPerMetre * uLeanStrength;
   vGlyphPxPerM = aRoofCentre.x >= aRoofCentre.y ? uScreenPxPerMetre : upPxPerMetre;
 
-  float bias = mix(SIGN_BIAS_M, POOL_BIAS_M, step(0.5, aShade));
+  // WHY: dist is convex in position but the rasterizer interpolates it linearly across a
+  // triangle, so a large quad reads FURTHER than the truth by ~span^2 * ppm / camHeight
+  // metres. Measured 1.8 m for a 60 m pool at the default 500 m camera and 5.9 m at 150 m,
+  // against a 1.5 m bias — the pool lost the depth test over part of itself and the ground
+  // showed sharp triangular bites along the quad's own diagonal. Panels are small enough
+  // that their term is noise, and adding it there would undo SIGN_BIAS_M.
+  float span = max(aRoofCentre.x, aRoofCentre.y);
+  float curvature = span * span * uPixelsPerMetre / max(uCamHeight, 1.0);
+  float bias = mix(SIGN_BIAS_M, POOL_BIAS_M + curvature, step(0.5, aShade));
   float dist = length(vec3(fromPivot, uCamHeight - hpx)) - bias * uPixelsPerMetre;
   float z = clamp(dist / uDepthFar, 0.0, 1.0) * 2.0 - 1.0;
 

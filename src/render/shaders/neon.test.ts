@@ -11,7 +11,18 @@ describe("neon shaders", () => {
   it("biases a facade panel far less than a pool, so a hidden wall stays hidden", () => {
     expect(NEON_VERT).toContain("const float SIGN_BIAS_M = 0.25;");
     expect(NEON_VERT).toContain("const float POOL_BIAS_M = 1.5;");
-    expect(NEON_VERT).toContain("float bias = mix(SIGN_BIAS_M, POOL_BIAS_M, step(0.5, aShade));");
+    expect(NEON_VERT).toContain(
+      "float bias = mix(SIGN_BIAS_M, POOL_BIAS_M + curvature, step(0.5, aShade));"
+    );
+  });
+
+  it("adds the pool's linear-interpolation depth error to its bias", () => {
+    // A flat bias cannot cover it: the error scales with quad size and 1 / camera height,
+    // and at r=30 it crosses 1.5 m at every camera at or below the 500 m default.
+    expect(NEON_VERT).toContain("float span = max(aRoofCentre.x, aRoofCentre.y);");
+    expect(NEON_VERT).toContain(
+      "float curvature = span * span * uPixelsPerMetre / max(uCamHeight, 1.0);"
+    );
   });
 
   it("thresholds the panel per axis against its own half-extents", () => {
