@@ -3,6 +3,7 @@ import {
   setBloom,
   setCameraHeightM,
   setCameraZoomMode,
+  setRain,
   setRenderScale
 } from "./adapter/canvas.js";
 import {
@@ -14,6 +15,7 @@ import {
   SETTING_BLOOM_STRENGTH,
   SETTING_CAMERA_HEIGHT,
   SETTING_CAMERA_ZOOM_MODE,
+  SETTING_RAIN_STRENGTH,
   SETTING_RENDER_SCALE
 } from "./constants.js";
 import type { CameraZoomMode } from "./constants.js";
@@ -25,7 +27,8 @@ export type NixieSettingKey =
   | typeof SETTING_ANTIALIAS
   | typeof SETTING_ANTIALIAS_FACTOR
   | typeof SETTING_BLOOM
-  | typeof SETTING_BLOOM_STRENGTH;
+  | typeof SETTING_BLOOM_STRENGTH
+  | typeof SETTING_RAIN_STRENGTH;
 
 interface SettingRange {
   min: number;
@@ -37,7 +40,8 @@ const RANGES: Partial<Record<NixieSettingKey, SettingRange>> = {
   [SETTING_CAMERA_HEIGHT]: { min: 150, max: 2000, step: 25 },
   [SETTING_RENDER_SCALE]: { min: 0.25, max: 1, step: 0.05 },
   [SETTING_ANTIALIAS_FACTOR]: { min: 1.25, max: 2, step: 0.25 },
-  [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 }
+  [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 },
+  [SETTING_RAIN_STRENGTH]: { min: 0, max: 2, step: 0.05 }
 };
 
 const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
@@ -47,7 +51,8 @@ const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
   [SETTING_ANTIALIAS]: true,
   [SETTING_ANTIALIAS_FACTOR]: 1.5,
   [SETTING_BLOOM]: true,
-  [SETTING_BLOOM_STRENGTH]: 1.35
+  [SETTING_BLOOM_STRENGTH]: 1.35,
+  [SETTING_RAIN_STRENGTH]: 1
 };
 
 /**
@@ -88,6 +93,7 @@ export function applySettings(): void {
     settingValue<number>(SETTING_ANTIALIAS_FACTOR)
   );
   setBloom(settingValue<boolean>(SETTING_BLOOM), settingValue<number>(SETTING_BLOOM_STRENGTH));
+  setRain(settingValue<number>(SETTING_RAIN_STRENGTH));
 }
 
 export function registerSettings(): void {
@@ -169,6 +175,17 @@ export function registerSettings(): void {
     range: RANGES[SETTING_BLOOM_STRENGTH],
     default: DEFAULTS[SETTING_BLOOM_STRENGTH],
     onChange: (value: number) => setBloom(settingValue<boolean>(SETTING_BLOOM), value)
+  });
+
+  game.settings.register(MODULE_ID, SETTING_RAIN_STRENGTH, {
+    name: "Rain",
+    hint: "Rain, splashes and drifting haze over the city. 0 is a dry night and costs nothing.",
+    scope: "world",
+    config: true,
+    type: Number,
+    range: RANGES[SETTING_RAIN_STRENGTH],
+    default: DEFAULTS[SETTING_RAIN_STRENGTH],
+    onChange: (value: number) => setRain(value)
   });
 
   applySettings();

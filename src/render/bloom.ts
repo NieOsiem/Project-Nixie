@@ -1,3 +1,4 @@
+import type { LookDials } from "./look-dials.js";
 import { ScreenQuad } from "./screen-quad.js";
 import {
   BLUR_FRAG,
@@ -21,34 +22,6 @@ const WIDE_STRENGTH = 0.55;
 const STREAK_STRIDE_A = 1;
 const STREAK_STRIDE_B = STREAK_TAPS;
 
-/** Live look dials. Plain mutable object; `render` pushes it into uniforms every call. */
-export interface LookDials {
-  fogStrength: number;
-  fogDensity: number;
-  fogHeightM: number;
-  fogInscatter: number;
-  fogTintR: number;
-  fogTintG: number;
-  fogTintB: number;
-  aoStrength: number;
-  aoHeightM: number;
-  streakStrength: number;
-}
-
-/** User-tuned in Foundry, 2026-07-31. Grain lives in FX Master's filter stack, not here. */
-export const DEFAULT_LOOK_DIALS: LookDials = {
-  fogStrength: 0.35,
-  fogDensity: 3.2,
-  fogHeightM: 36,
-  fogInscatter: 32,
-  fogTintR: 0.055,
-  fogTintG: 0.045,
-  fogTintB: 0.085,
-  aoStrength: 0.45,
-  aoHeightM: 18,
-  streakStrength: 1.3
-};
-
 /**
  * Threshold + downsample -> narrow and wide separable blurs + horizontal streak -> composite,
  * plus a blurred building mask for ground AO.
@@ -59,8 +32,8 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
 export class BloomChain {
   /** False skips the blur, streak and threshold passes only. The composite always runs. */
   bloomEnabled = true;
-  readonly dials: LookDials = { ...DEFAULT_LOOK_DIALS };
 
+  #dials: LookDials;
   #renderer: any;
   #threshold: ScreenQuad;
   #blurH: ScreenQuad;
@@ -104,8 +77,10 @@ export class BloomChain {
   #shadowUvScale = new Float32Array([1, 1]);
   #maskUvScale = new Float32Array([1, 1]);
 
-  constructor(renderer: any) {
+  /** `dials` is the renderer's own object, shared not copied: mutating it retunes the next frame. */
+  constructor(renderer: any, dials: LookDials) {
     this.#renderer = renderer;
+    this.#dials = dials;
 
     this.#threshold = new ScreenQuad(THRESHOLD_FRAG, {
       uScene: PIXI.Texture.EMPTY,
@@ -184,16 +159,16 @@ export class BloomChain {
       uAo: PIXI.Texture.EMPTY,
       uNarrowStrength: 1,
       uWideStrength: WIDE_STRENGTH,
-      uStreakStrength: DEFAULT_LOOK_DIALS.streakStrength,
-      uAoStrength: DEFAULT_LOOK_DIALS.aoStrength,
-      uAoHeightM: DEFAULT_LOOK_DIALS.aoHeightM,
-      uFogStrength: DEFAULT_LOOK_DIALS.fogStrength,
-      uFogDensity: DEFAULT_LOOK_DIALS.fogDensity,
-      uFogHeightM: DEFAULT_LOOK_DIALS.fogHeightM,
-      uFogInscatter: DEFAULT_LOOK_DIALS.fogInscatter,
-      uFogTintR: DEFAULT_LOOK_DIALS.fogTintR,
-      uFogTintG: DEFAULT_LOOK_DIALS.fogTintG,
-      uFogTintB: DEFAULT_LOOK_DIALS.fogTintB,
+      uStreakStrength: dials.streakStrength,
+      uAoStrength: dials.aoStrength,
+      uAoHeightM: dials.aoHeightM,
+      uFogStrength: dials.fogStrength,
+      uFogDensity: dials.fogDensity,
+      uFogHeightM: dials.fogHeightM,
+      uFogInscatter: dials.fogInscatter,
+      uFogTintR: dials.fogTintR,
+      uFogTintG: dials.fogTintG,
+      uFogTintB: dials.fogTintB,
       uPivotUv: new Float32Array([0.5, 0.5]),
       uSceneUvScale: this.#sceneUvScale,
       uBloomUvScale: this.#bloomUvScale,
@@ -263,7 +238,7 @@ export class BloomChain {
     this.#aoBlurV.uniforms.uTex = this.#aoB;
     renderer.render(this.#aoBlurV.display, { renderTexture: this.#aoA, clear: true });
 
-    const dials = this.dials;
+    const dials = this.#dials;
     const composite = this.#composite.uniforms;
     composite.uScene = scene;
     composite.uBloomNarrow = this.#bloomA;

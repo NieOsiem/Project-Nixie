@@ -58,7 +58,7 @@ import {
   type DistrictPalette,
   type Material
 } from "../core/palette.js";
-import type { LookDials } from "../render/bloom.js";
+import type { LookDials } from "../render/look-dials.js";
 import {
   CityRenderer,
   type ChunkGeometry,
@@ -139,6 +139,7 @@ let antialias = true;
 let antialiasFactor = 1.5;
 let bloomEnabled = true;
 let bloomStrength = 1;
+let rainStrength = 1;
 
 /** Unsaved palette being dragged in the editor. Cleared on commit or cancel. */
 let palettePreview: { id: string; palette: DistrictPalette } | null = null;
@@ -230,6 +231,7 @@ export function mount(): void {
   cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
+  cityRenderer.rainStrength = rainStrength;
   frameQuality.reset();
   footProbe = new FootProbe(canvas.app.renderer);
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
@@ -250,6 +252,13 @@ export function mount(): void {
   cityRenderer.overlay.sortLayer = 900;
   cityRenderer.overlay.sort = 0;
   canvas.primary.addChild(cityRenderer.overlay);
+
+  // Rain falls in front of people, so this clears the building overlay (900) and the tokens the
+  // foot probe lifts above it (950). Under SORT_LAYERS.WEATHER (1000), which is the host's.
+  cityRenderer.weather.elevation = 0;
+  cityRenderer.weather.sortLayer = WEATHER_SORT_LAYER;
+  cityRenderer.weather.sort = 0;
+  canvas.primary.addChild(cityRenderer.weather);
   canvas.primary.sortDirty = true;
 
   // HIGH outruns PIXI.Application's own render, which sits at LOW; the offscreen
@@ -258,7 +267,10 @@ export function mount(): void {
     const renderer = cityRenderer;
     if (renderer === null) return;
     const camera = readCamera();
-    renderer.update(camera, frameQuality.sample(camera, performance.now()));
+    const now = performance.now();
+    renderer.update(camera, frameQuality.sample(camera, now));
+    // Outside the frame cache on purpose — the city may have drawn nothing this tick.
+    renderer.animate(now);
     sortTokensAgainstOverlay(renderer.maskFrame());
   };
   canvas.app.ticker.add(tickerCallback, null, PIXI.UPDATE_PRIORITY.HIGH);
@@ -285,6 +297,7 @@ export function unmount(): void {
   footProbe = null;
   cityRenderer.display.parent?.removeChild(cityRenderer.display);
   cityRenderer.overlay.parent?.removeChild(cityRenderer.overlay);
+  cityRenderer.weather.parent?.removeChild(cityRenderer.weather);
   cityRenderer.destroy();
   cityRenderer = null;
   frameQuality.reset();
@@ -705,6 +718,12 @@ export function setBloom(enabled: boolean, strength?: number): void {
   cityRenderer.bloomStrength = bloomStrength;
 }
 
+export function setRain(strength: number): void {
+  rainStrength = Math.max(0, strength);
+  if (cityRenderer === null) return;
+  cityRenderer.rainStrength = rainStrength;
+}
+
 /**
  * Live look tuning for the post chain. In-memory only, like the lean calibration API — these
  * are iterated on in the console and then written into the shader defaults, not persisted.
@@ -1041,6 +1060,9 @@ const tokenSortLayer = (): number =>
 
 /** Above the building overlay, below weather at 1000. */
 const ABOVE_OVERLAY_SORT_LAYER = 950;
+
+/** Above everything at ground elevation, still under the host's own weather at 1000. */
+const WEATHER_SORT_LAYER = 990;
 
 function setSortLayer(token: any, layer: number): boolean {
   const mesh = token?.mesh;

@@ -21,6 +21,7 @@ export const SETTING_ANTIALIAS = "antialias";
 export const SETTING_ANTIALIAS_FACTOR = "antialiasFactor";
 export const SETTING_BLOOM = "bloom";
 export const SETTING_BLOOM_STRENGTH = "bloomStrength";
+export const SETTING_RAIN_STRENGTH = "rainStrength";
 
 export const CAMERA_ZOOM_MODE = {
   FIXED: "fixed",

@@ -9,7 +9,8 @@ import {
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
 import { dollyLeanStrength } from "../core/lean-curve.js";
-import { BloomChain, type LookDials } from "./bloom.js";
+import { BloomChain } from "./bloom.js";
+import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import {
   UNCULLED_BOUNDS,
   WHOLE_CITY_CHUNK_ID,
@@ -27,6 +28,8 @@ import type { MaskFrame } from "./foot-probe.js";
 import { PaletteTexture } from "./palette-texture.js";
 import { ScreenQuad } from "./screen-quad.js";
 import { CITY_OVERLAY_FRAG } from "./shaders/occlusion.js";
+import { RAIN_FALL_M } from "./shaders/weather.js";
+import { WeatherOverlay } from "./weather-overlay.js";
 
 export type { ChunkGeometry } from "./chunk-culling.js";
 
@@ -80,6 +83,14 @@ export class CityRenderer {
    * the host decides what it covers purely by where it is inserted.
    */
   readonly overlay: any;
+  /**
+   * Rain, splashes and drifting haze, animated over the presented city.
+   *
+   * A third display object rather than a term in the post chain: the settled frame is cached and a
+   * stationary frame draws nothing, so a time-varying composite would charge the whole city cost
+   * at 60 fps forever. Inserted above the token layers, since rain falls in front of people.
+   */
+  readonly weather: any;
 
   #renderer: any;
   #target: any = null;
@@ -93,7 +104,12 @@ export class CityRenderer {
   #chunks = new Map<string, LiveChunk>();
   #palette: PaletteTexture;
   #bloom: BloomChain;
+  #weather: WeatherOverlay;
+  /** One object, shared with the bloom chain and the weather quad. Mutated in place to retune. */
+  #dials: LookDials = { ...DEFAULT_LOOK_DIALS };
   #bloomStrength = 1.3;
+  #rainStrength = 1;
+  #lastAnimateS: number | null = null;
   #lastCamera: CameraState | null = null;
   #lastQuality: FrameQuality | null = null;
   #contentDirty = true;
@@ -127,7 +143,7 @@ export class CityRenderer {
     this.#cameraZoomMode = options.cameraZoomMode;
     // One texture for every chunk: retinting a district must not mean an upload per chunk.
     this.#palette = new PaletteTexture(palette);
-    this.#bloom = new BloomChain(renderer);
+    this.#bloom = new BloomChain(renderer, this.#dials);
 
     this.#content = new PIXI.Container();
     this.#detailContent = new PIXI.Container();
@@ -148,6 +164,9 @@ export class CityRenderer {
     this.#overlay.display.visible = false;
     this.#overlay.display.eventMode = "none";
     this.overlay = this.#overlay.display;
+
+    this.#weather = new WeatherOverlay(this.#pivotUv, this.#overlayUvScale);
+    this.weather = this.#weather.display;
   }
 
   /** Resolution multiplier for the offscreen pass. Lower trades sharpness for frame time. */
@@ -244,7 +263,7 @@ export class CityRenderer {
 
   /** Live look dials, mutated in place. Call `markContentDirty` after touching them. */
   get lookDials(): LookDials {
-    return this.#bloom.dials;
+    return this.#dials;
   }
 
   get bloomStrength(): number {
@@ -256,6 +275,20 @@ export class CityRenderer {
     if (clamped === this.#bloomStrength) return;
     this.#bloomStrength = clamped;
     this.#contentDirty = true;
+  }
+
+  /**
+   * Weather intensity. 0 hides the overlay outright, so a dry night costs no fill.
+   *
+   * Deliberately does not dirty the content: the overlay is outside the frame cache and picks
+   * this up on the next `animate`, so it retunes live even while the camera is parked.
+   */
+  get rainStrength(): number {
+    return this.#rainStrength;
+  }
+
+  set rainStrength(value: number) {
+    this.#rainStrength = Math.max(0, value);
   }
 
   markContentDirty(): void {
@@ -499,10 +532,37 @@ export class CityRenderer {
     this.#overlay.display.scale.set(view.width, view.height);
     this.#overlay.display.visible = this.#chunksDrawn > 0;
 
+    // WHY the raw scene target and not the composite: height and coverage live in the scene
+    // target's alpha, and the composite writes a flat 1.0 there. Handing it the presented texture
+    // instead type-checks, renders, and silently reports every pixel as ground.
+    this.#weather.setFrame(
+      this.display.texture,
+      this.#target,
+      view,
+      this.#pixelsPerMetre,
+      zoom,
+      (RAIN_FALL_M / Math.max(this.#cameraHeightMetres - RAIN_FALL_M, 1)) * leanStrength
+    );
+
     this.#lastCamera = cloneCamera(camera);
     this.#lastQuality = quality;
     this.#contentDirty = false;
     this.#renderCount++;
+  }
+
+  /**
+   * One frame of weather, independent of whether the city redrew.
+   *
+   * Separate from `update` because that early-outs on a static camera — this is the whole reason
+   * the animation lives in its own quad. Cheap: a clock, a drift offset and the dial uniforms.
+   */
+  animate(nowMs: number): void {
+    const seconds = nowMs / 1000;
+    const elapsed = this.#lastAnimateS === null ? 0 : seconds - this.#lastAnimateS;
+    this.#lastAnimateS = seconds;
+    this.#weather.advance(elapsed, this.#dials, this.#rainStrength);
+    this.#weather.display.visible =
+      this.#target !== null && this.#chunksDrawn > 0 && this.#rainStrength > 0;
   }
 
   stats(): Record<string, unknown> {
@@ -535,7 +595,8 @@ export class CityRenderer {
       detailTrianglesTotal,
       bloom: this.#bloom.bloomEnabled,
       bloomStrength: this.#bloomStrength,
-      lookDials: { ...this.#bloom.dials },
+      rainStrength: this.#rainStrength,
+      lookDials: { ...this.#dials },
       targetSize: this.#target ? [this.#target.width, this.#target.height] : null,
       targetCapacity: this.#target
         ? [
@@ -554,6 +615,7 @@ export class CityRenderer {
     this.#releaseTarget();
     this.clearChunks();
     this.#overlay.destroy();
+    this.#weather.destroy();
     this.#palette.destroy();
     this.#content.destroy({ children: true });
     this.#detailContent.destroy({ children: true });
@@ -562,6 +624,7 @@ export class CityRenderer {
     this.display.destroy();
     this.#lastCamera = null;
     this.#lastQuality = null;
+    this.#lastAnimateS = null;
   }
 
   #ensureTarget(camera: CameraState, quality: FrameQuality): boolean {
@@ -652,6 +715,7 @@ export class CityRenderer {
     this.#overlay.display.visible = false;
     this.#overlay.uniforms.uCity = PIXI.Texture.EMPTY;
     this.#overlay.uniforms.uMask = PIXI.Texture.EMPTY;
+    this.#weather.clear();
     this.#target = null;
     this.#maskTarget = null;
     this.#shadowTarget = null;

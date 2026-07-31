@@ -2,6 +2,7 @@ import {
   MODULE_ID,
   SETTING_CAMERA_HEIGHT,
   SETTING_CAMERA_ZOOM_MODE,
+  SETTING_RAIN_STRENGTH,
   SETTING_RENDER_SCALE,
   type CameraZoomMode
 } from "./constants.js";
@@ -117,6 +118,10 @@ Hooks.once("init", () => {
     setCameraZoomMode: async (mode: CameraZoomMode) => {
       await setSettingValue(SETTING_CAMERA_ZOOM_MODE, mode);
       return settingValue<CameraZoomMode>(SETTING_CAMERA_ZOOM_MODE);
+    },
+    setRain: async (strength: number) => {
+      await setSettingValue(SETTING_RAIN_STRENGTH, strength);
+      return settingValue<number>(SETTING_RAIN_STRENGTH);
     },
 
     lookDials,

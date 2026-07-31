@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_LOOK_DIALS } from "../bloom.js";
+import { DEFAULT_LOOK_DIALS } from "../look-dials.js";
 import {
   BLUR_FRAG,
   COMPOSITE_FRAG,
@@ -179,7 +179,15 @@ describe("look dials", () => {
       fogTintB: 0.085,
       aoStrength: 0.45,
       aoHeightM: 18,
-      streakStrength: 1.3
+      streakStrength: 1.3,
+      rainDrops: 0.85,
+      rainStreakPx: 15,
+      rainLit: 1.6,
+      splashStrength: 0.5,
+      hazeStrength: 0.12,
+      hazeBandM: 46,
+      hazeDrift: 0.7,
+      hazeInscatter: 0.35
     });
   });
 });

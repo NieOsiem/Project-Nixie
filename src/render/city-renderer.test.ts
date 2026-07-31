@@ -175,8 +175,11 @@ const SCREEN_H = 1440;
 /** Opaque colour, building silhouette, and quarter-resolution roof shadows. */
 const CITY_PASSES = 3;
 const CITY_RENDER_TEXTURES = 3;
-/** The overlay's screen quad, allocated once for the renderer's lifetime. */
-const OVERLAY_QUAD = 1;
+/**
+ * The building-occlusion quad and the weather quad, allocated once for the renderer's lifetime.
+ * Neither owns a render target: both sample textures the city passes already produced.
+ */
+const OVERLAY_QUAD = 2;
 
 const cam = (over: Partial<CameraState> = {}): CameraState => ({
   stageX: SCREEN_W / 2,
@@ -458,6 +461,87 @@ describe("CityRenderer building overlay", () => {
     r.update(cam());
 
     expect((r.overlay as StubMesh).visible).toBe(false);
+    r.destroy();
+  });
+});
+
+describe("CityRenderer weather overlay", () => {
+  it("animates on frames where the cached city draws nothing", () => {
+    // The entire reason this is a separate quad. If the clock only advanced when the city
+    // redrew, rain would freeze the moment the camera stopped — which is most of the time.
+    const r = make();
+    r.setChunk(chunk("0,0", NEAR));
+    r.update(cam());
+    r.animate(1000);
+    const settled = renderCalls;
+    const before = (r.weather as StubMesh).shader.uniforms.uTime as number;
+
+    r.update(cam());
+    r.animate(1500);
+
+    expect(renderCalls).toBe(settled);
+    expect((r.weather as StubMesh).shader.uniforms.uTime as number).toBeGreaterThan(before);
+    expect((r.weather as StubMesh).visible).toBe(true);
+    r.destroy();
+  });
+
+  it("reads height off the raw scene target, not the composite that flattened its alpha", () => {
+    const r = make();
+    r.setChunk(chunk("0,0", NEAR));
+    const camera = cam({ pivotX: 900, pivotY: 700, scale: 2 });
+    r.update(camera);
+    r.animate(0);
+
+    const view = visibleWorldRect(camera);
+    const weather = r.weather as StubMesh;
+    const display = r.display as StubSprite;
+    expect(weather.shader.uniforms.uCity).toBe(display.texture);
+    expect(weather.shader.uniforms.uHeight).toBe(createdTargets[0]);
+    expect(weather.shader.uniforms.uHeight).not.toBe(display.texture);
+    expect([weather.position.x, weather.position.y]).toEqual([view.x, view.y]);
+    expect([weather.scale.x, weather.scale.y]).toEqual([view.width, view.height]);
+    r.destroy();
+  });
+
+  it("hides at zero strength and comes back live, without redrawing the city", () => {
+    const r = make();
+    r.setChunk(chunk("0,0", NEAR));
+    r.update(cam());
+    r.animate(0);
+    expect((r.weather as StubMesh).visible).toBe(true);
+
+    // A dial outside the frame cache: it must take effect on the next tick with the camera parked.
+    r.rainStrength = 0;
+    const before = renderCalls;
+    r.update(cam());
+    r.animate(16);
+    expect((r.weather as StubMesh).visible).toBe(false);
+
+    r.rainStrength = 1;
+    r.update(cam());
+    r.animate(32);
+    expect((r.weather as StubMesh).visible).toBe(true);
+    expect(renderCalls).toBe(before);
+    expect(r.stats()).toMatchObject({ rainStrength: 1 });
+    r.destroy();
+  });
+
+  it("stays hidden while no chunk is on screen", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(chunk("0,0", FAR));
+    r.update(cam());
+    r.animate(0);
+
+    expect((r.weather as StubMesh).visible).toBe(false);
+    r.destroy();
+  });
+
+  it("animates safely before any city frame exists", () => {
+    const r = make();
+    r.animate(0);
+    r.animate(16);
+    expect((r.weather as StubMesh).visible).toBe(false);
     r.destroy();
   });
 });
