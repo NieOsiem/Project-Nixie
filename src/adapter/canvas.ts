@@ -1,7 +1,9 @@
 import {
   CAMERA_ZOOM_MODE,
   MODULE_ID,
-  type CameraZoomMode
+  WEATHER,
+  type CameraZoomMode,
+  type Weather
 } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
 import { buildChunk, chunkMarginM, cityChunks } from "../core/gen/chunked.js";
@@ -59,7 +61,7 @@ import {
   type DistrictPalette,
   type Material
 } from "../core/palette.js";
-import type { LookDials } from "../render/look-dials.js";
+import { WEATHER_PRESETS, type LookDials } from "../render/look-dials.js";
 import {
   CityRenderer,
   type ChunkGeometry,
@@ -141,6 +143,7 @@ let antialiasFactor = 1.5;
 let bloomEnabled = true;
 let bloomStrength = 1;
 let rainStrength = 1;
+let weather: Weather = WEATHER.RAIN;
 
 /** Unsaved palette being dragged in the editor. Cleared on commit or cancel. */
 let palettePreview: { id: string; palette: DistrictPalette } | null = null;
@@ -232,7 +235,7 @@ export function mount(): void {
   cityRenderer.leanOverride = leanOverride;
   cityRenderer.bloomEnabled = bloomEnabled;
   cityRenderer.bloomStrength = bloomStrength;
-  cityRenderer.rainStrength = rainStrength;
+  applyWeather();
   frameQuality.reset();
   footProbe = new FootProbe(canvas.app.renderer);
   // WHY: the constructor installs an empty whole-city chunk. Chunked builds own the
@@ -785,8 +788,41 @@ export function setBloom(enabled: boolean, strength?: number): void {
 /** Unbounded on purpose — nothing here rewrites the value the user asked for. */
 export function setRain(strength: number): void {
   rainStrength = strength;
+  pushRainStrength();
+}
+
+/**
+ * Select a weather preset: it writes its handful of dials and switches the overlay on or off.
+ *
+ * `rainStrength` stays the user's own multiplier on top and is never overwritten here — the preset
+ * decides the character of the rain, the setting decides how hard it comes down.
+ */
+export function setWeather(next: Weather): void {
+  weather = WEATHER_PRESETS[next] === undefined ? WEATHER.RAIN : next;
+  applyWeather();
+}
+
+export function currentWeather(): Weather {
+  return weather;
+}
+
+/**
+ * Writes the preset's dials. Only for a preset change or a mount — **never** for `setRain`, which
+ * would then wipe whatever the user had tuned live through `setLookDials`.
+ */
+function applyWeather(): void {
+  const renderer = cityRenderer;
+  if (renderer === null) return;
+  Object.assign(renderer.lookDials, WEATHER_PRESETS[weather].dials);
+  // WHY: a preset may carry a post-chain dial one day, and that half of the chain IS frame-cached.
+  renderer.markContentDirty();
+  pushRainStrength();
+}
+
+/** Just the master multiplier, leaving every dial exactly as it is. */
+function pushRainStrength(): void {
   if (cityRenderer === null) return;
-  cityRenderer.rainStrength = rainStrength;
+  cityRenderer.rainStrength = rainStrength * WEATHER_PRESETS[weather].strength;
 }
 
 /**

@@ -13,6 +13,20 @@ export const CITY_FORMAT_VERSION = 4;
  */
 export const GENERATOR_VERSION = 7;
 
+/**
+ * Weather presets. Stored strings, so renaming one strands an existing scene's setting.
+ *
+ * The dial values behind these are in `render/look-dials.ts`; the labels are in `settings.ts`.
+ */
+export const WEATHER = {
+  CLEAR: "clear",
+  DRIZZLE: "drizzle",
+  RAIN: "rain",
+  STORM: "storm"
+} as const;
+
+export type Weather = (typeof WEATHER)[keyof typeof WEATHER];
+
 /** Client and world settings, registered in `settings.ts`. */
 export const SETTING_CAMERA_HEIGHT = "cameraHeightM";
 export const SETTING_CAMERA_ZOOM_MODE = "cameraZoomMode";
@@ -22,6 +36,7 @@ export const SETTING_ANTIALIAS_FACTOR = "antialiasFactor";
 export const SETTING_BLOOM = "bloom";
 export const SETTING_BLOOM_STRENGTH = "bloomStrength";
 export const SETTING_RAIN_STRENGTH = "rainStrength";
+export const SETTING_WEATHER = "weather";
 
 export const CAMERA_ZOOM_MODE = {
   FIXED: "fixed",

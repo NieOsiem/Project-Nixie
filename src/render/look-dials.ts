@@ -1,4 +1,4 @@
-import { RESOLVE_HI, RESOLVE_LO } from "./shaders/weather.js";
+import { WEATHER, type Weather } from "../constants.js";
 
 /**
  * Live look dials for the post chain and the weather overlay.
@@ -29,6 +29,7 @@ export interface LookDials {
   rainLit: number;
   splashStrength: number;
   splashSizeM: number;
+  splashDensity: number;
   hazeStrength: number;
   hazeBandM: number;
   hazeDrift: number;
@@ -50,10 +51,10 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   aoStrength: 0.45,
   aoHeightM: 18,
   streakStrength: 1.3,
-  rainDrops: 1.85,
+  rainDrops: 0.55,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
   // fall, so this apparent speed stands in for the fall we cannot see.
-  rainSpeedMPS: 55,
+  rainSpeedMPS: 35,
   /**
    * Streak length as a fraction of the drop's own cell, which is what keeps the field
    * self-similar — see `RAIN_SPACING_M`. Sets the aspect ratio, here about 12.6:1. Raise toward
@@ -65,16 +66,68 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
    * `rainStrength` is amplitude, so raising that past 1 makes drops brighter, not more numerous.
    * Bounded only by `MIN_CELL_RATIO`, which stops a cell shrinking below the drop inside it.
    */
-  rainDensity: 1,
+  rainDensity: 2,
   /** Drop width in screen px at or below which rain is pure mist. Raise to see mist sooner. */
-  mistBelowPx: RESOLVE_LO,
+  mistBelowPx: 0.05,
   /** Drop width in screen px at or above which rain is entirely discrete drops. */
-  dropsAbovePx: RESOLVE_HI,
+  dropsAbovePx: 0.75,
   rainLit: 1.6,
   splashStrength: 0.2,
   splashSizeM: 0.35,
+  splashDensity: 1,
   hazeStrength: 0.12,
   hazeBandM: 46,
   hazeDrift: 0.7,
   hazeInscatter: 0.35
+};
+
+/**
+ * Weather presets. User-tuned in Foundry, 2026-08-01.
+ *
+ * A preset is only the handful of dials that actually differ between wet and wetter — every other
+ * value, the whole post chain included, is identical across all three and stays in
+ * `DEFAULT_LOOK_DIALS`. That is the point: the weather system is four numbers per preset, not a
+ * parallel copy of the dial set, so tuning a shared value does not have to be done three times.
+ *
+ * `strength` multiplies `rainStrength`, so `CLEAR` hides the overlay outright and costs no fill
+ * rather than drawing a field of zeroes. It carries no dials — switching to it leaves the previous
+ * preset's values in place, since nothing is drawn either way.
+ */
+export interface WeatherPreset {
+  strength: number;
+  dials: Partial<LookDials>;
+}
+
+export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
+  [WEATHER.CLEAR]: { strength: 0, dials: {} },
+  [WEATHER.DRIZZLE]: {
+    strength: 1,
+    dials: {
+      rainDrops: 0.45,
+      rainSpeedMPS: 25,
+      rainStreakDuty: 0.25,
+      rainDensity: 0.5,
+      splashDensity: 0.35
+    }
+  },
+  [WEATHER.RAIN]: {
+    strength: 1,
+    dials: {
+      rainDrops: 0.55,
+      rainSpeedMPS: 35,
+      rainStreakDuty: 0.35,
+      rainDensity: 2,
+      splashDensity: 1
+    }
+  },
+  [WEATHER.STORM]: {
+    strength: 1,
+    dials: {
+      rainDrops: 0.85,
+      rainSpeedMPS: 65,
+      rainStreakDuty: 0.35,
+      rainDensity: 14,
+      splashDensity: 3
+    }
+  }
 };

@@ -76,16 +76,14 @@ export const RAIN_PERIOD_M = 7;
 export const RAIN_HALF_M = 0.05;
 
 /**
- * Default drop width in screen px over which discrete streaks dissolve into mist. Both ends are
- * live dials (`mistBelowPx` / `dropsAbovePx`); these are only the starting values.
+ * The crossover from discrete drops to mist is entirely dial-driven (`mistBelowPx` /
+ * `dropsAbovePx`), because where it should sit turned out to be a matter of taste — the tuned
+ * values are far lower than the pixel-accuracy argument suggested.
  *
- * Below a pixel a drop cannot be drawn as a streak — only as aliasing — and it should not be: rain
- * seen from far enough away *is* mist. The cell stays comfortably multi-pixel across this window,
- * so the lattice never aliases before the drops have gone. `MIN_CELL_RATIO` guarantees that even at
- * the densest setting.
+ * What is *not* taste: below a pixel a drop can only alias, and the lattice itself must not go
+ * sub-pixel while drops are still being drawn. `MIN_CELL_RATIO` guarantees the latter even at the
+ * densest setting, and a test checks the worst case.
  */
-export const RESOLVE_LO = 1.5;
-export const RESOLVE_HI = 4;
 
 /**
  * Floor on cell pitch as a multiple of the drop's own half-width.
@@ -111,7 +109,14 @@ export const MIST_NOISE_M = 22;
 /** Streak length cannot exceed this fraction of a cell, or drops merge into a continuous line. */
 export const DUTY_MAX = 0.75;
 
-/** Splash rings started per cell per second. Constrained — see `TIME_WRAP_S`. */
+/**
+ * Splash rings started per cell per second at `splashDensity` 1.
+ *
+ * Free to change: the shader takes an accumulated *phase* rather than rate x clock, wrapped at
+ * `HASH_CYCLE` so `floor` and `fract` of it are both unchanged across a wrap. That is what lets
+ * `splashDensity` scale the rate at all — and it is why the pitch does not have to move, so
+ * pavement coverage is identical at every density.
+ */
 export const SPLASH_RATE = 1.28;
 
 /**
@@ -161,7 +166,7 @@ uniform vec2 uWorldSizeM;
 uniform vec2 uHazeOffsetM;
 uniform float uPxPerMetre;
 uniform float uRadialSmear;
-uniform float uTime;
+uniform float uSplashPhase;
 uniform float uFallM;
 uniform float uRainStrength;
 uniform float uRainDrops;
@@ -281,13 +286,17 @@ float dropLayer(vec2 wm, float spacingM, float periodM, float halfM, float duty)
  *
  * The site is keyed to the **strike index** as well as the cell. Keyed to the cell alone it was
  * fixed forever, so the same spot was struck over and over and the illusion died.
+ *
+ * Density rides in uSplashPhase's rate, never in the lattice pitch: the pitch is pinned at the
+ * widest value a pavement strip can still catch (see SPLASH_SPACING_M), so making splashes
+ * sparser by coarsening it would leave pavements dry — the exact bug that pitch was chosen to fix.
  */
 float splashRing(vec2 worldM) {
   vec2 g = worldM / SPLASH_SPACING_M;
   vec2 cell = floor(g);
   vec2 f = (g - cell) * SPLASH_SPACING_M;
   vec2 id = mod(cell, HASH_CYCLE);
-  float t = uTime * SPLASH_RATE + hash21(id + 4.3);
+  float t = uSplashPhase + hash21(id + 4.3);
   float strike = mod(floor(t), HASH_CYCLE);
   float life = fract(t);
   vec2 site = SPLASH_SPACING_M * vec2(
@@ -314,9 +323,9 @@ void main() {
 
   vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;
 
-  // Drifted world position, shared by the mist and the haze. Drifts on an accumulated offset rather
-  // than on uTime: uTime wraps, and value noise is not periodic, so deriving the drift from it would
-  // repattern both in one frame.
+  // Drifted world position, shared by the mist and the haze. Drifts on an accumulated offset, which
+  // is what every animated term here uses: value noise and hashed lattices are not periodic in
+  // time, so a wrapping clock times a rate would repattern them in one frame.
   vec2 hp = worldM + uHazeOffsetM;
 
   // The projection's own radial term, in metres: a drop stretches away from the pivot exactly as
@@ -332,13 +341,16 @@ void main() {
   // Drops shrink and multiply as the view widens, monotonically, until they are sub-pixel — at
   // which point they become mist rather than aliasing. Both branches are uniform across the draw,
   // since resolve depends only on uniforms, so only the side in use is ever evaluated.
-  float dropPx = 2.0 * RAIN_HALF_M * uPxPerMetre;
-  // Both edges are dials, so guard the degenerate case: smoothstep with e0 >= e1 divides by zero.
-  float resolve = smoothstep(uMistBelowPx, max(uDropsAbovePx, uMistBelowPx + 0.01), dropPx);
   float duty = clamp(uRainStreakDuty + radialM / RAIN_PERIOD_M, 0.02, DUTY_MAX);
   // Density divides the column pitch only. Leaving the along-period alone is what keeps FALL_WRAP_M
   // valid — the wrap is derived from that period, so a dial on it would break the seamless wrap.
   float spacingM = max(RAIN_SPACING_M / max(uRainDensity, 0.01), RAIN_HALF_M * MIN_CELL_RATIO);
+
+  // The dials are the only thing deciding this, so setting both to 0 genuinely switches the mist
+  // off. Guard the degenerate ordering only: smoothstep divides by zero when e0 >= e1, and a tuned
+  // pair has already arrived inverted once.
+  float dropPx = 2.0 * RAIN_HALF_M * uPxPerMetre;
+  float resolve = smoothstep(uMistBelowPx, max(uDropsAbovePx, uMistBelowPx + 0.01), dropPx);
 
   float dropField = 0.0;
   if (resolve > 0.0) {

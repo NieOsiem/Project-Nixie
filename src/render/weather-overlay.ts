@@ -1,21 +1,20 @@
 import type { Rect } from "../core/geom/types.js";
 import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import { ScreenQuad } from "./screen-quad.js";
-import { FALL_WRAP_M, WEATHER_FRAG, WIND_DIR } from "./shaders/weather.js";
+import {
+  FALL_WRAP_M,
+  HASH_CYCLE,
+  SPLASH_RATE,
+  WEATHER_FRAG,
+  WIND_DIR
+} from "./shaders/weather.js";
 
 /**
- * Where the clock wraps, in seconds.
- *
- * It has to wrap at all because the uniform is float32: left to grow across a session, the clock
- * loses the sub-period precision the motion is made of. The value is chosen so the wrap is seamless
- * rather than merely rare — it shifts the splash phase by `TIME_WRAP_S * SPLASH_RATE` periods, a
- * whole number, so the rings are identical either side of it. A test pins that.
- *
- * The drops do not use this clock at all: their phase is the `FALL_WRAP_M` accumulator. The
- * splashes do, and `TIME_WRAP_S * SPLASH_RATE` must stay a whole multiple of `HASH_CYCLE` so the
- * per-strike randomisation is identical across a wrap.
+ * There is no clock uniform. Every animated term is an accumulated *distance* or *phase*, wrapped
+ * where its own pattern repeats: `FALL_WRAP_M` for the drops, `HASH_CYCLE` for the splash phase,
+ * and the haze drift never wraps at all. Integrating rather than multiplying a rate by a clock is
+ * what lets a rate be a live dial without the field jumping when the dial moves.
  */
-export const TIME_WRAP_S = 4000;
 
 /** WHY: a backgrounded tab hands back one enormous step on return, which teleports the rain. */
 const MAX_STEP_S = 0.25;
@@ -31,7 +30,11 @@ export class WeatherOverlay {
   readonly display: any;
 
   #quad: ScreenQuad;
-  #timeS = 0;
+  /**
+   * Splash strike phase, in strikes. Wrapped at `HASH_CYCLE`, which leaves both `floor` (the strike
+   * index driving the site hash) and `fract` (the ring's life) untouched across a wrap.
+   */
+  #splashPhase = 0;
   /**
    * Drift accumulator, kept in doubles and copied into the uniform.
    *
@@ -69,7 +72,7 @@ export class WeatherOverlay {
       uHazeOffsetM: this.#hazeOffsetM,
       uPxPerMetre: 1,
       uRadialSmear: 0,
-      uTime: 0,
+      uSplashPhase: 0,
       uFallM: 0,
       uRainStrength: 0,
       uRainDrops: DEFAULT_LOOK_DIALS.rainDrops,
@@ -123,7 +126,9 @@ export class WeatherOverlay {
   /** One frame of animation. Safe before any city frame exists — the quad is hidden until then. */
   advance(dtSeconds: number, dials: LookDials, rainStrength: number): void {
     const dt = Math.min(Math.max(dtSeconds, 0), MAX_STEP_S);
-    this.#timeS = (this.#timeS + dt) % TIME_WRAP_S;
+    // Density is a rate multiplier on the strikes, not a change to the lattice pitch.
+    this.#splashPhase =
+      (this.#splashPhase + SPLASH_RATE * Math.max(0, dials.splashDensity) * dt) % HASH_CYCLE;
     // WHY: the haze drifts on an accumulated offset, not on the clock. Value noise is not
     // periodic, so a drift derived from a wrapping clock repatterns the whole veil in one frame.
     const step = dials.hazeDrift * dt;
@@ -135,7 +140,7 @@ export class WeatherOverlay {
     this.#fallM = (this.#fallM + dials.rainSpeedMPS * dt) % FALL_WRAP_M;
 
     const uniforms = this.#quad.uniforms;
-    uniforms.uTime = this.#timeS;
+    uniforms.uSplashPhase = this.#splashPhase;
     uniforms.uFallM = this.#fallM;
     uniforms.uRainStrength = rainStrength;
     uniforms.uRainDrops = dials.rainDrops;

@@ -474,13 +474,13 @@ describe("CityRenderer weather overlay", () => {
     r.update(cam());
     r.animate(1000);
     const settled = renderCalls;
-    const before = (r.weather as StubMesh).shader.uniforms.uTime as number;
+    const before = (r.weather as StubMesh).shader.uniforms.uSplashPhase as number;
 
     r.update(cam());
     r.animate(1500);
 
     expect(renderCalls).toBe(settled);
-    expect((r.weather as StubMesh).shader.uniforms.uTime as number).toBeGreaterThan(before);
+    expect((r.weather as StubMesh).shader.uniforms.uSplashPhase as number).toBeGreaterThan(before);
     expect((r.weather as StubMesh).visible).toBe(true);
     r.destroy();
   });

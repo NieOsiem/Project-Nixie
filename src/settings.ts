@@ -4,7 +4,8 @@ import {
   setCameraHeightM,
   setCameraZoomMode,
   setRain,
-  setRenderScale
+  setRenderScale,
+  setWeather
 } from "./adapter/canvas.js";
 import {
   CAMERA_ZOOM_MODE,
@@ -16,9 +17,11 @@ import {
   SETTING_CAMERA_HEIGHT,
   SETTING_CAMERA_ZOOM_MODE,
   SETTING_RAIN_STRENGTH,
-  SETTING_RENDER_SCALE
+  SETTING_RENDER_SCALE,
+  SETTING_WEATHER,
+  WEATHER
 } from "./constants.js";
-import type { CameraZoomMode } from "./constants.js";
+import type { CameraZoomMode, Weather } from "./constants.js";
 
 export type NixieSettingKey =
   | typeof SETTING_CAMERA_HEIGHT
@@ -28,7 +31,8 @@ export type NixieSettingKey =
   | typeof SETTING_ANTIALIAS_FACTOR
   | typeof SETTING_BLOOM
   | typeof SETTING_BLOOM_STRENGTH
-  | typeof SETTING_RAIN_STRENGTH;
+  | typeof SETTING_RAIN_STRENGTH
+  | typeof SETTING_WEATHER;
 
 interface SettingRange {
   min: number;
@@ -45,7 +49,7 @@ const RANGES: Partial<Record<NixieSettingKey, SettingRange>> = {
   // so the console could not push it past 2. Deliberately a free number input.
 };
 
-const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
+const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode | Weather> = {
   [SETTING_CAMERA_HEIGHT]: 500,
   [SETTING_CAMERA_ZOOM_MODE]: CAMERA_ZOOM_MODE.DOLLY,
   [SETTING_RENDER_SCALE]: 1,
@@ -53,7 +57,8 @@ const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
   [SETTING_ANTIALIAS_FACTOR]: 1.5,
   [SETTING_BLOOM]: true,
   [SETTING_BLOOM_STRENGTH]: 1.35,
-  [SETTING_RAIN_STRENGTH]: 1
+  [SETTING_RAIN_STRENGTH]: 1,
+  [SETTING_WEATHER]: WEATHER.RAIN
 };
 
 /**
@@ -74,7 +79,7 @@ export function settingValue<T>(key: NixieSettingKey): T {
  */
 export async function setSettingValue(
   key: NixieSettingKey,
-  value: number | boolean | CameraZoomMode
+  value: number | boolean | CameraZoomMode | Weather
 ): Promise<void> {
   const range = RANGES[key];
   const clamped =
@@ -95,6 +100,7 @@ export function applySettings(): void {
   );
   setBloom(settingValue<boolean>(SETTING_BLOOM), settingValue<number>(SETTING_BLOOM_STRENGTH));
   setRain(settingValue<number>(SETTING_RAIN_STRENGTH));
+  setWeather(settingValue<Weather>(SETTING_WEATHER));
 }
 
 export function registerSettings(): void {
@@ -188,6 +194,25 @@ export function registerSettings(): void {
     type: Number,
     default: DEFAULTS[SETTING_RAIN_STRENGTH],
     onChange: (value: number) => setRain(value)
+  });
+
+  game.settings.register(MODULE_ID, SETTING_WEATHER, {
+    name: "Weather",
+    hint:
+      "Preset driving the rain's character — drop count, speed, streak length and splash rate."
+      + " Clear switches the overlay off entirely and costs nothing. Read the exact values with"
+      + " api.weatherPresets() and override any of them live with api.setLookDials().",
+    scope: "world",
+    config: true,
+    type: String,
+    choices: {
+      [WEATHER.CLEAR]: "Clear",
+      [WEATHER.DRIZZLE]: "Light Drizzle",
+      [WEATHER.RAIN]: "Rain",
+      [WEATHER.STORM]: "Intense Rain"
+    },
+    default: DEFAULTS[SETTING_WEATHER],
+    onChange: (value: Weather) => setWeather(value)
   });
 
   applySettings();

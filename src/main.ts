@@ -4,7 +4,9 @@ import {
   SETTING_CAMERA_ZOOM_MODE,
   SETTING_RAIN_STRENGTH,
   SETTING_RENDER_SCALE,
-  type CameraZoomMode
+  SETTING_WEATHER,
+  type CameraZoomMode,
+  type Weather
 } from "./constants.js";
 import {
   adjustLeanAtCurrentZoom,
@@ -12,6 +14,7 @@ import {
   buildWalls,
   clearLeanCalibration,
   clearWalls,
+  currentWeather,
   commitDistrictPalette,
   getCity,
   getGraph,
@@ -36,6 +39,7 @@ import {
   undo
 } from "./adapter/canvas.js";
 import { PALETTE_PRESETS, normalizePalette, type DistrictPalette } from "./core/palette.js";
+import { WEATHER_PRESETS } from "./render/look-dials.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerSceneControls } from "./ui/controls.js";
 import { openDistrictApp } from "./ui/district-app.js";
@@ -86,6 +90,7 @@ Hooks.once("init", () => {
 
     buildWalls,
     clearWalls,
+  currentWeather,
     removeEdge,
     resetCity,
     getGraph,
@@ -125,6 +130,12 @@ Hooks.once("init", () => {
       await setSettingValue(SETTING_RAIN_STRENGTH, strength);
       return settingValue<number>(SETTING_RAIN_STRENGTH);
     },
+    setWeather: async (preset: Weather) => {
+      await setSettingValue(SETTING_WEATHER, preset);
+      return settingValue<Weather>(SETTING_WEATHER);
+    },
+    weather: currentWeather,
+    weatherPresets: () => WEATHER_PRESETS,
 
     lookDials,
     setLookDials,

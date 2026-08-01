@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import { HASH_CYCLE, SPLASH_RATE } from "./shaders/weather.js";
-import { TIME_WRAP_S, WeatherOverlay } from "./weather-overlay.js";
+import { WeatherOverlay } from "./weather-overlay.js";
 
 class StubGeometry {
   addAttribute(): this {
@@ -49,37 +49,55 @@ const dials = (over: Partial<LookDials> = {}): LookDials => ({
 const overlay = (): WeatherOverlay =>
   new WeatherOverlay(new Float32Array([0.5, 0.5]), new Float32Array([1, 1]));
 
-/** How far a value sits from the nearest whole number. */
-const fromWhole = (value: number): number => Math.abs(value - Math.round(value));
-
-describe("weather clock", () => {
-  it("wraps, because a session-length float32 clock loses the precision motion is made of", () => {
+describe("splash strike phase", () => {
+  it("advances at the density-scaled rate, with no clock uniform anywhere", () => {
+    // Density is a rate multiplier on the strikes. The pitch stays put, so pavement coverage is
+    // identical at every density — coarsening the pitch instead would leave pavements dry.
     const weather = overlay();
-    for (let i = 0; i < 100; i++) weather.advance(TIME_WRAP_S / 50, dials(), 1);
-    expect(weather.uniforms.uTime as number).toBeLessThan(TIME_WRAP_S);
+    weather.advance(0.2, dials({ splashDensity: 2 }), 1);
+    expect(weather.uniforms.uSplashPhase as number).toBeCloseTo(SPLASH_RATE * 2 * 0.2, 6);
+    expect(weather.uniforms).not.toHaveProperty("uTime");
     weather.destroy();
   });
 
-  it("wraps the splash clock where both phase AND strike index are continuous", () => {
-    // The strike index is mod(floor(t), HASH_CYCLE) and drives the site hash, so the wrap has to
-    // land on a whole number of HASH_CYCLEs too — otherwise every splash site jumps at the wrap.
-    expect(fromWhole(TIME_WRAP_S * SPLASH_RATE)).toBeLessThan(1e-9);
-    expect(fromWhole((TIME_WRAP_S * SPLASH_RATE) / HASH_CYCLE)).toBeLessThan(1e-9);
+  it("wraps at EXACTLY HASH_CYCLE, which leaves strike index and ring life untouched", () => {
+    // The shader takes floor(phase) as the strike index modulo HASH_CYCLE, and fract(phase) as the
+    // ring's life. Only a wrap at an exact multiple of HASH_CYCLE leaves both alone — so this has
+    // to pin where the wrap happens, not merely that one happens. Any earlier wrap jumps every
+    // splash site in one frame, and that seamlessness is what lets the rate be a dial at all.
+    const weather = overlay();
+    const step = 0.02;
+    let highest = 0;
+    for (let i = 0; i < 24000; i++) {
+      weather.advance(step, dials({ splashDensity: 1 }), 1);
+      highest = Math.max(highest, weather.uniforms.uSplashPhase as number);
+    }
+    expect(highest).toBeLessThan(HASH_CYCLE);
+    // Steps are SPLASH_RATE * step apart, so the top sample must land within one of the wrap.
+    expect(highest).toBeGreaterThan(HASH_CYCLE - 2 * SPLASH_RATE * step);
+    weather.destroy();
+  });
+
+  it("treats a negative density as a stop, never as running backwards", () => {
+    const weather = overlay();
+    weather.advance(0.2, dials({ splashDensity: -5 }), 1);
+    expect(weather.uniforms.uSplashPhase as number).toBe(0);
+    weather.destroy();
   });
 
   it("clamps one enormous step, so a backgrounded tab does not teleport the rain", () => {
     const weather = overlay();
-    weather.advance(600, dials(), 1);
-    expect(weather.uniforms.uTime as number).toBeLessThanOrEqual(0.25);
+    weather.advance(600, dials({ rainSpeedMPS: 10, splashDensity: 1 }), 1);
+    expect(weather.uniforms.uFallM as number).toBeLessThanOrEqual(10 * 0.25);
     weather.destroy();
   });
 
   it("ignores a negative step", () => {
     const weather = overlay();
     weather.advance(0.5, dials(), 1);
-    const before = weather.uniforms.uTime as number;
+    const before = weather.uniforms.uSplashPhase as number;
     weather.advance(-10, dials(), 1);
-    expect(weather.uniforms.uTime as number).toBe(before);
+    expect(weather.uniforms.uSplashPhase as number).toBe(before);
     weather.destroy();
   });
 });
@@ -96,17 +114,15 @@ describe("haze drift", () => {
     weather.destroy();
   });
 
-  it("keeps moving across a clock wrap, being independent of it", () => {
-    // WHY this is separate state: value noise is not periodic, so a drift derived from the
-    // wrapping clock would repattern the entire veil in one frame every wrap.
+  it("never wraps, unlike every other accumulator here", () => {
+    // WHY: value noise is not periodic in space, so there is no offset that leaves the veil
+    // unchanged. It grows without bound instead, which float32 carries fine for decades.
     const weather = overlay();
-    const step = TIME_WRAP_S / 4;
-    for (let i = 0; i < 6; i++) weather.advance(step, dials({ hazeDrift: 1 }), 1);
-    const wrapped = weather.uniforms.uTime as number;
-    const before = (weather.uniforms.uHazeOffsetM as Float32Array)[0]!;
-    weather.advance(0.2, dials({ hazeDrift: 1 }), 1);
-    expect(wrapped).toBeLessThan(TIME_WRAP_S);
-    expect((weather.uniforms.uHazeOffsetM as Float32Array)[0]!).toBeGreaterThan(before);
+    for (let i = 0; i < 200; i++) weather.advance(0.25, dials({ hazeDrift: 3 }), 1);
+    const far = (weather.uniforms.uHazeOffsetM as Float32Array)[0]!;
+    expect(far).toBeGreaterThan(100);
+    weather.advance(0.2, dials({ hazeDrift: 3 }), 1);
+    expect((weather.uniforms.uHazeOffsetM as Float32Array)[0]!).toBeGreaterThan(far);
     weather.destroy();
   });
 });
@@ -171,6 +187,7 @@ describe("weather uniforms", () => {
         rainLit: 2.5,
         splashStrength: 0.7,
         splashSizeM: 0.8,
+        splashDensity: 2,
         hazeStrength: 0.2,
         hazeBandM: 60,
         hazeInscatter: 0.9,

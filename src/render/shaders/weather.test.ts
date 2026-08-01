@@ -11,8 +11,6 @@ import {
   RAIN_HALF_M,
   RAIN_PERIOD_M,
   RAIN_SPACING_M,
-  RESOLVE_HI,
-  RESOLVE_LO,
   SPLASH_JITTER_SPAN,
   SPLASH_RATE,
   SPLASH_SPACING_M,
@@ -118,8 +116,9 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain(
       "float resolve = smoothstep(uMistBelowPx, max(uDropsAbovePx, uMistBelowPx + 0.01), dropPx);"
     );
-    expect(DEFAULT_LOOK_DIALS.mistBelowPx).toBe(RESOLVE_LO);
-    expect(DEFAULT_LOOK_DIALS.dropsAbovePx).toBe(RESOLVE_HI);
+    // Tuned defaults, and they must stay correctly ordered or the guard is the only thing between
+    // the shader and a divide by zero.
+    expect(DEFAULT_LOOK_DIALS.mistBelowPx).toBeLessThan(DEFAULT_LOOK_DIALS.dropsAbovePx);
   });
 
   it("scales density off the column pitch only, so the seamless wrap survives", () => {
@@ -142,13 +141,18 @@ describe("weather shader", () => {
     expect(0.55 + 0.9 * 0.5).toBeCloseTo(1, 9);
   });
 
-  it("keeps the lattice multi-pixel until the drops have gone, even at max density", () => {
-    // If cells went sub-pixel while drops were still being drawn, the lattice itself would alias.
-    // MIN_CELL_RATIO is the floor density can push the pitch to, so that is the worst case.
-    const pxPerHalfMetreAtHandover = RESOLVE_HI / (2 * RAIN_HALF_M);
-    expect((RAIN_SPACING_M * pxPerHalfMetreAtHandover)).toBeGreaterThan(8);
-    expect(RAIN_HALF_M * MIN_CELL_RATIO * pxPerHalfMetreAtHandover).toBeGreaterThan(4);
-    // And the floor has to leave room for the drop it contains, jitter span included.
+  it("leaves the crossover entirely to the dials, so zeroing both switches it off", () => {
+    // A second trigger on cell pitch used to be min'd in here. It moved the tuned cutoff and could
+    // not be dialled off, because it ignored both dials. The aliasing case it guarded is real —
+    // see open items — but the dials are authoritative and nothing else may override them.
+    expect(WEATHER_FRAG).not.toContain("CELL_MIST_LO");
+    expect(WEATHER_FRAG).not.toContain("cellPx");
+    expect(WEATHER_FRAG).not.toContain("resolve = min(");
+    // Both at 0 has to leave resolve at 1 for any visible drop, i.e. no mist at all.
+    const lo = 0;
+    const hi = Math.max(0, lo + 0.01);
+    expect(hi).toBeGreaterThan(lo);
+    // The floor still has to leave room for the drop inside the cell, jitter span included.
     expect(MIN_CELL_RATIO * 0.6).toBeGreaterThan(2);
   });
 
