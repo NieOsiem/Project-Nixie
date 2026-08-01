@@ -20,7 +20,7 @@ export interface LookDials {
   streakStrength: number;
   rainDrops: number;
   rainSpeedMPS: number;
-  rainStreakS: number;
+  rainStreakDuty: number;
   rainLit: number;
   splashStrength: number;
   splashSizeM: number;
@@ -45,14 +45,19 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   aoStrength: 0.45,
   aoHeightM: 18,
   streakStrength: 1.3,
-  rainDrops: 0.85,
+  rainDrops: 1.85,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
   // fall, so this apparent speed stands in for the fall we cannot see.
-  rainSpeedMPS: 25,
-  rainStreakS: 0.03,
+  rainSpeedMPS: 55,
+  /**
+   * Streak length as a fraction of the drop's own cell, which is what keeps the field
+   * self-similar — see `RAIN_SPACING_M`. Sets the aspect ratio, here about 12.6:1. Raise toward
+   * `DUTY_MAX` for longer streaks; at the cap drops merge into continuous lines.
+   */
+  rainStreakDuty: 0.35,
   rainLit: 1.6,
-  splashStrength: 0.5,
-  splashSizeM: 0.45,
+  splashStrength: 0.2,
+  splashSizeM: 0.35,
   hazeStrength: 0.12,
   hazeBandM: 46,
   hazeDrift: 0.7,

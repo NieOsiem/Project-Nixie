@@ -1,7 +1,7 @@
 import type { Rect } from "../core/geom/types.js";
 import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import { ScreenQuad } from "./screen-quad.js";
-import { FALL_WRAP_PX, WEATHER_FRAG, WIND_DIR } from "./shaders/weather.js";
+import { FALL_WRAP_M, WEATHER_FRAG, WIND_DIR } from "./shaders/weather.js";
 
 /**
  * Where the clock wraps, in seconds.
@@ -11,8 +11,9 @@ import { FALL_WRAP_PX, WEATHER_FRAG, WIND_DIR } from "./shaders/weather.js";
  * rather than merely rare — it shifts the splash phase by `TIME_WRAP_S * SPLASH_RATE` periods, a
  * whole number, so the rings are identical either side of it. A test pins that.
  *
- * The drops do not use this clock at all: their phase is the `FALL_WRAP_PX` accumulator, because
- * their speed depends on zoom and a rate times a clock would jump whenever zoom changed.
+ * The drops do not use this clock at all: their phase is the `FALL_WRAP_M` accumulator. The
+ * splashes do, and `TIME_WRAP_S * SPLASH_RATE` must stay a whole multiple of `HASH_CYCLE` so the
+ * per-strike randomisation is identical across a wrap.
  */
 export const TIME_WRAP_S = 4000;
 
@@ -40,13 +41,13 @@ export class WeatherOverlay {
    */
   #driftX = 0;
   #driftY = 0;
-  /**
-   * How far the drop lattice has travelled, screen px. Same reason as the drift: integrating the
-   * speed keeps the phase continuous when zoom changes `#pxPerMetre` under it, where multiplying
-   * a zoom-dependent rate by the clock would jump the whole field on every wheel notch.
+/**
+   * How far the drop lattice has travelled, **metres**. The lattice is world-space, so this needs
+   * no zoom term at all — zoom magnifies the motion for free, the way it magnifies the city.
+   * Integrated rather than derived from the clock so that changing `rainSpeedMPS` mid-session
+   * moves the rain from where it is instead of teleporting it.
    */
-  #fallPx = 0;
-  #pxPerMetre = 1;
+  #fallM = 0;
   #hazeOffsetM = new Float32Array(2);
   #worldOriginM = new Float32Array(2);
   #worldSizeM = new Float32Array(2);
@@ -69,10 +70,10 @@ export class WeatherOverlay {
       uPxPerMetre: 1,
       uRadialSmear: 0,
       uTime: 0,
-      uFallPx: 0,
+      uFallM: 0,
       uRainStrength: 0,
       uRainDrops: DEFAULT_LOOK_DIALS.rainDrops,
-      uRainStreakPx: 0,
+      uRainStreakDuty: DEFAULT_LOOK_DIALS.rainStreakDuty,
       uRainLit: DEFAULT_LOOK_DIALS.rainLit,
       uSplashStrength: DEFAULT_LOOK_DIALS.splashStrength,
       uSplashSizeM: DEFAULT_LOOK_DIALS.splashSizeM,
@@ -106,8 +107,7 @@ export class WeatherOverlay {
     const uniforms = this.#quad.uniforms;
     uniforms.uCity = city;
     uniforms.uHeight = height;
-    this.#pxPerMetre = pixelsPerMetre * zoom;
-    uniforms.uPxPerMetre = this.#pxPerMetre;
+    uniforms.uPxPerMetre = pixelsPerMetre * zoom;
     uniforms.uRadialSmear = radialSmear;
     this.#worldOriginM[0] = view.x / pixelsPerMetre;
     this.#worldOriginM[1] = view.y / pixelsPerMetre;
@@ -129,17 +129,14 @@ export class WeatherOverlay {
     this.#hazeOffsetM[0] = this.#driftX;
     this.#hazeOffsetM[1] = this.#driftY;
 
-    // Drops travel at a world speed, so zoom magnifies their motion the way it magnifies the city.
-    const fallPxPerSec = dials.rainSpeedMPS * this.#pxPerMetre;
-    this.#fallPx = (this.#fallPx + fallPxPerSec * dt) % FALL_WRAP_PX;
+    this.#fallM = (this.#fallM + dials.rainSpeedMPS * dt) % FALL_WRAP_M;
 
     const uniforms = this.#quad.uniforms;
     uniforms.uTime = this.#timeS;
-    uniforms.uFallPx = this.#fallPx;
+    uniforms.uFallM = this.#fallM;
     uniforms.uRainStrength = rainStrength;
     uniforms.uRainDrops = dials.rainDrops;
-    // Motion blur: distance covered in one exposure. Same speed, so the streak scales with zoom too.
-    uniforms.uRainStreakPx = fallPxPerSec * dials.rainStreakS;
+    uniforms.uRainStreakDuty = dials.rainStreakDuty;
     uniforms.uRainLit = dials.rainLit;
     uniforms.uSplashStrength = dials.splashStrength;
     uniforms.uSplashSizeM = dials.splashSizeM;

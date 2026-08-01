@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 import {
+  DUTY_MAX,
+  FALL_WRAP_M,
   glslFloat,
-  JITTER_CYCLE,
-  MIN_STREAK_PX,
+  HASH_CYCLE,
+  MIST_SHAPE_MEAN,
+  RAIN_HALF_M,
+  RAIN_PERIOD_M,
+  RAIN_SPACING_M,
+  RESOLVE_HI,
+  RESOLVE_LO,
   SPLASH_JITTER_SPAN,
   SPLASH_RATE,
   SPLASH_SPACING_M,
@@ -39,8 +46,8 @@ describe("weather shader", () => {
     // with zoom, so the rain changed character at every zoom level. Fixed basis: 0.60 flat
     // across a 60x range. The basis must stay a compile-time constant.
     expect(WEATHER_FRAG).toContain("const vec2 WIND_PERP =");
-    expect(WEATHER_FRAG).toContain("float a = dot(p, WIND_PERP);");
-    expect(WEATHER_FRAG).toContain("dot(p, WIND) - uFallPx");
+    expect(WEATHER_FRAG).toContain("float a = dot(wm, WIND_PERP);");
+    expect(WEATHER_FRAG).toContain("dot(wm, WIND) - uFallM");
     expect(WEATHER_FRAG).not.toContain("nAxis");
     expect(WEATHER_FRAG).not.toContain("tAxis");
   });
@@ -48,10 +55,8 @@ describe("weather shader", () => {
   it("takes the projection's radial term as a scalar length, never as a direction", () => {
     // Length may vary per fragment; the lattice basis may not. Short streaks at the pivot,
     // long ones at the frame edge, all parallel.
-    expect(WEATHER_FRAG).toContain(
-      "vec2 fromPivotPx = (vUv - uPivotUv) * uWorldSizeM * uPxPerMetre;"
-    );
-    expect(WEATHER_FRAG).toContain("uRainStreakPx + length(fromPivotPx) * uRadialSmear");
+    expect(WEATHER_FRAG).toContain("vec2 fromPivotM = (vUv - uPivotUv) * uWorldSizeM;");
+    expect(WEATHER_FRAG).toContain("float radialM = length(fromPivotM) * uRadialSmear;");
     expect(WEATHER_FRAG).not.toContain("smearPx");
   });
 
@@ -62,34 +67,108 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain(`const vec2 WIND = vec2(${glslFloat(WIND_DIR[0])}, ${glslFloat(WIND_DIR[1])});`);
   });
 
-  it("meters the drop lattice in screen pixels off a world-anchored origin", () => {
-    // Both halves matter: world-anchored so the pattern pans with the city, screen-metered so a
-    // drop never falls under a pixel wide (shimmer) and the on-screen count cannot grow with the
-    // visible area until a 7 km view is a solid sheet.
+  it("meters the drop lattice in metres, so drops parallax and grow like world objects", () => {
+    // The screen-space lattice this replaced could not help but read as an overlay: a
+    // world-anchored particle never holds a constant screen size or a constant on-screen count.
     expect(WEATHER_FRAG).toContain("vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;");
-    expect(WEATHER_FRAG).toContain("vec2 p = worldM * uPxPerMetre;");
+    expect(WEATHER_FRAG).toContain(`const float RAIN_SPACING_M = ${glslFloat(RAIN_SPACING_M)};`);
+    expect(WEATHER_FRAG).not.toContain("vec2 p = worldM * uPxPerMetre;");
+    expect(WEATHER_FRAG).not.toContain("NEAR_SPACING_PX");
+  });
+
+  it("makes drops smaller AND more numerous as the view widens, never the reverse", () => {
+    // This is the requirement two earlier designs inverted. A screen-space lattice held both
+    // constant; band-passed octaves swapped to a coarser lattice when zoomed out and so gave FEWER
+    // and BIGGER drops — city zoom drew 6.4 m drops in 46 x 230 m cells. Asserted straight off the
+    // constants, in both directions, across the real zoom range.
+    const screenPx = 3440 * 1440;
+    const widths: number[] = [];
+    const counts: number[] = [];
+    for (const pxPerMetre of [300, 200, 100, 50, 25, 12.5, 5, 2.5, 1.5]) {
+      widths.push(2 * RAIN_HALF_M * pxPerMetre);
+      counts.push(screenPx / pxPerMetre ** 2 / (RAIN_SPACING_M * RAIN_PERIOD_M));
+    }
+    for (let i = 1; i < widths.length; i++) {
+      expect(widths[i]!).toBeLessThan(widths[i - 1]!);
+      expect(counts[i]!).toBeGreaterThan(counts[i - 1]!);
+    }
+  });
+
+  it("has exactly one lattice — no octave stack to invert the relationship again", () => {
+    expect(WEATHER_FRAG).toContain(
+      "dropField = dropLayer(worldM, RAIN_SPACING_M, RAIN_PERIOD_M, RAIN_HALF_M, duty);"
+    );
+    expect(WEATHER_FRAG).not.toContain("RAIN_OCTAVE");
+    expect(WEATHER_FRAG).not.toContain("BAND_IN_LO");
+    expect(WEATHER_FRAG).not.toContain("BAND_OUT_LO");
+    // No per-octave scale factor, and no loop for one to iterate over.
+    expect(WEATHER_FRAG).not.toContain("float scale");
+    expect(WEATHER_FRAG).not.toMatch(/for\s*\(\s*int/);
+  });
+
+  it("dissolves sub-pixel drops into mist instead of drawing them", () => {
+    // Below a pixel a drop can only alias, and it should not be drawn: rain seen from far enough
+    // away IS mist. Trying to keep drops resolvable at every zoom is what caused the inversion.
+    expect(WEATHER_FRAG).toContain(`const float RESOLVE_LO = ${glslFloat(RESOLVE_LO)};`);
+    expect(WEATHER_FRAG).toContain(`const float RESOLVE_HI = ${glslFloat(RESOLVE_HI)};`);
+    expect(WEATHER_FRAG).toContain("float dropPx = 2.0 * RAIN_HALF_M * uPxPerMetre;");
+    expect(WEATHER_FRAG).toContain("float resolve = smoothstep(RESOLVE_LO, RESOLVE_HI, dropPx);");
+    expect(WEATHER_FRAG).toContain("float drops = mix(mist, dropField, resolve);");
+  });
+
+  it("gives the mist the drop field's own mean, so the crossover cannot step", () => {
+    expect(WEATHER_FRAG).toContain(`const float MIST_SHAPE_MEAN = ${glslFloat(MIST_SHAPE_MEAN)};`);
+    expect(WEATHER_FRAG).toContain(
+      "float mean = MIST_SHAPE_MEAN * duty * (2.0 * RAIN_HALF_M / RAIN_SPACING_M);"
+    );
+    // The noise modulation averages to 1, or it would shift the mean it just matched.
+    expect(WEATHER_FRAG).toContain("mist = mean * (0.55 + 0.9 * valueNoise(hp / MIST_NOISE_M));");
+    expect(0.55 + 0.9 * 0.5).toBeCloseTo(1, 9);
+  });
+
+  it("keeps the lattice multi-pixel until the drops have already gone", () => {
+    // If cells went sub-pixel while drops were still being drawn, the lattice itself would alias.
+    const cellPxAtHandover = (RAIN_SPACING_M / (2 * RAIN_HALF_M)) * RESOLVE_HI;
+    expect(cellPxAtHandover).toBeGreaterThan(8);
+  });
+
+  it("gives every drop an independent offset along its column, not just across it", () => {
+    // Without the along-offset each drop sat exactly one period from the next and the column
+    // pulsed in step — visible as travelling bands once the rain moved.
+    expect(WEATHER_FRAG).toContain("float t = (gy - cy - r2 * (1.0 - span)) / span;");
+    expect(WEATHER_FRAG).toContain("float r1 = hash21(id);");
+    expect(WEATHER_FRAG).toContain("float r2 = hash21(id + 11.3);");
+    expect(WEATHER_FRAG).toContain("float r3 = hash21(id + 29.7);");
+  });
+
+  it("reduces every hash input, because sin() of a large argument is not random", () => {
+    // Cell indices run to thousands. Unreduced they correlated neighbouring columns into the
+    // bands the first version showed, and they also make the field non-periodic.
+    expect(WEATHER_FRAG).toContain(`const float HASH_CYCLE = ${glslFloat(HASH_CYCLE)};`);
+    expect(WEATHER_FRAG).toContain("float hx = mod(cx, HASH_CYCLE);");
+    expect(WEATHER_FRAG).toContain("vec2 id = vec2(hx, mod(cy, HASH_CYCLE));");
+    expect(WEATHER_FRAG).toContain("vec2 id = mod(cell, HASH_CYCLE);");
   });
 
   it("takes the drop phase as one uniform distance, not a rate times the clock", () => {
     // A per-fragment rate has a phase gradient that grows with t: the lattice scrambles within a
-    // minute. And because the speed is now zoom-dependent, a rate times the clock would jump the
-    // whole field on every wheel notch — so the CPU integrates it and hands over a distance.
-    expect(WEATHER_FRAG).toContain("float gy = (dot(p, WIND) - uFallPx) / periodPx");
-    expect(WEATHER_FRAG).toContain("uniform float uFallPx;");
+    // minute. A distance also lets rainSpeedMPS change mid-session without teleporting the field.
+    expect(WEATHER_FRAG).toContain("uniform float uFallM;");
     expect(WEATHER_FRAG).not.toContain("FALL_RATE");
+    expect(WEATHER_FRAG).not.toContain("uFallPx");
     expect(WEATHER_FRAG).not.toMatch(/uTime\s*\*\s*u[A-Z]/);
   });
 
-  it("scales streak length with zoom, floored so it never degenerates into dots", () => {
-    expect(WEATHER_FRAG).toContain(`const float MIN_STREAK_PX = ${glslFloat(MIN_STREAK_PX)};`);
-    expect(WEATHER_FRAG).toContain(
-      "float lenPx = max(uRainStreakPx + length(fromPivotPx) * uRadialSmear, MIN_STREAK_PX);"
-    );
+  it("wraps the fall distance where the lattice is continuous across it", () => {
+    // A wrap shifts the cell index by FALL_WRAP_M / period, which has to be a whole number of
+    // HASH_CYCLEs or the wrap reshuffles the whole field in one frame.
+    const shift = FALL_WRAP_M / RAIN_PERIOD_M / HASH_CYCLE;
+    expect(Math.abs(shift - Math.round(shift))).toBeLessThan(1e-9);
   });
 
-  it("keys the drop jitter to the cycle the clock wrap preserves", () => {
-    expect(WEATHER_FRAG).toContain(`const float JITTER_CYCLE = ${glslFloat(JITTER_CYCLE)};`);
-    expect(WEATHER_FRAG).toContain("hash21(vec2(cx, mod(cy, JITTER_CYCLE)))");
+  it("caps streak duty so drops cannot merge into one continuous line", () => {
+    expect(WEATHER_FRAG).toContain(`const float DUTY_MAX = ${glslFloat(DUTY_MAX)};`);
+    expect(DUTY_MAX).toBeLessThan(1);
   });
 
   it("drifts the haze on an accumulated offset, never on the wrapping clock", () => {
@@ -119,7 +198,7 @@ describe("weather shader", () => {
     // camera, a splash is a physical mark and has to scale with the view.
     expect(WEATHER_FRAG).toContain(`const float SPLASH_SPACING_M = ${glslFloat(SPLASH_SPACING_M)};`);
     expect(WEATHER_FRAG).toContain("vec2 g = worldM / SPLASH_SPACING_M;");
-    expect(WEATHER_FRAG).toContain("life * uSplashSizeM");
+    expect(WEATHER_FRAG).toContain("life * sizeM");
     expect(WEATHER_FRAG).not.toContain("SPLASH_RADIUS_PX");
     expect(WEATHER_FRAG).not.toContain("SPLASH_SPACING_PX");
   });
@@ -127,7 +206,15 @@ describe("weather shader", () => {
   it("retires small splashes rather than letting thousands of them read as static", () => {
     // Site count grows as 1/zoom^2 because the lattice is metre-based: a district-wide view holds
     // thousands, so the fade has to start well above one pixel.
-    expect(WEATHER_FRAG).toContain("smoothstep(3.0, 8.0, uSplashSizeM * uPxPerMetre)");
+    expect(WEATHER_FRAG).toContain("smoothstep(3.0, 8.0, sizeM * uPxPerMetre)");
+  });
+
+  it("moves the splash site every strike, not once per cell forever", () => {
+    // Keyed to the cell alone the site never changed, so the same spot was struck over and over
+    // and the illusion died. The strike index has to be in the site hash.
+    expect(WEATHER_FRAG).toContain("float strike = mod(floor(t), HASH_CYCLE);");
+    expect(WEATHER_FRAG).toContain("hash21(id + vec2(strike * 13.7, strike * 5.1))");
+    expect(WEATHER_FRAG).toContain("float sizeM = uSplashSizeM * (0.55 + 0.9 * hash21(id + strike * 3.3));");
   });
 
   it("pitches the splash lattice so a pavement strip cannot fall between sites", () => {
@@ -136,7 +223,7 @@ describe("weather shader", () => {
     // pitch x span can sit entirely between sites.
     expect(SPLASH_SPACING_M * SPLASH_JITTER_SPAN).toBeLessThanOrEqual(SPLASH_TARGET_SURFACE_M);
     // The span the constant claims has to be the one the shader actually jitters by.
-    expect(WEATHER_FRAG).toContain(`0.2 + ${glslFloat(SPLASH_JITTER_SPAN)} * hash21(cell)`);
+    expect(WEATHER_FRAG).toContain(`0.15 + ${glslFloat(SPLASH_JITTER_SPAN)} * hash21(id +`);
   });
 
   it("makes water visibility follow the city's own light", () => {
