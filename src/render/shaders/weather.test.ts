@@ -17,17 +17,30 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain("if (encoded.a < ALPHA_BACKGROUND) discard;");
   });
 
-  it("builds the streak as wind plus the projection's own radial lean", () => {
-    // Added as vectors, which is also what removes the pivot singularity: normalizing
-    // fromPivotPx and scaling by its own length would be a 0/0 at the projection centre.
-    expect(WEATHER_FRAG).toContain(
-      "vec2 smearPx = WIND * uRainStreakPx + fromPivotPx * uRadialSmear;"
-    );
+  it("samples the lattice in a fixed basis — a rotating one aliases it into noise", () => {
+    // The bug this replaced. `p` is a world-anchored absolute coordinate, hundreds of thousands
+    // of pixels from the scene origin, so projecting it onto a basis that rotates across the
+    // screen adds |p| * d(basis)/dpx to the phase gradient. Measured 8998 lattice units per
+    // screen pixel at zoom 4 — 2.2 cells per pixel — against an intended 0.6, and the error grew
+    // with zoom, so the rain changed character at every zoom level. Fixed basis: 0.60 flat
+    // across a 60x range. The basis must stay a compile-time constant.
+    expect(WEATHER_FRAG).toContain("const vec2 WIND_PERP =");
+    expect(WEATHER_FRAG).toContain("float a = dot(p, WIND_PERP);");
+    expect(WEATHER_FRAG).toContain("float gy = dot(p, WIND) / periodPx");
+    expect(WEATHER_FRAG).not.toContain("nAxis");
+    expect(WEATHER_FRAG).not.toContain("tAxis");
+  });
+
+  it("takes the projection's radial term as a scalar length, never as a direction", () => {
+    // Length may vary per fragment; the lattice basis may not. Short streaks at the pivot,
+    // long ones at the frame edge, all parallel.
     expect(WEATHER_FRAG).toContain(
       "vec2 fromPivotPx = (vUv - uPivotUv) * uWorldSizeM * uPxPerMetre;"
     );
-    expect(WEATHER_FRAG).toContain("vec2 tAxis = smearPx / max(lenPx, 0.001);");
-    expect(WEATHER_FRAG).not.toContain("normalize(fromPivotPx)");
+    expect(WEATHER_FRAG).toContain(
+      "float lenPx = uRainStreakPx + length(fromPivotPx) * uRadialSmear;"
+    );
+    expect(WEATHER_FRAG).not.toContain("smearPx");
   });
 
   it("carries a unit wind vector, shared with the drift the class accumulates", () => {
@@ -75,8 +88,23 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain(
       "float ground = 1.0 - smoothstep(0.0, SPLASH_MAX_HEIGHT_M, heightM);"
     );
-    expect(WEATHER_FRAG).toContain("splashRing(p) * ground * uSplashStrength");
+    expect(WEATHER_FRAG).toContain("splashRing(worldM) * ground * uSplashStrength");
     expect(WEATHER_FRAG).toContain(`const float SPLASH_RATE = ${SPLASH_RATE};`);
+  });
+
+  it("sizes splashes in metres, because a splash is on the ground and not on the lens", () => {
+    // Held at a constant 27 screen px they measured 18 m across zoomed out — wider than a
+    // building — and 9 cm zoomed in. Unlike a drop, which really is a thin line in front of the
+    // camera, a splash is a physical mark and has to scale with the view.
+    expect(WEATHER_FRAG).toContain("const float SPLASH_SPACING_M = 9.0;");
+    expect(WEATHER_FRAG).toContain("vec2 g = worldM / SPLASH_SPACING_M;");
+    expect(WEATHER_FRAG).toContain("life * uSplashSizeM");
+    expect(WEATHER_FRAG).not.toContain("SPLASH_RADIUS_PX");
+    expect(WEATHER_FRAG).not.toContain("SPLASH_SPACING_PX");
+  });
+
+  it("fades a sub-pixel splash rather than letting it shimmer", () => {
+    expect(WEATHER_FRAG).toContain("smoothstep(1.5, 4.0, uSplashSizeM * uPxPerMetre)");
   });
 
   it("makes water visibility follow the city's own light", () => {

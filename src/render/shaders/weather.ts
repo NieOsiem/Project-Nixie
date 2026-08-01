@@ -63,6 +63,7 @@ uniform float uRainDrops;
 uniform float uRainStreakPx;
 uniform float uRainLit;
 uniform float uSplashStrength;
+uniform float uSplashSizeM;
 uniform float uHazeStrength;
 uniform float uHazeBandM;
 uniform float uHazeInscatter;
@@ -78,6 +79,20 @@ const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};
 const float ALPHA_BACKGROUND = ${SCENE_ALPHA_FLOOR * 0.5};
 
 const vec2 WIND = vec2(${WIND_DIR[0]}, ${WIND_DIR[1]});
+/**
+ * The lattice basis, and it must stay a compile-time constant.
+ *
+ * The first version derived it per fragment from the streak vector, so drops fanned radially.
+ * That aliases the lattice into noise: p is a world-anchored absolute coordinate, tens or
+ * hundreds of thousands of pixels from the scene origin, and projecting it onto a basis that
+ * rotates across the screen contributes length(p) * d(basis)/dpx to the phase gradient. Measured
+ * 8998 lattice units per screen pixel at zoom 4 — 2.2 cells per pixel — against an intended
+ * 0.6, and the error scaled with zoom, which is why the rain changed character at every zoom
+ * level. A fixed basis holds the gradient at 0.60 across a 60x zoom range.
+ *
+ * The radial term survives as a scalar streak *length*, which is what the fan-out reads as.
+ */
+const vec2 WIND_PERP = vec2(${-WIND_DIR[1]}, ${WIND_DIR[0]});
 
 /**
  * The drop and splash lattices are metered in **screen pixels** off a world-anchored origin.
@@ -102,9 +117,16 @@ const float RAIN_AMBIENT = 0.10;
 const vec3 RAIN_TINT = vec3(0.40, 0.48, 0.60);
 const float RAIN_LIGHT_GAIN = 1.5;
 
-const float SPLASH_SPACING_PX = 118.0;
-const float SPLASH_RADIUS_PX = 27.0;
-const float SPLASH_RING_PX = 3.0;
+/**
+ * Splashes are metered in **metres**, not screen pixels like the drops.
+ *
+ * A drop is between the camera and the world and is a thin line, so it belongs on the screen.
+ * A splash is a mark *on the ground*: at a constant 27 px it was 18 m across zoomed out — wider
+ * than a building — and 9 cm zoomed in. Metres make it a physical object, which also means it
+ * correctly becomes sub-pixel when zoomed out, hence the LOD fade.
+ */
+const float SPLASH_SPACING_M = 9.0;
+const float SPLASH_RING_M = 0.09;
 const float SPLASH_RATE = ${SPLASH_RATE};
 const float SPLASH_MAX_HEIGHT_M = 2.5;
 
@@ -138,18 +160,10 @@ float valueNoise(vec2 p) {
  * spatially varying rate grows linearly with t, so within a minute the lattice is scrambled at
  * every scale. Only the streak's direction and length may vary across the frame, never its speed.
  */
-float rainLayer(
-  vec2 p,
-  vec2 tAxis,
-  vec2 nAxis,
-  float lenPx,
-  float spacingPx,
-  float periodPx,
-  float halfPx
-) {
-  float a = dot(p, nAxis);
+float rainLayer(vec2 p, float lenPx, float spacingPx, float periodPx, float halfPx) {
+  float a = dot(p, WIND_PERP);
   float cx = floor(a / spacingPx);
-  float gy = dot(p, tAxis) / periodPx - uTime * FALL_RATE + hash11(cx * 1.7);
+  float gy = dot(p, WIND) / periodPx - uTime * FALL_RATE + hash11(cx * 1.7);
   float cy = floor(gy);
 
   // Jitter confined to the middle half of the cell: a drop straddling a cell edge would be cut
@@ -166,20 +180,21 @@ float rainLayer(
   return across * s * s * (1.0 - step(1.0, s));
 }
 
-/** One expanding ring per cell per period, fading as it grows. */
-float splashRing(vec2 p) {
-  vec2 g = p / SPLASH_SPACING_PX;
+/** One expanding ring per cell per period, fading as it grows. Metres in, so it scales with zoom. */
+float splashRing(vec2 worldM) {
+  vec2 g = worldM / SPLASH_SPACING_M;
   vec2 cell = floor(g);
-  vec2 f = (g - cell) * SPLASH_SPACING_PX;
-  vec2 site = SPLASH_SPACING_PX * vec2(
+  vec2 f = (g - cell) * SPLASH_SPACING_M;
+  vec2 site = SPLASH_SPACING_M * vec2(
     0.2 + 0.6 * hash21(cell),
     0.2 + 0.6 * hash21(cell + 19.7));
   float life = fract(uTime * SPLASH_RATE + hash21(cell + 4.3));
   float ring = 1.0 - smoothstep(
     0.0,
-    SPLASH_RING_PX,
-    abs(length(f - site) - life * SPLASH_RADIUS_PX));
-  return ring * (1.0 - life);
+    SPLASH_RING_M,
+    abs(length(f - site) - life * uSplashSizeM));
+  // A ring thinner than a pixel can only shimmer, so it fades out instead of aliasing.
+  return ring * (1.0 - life) * smoothstep(1.5, 4.0, uSplashSizeM * uPxPerMetre);
 }
 
 void main() {
@@ -196,14 +211,11 @@ void main() {
   vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;
   vec2 p = worldM * uPxPerMetre;
 
-  // Wind smears every drop the same way; the radial term is the projection's own, so a drop
-  // leans away from the pivot exactly as a building does and rain fans out toward the edges.
-  // Adding the two as vectors also removes the singularity a normalize at the pivot would have.
+  // Streak length only, never direction — see WIND_PERP. Wind sets the base, and the projection's
+  // radial term stretches it with distance from the pivot, so drops are short near the pivot and
+  // long at the frame edge exactly as a building's lean grows. A scalar, so nothing can rotate.
   vec2 fromPivotPx = (vUv - uPivotUv) * uWorldSizeM * uPxPerMetre;
-  vec2 smearPx = WIND * uRainStreakPx + fromPivotPx * uRadialSmear;
-  float lenPx = length(smearPx);
-  vec2 tAxis = smearPx / max(lenPx, 0.001);
-  vec2 nAxis = vec2(-tAxis.y, tAxis.x);
+  float lenPx = uRainStreakPx + length(fromPivotPx) * uRadialSmear;
 
   vec3 light = texture2D(uCity, uv).rgb;
   // Light-aware: water is only visible where something lights it, so drops glow under neon and
@@ -211,18 +223,17 @@ void main() {
   float lit = RAIN_AMBIENT + dot(light, LUMA) * uRainLit;
 
   float drops =
-    rainLayer(p, tAxis, nAxis, lenPx, NEAR_SPACING_PX, NEAR_PERIOD_PX, NEAR_HALF_PX)
+    rainLayer(p, lenPx, NEAR_SPACING_PX, NEAR_PERIOD_PX, NEAR_HALF_PX)
     + FAR_WEIGHT * rainLayer(
       p + vec2(37.0, 91.0),
-      tAxis,
-      nAxis,
       lenPx * 0.7,
       FAR_SPACING_PX,
       FAR_PERIOD_PX,
       FAR_HALF_PX);
 
   float ground = 1.0 - smoothstep(0.0, SPLASH_MAX_HEIGHT_M, heightM);
-  float water = (clamp(drops, 0.0, 1.0) * uRainDrops + splashRing(p) * ground * uSplashStrength)
+  float water =
+    (clamp(drops, 0.0, 1.0) * uRainDrops + splashRing(worldM) * ground * uSplashStrength)
     * lit * uRainStrength;
 
   // Haze drifts on an accumulated offset rather than on uTime: uTime wraps, and value noise is

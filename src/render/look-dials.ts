@@ -22,6 +22,7 @@ export interface LookDials {
   rainStreakPx: number;
   rainLit: number;
   splashStrength: number;
+  splashSizeM: number;
   hazeStrength: number;
   hazeBandM: number;
   hazeDrift: number;
@@ -47,6 +48,7 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   rainStreakPx: 15,
   rainLit: 1.6,
   splashStrength: 0.5,
+  splashSizeM: 0.45,
   hazeStrength: 0.12,
   hazeBandM: 46,
   hazeDrift: 0.7,
