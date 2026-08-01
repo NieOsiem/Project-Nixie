@@ -74,6 +74,9 @@ export class WeatherOverlay {
       uRainStrength: 0,
       uRainDrops: DEFAULT_LOOK_DIALS.rainDrops,
       uRainStreakDuty: DEFAULT_LOOK_DIALS.rainStreakDuty,
+      uRainDensity: DEFAULT_LOOK_DIALS.rainDensity,
+      uMistBelowPx: DEFAULT_LOOK_DIALS.mistBelowPx,
+      uDropsAbovePx: DEFAULT_LOOK_DIALS.dropsAbovePx,
       uRainLit: DEFAULT_LOOK_DIALS.rainLit,
       uSplashStrength: DEFAULT_LOOK_DIALS.splashStrength,
       uSplashSizeM: DEFAULT_LOOK_DIALS.splashSizeM,
@@ -137,6 +140,9 @@ export class WeatherOverlay {
     uniforms.uRainStrength = rainStrength;
     uniforms.uRainDrops = dials.rainDrops;
     uniforms.uRainStreakDuty = dials.rainStreakDuty;
+    uniforms.uRainDensity = dials.rainDensity;
+    uniforms.uMistBelowPx = dials.mistBelowPx;
+    uniforms.uDropsAbovePx = dials.dropsAbovePx;
     uniforms.uRainLit = dials.rainLit;
     uniforms.uSplashStrength = dials.splashStrength;
     uniforms.uSplashSizeM = dials.splashSizeM;

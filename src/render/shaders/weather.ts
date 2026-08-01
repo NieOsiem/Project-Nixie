@@ -76,14 +76,25 @@ export const RAIN_PERIOD_M = 7;
 export const RAIN_HALF_M = 0.05;
 
 /**
- * Drop width in screen px over which discrete streaks dissolve into mist.
+ * Default drop width in screen px over which discrete streaks dissolve into mist. Both ends are
+ * live dials (`mistBelowPx` / `dropsAbovePx`); these are only the starting values.
  *
  * Below a pixel a drop cannot be drawn as a streak — only as aliasing — and it should not be: rain
- * seen from far enough away *is* mist. The cell stays comfortably multi-pixel across this window
- * (~14 px across at `RESOLVE_HI`), so the lattice never aliases before the drops have gone.
+ * seen from far enough away *is* mist. The cell stays comfortably multi-pixel across this window,
+ * so the lattice never aliases before the drops have gone. `MIN_CELL_RATIO` guarantees that even at
+ * the densest setting.
  */
 export const RESOLVE_LO = 1.5;
 export const RESOLVE_HI = 4;
+
+/**
+ * Floor on cell pitch as a multiple of the drop's own half-width.
+ *
+ * `rainDensity` divides the column pitch, so without a floor a high density would shrink the cell
+ * below the drop it has to contain — drops would be clipped at cell edges, and the lattice could go
+ * sub-pixel while drops were still being drawn. A test pins the resulting worst case.
+ */
+export const MIN_CELL_RATIO = 3.5;
 
 /**
  * Mean of the drop field as a fraction of its geometric coverage, measured over the lattice.
@@ -155,6 +166,9 @@ uniform float uFallM;
 uniform float uRainStrength;
 uniform float uRainDrops;
 uniform float uRainStreakDuty;
+uniform float uRainDensity;
+uniform float uMistBelowPx;
+uniform float uDropsAbovePx;
 uniform float uRainLit;
 uniform float uSplashStrength;
 uniform float uSplashSizeM;
@@ -192,8 +206,7 @@ const float RAIN_SPACING_M = ${glslFloat(RAIN_SPACING_M)};
 const float RAIN_PERIOD_M = ${glslFloat(RAIN_PERIOD_M)};
 const float RAIN_HALF_M = ${glslFloat(RAIN_HALF_M)};
 const float DUTY_MAX = ${glslFloat(DUTY_MAX)};
-const float RESOLVE_LO = ${glslFloat(RESOLVE_LO)};
-const float RESOLVE_HI = ${glslFloat(RESOLVE_HI)};
+const float MIN_CELL_RATIO = ${glslFloat(MIN_CELL_RATIO)};
 const float MIST_SHAPE_MEAN = ${glslFloat(MIST_SHAPE_MEAN)};
 const float MIST_NOISE_M = ${glslFloat(MIST_NOISE_M)};
 
@@ -320,18 +333,23 @@ void main() {
   // which point they become mist rather than aliasing. Both branches are uniform across the draw,
   // since resolve depends only on uniforms, so only the side in use is ever evaluated.
   float dropPx = 2.0 * RAIN_HALF_M * uPxPerMetre;
-  float resolve = smoothstep(RESOLVE_LO, RESOLVE_HI, dropPx);
+  // Both edges are dials, so guard the degenerate case: smoothstep with e0 >= e1 divides by zero.
+  float resolve = smoothstep(uMistBelowPx, max(uDropsAbovePx, uMistBelowPx + 0.01), dropPx);
   float duty = clamp(uRainStreakDuty + radialM / RAIN_PERIOD_M, 0.02, DUTY_MAX);
+  // Density divides the column pitch only. Leaving the along-period alone is what keeps FALL_WRAP_M
+  // valid — the wrap is derived from that period, so a dial on it would break the seamless wrap.
+  float spacingM = max(RAIN_SPACING_M / max(uRainDensity, 0.01), RAIN_HALF_M * MIN_CELL_RATIO);
 
   float dropField = 0.0;
   if (resolve > 0.0) {
-    dropField = dropLayer(worldM, RAIN_SPACING_M, RAIN_PERIOD_M, RAIN_HALF_M, duty);
+    dropField = dropLayer(worldM, spacingM, RAIN_PERIOD_M, RAIN_HALF_M, duty);
   }
   float mist = 0.0;
   if (resolve < 1.0) {
     // Carries the drop field's own mean, so the crossover does not step in brightness, and its own
-    // noise so distant rain reads as drizzle rather than a flat wash.
-    float mean = MIST_SHAPE_MEAN * duty * (2.0 * RAIN_HALF_M / RAIN_SPACING_M);
+    // noise so distant rain reads as drizzle rather than a flat wash. Reads the live pitch, so
+    // density moves the mist and the drops together.
+    float mean = MIST_SHAPE_MEAN * duty * (2.0 * RAIN_HALF_M / spacingM);
     mist = mean * (0.55 + 0.9 * valueNoise(hp / MIST_NOISE_M));
   }
   float drops = mix(mist, dropField, resolve);

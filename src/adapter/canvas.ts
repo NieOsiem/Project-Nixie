@@ -782,8 +782,9 @@ export function setBloom(enabled: boolean, strength?: number): void {
   cityRenderer.bloomStrength = bloomStrength;
 }
 
+/** Unbounded on purpose — nothing here rewrites the value the user asked for. */
 export function setRain(strength: number): void {
-  rainStrength = Math.max(0, strength);
+  rainStrength = strength;
   if (cityRenderer === null) return;
   cityRenderer.rainStrength = rainStrength;
 }

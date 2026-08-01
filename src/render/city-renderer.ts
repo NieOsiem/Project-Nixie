@@ -278,17 +278,18 @@ export class CityRenderer {
   }
 
   /**
-   * Weather intensity. 0 hides the overlay outright, so a dry night costs no fill.
+   * Weather intensity. 0 or below hides the overlay outright, so a dry night costs no fill.
    *
-   * Deliberately does not dirty the content: the overlay is outside the frame cache and picks
-   * this up on the next `animate`, so it retunes live even while the camera is parked.
+   * Unclamped above: the value is a plain multiplier and the user is trusted with it. Deliberately
+   * does not dirty the content either — the overlay is outside the frame cache and picks this up on
+   * the next `animate`, so it retunes live even while the camera is parked.
    */
   get rainStrength(): number {
     return this.#rainStrength;
   }
 
   set rainStrength(value: number) {
-    this.#rainStrength = Math.max(0, value);
+    this.#rainStrength = value;
   }
 
   markContentDirty(): void {

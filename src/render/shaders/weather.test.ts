@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_LOOK_DIALS } from "../look-dials.js";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 import {
   DUTY_MAX,
   FALL_WRAP_M,
   glslFloat,
   HASH_CYCLE,
+  MIN_CELL_RATIO,
   MIST_SHAPE_MEAN,
   RAIN_HALF_M,
   RAIN_PERIOD_M,
@@ -95,9 +97,7 @@ describe("weather shader", () => {
   });
 
   it("has exactly one lattice — no octave stack to invert the relationship again", () => {
-    expect(WEATHER_FRAG).toContain(
-      "dropField = dropLayer(worldM, RAIN_SPACING_M, RAIN_PERIOD_M, RAIN_HALF_M, duty);"
-    );
+    expect(WEATHER_FRAG.match(/dropLayer\(/g)).toHaveLength(2); // one definition, one call
     expect(WEATHER_FRAG).not.toContain("RAIN_OCTAVE");
     expect(WEATHER_FRAG).not.toContain("BAND_IN_LO");
     expect(WEATHER_FRAG).not.toContain("BAND_OUT_LO");
@@ -109,27 +109,47 @@ describe("weather shader", () => {
   it("dissolves sub-pixel drops into mist instead of drawing them", () => {
     // Below a pixel a drop can only alias, and it should not be drawn: rain seen from far enough
     // away IS mist. Trying to keep drops resolvable at every zoom is what caused the inversion.
-    expect(WEATHER_FRAG).toContain(`const float RESOLVE_LO = ${glslFloat(RESOLVE_LO)};`);
-    expect(WEATHER_FRAG).toContain(`const float RESOLVE_HI = ${glslFloat(RESOLVE_HI)};`);
     expect(WEATHER_FRAG).toContain("float dropPx = 2.0 * RAIN_HALF_M * uPxPerMetre;");
-    expect(WEATHER_FRAG).toContain("float resolve = smoothstep(RESOLVE_LO, RESOLVE_HI, dropPx);");
     expect(WEATHER_FRAG).toContain("float drops = mix(mist, dropField, resolve);");
+  });
+
+  it("takes both crossover edges as dials, guarding the degenerate ordering", () => {
+    // smoothstep with e0 >= e1 divides by zero, and both ends are user-settable.
+    expect(WEATHER_FRAG).toContain(
+      "float resolve = smoothstep(uMistBelowPx, max(uDropsAbovePx, uMistBelowPx + 0.01), dropPx);"
+    );
+    expect(DEFAULT_LOOK_DIALS.mistBelowPx).toBe(RESOLVE_LO);
+    expect(DEFAULT_LOOK_DIALS.dropsAbovePx).toBe(RESOLVE_HI);
+  });
+
+  it("scales density off the column pitch only, so the seamless wrap survives", () => {
+    // FALL_WRAP_M is derived from the along-period, so a dial on that period would break the wrap.
+    expect(WEATHER_FRAG).toContain(
+      "float spacingM = max(RAIN_SPACING_M / max(uRainDensity, 0.01), RAIN_HALF_M * MIN_CELL_RATIO);"
+    );
+    expect(WEATHER_FRAG).toContain("dropField = dropLayer(worldM, spacingM, RAIN_PERIOD_M,");
+    expect(WEATHER_FRAG).not.toContain("RAIN_PERIOD_M / ");
+    // The mist reads the live pitch too, or density would move drops and mist apart in brightness.
+    expect(WEATHER_FRAG).toContain(
+      "float mean = MIST_SHAPE_MEAN * duty * (2.0 * RAIN_HALF_M / spacingM);"
+    );
   });
 
   it("gives the mist the drop field's own mean, so the crossover cannot step", () => {
     expect(WEATHER_FRAG).toContain(`const float MIST_SHAPE_MEAN = ${glslFloat(MIST_SHAPE_MEAN)};`);
-    expect(WEATHER_FRAG).toContain(
-      "float mean = MIST_SHAPE_MEAN * duty * (2.0 * RAIN_HALF_M / RAIN_SPACING_M);"
-    );
     // The noise modulation averages to 1, or it would shift the mean it just matched.
     expect(WEATHER_FRAG).toContain("mist = mean * (0.55 + 0.9 * valueNoise(hp / MIST_NOISE_M));");
     expect(0.55 + 0.9 * 0.5).toBeCloseTo(1, 9);
   });
 
-  it("keeps the lattice multi-pixel until the drops have already gone", () => {
+  it("keeps the lattice multi-pixel until the drops have gone, even at max density", () => {
     // If cells went sub-pixel while drops were still being drawn, the lattice itself would alias.
-    const cellPxAtHandover = (RAIN_SPACING_M / (2 * RAIN_HALF_M)) * RESOLVE_HI;
-    expect(cellPxAtHandover).toBeGreaterThan(8);
+    // MIN_CELL_RATIO is the floor density can push the pitch to, so that is the worst case.
+    const pxPerHalfMetreAtHandover = RESOLVE_HI / (2 * RAIN_HALF_M);
+    expect((RAIN_SPACING_M * pxPerHalfMetreAtHandover)).toBeGreaterThan(8);
+    expect(RAIN_HALF_M * MIN_CELL_RATIO * pxPerHalfMetreAtHandover).toBeGreaterThan(4);
+    // And the floor has to leave room for the drop it contains, jitter span included.
+    expect(MIN_CELL_RATIO * 0.6).toBeGreaterThan(2);
   });
 
   it("gives every drop an independent offset along its column, not just across it", () => {

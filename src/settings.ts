@@ -40,8 +40,9 @@ const RANGES: Partial<Record<NixieSettingKey, SettingRange>> = {
   [SETTING_CAMERA_HEIGHT]: { min: 150, max: 2000, step: 25 },
   [SETTING_RENDER_SCALE]: { min: 0.25, max: 1, step: 0.05 },
   [SETTING_ANTIALIAS_FACTOR]: { min: 1.25, max: 2, step: 0.25 },
-  [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 },
-  [SETTING_RAIN_STRENGTH]: { min: 0, max: 2, step: 0.05 }
+  [SETTING_BLOOM_STRENGTH]: { min: 0, max: 2, step: 0.05 }
+  // WHY no rainStrength range: a range makes it a slider AND makes `setSettingValue` clamp to it,
+  // so the console could not push it past 2. Deliberately a free number input.
 };
 
 const DEFAULTS: Record<NixieSettingKey, number | boolean | CameraZoomMode> = {
@@ -179,11 +180,12 @@ export function registerSettings(): void {
 
   game.settings.register(MODULE_ID, SETTING_RAIN_STRENGTH, {
     name: "Rain",
-    hint: "Rain, splashes and drifting haze over the city. 0 is a dry night and costs nothing.",
+    hint:
+      "Rain, splashes and drifting haze. 0 is a dry night and costs nothing. Unbounded on purpose"
+      + " — a plain number, not a slider, so it can be pushed as far as you like.",
     scope: "world",
     config: true,
     type: Number,
-    range: RANGES[SETTING_RAIN_STRENGTH],
     default: DEFAULTS[SETTING_RAIN_STRENGTH],
     onChange: (value: number) => setRain(value)
   });

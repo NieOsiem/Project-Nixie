@@ -1,3 +1,5 @@
+import { RESOLVE_HI, RESOLVE_LO } from "./shaders/weather.js";
+
 /**
  * Live look dials for the post chain and the weather overlay.
  *
@@ -21,6 +23,9 @@ export interface LookDials {
   rainDrops: number;
   rainSpeedMPS: number;
   rainStreakDuty: number;
+  rainDensity: number;
+  mistBelowPx: number;
+  dropsAbovePx: number;
   rainLit: number;
   splashStrength: number;
   splashSizeM: number;
@@ -55,6 +60,16 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
    * `DUTY_MAX` for longer streaks; at the cap drops merge into continuous lines.
    */
   rainStreakDuty: 0.35,
+  /**
+   * Multiplies the drop count by dividing the column pitch. This is the density knob —
+   * `rainStrength` is amplitude, so raising that past 1 makes drops brighter, not more numerous.
+   * Bounded only by `MIN_CELL_RATIO`, which stops a cell shrinking below the drop inside it.
+   */
+  rainDensity: 1,
+  /** Drop width in screen px at or below which rain is pure mist. Raise to see mist sooner. */
+  mistBelowPx: RESOLVE_LO,
+  /** Drop width in screen px at or above which rain is entirely discrete drops. */
+  dropsAbovePx: RESOLVE_HI,
   rainLit: 1.6,
   splashStrength: 0.2,
   splashSizeM: 0.35,
