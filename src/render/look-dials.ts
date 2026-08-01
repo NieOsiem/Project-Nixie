@@ -19,7 +19,8 @@ export interface LookDials {
   aoHeightM: number;
   streakStrength: number;
   rainDrops: number;
-  rainStreakPx: number;
+  rainSpeedMPS: number;
+  rainStreakS: number;
   rainLit: number;
   splashStrength: number;
   splashSizeM: number;
@@ -45,7 +46,10 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   aoHeightM: 18,
   streakStrength: 1.3,
   rainDrops: 0.85,
-  rainStreakPx: 15,
+  // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
+  // fall, so this apparent speed stands in for the fall we cannot see.
+  rainSpeedMPS: 25,
+  rainStreakS: 0.03,
   rainLit: 1.6,
   splashStrength: 0.5,
   splashSizeM: 0.45,

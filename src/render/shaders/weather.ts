@@ -14,6 +14,16 @@
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 /**
+ * Formats a number as a GLSL float literal.
+ *
+ * WHY: ESSL 100 has no implicit int-to-float conversion, so `const float X = 4;` is a compile
+ * error while `4.0` is fine. Interpolating a TS constant that happens to be whole is exactly how
+ * that slips in — it type-checks, the string tests pass, and only the shader compiler objects.
+ */
+export const glslFloat = (value: number): string =>
+  Number.isInteger(value) ? `${value}.0` : `${value}`;
+
+/**
  * Fall represented by one streak, in metres. Not the whole visible fall: the streak is a motion
  * blur, and this feeds the projection term below, where it decides how hard rain fans outward.
  */
@@ -24,26 +34,66 @@ export const RAIN_FALL_M = 1.6;
  * vector and `LookDials` is validated as plain finite numbers, so an angle dial would need its
  * own path for a knob nobody is going to turn twice.
  *
- * Exactly unit-length, and a test holds it there — its length multiplies both `rainStreakPx` and
+ * Exactly unit-length, and a test holds it there — its length multiplies both `rainSpeedMPS` and
  * `hazeDrift`, so a stray value silently means neither dial reads in the unit it claims.
  */
 export const WIND_DIR = [0.8, 0.6] as const;
-
-/** Drop lattice steps per second. Constant across the frame — see the WHY on `rainLayer`. */
-export const FALL_RATE = 5.5;
 
 /** Splash rings started per cell per second. */
 export const SPLASH_RATE = 1.15;
 
 /**
+ * Splash lattice pitch, metres. One site per cell.
+ *
+ * Sized against the **narrowest surface that must catch a splash**, not against a comfortable
+ * carriageway density. At 9 m a 2.5 m pavement strip held a site in only about 40% of cells — one
+ * splash per 22 m of pavement against many on a 9–24 m road — so pavements read as dry.
+ *
+ * The binding constraint is the jitter *span*, not the pitch: the site sits within the middle
+ * `SPLASH_JITTER_SPAN` of its cell, so a strip narrower than `pitch × span` can fall entirely
+ * between sites. Pitched for the `street`/`arterial` pavement below; a 1.5 m `lane` pavement is
+ * still sparse, which is an accepted trade against making the roads five times busier again.
+ * Turn `splashStrength` down if the carriageway is too busy — do not widen this.
+ */
+export const SPLASH_SPACING_M = 4;
+
+/** Fraction of a cell the site jitter spans. Must match the shader's `0.2 + 0.6 * hash21`. */
+export const SPLASH_JITTER_SPAN = 0.6;
+
+/** Pavement width the pitch is chosen to cover: `street` 2.5 m, per `ROAD_CLASSES`. */
+export const SPLASH_TARGET_SURFACE_M = 2.5;
+
+/** Along-lattice cell length of each drop layer, in screen pixels. */
+export const NEAR_PERIOD_PX = 210;
+export const FAR_PERIOD_PX = 132;
+
+/**
  * Length, in lattice cells, of the per-drop jitter sequence down one column.
  *
- * Exists purely so the clock wrap is seamless: `uTime` has to wrap somewhere, and a wrap shifts
- * the along-lattice cell index by `TIME_WRAP_S * FALL_RATE`. Keying the jitter to the cell index
+ * Exists purely so the fall wrap is seamless: `uFallPx` has to wrap somewhere, and a wrap shifts
+ * the along-lattice cell index by `FALL_WRAP_PX / period`. Keying the jitter to the cell index
  * modulo this, with the shift an exact multiple of it, leaves the pattern identical across the
- * wrap. `weather-overlay.ts` holds the wrap and a test pins the divisibility both ways.
+ * wrap. A test pins the divisibility for every layer.
  */
 export const JITTER_CYCLE = 8;
+
+const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+
+/**
+ * Where the fall accumulator wraps, in screen pixels.
+ *
+ * Derived, never written by hand: a wrap must shift every layer's cell index by a whole number of
+ * `JITTER_CYCLE`s, so it is the LCM of each layer's `period × JITTER_CYCLE`. Both layers are then
+ * pixel-identical either side of the wrap. A test pins the divisibility per layer.
+ */
+export const FALL_WRAP_PX = (() => {
+  const near = NEAR_PERIOD_PX * JITTER_CYCLE;
+  const far = FAR_PERIOD_PX * JITTER_CYCLE;
+  return (near * far) / gcd(near, far);
+})();
+
+/** Below this a streak is a dot, and rain reads as static rather than weather. */
+export const MIN_STREAK_PX = 3;
 
 export const WEATHER_FRAG = `
 precision highp float;
@@ -58,6 +108,7 @@ uniform vec2 uHazeOffsetM;
 uniform float uPxPerMetre;
 uniform float uRadialSmear;
 uniform float uTime;
+uniform float uFallPx;
 uniform float uRainStrength;
 uniform float uRainDrops;
 uniform float uRainStreakPx;
@@ -74,11 +125,11 @@ uniform float uFogTintB;
 varying vec2 vUv;
 
 const vec3 LUMA = vec3(0.299, 0.587, 0.114);
-const float SCENE_HEIGHT_NORM_M = ${SCENE_HEIGHT_NORM_M}.0;
-const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};
-const float ALPHA_BACKGROUND = ${SCENE_ALPHA_FLOOR * 0.5};
+const float SCENE_HEIGHT_NORM_M = ${glslFloat(SCENE_HEIGHT_NORM_M)};
+const float SCENE_ALPHA_FLOOR = ${glslFloat(SCENE_ALPHA_FLOOR)};
+const float ALPHA_BACKGROUND = ${glslFloat(SCENE_ALPHA_FLOOR * 0.5)};
 
-const vec2 WIND = vec2(${WIND_DIR[0]}, ${WIND_DIR[1]});
+const vec2 WIND = vec2(${glslFloat(WIND_DIR[0])}, ${glslFloat(WIND_DIR[1])});
 /**
  * The lattice basis, and it must stay a compile-time constant.
  *
@@ -92,27 +143,32 @@ const vec2 WIND = vec2(${WIND_DIR[0]}, ${WIND_DIR[1]});
  *
  * The radial term survives as a scalar streak *length*, which is what the fan-out reads as.
  */
-const vec2 WIND_PERP = vec2(${-WIND_DIR[1]}, ${WIND_DIR[0]});
+const vec2 WIND_PERP = vec2(${glslFloat(-WIND_DIR[1])}, ${glslFloat(WIND_DIR[0])});
 
 /**
- * The drop and splash lattices are metered in **screen pixels** off a world-anchored origin.
+ * The **drop** lattice is metered in screen pixels off a world-anchored origin. The splash
+ * lattice below is metered in metres — see it for why the two differ.
  *
- * World-metre cells would be the obvious choice and are wrong twice over: a drop is inherently
- * a thin line, so at any zoom where its width falls under a pixel it aliases into shimmer, and
- * the on-screen count would grow with the visible area until a 7 km view is a solid sheet.
- * Anchoring the origin in the world but sizing the cells in pixels keeps density and streak
- * length fixed on screen while the pattern still pans with the city. Zooming re-lays the
- * lattice, which is one discrete step per wheel notch and reads as nothing.
+ * World-metre cells would be the obvious choice for drops and are wrong twice over: a drop is
+ * inherently a thin line, so at any zoom where its width falls under a pixel it aliases into
+ * shimmer, and the on-screen count would grow with the visible area until a 7 km view is a solid
+ * sheet. Anchoring the origin in the world but sizing the cells in pixels keeps the density fixed
+ * on screen while the pattern still pans with the city. Zooming re-lays the lattice, which is one
+ * discrete step per wheel notch and reads as nothing.
+ *
+ * Speed and streak length are the exception: both come from a world speed, so zoom magnifies the
+ * motion the way it magnifies the city. A constant screen speed read as *slower* zoomed in, since
+ * a fixed px/s is a smaller fraction of a magnified scene.
  */
 const float NEAR_SPACING_PX = 44.0;
-const float NEAR_PERIOD_PX = 210.0;
+const float NEAR_PERIOD_PX = ${glslFloat(NEAR_PERIOD_PX)};
 const float NEAR_HALF_PX = 0.9;
 const float FAR_SPACING_PX = 21.0;
-const float FAR_PERIOD_PX = 132.0;
+const float FAR_PERIOD_PX = ${glslFloat(FAR_PERIOD_PX)};
 const float FAR_HALF_PX = 0.55;
 const float FAR_WEIGHT = 0.45;
-const float FALL_RATE = ${FALL_RATE};
-const float JITTER_CYCLE = ${JITTER_CYCLE}.0;
+const float JITTER_CYCLE = ${glslFloat(JITTER_CYCLE)};
+const float MIN_STREAK_PX = ${glslFloat(MIN_STREAK_PX)};
 const float RAIN_AMBIENT = 0.10;
 const vec3 RAIN_TINT = vec3(0.40, 0.48, 0.60);
 const float RAIN_LIGHT_GAIN = 1.5;
@@ -125,9 +181,9 @@ const float RAIN_LIGHT_GAIN = 1.5;
  * than a building — and 9 cm zoomed in. Metres make it a physical object, which also means it
  * correctly becomes sub-pixel when zoomed out, hence the LOD fade.
  */
-const float SPLASH_SPACING_M = 9.0;
+const float SPLASH_SPACING_M = ${glslFloat(SPLASH_SPACING_M)};
 const float SPLASH_RING_M = 0.09;
-const float SPLASH_RATE = ${SPLASH_RATE};
+const float SPLASH_RATE = ${glslFloat(SPLASH_RATE)};
 const float SPLASH_MAX_HEIGHT_M = 2.5;
 
 const float HAZE_COARSE_M = 92.0;
@@ -154,16 +210,20 @@ float valueNoise(vec2 p) {
 }
 
 /**
- * One layer of drops, in the streak's own frame so the lattice bends with the projection.
+ * One layer of drops, on the fixed wind-aligned lattice.
  *
- * WHY the fall rate is a constant and never a per-fragment value: the phase gradient of a
+ * WHY the phase arrives as one uniform and never as a per-fragment rate: the phase gradient of a
  * spatially varying rate grows linearly with t, so within a minute the lattice is scrambled at
- * every scale. Only the streak's direction and length may vary across the frame, never its speed.
+ * every scale. Only the streak's length may vary across the frame, never its speed or direction.
+ *
+ * uFallPx is a distance, integrated CPU-side from a world speed, so the drops travel at a fixed
+ * m/s and zoom magnifies that motion the way it magnifies everything else. Integrating rather
+ * than multiplying a rate by the clock is what keeps the phase continuous when zoom changes it.
  */
 float rainLayer(vec2 p, float lenPx, float spacingPx, float periodPx, float halfPx) {
   float a = dot(p, WIND_PERP);
   float cx = floor(a / spacingPx);
-  float gy = dot(p, WIND) / periodPx - uTime * FALL_RATE + hash11(cx * 1.7);
+  float gy = (dot(p, WIND) - uFallPx) / periodPx + hash11(cx * 1.7);
   float cy = floor(gy);
 
   // Jitter confined to the middle half of the cell: a drop straddling a cell edge would be cut
@@ -186,15 +246,17 @@ float splashRing(vec2 worldM) {
   vec2 cell = floor(g);
   vec2 f = (g - cell) * SPLASH_SPACING_M;
   vec2 site = SPLASH_SPACING_M * vec2(
-    0.2 + 0.6 * hash21(cell),
-    0.2 + 0.6 * hash21(cell + 19.7));
+    0.2 + ${glslFloat(SPLASH_JITTER_SPAN)} * hash21(cell),
+    0.2 + ${glslFloat(SPLASH_JITTER_SPAN)} * hash21(cell + 19.7));
   float life = fract(uTime * SPLASH_RATE + hash21(cell + 4.3));
   float ring = 1.0 - smoothstep(
     0.0,
     SPLASH_RING_M,
     abs(length(f - site) - life * uSplashSizeM));
-  // A ring thinner than a pixel can only shimmer, so it fades out instead of aliasing.
-  return ring * (1.0 - life) * smoothstep(1.5, 4.0, uSplashSizeM * uPxPerMetre);
+  // Small rings retire rather than alias. The band is wide because the site count grows as
+  // 1/zoom^2 — a whole-district view holds thousands of them, and a 3 px ring at that density
+  // reads as static, not as rain.
+  return ring * (1.0 - life) * smoothstep(3.0, 8.0, uSplashSizeM * uPxPerMetre);
 }
 
 void main() {
@@ -214,8 +276,10 @@ void main() {
   // Streak length only, never direction — see WIND_PERP. Wind sets the base, and the projection's
   // radial term stretches it with distance from the pivot, so drops are short near the pivot and
   // long at the frame edge exactly as a building's lean grows. A scalar, so nothing can rotate.
+  // uRainStreakPx is speed x exposure, computed CPU-side, so it grows with zoom exactly as the
+  // motion does. Floored because a sub-3px streak is a dot, and a field of dots reads as static.
   vec2 fromPivotPx = (vUv - uPivotUv) * uWorldSizeM * uPxPerMetre;
-  float lenPx = uRainStreakPx + length(fromPivotPx) * uRadialSmear;
+  float lenPx = max(uRainStreakPx + length(fromPivotPx) * uRadialSmear, MIN_STREAK_PX);
 
   vec3 light = texture2D(uCity, uv).rgb;
   // Light-aware: water is only visible where something lights it, so drops glow under neon and

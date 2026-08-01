@@ -1,14 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
-import { FALL_RATE, JITTER_CYCLE, SPLASH_RATE, WEATHER_FRAG, WIND_DIR } from "./weather.js";
+import {
+  glslFloat,
+  JITTER_CYCLE,
+  MIN_STREAK_PX,
+  SPLASH_JITTER_SPAN,
+  SPLASH_RATE,
+  SPLASH_SPACING_M,
+  SPLASH_TARGET_SURFACE_M,
+  WEATHER_FRAG,
+  WIND_DIR
+} from "./weather.js";
 
 describe("weather shader", () => {
   it("decodes height from scene alpha with the same constants the composite uses", () => {
-    expect(WEATHER_FRAG).toContain(`const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};`);
     expect(WEATHER_FRAG).toContain(
-      `const float SCENE_HEIGHT_NORM_M = ${SCENE_HEIGHT_NORM_M}.0;`
+      `const float SCENE_ALPHA_FLOOR = ${glslFloat(SCENE_ALPHA_FLOOR)};`
     );
-    expect(WEATHER_FRAG).toContain(`const float ALPHA_BACKGROUND = ${SCENE_ALPHA_FLOOR * 0.5};`);
+    expect(WEATHER_FRAG).toContain(
+      `const float SCENE_HEIGHT_NORM_M = ${glslFloat(SCENE_HEIGHT_NORM_M)};`
+    );
+    expect(WEATHER_FRAG).toContain(
+      `const float ALPHA_BACKGROUND = ${glslFloat(SCENE_ALPHA_FLOOR * 0.5)};`
+    );
     expect(WEATHER_FRAG).toContain("float heightM = max(encoded.a - SCENE_ALPHA_FLOOR, 0.0)");
     expect(WEATHER_FRAG).toContain("/ (1.0 - SCENE_ALPHA_FLOOR) * SCENE_HEIGHT_NORM_M;");
   });
@@ -26,7 +40,7 @@ describe("weather shader", () => {
     // across a 60x range. The basis must stay a compile-time constant.
     expect(WEATHER_FRAG).toContain("const vec2 WIND_PERP =");
     expect(WEATHER_FRAG).toContain("float a = dot(p, WIND_PERP);");
-    expect(WEATHER_FRAG).toContain("float gy = dot(p, WIND) / periodPx");
+    expect(WEATHER_FRAG).toContain("dot(p, WIND) - uFallPx");
     expect(WEATHER_FRAG).not.toContain("nAxis");
     expect(WEATHER_FRAG).not.toContain("tAxis");
   });
@@ -37,9 +51,7 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain(
       "vec2 fromPivotPx = (vUv - uPivotUv) * uWorldSizeM * uPxPerMetre;"
     );
-    expect(WEATHER_FRAG).toContain(
-      "float lenPx = uRainStreakPx + length(fromPivotPx) * uRadialSmear;"
-    );
+    expect(WEATHER_FRAG).toContain("uRainStreakPx + length(fromPivotPx) * uRadialSmear");
     expect(WEATHER_FRAG).not.toContain("smearPx");
   });
 
@@ -47,7 +59,7 @@ describe("weather shader", () => {
     // Not cosmetic: its length scales the streak here and hazeDrift in weather-overlay.ts, so a
     // non-unit value makes both dials read in a unit they do not claim.
     expect(Math.hypot(WIND_DIR[0], WIND_DIR[1])).toBe(1);
-    expect(WEATHER_FRAG).toContain(`const vec2 WIND = vec2(${WIND_DIR[0]}, ${WIND_DIR[1]});`);
+    expect(WEATHER_FRAG).toContain(`const vec2 WIND = vec2(${glslFloat(WIND_DIR[0])}, ${glslFloat(WIND_DIR[1])});`);
   });
 
   it("meters the drop lattice in screen pixels off a world-anchored origin", () => {
@@ -58,16 +70,25 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain("vec2 p = worldM * uPxPerMetre;");
   });
 
-  it("advances the lattice at a rate constant across the frame", () => {
+  it("takes the drop phase as one uniform distance, not a rate times the clock", () => {
     // A per-fragment rate has a phase gradient that grows with t: the lattice scrambles within a
-    // minute. Direction and length may vary per fragment; speed may not.
-    expect(WEATHER_FRAG).toContain(`const float FALL_RATE = ${FALL_RATE};`);
-    expect(WEATHER_FRAG).toContain("- uTime * FALL_RATE");
+    // minute. And because the speed is now zoom-dependent, a rate times the clock would jump the
+    // whole field on every wheel notch — so the CPU integrates it and hands over a distance.
+    expect(WEATHER_FRAG).toContain("float gy = (dot(p, WIND) - uFallPx) / periodPx");
+    expect(WEATHER_FRAG).toContain("uniform float uFallPx;");
+    expect(WEATHER_FRAG).not.toContain("FALL_RATE");
     expect(WEATHER_FRAG).not.toMatch(/uTime\s*\*\s*u[A-Z]/);
   });
 
+  it("scales streak length with zoom, floored so it never degenerates into dots", () => {
+    expect(WEATHER_FRAG).toContain(`const float MIN_STREAK_PX = ${glslFloat(MIN_STREAK_PX)};`);
+    expect(WEATHER_FRAG).toContain(
+      "float lenPx = max(uRainStreakPx + length(fromPivotPx) * uRadialSmear, MIN_STREAK_PX);"
+    );
+  });
+
   it("keys the drop jitter to the cycle the clock wrap preserves", () => {
-    expect(WEATHER_FRAG).toContain(`const float JITTER_CYCLE = ${JITTER_CYCLE}.0;`);
+    expect(WEATHER_FRAG).toContain(`const float JITTER_CYCLE = ${glslFloat(JITTER_CYCLE)};`);
     expect(WEATHER_FRAG).toContain("hash21(vec2(cx, mod(cy, JITTER_CYCLE)))");
   });
 
@@ -89,22 +110,33 @@ describe("weather shader", () => {
       "float ground = 1.0 - smoothstep(0.0, SPLASH_MAX_HEIGHT_M, heightM);"
     );
     expect(WEATHER_FRAG).toContain("splashRing(worldM) * ground * uSplashStrength");
-    expect(WEATHER_FRAG).toContain(`const float SPLASH_RATE = ${SPLASH_RATE};`);
+    expect(WEATHER_FRAG).toContain(`const float SPLASH_RATE = ${glslFloat(SPLASH_RATE)};`);
   });
 
   it("sizes splashes in metres, because a splash is on the ground and not on the lens", () => {
     // Held at a constant 27 screen px they measured 18 m across zoomed out — wider than a
     // building — and 9 cm zoomed in. Unlike a drop, which really is a thin line in front of the
     // camera, a splash is a physical mark and has to scale with the view.
-    expect(WEATHER_FRAG).toContain("const float SPLASH_SPACING_M = 9.0;");
+    expect(WEATHER_FRAG).toContain(`const float SPLASH_SPACING_M = ${glslFloat(SPLASH_SPACING_M)};`);
     expect(WEATHER_FRAG).toContain("vec2 g = worldM / SPLASH_SPACING_M;");
     expect(WEATHER_FRAG).toContain("life * uSplashSizeM");
     expect(WEATHER_FRAG).not.toContain("SPLASH_RADIUS_PX");
     expect(WEATHER_FRAG).not.toContain("SPLASH_SPACING_PX");
   });
 
-  it("fades a sub-pixel splash rather than letting it shimmer", () => {
-    expect(WEATHER_FRAG).toContain("smoothstep(1.5, 4.0, uSplashSizeM * uPxPerMetre)");
+  it("retires small splashes rather than letting thousands of them read as static", () => {
+    // Site count grows as 1/zoom^2 because the lattice is metre-based: a district-wide view holds
+    // thousands, so the fade has to start well above one pixel.
+    expect(WEATHER_FRAG).toContain("smoothstep(3.0, 8.0, uSplashSizeM * uPxPerMetre)");
+  });
+
+  it("pitches the splash lattice so a pavement strip cannot fall between sites", () => {
+    // At 9 m a 2.5 m pavement held a site in only ~40% of cells, so pavements read as dry while
+    // the road was busy. The constraint is the jitter span, not the pitch: a strip narrower than
+    // pitch x span can sit entirely between sites.
+    expect(SPLASH_SPACING_M * SPLASH_JITTER_SPAN).toBeLessThanOrEqual(SPLASH_TARGET_SURFACE_M);
+    // The span the constant claims has to be the one the shader actually jitters by.
+    expect(WEATHER_FRAG).toContain(`0.2 + ${glslFloat(SPLASH_JITTER_SPAN)} * hash21(cell)`);
   });
 
   it("makes water visibility follow the city's own light", () => {
@@ -126,6 +158,17 @@ describe("weather shader", () => {
     expect(WEATHER_FRAG).toContain("vec2 uv = vUv * uUvScale;");
     expect(WEATHER_FRAG).toContain("texture2D(uHeight, uv)");
     expect(WEATHER_FRAG).toContain("texture2D(uCity, uv)");
+  });
+
+  it("writes every float constant with a decimal point, as ES 1.00 requires", () => {
+    // `const float X = 4;` does not compile — ESSL 100 has no implicit int-to-float conversion.
+    // Interpolating a TS constant that happens to be whole is exactly how it gets in: it
+    // type-checks and every string assertion still passes. Caught once, by glslangValidator.
+    const declarations = WEATHER_FRAG.match(/const float \w+ = [^;]+;/g) ?? [];
+    expect(declarations.length).toBeGreaterThan(10);
+    for (const declaration of declarations) {
+      expect(declaration).toMatch(/=\s*-?\d+\.\d/);
+    }
   });
 
   it("uses no derivatives, which ES 1.00 does not guarantee", () => {
