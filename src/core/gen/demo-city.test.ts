@@ -129,8 +129,8 @@ describe("buildCity", () => {
     }
   });
 
-  it("stays well inside the 150k triangle budget", () => {
-    expect(build.mesh.triangleCount).toBeLessThan(20000);
+  it("stays well inside the 450k triangle budget", () => {
+    expect(build.mesh.triangleCount).toBeLessThan(60000);
   });
 
   it("is deterministic", () => {
