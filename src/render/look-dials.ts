@@ -63,8 +63,8 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   puddleScaleM: 4,
   wetDarken: 0.78,
   wetGloss: 0.6,
-  smearStrength: 0.6,
-  smearHeightM: 12,
+  smearStrength: 1,
+  smearHeightM: 50,
   rainDrops: 0.55,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
   // fall, so this apparent speed stands in for the fall we cannot see.

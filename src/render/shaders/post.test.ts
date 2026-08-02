@@ -150,8 +150,8 @@ describe("composite shader", () => {
     expect(smear).toContain("vUv + smearReach * t");
     expect(smear).toContain("texture2D(uBloomWide, sampleUv)");
     expect(smear).not.toContain("texture2D(uScene,");
-    expect(smear).toContain("float w = pow(0.65, float(i));");
-    expect(smear).toContain("for (int i = 1; i <= 4; i++) {");
+    expect(smear).toContain("float w = pow(0.65, t * 4.0);");
+    expect(smear).toContain("for (int i = 1; i <= 12; i++) {");
     expect(smear).toContain("vec2 rawUv = (vUv + smearReach * t) * uWideUvScale;");
     expect(smear).toContain("vec2 inFrame = step(vec2(0.0), rawUv) * step(rawUv, uWideUvScale);");
     expect(smear).toContain("float valid = inFrame.x * inFrame.y;");
@@ -245,8 +245,8 @@ describe("look dials", () => {
       puddleScaleM: 4,
       wetDarken: 0.78,
       wetGloss: 0.6,
-      smearStrength: 0.6,
-      smearHeightM: 12,
+      smearStrength: 1,
+      smearHeightM: 50,
       rainDrops: 0.55,
       rainSpeedMPS: 35,
       rainStreakDuty: 0.35,

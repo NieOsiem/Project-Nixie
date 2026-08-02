@@ -90,8 +90,8 @@ describe("weather presets", () => {
 
   it("keeps the smear defaults finite and positive where required", () => {
     expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearStrength)).toBe(true);
-    expect(DEFAULT_LOOK_DIALS.smearStrength).toBeGreaterThan(0);
+    expect(DEFAULT_LOOK_DIALS.smearStrength).toBe(1);
     expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearHeightM)).toBe(true);
-    expect(DEFAULT_LOOK_DIALS.smearHeightM).toBeGreaterThan(0);
+    expect(DEFAULT_LOOK_DIALS.smearHeightM).toBe(50);
   });
 });

@@ -11,10 +11,11 @@ const WET_STRENGTH = 0.7;
 const WET_DARKEN = 0.78;
 const WET_GLOSS = 0.6;
 const PUDDLE_EDGE = 0.08;
-const SMEAR_STRENGTH = 0.6;
-const SMEAR_HEIGHT_M = 12;
+const SMEAR_STRENGTH = 1;
+const SMEAR_HEIGHT_M = 50;
 const CAM_HEIGHT_M = 500;
-const SMEAR_TAPS = 4;
+const SMEAR_TAPS = 12;
+const SMEAR_PROFILE_STEPS = 4;
 const SMEAR_DECAY = 0.65;
 const EDGE_WIDE_TEXEL = 1 / 64;
 const WIDE_STRENGTH = 0.55;
@@ -88,7 +89,7 @@ function edgeSmear(uvX: number, clampOutOfBounds: boolean): number {
   let weight = 0;
   for (let i = 1; i <= SMEAR_TAPS; i += 1) {
     const t = div(i, SMEAR_TAPS);
-    const w = f(Math.pow(SMEAR_DECAY, i));
+    const w = f(Math.pow(SMEAR_DECAY, t * SMEAR_PROFILE_STEPS));
     const rawX = add(uvX, mul(reachX, t));
     const rawY = add(0.5, mul(reachY, t));
     const valid = rawX >= 0 && rawX <= 1 && rawY >= 0 && rawY <= 1;
@@ -145,7 +146,7 @@ function shade(
   let smearWeight = 0;
   for (let i = 1; i <= SMEAR_TAPS; i += 1) {
     const t = div(i, SMEAR_TAPS);
-    const w = f(Math.pow(SMEAR_DECAY, i));
+    const w = f(Math.pow(SMEAR_DECAY, t * SMEAR_PROFILE_STEPS));
     const rawX = add(uvX, mul(reachX, t));
     const rawY = add(uvY, mul(reachY, t));
     const valid = rawX >= 0 && rawX <= 1 && rawY >= 0 && rawY <= 1;
@@ -251,6 +252,19 @@ describe("wet-look CPU evidence", () => {
     }
   });
 
+  it("densifies the smear without changing its old normalized falloff", () => {
+    const oldSteps = [1, 2, 3, 4];
+    const denseSteps = [3, 6, 9, 12];
+    for (let i = 0; i < oldSteps.length; i += 1) {
+      const denseWeight = Math.pow(
+        SMEAR_DECAY,
+        (denseSteps[i]! / SMEAR_TAPS) * SMEAR_PROFILE_STEPS
+      );
+      expect(denseWeight).toBeCloseTo(Math.pow(SMEAR_DECAY, oldSteps[i]!), 6);
+    }
+    expect(Math.pow(SMEAR_DECAY, SMEAR_PROFILE_STEPS)).toBeCloseTo(Math.pow(0.65, 4), 6);
+  });
+
   it("points smear away from every corner and vanishes at the pivot", () => {
     const corners: Array<[number, number]> = [
       [0, 0],
@@ -333,7 +347,7 @@ describe("wet-look CPU evidence", () => {
       expect(statSync(path).size).toBeGreaterThan(64);
     }
     expect(renderPng(12).equals(renderPng(12))).toBe(true);
-  });
+  }, 15_000);
 
   it("makes a zero coverage field exactly dry", () => {
     expect(puddleMask(0, 0.99)).toBe(0);

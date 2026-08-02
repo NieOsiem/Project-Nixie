@@ -28,7 +28,9 @@ const WET_GROUND_HEIGHT_M = 2.5;
 /** Noise edge in normalized field units; this is the damp margin around a puddle island. */
 const PUDDLE_EDGE = 0.08;
 /** Constant-bound radial taps keep the smear a cheap composite term. */
-const SMEAR_TAPS = 4;
+const SMEAR_TAPS = 12;
+/** Keep the old 0.65^4 endpoint while sampling the same profile at a denser spatial cadence. */
+const SMEAR_PROFILE_STEPS = 4;
 const SMEAR_DECAY = 0.65;
 
 const ALPHA_FLOOR = SCENE_ALPHA_FLOOR.toFixed(6);
@@ -311,7 +313,7 @@ void main() {
   float smearWeight = 0.0;
   for (int i = 1; i <= ${SMEAR_TAPS}; i++) {
     float t = float(i) / ${glslFloat(SMEAR_TAPS)};
-    float w = pow(${glslFloat(SMEAR_DECAY)}, float(i));
+    float w = pow(${glslFloat(SMEAR_DECAY)}, t * ${glslFloat(SMEAR_PROFILE_STEPS)});
     vec2 rawUv = (vUv + smearReach * t) * uWideUvScale;
     vec2 inFrame = step(vec2(0.0), rawUv) * step(rawUv, uWideUvScale);
     float valid = inFrame.x * inFrame.y;
