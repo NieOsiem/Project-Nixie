@@ -660,6 +660,13 @@ describe("CityRenderer bloom", () => {
       uNarrowStrength: 1.3,
       uWideStrength: 1.3 * 0.55
     });
+    const wideBlur = renderLog.find(
+      (call) =>
+        call.content instanceof StubMesh &&
+        call.content.shader.uniforms.uTexUvScale === composite.uWideUvScale &&
+        call.content.shader.uniforms.uTexel === composite.uWideTexel
+    );
+    expect(wideBlur).toBeDefined();
     r.destroy();
   });
 
@@ -779,6 +786,67 @@ describe("CityRenderer bloom", () => {
     expect(renderCalls).toBe(before + CITY_PASSES + post.passesOn);
     expect(r.lookDials).toBe(dials);
     expect(r.stats()).toMatchObject({ lookDials: { fogStrength: 0.9 } });
+    r.destroy();
+  });
+
+  it("passes the view-space wet field and every wet dial to the cached composite", () => {
+    const r = raw();
+    const camera = cam({ pivotX: 900, pivotY: 700, scale: 2 });
+    const dials = r.lookDials;
+    dials.wetStrength = 0.7;
+    dials.puddleCoverage = 0.4;
+    dials.puddleScaleM = 9;
+    dials.wetDarken = 0.68;
+    dials.wetGloss = 0.23;
+    r.markContentDirty();
+    r.update(camera);
+
+    const view = visibleWorldRect(camera);
+    const uniforms = (lastCall().content as StubMesh).shader.uniforms;
+    const worldOrigin = Array.from(uniforms.uWorldOriginM as Float32Array);
+    const worldSize = Array.from(uniforms.uWorldSizeM as Float32Array);
+    expect(worldOrigin[0]).toBeCloseTo(view.x / 25);
+    expect(worldOrigin[1]).toBeCloseTo(view.y / 25);
+    expect(worldSize[0]).toBeCloseTo(view.width / 25);
+    expect(worldSize[1]).toBeCloseTo(view.height / 25);
+    expect(uniforms.uPxPerMetre).toBe(50);
+    expect(uniforms).toMatchObject({
+      uWetStrength: 0.7,
+      uPuddleCoverage: 0.4,
+      uPuddleScaleM: 9,
+      uWetDarken: 0.68,
+      uWetGloss: 0.23
+    });
+    r.destroy();
+  });
+
+  it("derives radial smear from the live height, camera altitude, and lean", () => {
+    const r = raw();
+    const camera = cam();
+    r.update(camera);
+
+    let uniforms = (lastCall().content as StubMesh).shader.uniforms;
+    expect(uniforms.uSmearStrength).toBe(0.6);
+    expect(uniforms.uRadialSmear).toBeCloseTo((12 / (900 - 12)) * dollyLeanStrength(1));
+
+    const before = renderCalls;
+    r.lookDials.smearStrength = 0.25;
+    r.lookDials.smearHeightM = 0;
+    r.update(camera);
+    expect(renderCalls).toBe(before);
+
+    r.markContentDirty();
+    r.update(camera);
+    uniforms = (lastCall().content as StubMesh).shader.uniforms;
+    expect(uniforms.uSmearStrength).toBe(0.25);
+    expect(uniforms.uRadialSmear).toBe(0);
+
+    r.lookDials.smearHeightM = 12;
+    r.cameraHeightMetres = 450;
+    r.leanOverride = 2;
+    r.update(cam({ scale: 2 }));
+    uniforms = (lastCall().content as StubMesh).shader.uniforms;
+    expect(uniforms.uRadialSmear).toBeCloseTo((12 / (450 - 12)) * 2);
     r.destroy();
   });
 

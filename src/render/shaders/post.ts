@@ -7,6 +7,7 @@
  * composite tone maps once into its RGBA8 output.
  */
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
+import { glslFloat } from "./weather.js";
 
 const THRESHOLD = 0.55;
 /** Half-width of the quadratic knee below the threshold. Softens the cut-in. */
@@ -21,6 +22,14 @@ const NEON_CHROMA = 1.15;
 const DEPTH_FALLOFF = 0.16;
 /** WHY: saturation must not lift black surfaces into purple fog. */
 const BLACK_FLOOR = 0.012;
+
+/** Ground height shared with the weather splash mask. */
+const WET_GROUND_HEIGHT_M = 2.5;
+/** Noise edge in normalized field units; this is the damp margin around a puddle island. */
+const PUDDLE_EDGE = 0.08;
+/** Constant-bound radial taps keep the smear a cheap composite term. */
+const SMEAR_TAPS = 4;
+const SMEAR_DECAY = 0.65;
 
 const ALPHA_FLOOR = SCENE_ALPHA_FLOOR.toFixed(6);
 /** Half the floor: anything below it is cleared background, not geometry. */
@@ -223,7 +232,17 @@ uniform float uFogInscatter;
 uniform float uFogTintR;
 uniform float uFogTintG;
 uniform float uFogTintB;
+uniform float uWetStrength;
+uniform float uPuddleCoverage;
+uniform float uPuddleScaleM;
+uniform float uWetDarken;
+uniform float uWetGloss;
+uniform float uRadialSmear;
+uniform float uSmearStrength;
 uniform vec2 uPivotUv;
+uniform vec2 uWorldOriginM;
+uniform vec2 uWorldSizeM;
+uniform vec2 uWideTexel;
 uniform vec2 uSceneUvScale;
 uniform vec2 uBloomUvScale;
 uniform vec2 uWideUvScale;
@@ -233,6 +252,24 @@ uniform vec2 uMaskUvScale;
 uniform vec2 uAoUvScale;
 
 varying vec2 vUv;
+
+const float WET_GROUND_HEIGHT_M = ${glslFloat(WET_GROUND_HEIGHT_M)};
+const float PUDDLE_EDGE = ${glslFloat(PUDDLE_EDGE)};
+
+float hash21(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float valueNoise(vec2 p) {
+  vec2 cell = floor(p);
+  vec2 f = fract(p);
+  vec2 w = f * f * (3.0 - 2.0 * f);
+  float a = hash21(cell);
+  float b = hash21(cell + vec2(1.0, 0.0));
+  float c = hash21(cell + vec2(0.0, 1.0));
+  float d = hash21(cell + vec2(1.0, 1.0));
+  return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
 
 void main() {
   vec4 sceneSample = texture2D(uScene, vUv * uSceneUvScale);
@@ -245,6 +282,61 @@ void main() {
     + texture2D(uBloomNarrow, vUv * uBloomUvScale).rgb * uNarrowStrength
     + wideBloom * uWideStrength
     + texture2D(uStreak, vUv * uStreakUvScale).rgb * uStreakStrength;
+
+  // The composite has no material channel. A world-anchored field is deliberately surface-blind,
+  // while the decoded height keeps the wet look on flat roads and low caps only.
+  float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;
+  vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;
+  float puddleNoise = valueNoise(worldM / max(uPuddleScaleM, 0.001));
+  float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);
+  float puddle = smoothstep(
+    puddleThreshold - PUDDLE_EDGE,
+    puddleThreshold + PUDDLE_EDGE,
+    puddleNoise) * step(0.0001, uPuddleCoverage);
+  float wet = clamp(uWetStrength, 0.0, 1.0) * ground * puddle;
+
+  // Darken first to make headroom, then lift only lit puddles. The mix is bounded so highlights
+  // that already hit the tone-map ceiling do not turn into an invisible additive spike.
+  c *= mix(1.0, clamp(uWetDarken, 0.0, 1.0), wet);
+  float light = clamp(dot(c, ${LUMA}), 0.0, 1.0);
+  float gloss = wet * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.03, 0.72, light);
+  c = mix(c, c * (1.0 + ${glslFloat(0.35)}), gloss);
+
+  // The projection leans geometry away from the pivot. A mirror image therefore samples away
+  // from the pivot too; the reach is exactly zero at the pivot and grows radially with uRadialSmear.
+  // Wide bloom is already blurred, so four geometrically weighted taps are enough for a smooth tail.
+  float smearAmount = wet * clamp(uSmearStrength, 0.0, 1.0);
+  vec2 smearReach = (vUv - uPivotUv) * uRadialSmear;
+  vec3 smearSample = vec3(0.0);
+  float smearWeight = 0.0;
+  for (int i = 1; i <= ${SMEAR_TAPS}; i++) {
+    float t = float(i) / ${glslFloat(SMEAR_TAPS)};
+    float w = pow(${glslFloat(SMEAR_DECAY)}, float(i));
+    vec2 rawUv = (vUv + smearReach * t) * uWideUvScale;
+    vec2 inFrame = step(vec2(0.0), rawUv) * step(rawUv, uWideUvScale);
+    float valid = inFrame.x * inFrame.y;
+    vec2 edgeFade = smoothstep(
+      vec2(0.0), uWideTexel, rawUv)
+      * (1.0 - smoothstep(
+        uWideUvScale - uWideTexel,
+        uWideUvScale,
+        rawUv));
+    float tapWeight = valid * edgeFade.x * edgeFade.y;
+    vec2 sampleUv = clamp(rawUv, vec2(0.0), uWideUvScale);
+    smearSample += texture2D(uBloomWide, sampleUv).rgb * (w * tapWeight);
+    // WHY: renormalising valid taps would cancel the fade and recreate the hard edge plateau.
+    smearWeight += w;
+  }
+  smearSample /= max(smearWeight, 0.001);
+  // Tint a bounded dark lift toward the sampled neon hue. The explicit cap keeps wet highlights
+  // from turning into a raw additive spike before the composite tone map.
+  float smearLuma = dot(smearSample, ${LUMA});
+  float smearLight = clamp(smearLuma * uWideStrength, 0.0, 1.0);
+  vec3 smearHue = smearSample / max(smearLuma, 0.001);
+  vec3 smearLift = mix(vec3(smearLight), smearHue * smearLight, clamp(uWetGloss, 0.0, 1.0));
+  vec3 smearTarget = min(c + smearLift * ${glslFloat(0.35)}, vec3(1.0));
+  c = mix(c, smearTarget, smearAmount);
+
   float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
     * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
   c *= 1.0 - 0.38 * castShadow;

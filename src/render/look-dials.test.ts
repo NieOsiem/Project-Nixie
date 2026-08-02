@@ -22,11 +22,19 @@ describe("weather presets", () => {
     }
   });
 
+  it("keeps smear controls shared with the wet look", () => {
+    for (const [name, preset] of Object.entries(WEATHER_PRESETS)) {
+      expect(preset.dials, `${name} owns smearStrength`).not.toHaveProperty("smearStrength");
+      expect(preset.dials, `${name} owns smearHeightM`).not.toHaveProperty("smearHeightM");
+    }
+  });
+
   it("varies only the rain character, leaving the shared look alone", () => {
     // The point of a preset being four numbers: fog, AO, streak, tint, haze and splash *size* are
     // identical across all three, so tuning a shared value is not a three-way edit. If a preset
     // starts carrying post-chain dials, applyWeather's markContentDirty becomes load-bearing.
     const allowed = new Set([
+      "wetStrength",
       "rainDrops",
       "rainSpeedMPS",
       "rainStreakDuty",
@@ -40,18 +48,24 @@ describe("weather presets", () => {
     }
   });
 
-  it("clear draws nothing at all rather than a field of zeroes", () => {
+  it("clear is explicitly dry while drawing nothing at all", () => {
     // strength 0 multiplies rainStrength, and the renderer hides the quad at or below 0 — so a dry
-    // night costs no fill. Carrying zeroed dials instead would still pay for the whole pass.
+    // night costs no fill. The composite still needs an explicit wetness zero to stay dry.
     expect(WEATHER_PRESETS[WEATHER.CLEAR].strength).toBe(0);
-    expect(WEATHER_PRESETS[WEATHER.CLEAR].dials).toEqual({});
+    expect(WEATHER_PRESETS[WEATHER.CLEAR].dials).toEqual({ wetStrength: 0 });
   });
 
   it("orders drizzle, rain and storm monotonically on every dial they vary", () => {
     // Not decoration: these are the three the user tuned by eye, and a preset that went backwards
     // on one dial would read as the wrong weather while looking deliberate.
     const ladder: Weather[] = [WEATHER.DRIZZLE, WEATHER.RAIN, WEATHER.STORM];
-    for (const key of ["rainDrops", "rainSpeedMPS", "rainDensity", "splashDensity"] as const) {
+    for (const key of [
+      "wetStrength",
+      "rainDrops",
+      "rainSpeedMPS",
+      "rainDensity",
+      "splashDensity"
+    ] as const) {
       const values = ladder.map((name) => WEATHER_PRESETS[name].dials[key as keyof LookDials]!);
       for (let i = 1; i < values.length; i++) {
         expect(values[i]!, `${key} is not monotonic`).toBeGreaterThan(values[i - 1]!);
@@ -72,5 +86,12 @@ describe("weather presets", () => {
     for (const [key, value] of Object.entries(WEATHER_PRESETS[WEATHER.RAIN].dials)) {
       expect(DEFAULT_LOOK_DIALS[key as keyof LookDials]).toBe(value);
     }
+  });
+
+  it("keeps the smear defaults finite and positive where required", () => {
+    expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearStrength)).toBe(true);
+    expect(DEFAULT_LOOK_DIALS.smearStrength).toBeGreaterThan(0);
+    expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearHeightM)).toBe(true);
+    expect(DEFAULT_LOOK_DIALS.smearHeightM).toBeGreaterThan(0);
   });
 });

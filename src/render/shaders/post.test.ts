@@ -117,12 +117,72 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG).toContain("c *= 1.0 - uAoStrength * ao * lowness * covered;");
   });
 
+  it("builds a covered low-ground mask and anchors puddles in world space", () => {
+    expect(COMPOSITE_FRAG).toContain("uniform vec2 uWorldOriginM;");
+    expect(COMPOSITE_FRAG).toContain("uniform vec2 uWorldSizeM;");
+    expect(COMPOSITE_FRAG).toContain("vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;");
+    expect(COMPOSITE_FRAG).toContain("float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;");
+    expect(COMPOSITE_FRAG).toContain("float puddleNoise = valueNoise(worldM / max(uPuddleScaleM, 0.001));");
+    expect(COMPOSITE_FRAG).toContain("float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);");
+    expect(COMPOSITE_FRAG).toContain("* step(0.0001, uPuddleCoverage);");
+  });
+
+  it("darkens before the cast shadow and applies only a bounded light-aware gloss", () => {
+    const wet = COMPOSITE_FRAG.indexOf("c *= mix(1.0, clamp(uWetDarken, 0.0, 1.0), wet);");
+    const gloss = COMPOSITE_FRAG.indexOf("c = mix(c, c * (1.0 + 0.35), gloss);");
+    const shadow = COMPOSITE_FRAG.indexOf("float castShadow =");
+    expect(wet).toBeGreaterThan(-1);
+    expect(gloss).toBeGreaterThan(wet);
+    expect(shadow).toBeGreaterThan(gloss);
+    expect(COMPOSITE_FRAG).toContain("float light = clamp(dot(c, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);");
+    expect(COMPOSITE_FRAG).not.toMatch(/c\s*\+=/);
+  });
+
+  it("smears only wide bloom away from the pivot, masked by the wet field", () => {
+    for (const uniform of ["uniform float uRadialSmear;", "uniform float uSmearStrength;"]) {
+      expect(COMPOSITE_FRAG).toContain(uniform);
+    }
+    const start = COMPOSITE_FRAG.indexOf("float smearAmount =");
+    const end = COMPOSITE_FRAG.indexOf("float castShadow =");
+    const smear = COMPOSITE_FRAG.slice(start, end);
+    expect(smear).toContain("float smearAmount = wet * clamp(uSmearStrength, 0.0, 1.0);");
+    expect(smear).toContain("vec2 smearReach = (vUv - uPivotUv) * uRadialSmear;");
+    expect(smear).toContain("vUv + smearReach * t");
+    expect(smear).toContain("texture2D(uBloomWide, sampleUv)");
+    expect(smear).not.toContain("texture2D(uScene,");
+    expect(smear).toContain("float w = pow(0.65, float(i));");
+    expect(smear).toContain("for (int i = 1; i <= 4; i++) {");
+    expect(smear).toContain("vec2 rawUv = (vUv + smearReach * t) * uWideUvScale;");
+    expect(smear).toContain("vec2 inFrame = step(vec2(0.0), rawUv) * step(rawUv, uWideUvScale);");
+    expect(smear).toContain("float valid = inFrame.x * inFrame.y;");
+    expect(smear).toContain("float tapWeight = valid * edgeFade.x * edgeFade.y;");
+    expect(smear).toContain("smearSample += texture2D(uBloomWide, sampleUv).rgb * (w * tapWeight);");
+    expect(smear).toContain("smearWeight += w;");
+    expect(smear).toContain("vec2 edgeFade = smoothstep(");
+    expect(smear).toContain("uWideTexel, rawUv)");
+    expect(COMPOSITE_FRAG).toContain("uniform vec2 uWideTexel;");
+    expect(smear).toContain("float smearLuma = dot(smearSample, vec3(0.299, 0.587, 0.114));");
+    expect(smear).toContain("float smearLight = clamp(smearLuma * uWideStrength, 0.0, 1.0);");
+    expect(smear).toContain("vec3 smearHue = smearSample / max(smearLuma, 0.001);");
+    expect(smear).toContain("vec3 smearLift = mix(vec3(smearLight), smearHue * smearLight, clamp(uWetGloss, 0.0, 1.0));");
+    expect(smear).toContain("vec3 smearTarget = min(c + smearLift * 0.35, vec3(1.0));");
+    expect(smear).toContain("c = mix(c, smearTarget, smearAmount);");
+    expect(smear).not.toContain("max(c, min(smearSample");
+  });
+
+  it("formats interpolated constant floats for ESSL 100 and has no derivative or time terms", () => {
+    expect(COMPOSITE_FRAG).not.toMatch(/\b(?:fwidth|dFdx|dFdy)\b/);
+    expect(COMPOSITE_FRAG).not.toContain("uTime");
+    expect(COMPOSITE_FRAG).not.toMatch(/const float [A-Z0-9_]+ = -?\d+(?:;|\s*;)/);
+    expect(COMPOSITE_FRAG).toContain("const float WET_GROUND_HEIGHT_M = 2.5;");
+    expect(COMPOSITE_FRAG).toContain("const float PUDDLE_EDGE = 0.08;");
+  });
+
   it("carries no grain and no time term — grain lives in the host's filter stack", () => {
     for (const gone of [
       "grain",
       "uGrainStrength",
       "uGrainCells",
-      "hash21",
       "uScreenPxPerMetre",
       "uTime"
     ]) {
@@ -180,6 +240,13 @@ describe("look dials", () => {
       aoStrength: 0.45,
       aoHeightM: 18,
       streakStrength: 1.3,
+      wetStrength: 0.7,
+      puddleCoverage: 0.45,
+      puddleScaleM: 4,
+      wetDarken: 0.78,
+      wetGloss: 0.6,
+      smearStrength: 0.6,
+      smearHeightM: 12,
       rainDrops: 0.55,
       rainSpeedMPS: 35,
       rainStreakDuty: 0.35,

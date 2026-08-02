@@ -515,12 +515,19 @@ export class CityRenderer {
       });
     }
 
+    const smearHeightM = Math.max(0, this.#dials.smearHeightM);
+    const radialSmear =
+      (smearHeightM / Math.max(this.#cameraHeightMetres - smearHeightM, 1)) * leanStrength;
     this.display.texture = this.#bloom.render(
       this.#target,
       this.#bloomStrength,
       this.#shadowTarget,
       this.#maskTarget,
-      this.#pivotUv
+      this.#pivotUv,
+      view,
+      this.#pixelsPerMetre,
+      zoom,
+      radialSmear
     );
     this.display.position.set(view.x, view.y);
     this.display.width = view.width;

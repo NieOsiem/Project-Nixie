@@ -20,6 +20,13 @@ export interface LookDials {
   aoStrength: number;
   aoHeightM: number;
   streakStrength: number;
+  wetStrength: number;
+  puddleCoverage: number;
+  puddleScaleM: number;
+  wetDarken: number;
+  wetGloss: number;
+  smearStrength: number;
+  smearHeightM: number;
   rainDrops: number;
   rainSpeedMPS: number;
   rainStreakDuty: number;
@@ -37,8 +44,8 @@ export interface LookDials {
 }
 
 /**
- * Post-chain values are user-tuned in Foundry (2026-07-31), not guesses. Grain lives in FX
- * Master's filter stack, not here. The weather block is a starting point, not yet tuned.
+ * The original post-chain, weather and wet-look values are user-tuned in Foundry. Grain lives in
+ * FX Master's filter stack, not here.
  */
 export const DEFAULT_LOOK_DIALS: LookDials = {
   fogStrength: 0.35,
@@ -51,6 +58,13 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   aoStrength: 0.45,
   aoHeightM: 18,
   streakStrength: 1.3,
+  wetStrength: 0.7,
+  puddleCoverage: 0.45,
+  puddleScaleM: 4,
+  wetDarken: 0.78,
+  wetGloss: 0.6,
+  smearStrength: 0.6,
+  smearHeightM: 12,
   rainDrops: 0.55,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
   // fall, so this apparent speed stands in for the fall we cannot see.
@@ -86,12 +100,13 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
  *
  * A preset is only the handful of dials that actually differ between wet and wetter — every other
  * value, the whole post chain included, is identical across all three and stays in
- * `DEFAULT_LOOK_DIALS`. That is the point: the weather system is four numbers per preset, not a
- * parallel copy of the dial set, so tuning a shared value does not have to be done three times.
+ * `DEFAULT_LOOK_DIALS`. That is the point: the weather system is a small set of numbers per
+ * preset, not a parallel copy of the dial set, so tuning a shared value does not have to be done
+ * three times.
  *
  * `strength` multiplies `rainStrength`, so `CLEAR` hides the overlay outright and costs no fill
- * rather than drawing a field of zeroes. It carries no dials — switching to it leaves the previous
- * preset's values in place, since nothing is drawn either way.
+ * rather than drawing a field of zeroes. It still carries an explicit zero wetness dial because
+ * the wet look is part of the always-drawn composite.
  */
 export interface WeatherPreset {
   strength: number;
@@ -99,10 +114,11 @@ export interface WeatherPreset {
 }
 
 export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
-  [WEATHER.CLEAR]: { strength: 0, dials: {} },
+  [WEATHER.CLEAR]: { strength: 0, dials: { wetStrength: 0 } },
   [WEATHER.DRIZZLE]: {
     strength: 1,
     dials: {
+      wetStrength: 0.25,
       rainDrops: 0.45,
       rainSpeedMPS: 25,
       rainStreakDuty: 0.25,
@@ -113,6 +129,7 @@ export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
   [WEATHER.RAIN]: {
     strength: 1,
     dials: {
+      wetStrength: 0.7,
       rainDrops: 0.55,
       rainSpeedMPS: 35,
       rainStreakDuty: 0.35,
@@ -123,6 +140,7 @@ export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
   [WEATHER.STORM]: {
     strength: 1,
     dials: {
+      wetStrength: 1,
       rainDrops: 0.85,
       rainSpeedMPS: 65,
       rainStreakDuty: 0.35,

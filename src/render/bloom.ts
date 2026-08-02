@@ -1,3 +1,4 @@
+import type { Rect } from "../core/geom/types.js";
 import type { LookDials } from "./look-dials.js";
 import { ScreenQuad } from "./screen-quad.js";
 import {
@@ -76,6 +77,8 @@ export class BloomChain {
   #aoUvScale = new Float32Array([1, 1]);
   #shadowUvScale = new Float32Array([1, 1]);
   #maskUvScale = new Float32Array([1, 1]);
+  #worldOriginM = new Float32Array(2);
+  #worldSizeM = new Float32Array(2);
 
   /** `dials` is the renderer's own object, shared not copied: mutating it retunes the next frame. */
   constructor(renderer: any, dials: LookDials) {
@@ -169,7 +172,18 @@ export class BloomChain {
       uFogTintR: dials.fogTintR,
       uFogTintG: dials.fogTintG,
       uFogTintB: dials.fogTintB,
+      uWorldOriginM: this.#worldOriginM,
+      uWorldSizeM: this.#worldSizeM,
+      uPxPerMetre: 1,
+      uWetStrength: dials.wetStrength,
+      uPuddleCoverage: dials.puddleCoverage,
+      uPuddleScaleM: dials.puddleScaleM,
+      uWetDarken: dials.wetDarken,
+      uWetGloss: dials.wetGloss,
+      uRadialSmear: 0,
+      uSmearStrength: dials.smearStrength,
       uPivotUv: new Float32Array([0.5, 0.5]),
+      uWideTexel: this.#wideTexel,
       uSceneUvScale: this.#sceneUvScale,
       uBloomUvScale: this.#bloomUvScale,
       uWideUvScale: this.#wideUvScale,
@@ -187,7 +201,11 @@ export class BloomChain {
     strength: number,
     shadow: any,
     buildingMask: any,
-    pivotUv: Float32Array
+    pivotUv: Float32Array,
+    view: Rect,
+    pixelsPerMetre: number,
+    zoom: number,
+    radialSmear: number
   ): any {
     this.#ensureTargets(scene);
     const renderer = this.#renderer;
@@ -261,6 +279,20 @@ export class BloomChain {
     composite.uFogTintR = dials.fogTintR;
     composite.uFogTintG = dials.fogTintG;
     composite.uFogTintB = dials.fogTintB;
+    this.#worldOriginM[0] = view.x / pixelsPerMetre;
+    this.#worldOriginM[1] = view.y / pixelsPerMetre;
+    this.#worldSizeM[0] = view.width / pixelsPerMetre;
+    this.#worldSizeM[1] = view.height / pixelsPerMetre;
+    composite.uWorldOriginM = this.#worldOriginM;
+    composite.uWorldSizeM = this.#worldSizeM;
+    composite.uPxPerMetre = pixelsPerMetre * zoom;
+    composite.uWetStrength = dials.wetStrength;
+    composite.uPuddleCoverage = dials.puddleCoverage;
+    composite.uPuddleScaleM = dials.puddleScaleM;
+    composite.uWetDarken = dials.wetDarken;
+    composite.uWetGloss = dials.wetGloss;
+    composite.uRadialSmear = radialSmear;
+    composite.uSmearStrength = dials.smearStrength;
     composite.uPivotUv = pivotUv;
     renderer.render(this.#composite.display, { renderTexture: this.#out, clear: true });
 
