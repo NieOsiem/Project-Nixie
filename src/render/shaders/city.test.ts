@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { CITY_FRAG, CITY_VERT } from "./city.js";
+import { CITY_FRAG, CITY_VERT, SEED_STEPS } from "./city.js";
+import { NEON_FRAG } from "./neon.js";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 describe("city fragment shader", () => {
@@ -56,13 +57,32 @@ describe("city fragment shader", () => {
   });
 
   it("gates parapet emission to a minority and caps the rest by value", () => {
-    expect(CITY_FRAG).toContain("float parapetGlow = step(0.62, hash11(vSeed + 3.41));");
+    expect(CITY_FRAG).toContain("float parapetGlow = step(0.62, hash11(seed + 3.41));");
     expect(CITY_FRAG).toContain("float coping = parapet * (1.0 - parapetGlow);");
     // Both quality branches gate off the same decision, or a building would change style
     // when the camera settles. One assignment, two uses.
     expect(CITY_FRAG.match(/float parapetGlow = /g)).toHaveLength(1);
     expect(CITY_FRAG.match(/parapet \* parapetGlow/g)).toHaveLength(2);
     expect(CITY_FRAG.match(/1\.0 \+ 0\.30 \* coping/g)).toHaveLength(2);
+  });
+
+  it("hashes a snapped seed, never the raw varying", () => {
+    // WHY: wall quads carry a varying w, so vSeed interpolates ~1 ULP off the constant the
+    // four vertices agree on. hash11 multiplies by 78233 before the sin, which turned that
+    // into a different facade style per band on NVIDIA while AMD happened to be exact.
+    expect(CITY_FRAG).toContain(
+      `return floor(raw * ${SEED_STEPS}.0 + 0.5) / ${SEED_STEPS}.0;`
+    );
+    const facade = CITY_FRAG.slice(
+      CITY_FRAG.indexOf("vec3 facade()"),
+      CITY_FRAG.indexOf("vec3 roof()")
+    );
+    expect(facade).toContain("float seed = buildingSeed(vSeed);");
+    expect(facade.match(/vSeed/g)).toHaveLength(1);
+    expect(NEON_FRAG).toContain(
+      `float seed = floor(vSeed * ${SEED_STEPS}.0 + 0.5) / ${SEED_STEPS}.0;`
+    );
+    expect(NEON_FRAG).toContain("hash11(floor(cell) + seed * 37.0)");
   });
 
   it("encodes surface height into scene alpha from the shared constants", () => {

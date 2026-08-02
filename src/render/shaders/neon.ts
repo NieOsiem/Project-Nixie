@@ -1,4 +1,5 @@
 import { PALETTE_SIZE } from "../../core/palette.js";
+import { SEED_STEPS } from "./city.js";
 
 /**
  * Bounded additive glow quads.
@@ -132,7 +133,10 @@ void main() {
       : vLocal.y * (vPanelM.y + uGlowMarginM);
     float cell = alongM / GLYPH_PERIOD_M;
     // halfFill, not half: 'half' is a reserved word in GLSL ES 1.00.
-    float halfFill = GLYPH_FILL * (0.45 + 0.55 * hash11(floor(cell) + vSeed * 37.0)) * 0.5;
+    // Snapped like city.ts: a banner spans the facade, so its varying w interpolates the
+    // per-sign vSeed ~1 ULP off and hash11 turns that into a different glyph run per band.
+    float seed = floor(vSeed * ${SEED_STEPS}.0 + 0.5) / ${SEED_STEPS}.0;
+    float halfFill = GLYPH_FILL * (0.45 + 0.55 * hash11(floor(cell) + seed * 37.0)) * 0.5;
     float aa = 0.5 / max(GLYPH_PERIOD_M * vGlyphPxPerM, 1.0);
     float block = 1.0 - smoothstep(halfFill - aa, halfFill + aa, abs(fract(cell) - 0.5));
 

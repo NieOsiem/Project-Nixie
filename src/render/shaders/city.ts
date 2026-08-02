@@ -2,6 +2,9 @@ import { BANK_SIZE, DISTRICT_SLOT, PALETTE_SIZE } from "../../core/palette.js";
 import { CAR_SURFACE } from "../../core/geom/mesh.js";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
+/** Seed buckets a facade hash may resolve to. Far above the ~1e-7 interpolation jitter. */
+export const SEED_STEPS = 4096;
+
 /**
  * Fake-3D extrusion.
  *
@@ -148,6 +151,12 @@ float hash11(float x) {
   return fract(sin(x * 78.233) * 43758.5453);
 }
 
+// WHY: a wall quad's varying w interpolates the per-building vSeed ~1 ULP off its vertex
+// value, and hash11 amplifies that by 78233 into a different facade style per band.
+float buildingSeed(float raw) {
+  return floor(raw * ${SEED_STEPS}.0 + 0.5) / ${SEED_STEPS}.0;
+}
+
 float hash21(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
@@ -190,6 +199,7 @@ vec3 flatGround() {
 }
 
 vec3 facade() {
+  float seed = buildingSeed(vSeed);
   float upPx = max(vUpPxPerMetre, 0.0001);
   float alongPx = max(uScreenPxPerMetre, 0.0001);
   float wUp = 0.6 / upPx;
@@ -201,9 +211,9 @@ vec3 facade() {
   float above = max(aboveRaw, 0.0);
   float upper = smoothstep(-wUp, wUp, aboveRaw);
   float floorId = floor(above / FLOOR_M);
-  float sectionFloors = floor(mix(4.0, 9.0, hash11(vSeed + 1.73)));
+  float sectionFloors = floor(mix(4.0, 9.0, hash11(seed + 1.73)));
   float section = floor(floorId / sectionFloors);
-  float sectionTone = mix(0.82, 1.0, hash11(vSeed + section * 13.37 + 2.19));
+  float sectionTone = mix(0.82, 1.0, hash11(seed + section * 13.37 + 2.19));
   float fy = fract(above / FLOOR_M);
   float parapet = smoothstep(vTop - PARAPET_M - wUp, vTop - PARAPET_M + wUp, vHeight);
   float canyon = mix(0.68, 1.0, smoothstep(0.0, 12.0, vHeight));
@@ -212,7 +222,7 @@ vec3 facade() {
   // edge in the city and the skyline read as wireframe. Lit coping is a minority style; the rest
   // get a value-only cap. Decided before the quality branch so a building cannot change style
   // between a moving and a settled frame.
-  float parapetGlow = step(0.62, hash11(vSeed + 3.41));
+  float parapetGlow = step(0.62, hash11(seed + 3.41));
   float coping = parapet * (1.0 - parapetGlow);
 
   // WHY: moving frames skip cell work; one section-coherent ribbon avoids shimmer.
@@ -222,7 +232,7 @@ vec3 facade() {
       0.18,
       0.18 + RIBBON_M / FLOOR_M,
       wUp / FLOOR_M);
-    float movingOn = step(0.24, hash11(vSeed + section * 7.91 + 4.07));
+    float movingOn = step(0.24, hash11(seed + section * 7.91 + 4.07));
     float movingLight = movingRibbon * movingOn * upper * lod(FLOOR_M, upPx);
     vec3 body = vBase * vShade * canyon * sectionTone * (1.0 + 0.30 * coping);
     return body
@@ -230,7 +240,7 @@ vec3 facade() {
       + vAccent * (0.68 * movingLight);
   }
 
-  float family = hash11(vSeed + 0.37);
+  float family = hash11(seed + 0.37);
   float gridStyle = 1.0 - step(0.35, family);
   float ribbonStyle = step(0.35, family) * (1.0 - step(0.65, family));
   float finStyle = step(0.65, family) * (1.0 - step(0.85, family));
@@ -240,28 +250,28 @@ vec3 facade() {
   float gridPane = slab(gx, 0.12, 0.88, wAlong / GRID_M)
     * slab(fy, 0.14, 0.86, wUp / FLOOR_M);
   float gridLod = min(lod(FLOOR_M, upPx), lod(GRID_M, alongPx));
-  float litThreshold = mix(0.20, 0.40, hash11(vSeed + section * 5.23 + 6.11));
+  float litThreshold = mix(0.20, 0.40, hash11(seed + section * 5.23 + 6.11));
   float gridOn = step(
     litThreshold,
-    hash21(vec2(floor(vU / (GRID_M * 2.0)), floor(floorId / 2.0)) + vSeed * 91.0));
+    hash21(vec2(floor(vU / (GRID_M * 2.0)), floor(floorId / 2.0)) + seed * 91.0));
 
   float ribbon = slab(
     fy,
     0.18,
     0.18 + RIBBON_M / FLOOR_M,
     wUp / FLOOR_M) * lod(FLOOR_M, upPx);
-  float ribbonOn = step(0.24, hash11(vSeed + section * 7.91 + 8.03));
+  float ribbonOn = step(0.24, hash11(seed + section * 7.91 + 8.03));
 
   float finX = fract(vU / FIN_M);
   float fin = slab(finX, 0.08, 0.56, wAlong / FIN_M) * lod(FIN_M, alongPx);
-  float finOn = step(0.28, hash11(vSeed + section * 9.17 + 9.13));
+  float finOn = step(0.28, hash11(seed + section * 9.17 + 9.13));
 
-  float featureX = fract((vU + vSeed * FEATURE_M) / FEATURE_M);
+  float featureX = fract((vU + seed * FEATURE_M) / FEATURE_M);
   float wallN = vHeight / max(vTop, 0.0001);
   float feature = slab(featureX, 0.24, 0.76, wAlong / FEATURE_M)
     * slab(wallN, 0.20, 0.78, wUp / max(vTop, 0.0001))
     * lod(FEATURE_M, alongPx);
-  float featureOn = step(0.32, hash11(vSeed + section * 11.71 + 10.31));
+  float featureOn = step(0.32, hash11(seed + section * 11.71 + 10.31));
 
   float lit = upper * (
     gridStyle * gridPane * gridOn * gridLod
