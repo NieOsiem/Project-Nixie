@@ -4,6 +4,7 @@ import {
   BANK_SIZE,
   BASE_BANK,
   CITY_BANK,
+  CITY_SLOT,
   CITY_SURFACES,
   DEFAULT_DISTRICT_PALETTE,
   DISTRICT_SLOT,
@@ -104,6 +105,13 @@ describe("packPalette", () => {
 });
 
 describe("bank layout", () => {
+  it("reserves exactly one shared water material slot", () => {
+    expect(CITY_SLOT.WATER).toBe(6);
+    expect(MATERIAL.WATER).toBe(materialIndex(CITY_BANK, CITY_SLOT.WATER));
+    expect(CITY_SURFACES).toHaveLength(7);
+    expect(CITY_SURFACES.length).toBeLessThanOrEqual(BANK_SIZE);
+  });
+
   it("keeps the shared surfaces in bank 0, out of every district's reach", () => {
     for (const index of Object.values(MATERIAL)) {
       expect(Math.floor(index / BANK_SIZE)).toBe(CITY_BANK);

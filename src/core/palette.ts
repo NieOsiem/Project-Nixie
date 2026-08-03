@@ -25,7 +25,8 @@ export const CITY_SLOT = {
   SIDEWALK: 2,
   LANE_MARK: 3,
   CROSSING: 4,
-  KERB: 5
+  KERB: 5,
+  WATER: 6
 } as const;
 
 /** Slot within a district bank. Every district palette supplies exactly these, in order. */
@@ -60,7 +61,8 @@ export const MATERIAL = {
   SIDEWALK: materialIndex(CITY_BANK, CITY_SLOT.SIDEWALK),
   LANE_MARK: materialIndex(CITY_BANK, CITY_SLOT.LANE_MARK),
   CROSSING: materialIndex(CITY_BANK, CITY_SLOT.CROSSING),
-  KERB: materialIndex(CITY_BANK, CITY_SLOT.KERB)
+  KERB: materialIndex(CITY_BANK, CITY_SLOT.KERB),
+  WATER: materialIndex(CITY_BANK, CITY_SLOT.WATER)
 } as const;
 
 /** Zone n takes the nth district bank, wrapping once the palette runs out. */
@@ -152,7 +154,8 @@ export const CITY_SURFACES: Material[] = [
   lit(rgb(0.165, 0.14, 0.215), rgb(1, 0.7, 0.52), 0.06),
   lit(rgb(0.18, 0.15, 0.23), rgb(0.62, 0.46, 0.9), 0.08),
   lit(rgb(0.21, 0.19, 0.28), rgb(0.55, 0.68, 1), 0.09),
-  lit(rgb(0.12, 0.115, 0.165), rgb(0.25, 0.95, 0.88), 0.06)
+  lit(rgb(0.12, 0.115, 0.165), rgb(0.25, 0.95, 0.88), 0.06),
+  dark(0.025, 0.045, 0.11)
 ];
 
 const district = (name: string, materials: Material[]): DistrictPalette => ({ name, materials });

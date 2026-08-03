@@ -1,179 +1,166 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CITY_FORMAT_VERSION, FLAG_CITY, MODULE_ID } from "../constants.js";
-import { ROAD_CLASSES } from "../core/gen/demo-city.js";
-import { DEFAULT_ZONE_PARAMS } from "../core/gen/zones.js";
-import { BANK_SIZE, DEFAULT_DISTRICT_PALETTE, FIRST_ZONE_BANK } from "../core/palette.js";
-import { loadCityState } from "./documents.js";
+import {
+  CITY_SCHEMA_VERSION,
+  FLAG_CITY,
+  GENERATOR_VERSION,
+  MODULE_ID
+} from "../constants.js";
+import type { CityStateV2 } from "../core/gen/terrain.js";
+import { loadCityState, saveCityState } from "./documents.js";
 
-/**
- * A stub scene, not Foundry. It exists only to hand `loadCityState` a stored flag, which
- * is the one thing the migration path cannot be tested without.
- */
-const storeCity = (city: unknown): void => {
+let stored: unknown;
+let setFlag: ReturnType<typeof vi.fn>;
+
+function installScene(flag: unknown, write: (value: unknown) => Promise<void> = async (value) => {
+  stored = value;
+}): void {
+  stored = flag;
+  setFlag = vi.fn(async (_module: string, key: string, value: unknown) => {
+    if (key === FLAG_CITY) await write(value);
+  });
   (globalThis as any).canvas = {
     scene: {
       getFlag: (module: string, key: string) =>
-        module === MODULE_ID && key === FLAG_CITY ? city : undefined
+        module === MODULE_ID && key === FLAG_CITY ? stored : undefined,
+      setFlag
     }
   };
-};
+  (globalThis as any).game = { user: { isGM: true } };
+}
+
+function state(revision = 1): CityStateV2 {
+  return {
+    kind: "city-generator-2",
+    schemaVersion: CITY_SCHEMA_VERSION,
+    generatorVersion: GENERATOR_VERSION,
+    revision,
+    source: {
+      origin: { x: 5000, y: 4000 },
+      citySeed: "phase1-seed",
+      generation: { terrainMode: "rectangle", coastEdge: null },
+      terrain: {
+        land: [
+          { x: -100, y: -80 },
+          { x: 100, y: -80 },
+          { x: 100, y: 80 },
+          { x: -100, y: 80 }
+        ],
+        urbanFootprint: null
+      }
+    }
+  };
+}
 
 afterEach(() => {
   delete (globalThis as any).canvas;
+  delete (globalThis as any).game;
   vi.restoreAllMocks();
 });
 
-/** Shape of the user's real stored city: metres, `origin`, zones without banks. */
-const formatThreeCity = () => ({
-  formatVersion: 3,
-  generatorVersion: 2,
-  origin: { x: 5000, y: 4000 },
-  graph: {
-    nodes: [
-      { id: "A", x: -80, y: -52 },
-      { id: "B", x: 0, y: -52 },
-      { id: "E", x: 0, y: 0 }
-    ],
-    edges: [
-      { id: "AB", a: "A", b: "B", classId: "street" },
-      { id: "BE", a: "B", b: "E", classId: "arterial", sidewalks: false }
-    ],
-    classes: [{ id: "street", widthM: 1, sidewalkM: 0 }]
-  },
-  base: { seed: 12, lotSizeM: 30, gapM: 5, minHeightM: 6, maxHeightM: 120 },
-  zones: [
-    { id: "z1", seed: 77, rect: { x: -100, y: -60, width: 90, height: 120 }, lotSizeM: 18, gapM: 3, minHeightM: 20, maxHeightM: 90 },
-    { id: "z2", seed: 78, rect: { x: 20, y: -60, width: 90, height: 120 }, lotSizeM: 40, gapM: 6, minHeightM: 4, maxHeightM: 40 }
-  ]
+describe("loadCityState", () => {
+  it("classifies an undefined flag as absent", () => {
+    installScene(undefined);
+    expect(loadCityState()).toEqual({ kind: "absent" });
+  });
+
+  it("classifies every existing non-2.0 flag as legacy", () => {
+    const raw = { formatVersion: 4, origin: { x: 1, y: 2 } };
+    installScene(raw);
+    expect(loadCityState()).toEqual({ kind: "legacy", raw });
+  });
+
+  it("round-trips a valid schema-1 state without changing geometry", () => {
+    const raw = state();
+    installScene(raw);
+    const result = loadCityState();
+    expect(result.kind).toBe("supported");
+    if (result.kind === "supported") expect(result.state).toEqual(raw);
+  });
+
+  it("refuses an unsupported integer schema and preserves the raw value", () => {
+    const raw = { ...state(), schemaVersion: 2 };
+    installScene(raw);
+    expect(loadCityState()).toEqual({ kind: "unsupported", raw, schemaVersion: 2 });
+  });
+
+  it("refuses an unsupported generator without rebuilding it as version 8", () => {
+    const raw = { ...state(), generatorVersion: GENERATOR_VERSION + 1 };
+    installScene(raw);
+    expect(loadCityState()).toEqual({
+      kind: "unsupported",
+      raw,
+      schemaVersion: CITY_SCHEMA_VERSION,
+      generatorVersion: GENERATOR_VERSION + 1
+    });
+  });
+
+  it("refuses malformed recognized schema metadata and source", () => {
+    const metadata = { ...state(), schemaVersion: "1" };
+    installScene(metadata);
+    expect(loadCityState()).toMatchObject({ kind: "malformed", raw: metadata });
+
+    const source = { ...state(), source: { ...state().source, terrain: { land: [], urbanFootprint: null } } };
+    installScene(source);
+    expect(loadCityState()).toMatchObject({ kind: "malformed", raw: source });
+  });
+
+  it("refuses inconsistent terrain mode and coast-edge configuration", () => {
+    for (const generation of [
+      { terrainMode: "coastal", coastEdge: null },
+      { terrainMode: "rectangle", coastEdge: "north" },
+      { terrainMode: "custom", coastEdge: "west" }
+    ]) {
+      const raw = { ...state(), source: { ...state().source, generation } };
+      installScene(raw);
+      expect(loadCityState()).toMatchObject({ kind: "malformed", raw });
+    }
+  });
 });
 
-describe("loadCityState", () => {
-  it("returns nothing when the scene has no city", () => {
-    storeCity(undefined);
-    expect(loadCityState()).toBeNull();
+describe("saveCityState", () => {
+  it("creates an absent city at revision 1", async () => {
+    installScene(undefined);
+    const candidate = state();
+    await expect(saveCityState(candidate, "absent")).resolves.toEqual(candidate);
+    expect(setFlag).toHaveBeenCalledOnce();
+    expect(stored).toEqual(candidate);
+    expect((stored as any).formatVersion).toBeUndefined();
   });
 
-  it("keeps a format-3 city intact through the migration", () => {
-    const stored = formatThreeCity();
-    storeCity(stored);
-    const city = loadCityState()!;
+  it("allows explicit replacement of legacy data only", async () => {
+    const legacy = { formatVersion: 4, graph: {} };
+    installScene(legacy);
+    const candidate = state();
+    await saveCityState(candidate, "legacy");
+    expect(stored).toEqual(candidate);
+  });
 
-    expect(city).not.toBeNull();
-    expect(city.formatVersion).toBe(CITY_FORMAT_VERSION);
-    expect(city.origin).toEqual(stored.origin);
-
-    // The geometry is the thing worth protecting: same nodes, same edges, same positions.
-    expect(city.graph.nodes).toEqual(stored.graph.nodes);
-    expect(city.graph.edges).toEqual(stored.graph.edges);
-    expect(city.zones).toHaveLength(stored.zones.length);
-    for (const [i, zone] of city.zones.entries()) {
-      const before = stored.zones[i]!;
-      expect(zone.id).toBe(before.id);
-      expect(zone.rect).toEqual(before.rect);
-      expect(zone.seed).toBe(before.seed);
-      expect(zone.lotSizeM).toBe(before.lotSizeM);
-      expect(zone.minHeightM).toBe(before.minHeightM);
-      expect(zone.maxHeightM).toBe(before.maxHeightM);
+  it("refuses unsupported or malformed flags without writing", async () => {
+    for (const raw of [
+      { kind: "city-generator-2", schemaVersion: 2 },
+      { kind: "city-generator-2", schemaVersion: 1, revision: 1 }
+    ]) {
+      installScene(raw);
+      await expect(saveCityState(state(), "absent")).rejects.toThrow();
+      expect(setFlag).not.toHaveBeenCalled();
+      expect(stored).toBe(raw);
     }
-    expect(city.base.seed).toBe(stored.base.seed);
-    expect(city.base.lotSizeM).toBe(stored.base.lotSizeM);
   });
 
-  it("gives a migrated city distinct banks and full palettes", () => {
-    storeCity(formatThreeCity());
-    const city = loadCityState()!;
-
-    const banks = city.zones.map((z) => z.bank);
-    expect(banks).toEqual([FIRST_ZONE_BANK, FIRST_ZONE_BANK + 1]);
-    expect(new Set(banks).size).toBe(banks.length);
-    expect(city.base.palette.materials).toHaveLength(BANK_SIZE);
-    for (const zone of city.zones) expect(zone.palette.materials).toHaveLength(BANK_SIZE);
-    expect(city.base.palette.name).toBe(DEFAULT_DISTRICT_PALETTE.name);
+  it("rejects a stale revision immediately before writing", async () => {
+    const current = state(2);
+    installScene(current);
+    await expect(saveCityState(state(2), 1)).rejects.toThrow(/revision/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(current);
   });
 
-  it("still adopts the current road classes on a migrated city", () => {
-    storeCity(formatThreeCity());
-    expect(loadCityState()!.graph.classes).toEqual(ROAD_CLASSES);
-  });
-
-  it("keeps a format-4 city's stored banks rather than renumbering them", () => {
-    const stored = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION };
-    stored.zones[0]!.id = "z1";
-    (stored.zones[0] as any).bank = 11;
-    (stored.zones[1] as any).bank = 5;
-    storeCity(stored);
-    expect(loadCityState()!.zones.map((z) => z.bank)).toEqual([11, 5]);
-  });
-
-  it("preserves a stored per-road parked-car toggle", () => {
-    const stored = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION };
-    (stored.graph.edges[0] as any).parkedCars = false;
-    storeCity(stored);
-    expect(loadCityState()!.graph.edges[0]!.parkedCars).toBe(false);
-  });
-
-  it("pads a short or half-written stored palette up to a full bank", () => {
-    const stored: any = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION };
-    stored.base.palette = { name: "Half", materials: DEFAULT_DISTRICT_PALETTE.materials.slice(0, 3) };
-    stored.zones[0].bank = FIRST_ZONE_BANK;
-    stored.zones[1].bank = FIRST_ZONE_BANK + 1;
-    storeCity(stored);
-
-    const city = loadCityState()!;
-    expect(city.base.palette.name).toBe("Half");
-    expect(city.base.palette.materials).toHaveLength(BANK_SIZE);
-    expect(city.base.palette.materials[7]).toEqual(DEFAULT_DISTRICT_PALETTE.materials[7]);
-  });
-
-  it("fills missing zone params from the defaults", () => {
-    const stored: any = { ...formatThreeCity(), formatVersion: CITY_FORMAT_VERSION, base: { seed: 3 } };
-    storeCity(stored);
-    const city = loadCityState()!;
-    expect(city.base.lotSizeM).toBe(DEFAULT_ZONE_PARAMS.lotSizeM);
-    expect(city.base.occupancy).toBe(DEFAULT_ZONE_PARAMS.occupancy);
-    expect(city.base.heightCluster).toBe(DEFAULT_ZONE_PARAMS.heightCluster);
-    expect(city.base.massingWeights).toEqual(DEFAULT_ZONE_PARAMS.massingWeights);
-    expect(city.base.wallWeights).toEqual(DEFAULT_ZONE_PARAMS.wallWeights);
-    expect(city.base.roofWeights).toEqual(DEFAULT_ZONE_PARAMS.roofWeights);
-    expect(city.base.neonWeights).toEqual(DEFAULT_ZONE_PARAMS.neonWeights);
-    expect(city.base.facadeRate).toBe(DEFAULT_ZONE_PARAMS.facadeRate);
-    expect(city.base.poolRate).toBe(DEFAULT_ZONE_PARAMS.poolRate);
-    expect(city.base.massingWeights).not.toBe(DEFAULT_ZONE_PARAMS.massingWeights);
-    expect(city.base.wallWeights).not.toBe(DEFAULT_ZONE_PARAMS.wallWeights);
-    expect(city.base.palette).not.toBe(DEFAULT_ZONE_PARAMS.palette);
-  });
-
-  it("normalizes identity fields on every legacy zone without sharing mutable defaults", () => {
-    storeCity(formatThreeCity());
-    const city = loadCityState()!;
-    expect(city.zones).toHaveLength(2);
-    for (const zone of city.zones) {
-      expect(zone.occupancy).toBe(DEFAULT_ZONE_PARAMS.occupancy);
-      expect(zone.heightCluster).toBe(DEFAULT_ZONE_PARAMS.heightCluster);
-      expect(zone.massingWeights).toEqual(DEFAULT_ZONE_PARAMS.massingWeights);
-      expect(zone.wallWeights).toEqual(DEFAULT_ZONE_PARAMS.wallWeights);
-      expect(zone.roofWeights).toEqual(DEFAULT_ZONE_PARAMS.roofWeights);
-      expect(zone.neonWeights).toEqual(DEFAULT_ZONE_PARAMS.neonWeights);
-      expect(zone.facadeRate).toBe(DEFAULT_ZONE_PARAMS.facadeRate);
-      expect(zone.poolRate).toBe(DEFAULT_ZONE_PARAMS.poolRate);
-      expect(zone.massingWeights).not.toBe(DEFAULT_ZONE_PARAMS.massingWeights);
-      expect(zone.palette).not.toBe(DEFAULT_ZONE_PARAMS.palette);
-    }
-    expect(city.zones[0]!.massingWeights).not.toBe(city.zones[1]!.massingWeights);
-    expect(city.zones[0]!.palette).not.toBe(city.zones[1]!.palette);
-  });
-
-  it("still warns and ignores a format older than 3", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    storeCity({ ...formatThreeCity(), formatVersion: 2 });
-    expect(loadCityState()).toBeNull();
-    expect(warn).toHaveBeenCalledOnce();
-  });
-
-  it("still warns and ignores an unrecognised future format", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    storeCity({ ...formatThreeCity(), formatVersion: 99 });
-    expect(loadCityState()).toBeNull();
-    expect(warn).toHaveBeenCalledOnce();
+  it("does not hide a failed Scene write", async () => {
+    installScene(undefined, async () => {
+      throw new Error("write failed");
+    });
+    await expect(saveCityState(state(), "absent")).rejects.toThrow("write failed");
+    expect(setFlag).toHaveBeenCalledOnce();
+    expect(stored).toBeUndefined();
   });
 });

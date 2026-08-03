@@ -861,6 +861,24 @@ describe("CityRenderer bloom", () => {
     expect(live).toEqual({ meshes: 0, geometries: 0, textures: 0, renderTextures: 0 });
   });
 
+  it("redraws with a new metre scale without reallocating the renderer", () => {
+    const r = make();
+    const camera = cam();
+    r.update(camera);
+    const before = renderCalls;
+
+    r.pixelsPerMetre = 40;
+    r.update(camera);
+
+    expect(renderCalls).toBe(before + CITY_PASSES + post.passesOff);
+    expect(renderedContent?.children[0]?.shader.uniforms.uPixelsPerMetre).toBe(40);
+    expect(r.stats()).toMatchObject({ pixelsPerMetre: 40 });
+    expect(() => {
+      r.pixelsPerMetre = 0;
+    }).toThrow(/positive/i);
+    r.destroy();
+  });
+
   it("reuses settled-frame capacity while post-processing the smaller moving frame", () => {
     const r = raw();
     r.supersample = 2;

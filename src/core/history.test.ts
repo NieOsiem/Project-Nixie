@@ -6,6 +6,8 @@ describe("History", () => {
     const h = new History<string>();
     expect(h.canUndo).toBe(false);
     expect(h.canRedo).toBe(false);
+    expect(h.undoTarget).toBeNull();
+    expect(h.redoTarget).toBeNull();
     expect(h.undo("a")).toBeNull();
     expect(h.redo("a")).toBeNull();
   });
@@ -14,7 +16,9 @@ describe("History", () => {
     const h = new History<string>();
     h.push("a");
     h.push("b");
+    expect(h.undoTarget).toBe("b");
     expect(h.undo("c")).toBe("b");
+    expect(h.redoTarget).toBe("c");
     expect(h.undo("b")).toBe("a");
     expect(h.canUndo).toBe(false);
     expect(h.redo("a")).toBe("b");

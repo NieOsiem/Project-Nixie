@@ -26,6 +26,14 @@ export class History<T> {
     return this.#past.length;
   }
 
+  get undoTarget(): T | null {
+    return this.#past.at(-1) ?? null;
+  }
+
+  get redoTarget(): T | null {
+    return this.#future.at(-1) ?? null;
+  }
+
   /** Record the state being replaced. Discards any redo branch. */
   push(previous: T): void {
     this.#past.push(previous);

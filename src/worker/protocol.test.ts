@@ -1,30 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { chunkMarginM } from "../core/gen/chunked.js";
-import { chunkRect, type ChunkKey } from "../core/gen/chunks.js";
-import { cityBounds, demoCity } from "../core/gen/demo-city.js";
+import { rectangleLand, type CitySourceV2 } from "../core/gen/terrain.js";
 import { VERTEX_FLOATS } from "../core/geom/mesh.js";
 import {
+  type BuildTerrainChunkRequest,
+  type BuildTerrainChunkResult,
   handleRequest,
-  type BuildChunkRequest,
-  type BuildChunkResult,
   type WorkerRequest,
   type WorkerSuccess
 } from "./protocol.js";
 
-const PPM = 25;
-const KEY: ChunkKey = { cx: -1, cy: -1 };
-
-function buildChunkRequest(id = 1, key: ChunkKey = KEY): BuildChunkRequest {
-  const params = demoCity({ x: 5000, y: 4000 });
-  return {
-    id,
-    type: "buildChunk",
-    params,
-    key,
-    cityBoundsM: cityBounds(params, chunkMarginM(params))!,
-    pixelsPerMetre: PPM
-  };
-}
+const TERRAIN_SOURCE: CitySourceV2 = {
+  origin: { x: 5000, y: 4000 },
+  citySeed: "protocol-fixture",
+  generation: { terrainMode: "rectangle", coastEdge: null },
+  terrain: { land: rectangleLand({ x: -96, y: -96, width: 192, height: 192 }), urbanFootprint: null }
+};
 
 describe("handleRequest", () => {
   it("echoes a ping payload and its id", () => {
@@ -68,84 +58,41 @@ describe("handleRequest", () => {
   });
 });
 
-describe("handleRequest buildChunk", () => {
-  const response = handleRequest(buildChunkRequest(7)) as WorkerSuccess;
-  const result = response.result as BuildChunkResult;
+describe("handleRequest buildTerrainChunk", () => {
+  const request: BuildTerrainChunkRequest = {
+    id: 21,
+    type: "buildTerrainChunk",
+    source: TERRAIN_SOURCE,
+    sourceRevision: 14,
+    key: { cx: 0, cy: 0 },
+    sceneBoundsM: { x: -128, y: -128, width: 256, height: 256 },
+    pixelsPerMetre: 25
+  };
+  const response = handleRequest(request) as WorkerSuccess;
+  const result = response.result as BuildTerrainChunkResult;
 
-  it("succeeds and echoes the request id and chunk identity", () => {
+  it("echoes the source revision and chunk identity", () => {
     expect(response.ok).toBe(true);
-    expect(response.id).toBe(7);
-    expect(result.key).toEqual(KEY);
-    expect(result.chunkId).toBe("-1,-1");
+    expect(response.id).toBe(request.id);
+    expect(result.sourceRevision).toBe(request.sourceRevision);
+    expect(result.chunkId).toBe("0,0");
+    expect(result.key).toEqual(request.key);
   });
 
-  it("returns a non-empty, internally consistent mesh", () => {
+  it("returns a consistent flat terrain mesh", () => {
     expect(result.vertexCount).toBeGreaterThan(0);
     expect(result.triangleCount).toBeGreaterThan(0);
-    expect(result.indices.length).toBe(result.triangleCount * 3);
     expect(result.vertices.length).toBe(result.vertexCount * VERTEX_FLOATS);
-    expect(result.indices.reduce((max, i) => (i > max ? i : max), 0)).toBeLessThan(
-      result.vertexCount
-    );
+    expect(result.indices.length).toBe(result.triangleCount * 3);
+    expect(result.indices.reduce((max, i) => Math.max(max, i), 0)).toBeLessThan(result.vertexCount);
+    expect(result.landTriangleCount).toBeGreaterThan(0);
+    expect(result.waterTriangleCount).toBeGreaterThan(0);
   });
 
-  it("returns non-empty, internally consistent architectural detail", () => {
-    expect(result.detailVertexCount).toBeGreaterThan(0);
-    expect(result.detailTriangleCount).toBeGreaterThan(0);
-    expect(result.detailIndices.length).toBe(result.detailTriangleCount * 3);
-    expect(result.detailVertices.length).toBe(result.detailVertexCount * VERTEX_FLOATS);
-    expect(result.detailIndices.reduce((max, i) => (i > max ? i : max), 0)).toBeLessThan(
-      result.detailVertexCount
-    );
-  });
-
-  it("returns bounds in metres covering at least the chunk rect", () => {
-    const rect = chunkRect(KEY);
-    expect(result.boundsM.x).toBeLessThanOrEqual(rect.x);
-    expect(result.boundsM.y).toBeLessThanOrEqual(rect.y);
-    expect(result.boundsM.x + result.boundsM.width).toBeGreaterThanOrEqual(rect.x + rect.width);
-    expect(result.boundsM.y + result.boundsM.height).toBeGreaterThanOrEqual(rect.y + rect.height);
-    expect(Number.isFinite(result.boundsM.width)).toBe(true);
-    expect(Number.isFinite(result.boundsM.height)).toBe(true);
-  });
-
-  it("returns an internally consistent neon mesh", () => {
-    expect(result.neonIndices.length).toBe(result.neonTriangleCount * 3);
-    expect(result.neonVertices.length).toBe(result.neonVertexCount * VERTEX_FLOATS);
-    expect(result.neonIndices.reduce((max, i) => (i > max ? i : max), 0)).toBeLessThanOrEqual(
-      Math.max(0, result.neonVertexCount - 1)
-    );
-  });
-
-  it("declares exactly the six mesh ArrayBuffers as transferables", () => {
-    expect(response.transfer).toEqual([
-      result.vertices.buffer,
-      result.indices.buffer,
-      result.detailVertices.buffer,
-      result.detailIndices.buffer,
-      result.neonVertices.buffer,
-      result.neonIndices.buffer
-    ]);
-    expect(response.transfer).toHaveLength(6);
+  it("transfers exactly the independent vertex and index buffers", () => {
+    expect(response.transfer).toEqual([result.vertices.buffer, result.indices.buffer]);
+    expect(response.transfer).toHaveLength(2);
+    expect(new Set(response.transfer!).size).toBe(2);
     for (const buffer of response.transfer!) expect(buffer).toBeInstanceOf(ArrayBuffer);
-  });
-
-  it("gives every transferable its own buffer, or postMessage would throw on the duplicate", () => {
-    expect(new Set(response.transfer!).size).toBe(response.transfer!.length);
-  });
-
-  it("drops the surfaces and buildings the renderer does not need", () => {
-    expect(result).not.toHaveProperty("surfaces");
-    expect(result).not.toHaveProperty("buildings");
-    expect(result.buildingCount).toBeGreaterThan(0);
-    expect(result.carCount).toBeGreaterThan(0);
-  });
-
-  it("turns malformed params into a failure response instead of throwing", () => {
-    const bogus = { ...buildChunkRequest(9), params: {} } as unknown as WorkerRequest;
-    const failure = handleRequest(bogus);
-    expect(failure.ok).toBe(false);
-    expect(failure.id).toBe(9);
-    expect(!failure.ok && failure.error.length).toBeGreaterThan(0);
   });
 });

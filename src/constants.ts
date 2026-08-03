@@ -4,14 +4,14 @@ export const FLAG_ENABLED = "enabled";
 export const FLAG_CITY = "city";
 export const FLAG_GENERATED = "generated";
 
-/** Shape of the persisted scene flag. Bump when the stored structure changes. */
-export const CITY_FORMAT_VERSION = 4;
+/** City Generator 2.0 schema version. Independent from the generator algorithm version. */
+export const CITY_SCHEMA_VERSION = 1;
 
 /**
  * Identifies the generation algorithm. Never change the output of an existing version —
  * bump this instead, so an in-progress campaign's city survives a module update.
  */
-export const GENERATOR_VERSION = 7;
+export const GENERATOR_VERSION = 8;
 
 /**
  * Weather presets. Stored strings, so renaming one strands an existing scene's setting.

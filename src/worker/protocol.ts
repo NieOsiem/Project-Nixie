@@ -5,10 +5,10 @@
  * dispatcher stays testable under plain node.
  */
 
-import { buildChunk } from "../core/gen/chunked.js";
+import { buildTerrainChunk } from "../core/gen/terrain-chunk.js";
 import type { ChunkKey } from "../core/gen/chunks.js";
-import type { CityParams } from "../core/gen/demo-city.js";
 import type { Rect } from "../core/geom/types.js";
+import type { CitySourceV2 } from "../core/gen/terrain.js";
 
 export interface PingRequest {
   id: number;
@@ -16,40 +16,30 @@ export interface PingRequest {
   payload: unknown;
 }
 
-export interface BuildChunkRequest {
+export interface BuildTerrainChunkRequest {
   id: number;
-  type: "buildChunk";
-  params: CityParams;
+  type: "buildTerrainChunk";
+  source: CitySourceV2;
+  sourceRevision: number;
   key: ChunkKey;
-  cityBoundsM: Rect;
+  sceneBoundsM: Rect;
   pixelsPerMetre: number;
 }
 
 /** Extend by adding an interface with its own `type` literal and unioning it here. */
-export type WorkerRequest = PingRequest | BuildChunkRequest;
+export type WorkerRequest = PingRequest | BuildTerrainChunkRequest;
 
-/**
- * The renderer's slice of `ChunkBuild`. `surfaces` and `buildings` are deliberately dropped:
- * they are large and only the whole-city wall pass consumes them.
- */
-export interface BuildChunkResult {
+export interface BuildTerrainChunkResult {
+  sourceRevision: number;
   key: ChunkKey;
   chunkId: string;
   vertices: Float32Array;
   indices: Uint32Array;
   vertexCount: number;
   triangleCount: number;
-  detailVertices: Float32Array;
-  detailIndices: Uint32Array;
-  detailVertexCount: number;
-  detailTriangleCount: number;
-  neonVertices: Float32Array;
-  neonIndices: Uint32Array;
-  neonVertexCount: number;
-  neonTriangleCount: number;
   boundsM: Rect;
-  buildingCount: number;
-  carCount: number;
+  landTriangleCount: number;
+  waterTriangleCount: number;
 }
 
 export interface WorkerSuccess {
@@ -77,46 +67,30 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
     switch (request.type) {
       case "ping":
         return { id: request.id, ok: true, result: request.payload };
-      case "buildChunk": {
-        const build = buildChunk(
-          request.params,
+      case "buildTerrainChunk": {
+        const build = buildTerrainChunk(
+          request.source,
           request.key,
-          request.cityBoundsM,
+          request.sceneBoundsM,
           request.pixelsPerMetre
         );
-        const result: BuildChunkResult = {
+        const result: BuildTerrainChunkResult = {
+          sourceRevision: request.sourceRevision,
           key: build.key,
           chunkId: build.id,
           vertices: build.mesh.vertices,
           indices: build.mesh.indices,
           vertexCount: build.mesh.vertexCount,
           triangleCount: build.mesh.triangleCount,
-          detailVertices: build.detail.vertices,
-          detailIndices: build.detail.indices,
-          detailVertexCount: build.detail.vertexCount,
-          detailTriangleCount: build.detail.triangleCount,
-          neonVertices: build.neon.vertices,
-          neonIndices: build.neon.indices,
-          neonVertexCount: build.neon.vertexCount,
-          neonTriangleCount: build.neon.triangleCount,
           boundsM: build.boundsM,
-          buildingCount: build.buildingCount,
-          carCount: build.carCount
+          landTriangleCount: build.landTriangleCount,
+          waterTriangleCount: build.waterTriangleCount
         };
         return {
           id: request.id,
           ok: true,
           result,
-          // WHY: TypedArray.buffer widens to ArrayBufferLike; SharedArrayBuffer is unavailable here.
-          // All six are exact-sized allocations, so no two share a buffer and one list is legal.
-          transfer: [
-            result.vertices.buffer as ArrayBuffer,
-            result.indices.buffer as ArrayBuffer,
-            result.detailVertices.buffer as ArrayBuffer,
-            result.detailIndices.buffer as ArrayBuffer,
-            result.neonVertices.buffer as ArrayBuffer,
-            result.neonIndices.buffer as ArrayBuffer
-          ]
+          transfer: [result.vertices.buffer as ArrayBuffer, result.indices.buffer as ArrayBuffer]
         };
       }
       default:

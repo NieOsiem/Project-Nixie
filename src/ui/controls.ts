@@ -1,15 +1,6 @@
-import {
-  autoWallsEnabled,
-  buildWalls,
-  isMounted,
-  redo,
-  resetCity,
-  setAutoWalls,
-  undo
-} from "../adapter/canvas.js";
-import { DEFAULT_ROAD_CLASS, ROAD_CLASSES } from "../core/gen/demo-city.js";
-import { LAYER_NAME, TOOL } from "./nixie-layer.js";
-import { openDistrictApp } from "./district-app.js";
+import { isSceneEnabled, redo, setSceneEnabled, undo } from "../adapter/canvas.js";
+import { cancelTerrainDraft, finishTerrainDraft, LAYER_NAME, TOOL } from "./nixie-layer.js";
+import { openTerrainApp } from "./terrain-app.js";
 
 interface NixieTool {
   name: string;
@@ -21,122 +12,90 @@ interface NixieTool {
   onSelect?: (active: boolean) => void;
 }
 
-/** Report failures instead of leaving a rejected promise in the console. */
 function run(label: string, action: () => Promise<unknown>): void {
-  if (!isMounted()) {
-    ui.notifications?.warn("Nixie: enable the city on this scene first.");
+  if (!isSceneEnabled()) {
+    ui.notifications?.warn("Nixie: create or enable a 2.0 terrain first.");
     return;
   }
-  void action().catch((err) => {
+  void action().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
     console.error(`${LAYER_NAME} | ${label} failed`, err);
-    ui.notifications?.error(`Nixie: ${label} failed — ${err.message}`);
-  });
-}
-
-/** Label and icon per road class. Widths come from the class itself, so they never drift. */
-const ROAD_UI: Record<string, { label: string; icon: string }> = {
-  highway: { label: "Highway", icon: "fa-solid fa-road-bridge" },
-  arterial: { label: "Arterial", icon: "fa-solid fa-road" },
-  street: { label: "Street", icon: "fa-solid fa-road-barrier" },
-  narrow: { label: "Narrow Road", icon: "fa-solid fa-grip-lines" },
-  lane: { label: "Lane", icon: "fa-solid fa-grip-lines-vertical" },
-  alley: { label: "Alley", icon: "fa-solid fa-minus" }
-};
-
-/** One draw tool per road class, named after the class so the layer can dispatch on it. */
-function roadTools(): NixieTool[] {
-  return ROAD_CLASSES.map((c) => {
-    const ui = ROAD_UI[c.id] ?? { label: c.id, icon: "fa-solid fa-road" };
-    const pavement = c.sidewalkM > 0 ? `+ ${c.sidewalkM} m walkways` : "no walkway";
-    return {
-      name: c.id,
-      title: `Draw ${ui.label} — ${c.widthM} m ${pavement}`,
-      icon: ui.icon
-    };
+    ui.notifications?.error(`Nixie: ${label} failed — ${message}`);
   });
 }
 
 function tools(): NixieTool[] {
   return [
-    ...roadTools(),
     {
-      name: TOOL.EDIT,
-      title: "Edit Junctions — drag to move, drop on another to weld",
-      icon: "fa-solid fa-arrows-up-down-left-right"
-    },
-    { name: TOOL.WALKWAY, title: "Toggle a Road's Walkways", icon: "fa-solid fa-shoe-prints" },
-    { name: TOOL.PARKING, title: "Toggle a Road's Parked Cars", icon: "fa-solid fa-car-side" },
-    { name: TOOL.ZONE, title: "Zone — drag to add, click to reseed", icon: "fa-solid fa-vector-square" },
-    { name: TOOL.ERASE, title: "Erase Road or Zone", icon: "fa-solid fa-eraser" },
-    {
-      name: "autoWalls",
-      title: "Rebuild Walls Automatically",
-      icon: "fa-solid fa-block-brick",
+      name: "enabled",
+      title: "Enable Nixie terrain on this Scene",
+      icon: "fa-solid fa-power-off",
       toggle: true,
-      isActive: autoWallsEnabled,
-      onSelect: (active) => setAutoWalls(active)
+      isActive: isSceneEnabled,
+      onSelect: (active) => {
+        void setSceneEnabled(active)
+          .then(() => {
+            if (active) openTerrainApp();
+          })
+          .catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            ui.notifications?.error(`Nixie: enable change failed — ${message}`);
+          });
+      }
+    },
+    { name: TOOL.LAND_DRAW, title: "Draw or replace the land boundary", icon: "fa-solid fa-draw-polygon" },
+    { name: TOOL.FOOTPRINT_DRAW, title: "Draw or replace the urban footprint", icon: "fa-solid fa-vector-square" },
+    { name: TOOL.LAND_EDIT, title: "Drag land vertices", icon: "fa-solid fa-pen-to-square" },
+    { name: TOOL.FOOTPRINT_EDIT, title: "Drag urban-footprint vertices", icon: "fa-solid fa-arrows-up-down-left-right" },
+    {
+      name: "finish",
+      title: "Finish the current boundary draft",
+      icon: "fa-solid fa-check",
+      button: true,
+      onSelect: () => {
+        void finishTerrainDraft();
+      }
     },
     {
-      name: "districts",
-      title: "Edit Districts",
-      icon: "fa-solid fa-city",
+      name: "cancel",
+      title: "Cancel the current boundary draft",
+      icon: "fa-solid fa-xmark",
       button: true,
-      onSelect: () => openDistrictApp()
+      onSelect: () => cancelTerrainDraft()
     },
     {
       name: "undo",
-      title: "Undo",
+      title: "Undo terrain edit",
       icon: "fa-solid fa-rotate-left",
       button: true,
-      onSelect: () =>
-        run("undo", async () => {
-          if (!(await undo())) ui.notifications?.info("Nixie: nothing to undo.");
-        })
+      onSelect: () => run("undo", undo)
     },
     {
       name: "redo",
-      title: "Redo",
+      title: "Redo terrain edit",
       icon: "fa-solid fa-rotate-right",
       button: true,
-      onSelect: () =>
-        run("redo", async () => {
-          if (!(await redo())) ui.notifications?.info("Nixie: nothing to redo.");
-        })
+      onSelect: () => run("redo", redo)
     },
     {
-      name: "walls",
-      title: "Rebuild Walls Now",
-      icon: "fa-solid fa-bars",
+      name: "terrain",
+      title: "Open Terrain workspace",
+      icon: "fa-solid fa-water",
       button: true,
-      onSelect: () => run("wall rebuild", buildWalls)
-    },
-    {
-      name: "reset",
-      title: "Reset to Demo City",
-      icon: "fa-solid fa-trash-arrow-up",
-      button: true,
-      onSelect: () => run("reset", resetCity)
+      onSelect: () => openTerrainApp()
     }
   ];
 }
 
-const CONTROL_TITLE = "Nixie City";
-const CONTROL_ICON = "fa-solid fa-city";
+const CONTROL_TITLE = "Nixie Terrain";
+const CONTROL_ICON = "fa-solid fa-water";
 
-/**
- * v12 hands the hook an array of controls with array-valued `tools`; v13 and v14 hand it
- * a record of records and expect the control to activate its own layer. Both shapes come
- * off the same definitions.
- */
 export function registerSceneControls(): void {
   Hooks.on("getSceneControlButtons", (controls: any) => {
     if (!game.user?.isGM) return;
     const defs = tools();
-
-    // The overlay draws differently per tool (grab handles fatten under the edit tool),
-    // so every tool change has to redraw it, not just every city change.
-    const select = (t: NixieTool) => (active: boolean) => {
-      t.onSelect?.(active);
+    const select = (tool: NixieTool) => (active: boolean) => {
+      tool.onSelect?.(active);
       canvas[LAYER_NAME]?.refresh();
     };
 
@@ -147,34 +106,33 @@ export function registerSceneControls(): void {
         layer: LAYER_NAME,
         icon: CONTROL_ICON,
         visible: true,
-        activeTool: DEFAULT_ROAD_CLASS,
-        tools: defs.map((t) => ({
-          name: t.name,
-          title: t.title,
-          icon: t.icon,
-          button: t.button ?? false,
-          toggle: t.toggle ?? false,
-          active: t.isActive?.() ?? false,
-          onClick: select(t)
+        activeTool: TOOL.LAND_DRAW,
+        tools: defs.map((tool) => ({
+          name: tool.name,
+          title: tool.title,
+          icon: tool.icon,
+          button: tool.button ?? false,
+          toggle: tool.toggle ?? false,
+          active: tool.isActive?.() ?? false,
+          onClick: select(tool)
         }))
       });
       return;
     }
 
     const toolRecord: Record<string, unknown> = {};
-    defs.forEach((t, order) => {
-      toolRecord[t.name] = {
-        name: t.name,
+    defs.forEach((tool, order) => {
+      toolRecord[tool.name] = {
+        name: tool.name,
         order,
-        title: t.title,
-        icon: t.icon,
-        button: t.button ?? false,
-        toggle: t.toggle ?? false,
-        active: t.isActive?.() ?? false,
-        onChange: (_event: Event, active: boolean) => select(t)(active)
+        title: tool.title,
+        icon: tool.icon,
+        button: tool.button ?? false,
+        toggle: tool.toggle ?? false,
+        active: tool.isActive?.() ?? false,
+        onChange: (_event: Event, active: boolean) => select(tool)(active)
       };
     });
-
     controls[LAYER_NAME] = {
       name: LAYER_NAME,
       order: Object.keys(controls).length,
@@ -182,7 +140,7 @@ export function registerSceneControls(): void {
       layer: LAYER_NAME,
       icon: CONTROL_ICON,
       visible: true,
-      activeTool: DEFAULT_ROAD_CLASS,
+      activeTool: TOOL.LAND_DRAW,
       onChange: (_event: Event, active: boolean) => {
         if (active) canvas[LAYER_NAME]?.activate();
       },

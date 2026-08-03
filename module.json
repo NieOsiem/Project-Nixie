@@ -8,6 +8,5 @@
     "verified": "14"
   },
   "esmodules": ["dist/project-nixie.mjs"],
-  "persistentStorage": true,
   "authors": [{ "name": "Vira" }]
 }

@@ -169,6 +169,17 @@ export class CityRenderer {
     this.weather = this.#weather.display;
   }
 
+  get pixelsPerMetre(): number {
+    return this.#pixelsPerMetre;
+  }
+
+  set pixelsPerMetre(value: number) {
+    if (!Number.isFinite(value) || value <= 0) throw new Error("Pixels per metre must be positive.");
+    if (value === this.#pixelsPerMetre) return;
+    this.#pixelsPerMetre = value;
+    this.#contentDirty = true;
+  }
+
   /** Resolution multiplier for the offscreen pass. Lower trades sharpness for frame time. */
   get renderScale(): number {
     return this.#renderScale;

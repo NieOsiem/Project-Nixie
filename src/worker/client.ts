@@ -1,7 +1,7 @@
 import { MODULE_ID } from "../constants.js";
 import type {
-  BuildChunkRequest,
-  BuildChunkResult,
+  BuildTerrainChunkRequest,
+  BuildTerrainChunkResult,
   WorkerRequest,
   WorkerResponse
 } from "./protocol.js";
@@ -54,8 +54,10 @@ export class WorkerClient {
     });
   }
 
-  buildChunk(body: Omit<BuildChunkRequest, "id" | "type">): Promise<BuildChunkResult> {
-    return this.request({ ...body, type: "buildChunk" }) as Promise<BuildChunkResult>;
+  buildTerrainChunk(
+    body: Omit<BuildTerrainChunkRequest, "id" | "type">
+  ): Promise<BuildTerrainChunkResult> {
+    return this.request({ ...body, type: "buildTerrainChunk" }) as Promise<BuildTerrainChunkResult>;
   }
 
   terminate(): void {
