@@ -108,8 +108,10 @@ describe("bank layout", () => {
   it("reserves exactly one shared water material slot", () => {
     expect(CITY_SLOT.WATER).toBe(6);
     expect(MATERIAL.WATER).toBe(materialIndex(CITY_BANK, CITY_SLOT.WATER));
-    expect(CITY_SURFACES).toHaveLength(7);
-    expect(CITY_SURFACES.length).toBeLessThanOrEqual(BANK_SIZE);
+    expect(CITY_SURFACES).toHaveLength(8);
+    expect(CITY_SLOT.NON_VEHICLE_ROUTE).toBe(7);
+    expect(MATERIAL.NON_VEHICLE_ROUTE).toBe(materialIndex(CITY_BANK, CITY_SLOT.NON_VEHICLE_ROUTE));
+    expect(CITY_SURFACES.length).toBe(BANK_SIZE);
   });
 
   it("keeps the shared surfaces in bank 0, out of every district's reach", () => {

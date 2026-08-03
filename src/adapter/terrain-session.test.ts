@@ -5,18 +5,24 @@ import {
   TerrainSession,
   terrainBuildIsCurrent
 } from "./terrain-session.js";
-import type { CityStateV2 } from "../core/gen/terrain.js";
+import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
+import type { CityStateV2 } from "../core/gen/city.js";
 
 function state(revision: number, seed = "session-seed"): CityStateV2 {
   return {
     kind: "city-generator-2",
-    schemaVersion: 1,
-    generatorVersion: 8,
+    schemaVersion: CITY_SCHEMA_VERSION,
+    generatorVersion: GENERATOR_VERSION,
     revision,
     source: {
       origin: { x: 0, y: 0 },
       citySeed: seed,
-      generation: { terrainMode: "rectangle", coastEdge: null },
+      generation: {
+        terrainMode: "rectangle",
+        coastEdge: null,
+        roadLayout: "european",
+        hubMode: "single-centre"
+      },
       terrain: {
         land: [
           { x: -10, y: -10 },
@@ -25,7 +31,8 @@ function state(revision: number, seed = "session-seed"): CityStateV2 {
           { x: -10, y: 10 }
         ],
         urbanFootprint: null
-      }
+      },
+      roads: { nodes: [], routes: [], edges: [] }
     }
   };
 }

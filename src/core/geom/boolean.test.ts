@@ -45,6 +45,32 @@ describe("union", () => {
     expect(first.x === last.x && first.y === last.y).toBe(false);
     expect(ring).toHaveLength(4);
   });
+
+  it("drops rings that collapse after snapping without promoting a hole", () => {
+    const collapsed = [[[
+      { x: 0, y: 0 },
+      { x: 0.0004, y: 0 },
+      { x: 0.0004, y: 0.0004 }
+    ]]];
+    expect(union([collapsed])).toEqual([]);
+
+    const outer = rectRing({ x: 0, y: 0, width: 10, height: 10 });
+    const tinyHole = [
+      { x: 4, y: 4 },
+      { x: 4.0004, y: 4 },
+      { x: 4.0004, y: 4.0004 }
+    ];
+    const result = union([[[outer, tinyHole]]]);
+    expect(totalArea(result)).toBeCloseTo(100, 6);
+
+    const nearDuplicate = ringAsMulti([
+      { x: 3.6240000000000006, y: 44.436 },
+      { x: 3.6240000000000028, y: 44.436 },
+      { x: 4, y: 45 },
+      { x: 3, y: 45 }
+    ]);
+    expect(totalArea(union([nearDuplicate]))).toBeGreaterThan(0);
+  });
 });
 
 describe("difference", () => {

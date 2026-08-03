@@ -6,14 +6,20 @@ import {
   GENERATOR_VERSION,
   MODULE_ID
 } from "../constants.js";
-import type { CitySourceV2, CityStateV2, TerrainSource } from "../core/gen/terrain.js";
+import type { CitySourceV2, CityStateV2 } from "../core/gen/city.js";
+import type { TerrainSource } from "../core/gen/terrain.js";
 import { validateTerrain } from "../core/gen/terrain.js";
 import type { WallSegment } from "../core/gen/walls.js";
+import { validateRouteTopology } from "../core/graph/topology.js";
 
 export type CityLoadResult =
   | { kind: "absent" }
   | { kind: "legacy"; raw: unknown }
-  | { kind: "supported"; state: CityStateV2 }
+  | {
+      kind: "supported";
+      state: CityStateV2;
+      migratedFrom?: { schemaVersion: 1; generatorVersion: 8; revision: number };
+    }
   | {
       kind: "unsupported";
       raw: unknown;
@@ -22,7 +28,11 @@ export type CityLoadResult =
     }
   | { kind: "malformed"; raw: unknown; reason: string };
 
-export type SaveExpectation = "absent" | "legacy" | number;
+export type SaveExpectation =
+  | "absent"
+  | "legacy"
+  | number
+  | { kind: "migrated-schema-1"; revision: number };
 
 type RecordValue = Record<string, unknown>;
 
@@ -61,6 +71,27 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
+function nonEmptyText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value;
+}
+
+const ROUTE_CLASS_IDS = [
+  "highway",
+  "arterial",
+  "street",
+  "narrow",
+  "lane",
+  "alley",
+  "pedestrian-path",
+  "park-path",
+  "plaza-route",
+  "public-passage",
+  "waterfront-promenade",
+  "cycleway"
+] as const;
+
+const CURVE_PRESETS = ["tight", "standard", "broad"] as const;
+
 function decodePoint(value: unknown): { x: number; y: number } | null {
   if (!isRecord(value) || !has(value, "x") || !has(value, "y") || !finiteNumber(value.x) || !finiteNumber(value.y)) return null;
   return { x: value.x, y: value.y };
@@ -81,26 +112,116 @@ function decodeTerrain(value: unknown): TerrainSource | null {
   return { land, urbanFootprint } as TerrainSource;
 }
 
-function decodeSource(value: unknown): CitySourceV2 | null {
-  if (!isRecord(value) || !has(value, "origin") || !has(value, "citySeed") || !has(value, "generation") || !has(value, "terrain")) return null;
-  const origin = decodePoint(value.origin);
-  if (origin === null || typeof value.citySeed !== "string" || value.citySeed.length === 0 || value.citySeed.trim() !== value.citySeed) return null;
-
-  if (!isRecord(value.generation) || !has(value.generation, "terrainMode") || !has(value.generation, "coastEdge")) return null;
-  const mode = value.generation.terrainMode;
-  const edge = value.generation.coastEdge;
+function decodeGeneration(value: unknown): CitySourceV2["generation"] | null {
+  if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge") || !has(value, "roadLayout") || !has(value, "hubMode")) return null;
+  const mode = value.terrainMode;
+  const edge = value.coastEdge;
+  const roadLayout = value.roadLayout;
+  const hubMode = value.hubMode;
   if (mode !== "rectangle" && mode !== "coastal" && mode !== "custom") return null;
   if (edge !== null && edge !== "north" && edge !== "east" && edge !== "south" && edge !== "west") return null;
   if ((mode === "coastal") !== (edge !== null)) return null;
+  if (roadLayout !== "european" && roadLayout !== "grid" && roadLayout !== "mixed") return null;
+  if (hubMode !== "single-centre" && hubMode !== "multiple-hubs") return null;
+  return { terrainMode: mode, coastEdge: edge, roadLayout, hubMode };
+}
 
+function decodeSchemaOneGeneration(value: unknown): CitySourceV2["generation"] | null {
+  if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge")) return null;
+  const mode = value.terrainMode;
+  const edge = value.coastEdge;
+  if (mode !== "rectangle" && mode !== "coastal" && mode !== "custom") return null;
+  if (edge !== null && edge !== "north" && edge !== "east" && edge !== "south" && edge !== "west") return null;
+  if ((mode === "coastal") !== (edge !== null)) return null;
+  return { terrainMode: mode, coastEdge: edge, roadLayout: "european", hubMode: "single-centre" };
+}
+
+function decodeRoads(value: unknown): CitySourceV2["roads"] | null {
+  if (!isRecord(value) || !Array.isArray(value.nodes) || !Array.isArray(value.routes) || !Array.isArray(value.edges)) return null;
+
+  const nodes: CitySourceV2["roads"]["nodes"] = [];
+  const nodeIds = new Set<string>();
+  for (const item of value.nodes) {
+    if (!isRecord(item) || !has(item, "id") || !has(item, "x") || !has(item, "y") || !nonEmptyText(item.id) || !finiteNumber(item.x) || !finiteNumber(item.y) || nodeIds.has(item.id)) return null;
+    nodeIds.add(item.id);
+    nodes.push({ id: item.id, x: item.x, y: item.y });
+  }
+
+  const routes: CitySourceV2["roads"]["routes"] = [];
+  const routeIds = new Set<string>();
+  for (const item of value.routes) {
+    if (!isRecord(item) || !has(item, "id") || !has(item, "curvePreset") || !nonEmptyText(item.id) || !CURVE_PRESETS.includes(item.curvePreset as (typeof CURVE_PRESETS)[number]) || routeIds.has(item.id)) return null;
+    routeIds.add(item.id);
+    routes.push({ id: item.id, curvePreset: item.curvePreset as (typeof CURVE_PRESETS)[number] });
+  }
+
+  const edges: CitySourceV2["roads"]["edges"] = [];
+  const edgeIds = new Set<string>();
+  const referencedRoutes = new Set<string>();
+  for (const item of value.edges) {
+    if (
+      !isRecord(item) ||
+      !has(item, "id") ||
+      !has(item, "a") ||
+      !has(item, "b") ||
+      !has(item, "routeId") ||
+      !has(item, "classId") ||
+      !has(item, "name") ||
+      !has(item, "locked") ||
+      !has(item, "origin") ||
+      !nonEmptyText(item.id) ||
+      !nonEmptyText(item.a) ||
+      !nonEmptyText(item.b) ||
+      item.a === item.b ||
+      !nodeIds.has(item.a) ||
+      !nodeIds.has(item.b) ||
+      !nonEmptyText(item.routeId) ||
+      !routeIds.has(item.routeId) ||
+      !ROUTE_CLASS_IDS.includes(item.classId as (typeof ROUTE_CLASS_IDS)[number]) ||
+      (item.name !== null && typeof item.name !== "string") ||
+      typeof item.locked !== "boolean" ||
+      (item.origin !== "generated" && item.origin !== "authored") ||
+      edgeIds.has(item.id)
+    ) return null;
+    edgeIds.add(item.id);
+    referencedRoutes.add(item.routeId);
+    edges.push({
+      id: item.id,
+      a: item.a,
+      b: item.b,
+      routeId: item.routeId,
+      classId: item.classId as (typeof ROUTE_CLASS_IDS)[number],
+      name: item.name,
+      locked: item.locked,
+      origin: item.origin
+    });
+  }
+  if (routes.some((route) => !referencedRoutes.has(route.id))) return null;
+  return { nodes, routes, edges };
+}
+
+function decodeSource(value: unknown): CitySourceV2 | null {
+  if (!isRecord(value) || !has(value, "origin") || !has(value, "citySeed") || !has(value, "generation") || !has(value, "terrain") || !has(value, "roads")) return null;
+  const origin = decodePoint(value.origin);
+  if (origin === null || !nonEmptyText(value.citySeed)) return null;
+  const generation = decodeGeneration(value.generation);
+  if (generation === null) return null;
   const terrain = decodeTerrain(value.terrain);
   if (terrain === null) return null;
-  return {
-    origin,
-    citySeed: value.citySeed,
-    generation: { terrainMode: mode, coastEdge: edge },
-    terrain
-  };
+  const roads = decodeRoads(value.roads);
+  if (roads === null) return null;
+  return { origin, citySeed: value.citySeed, generation, terrain, roads };
+}
+
+function decodeSchemaOneSource(value: unknown): CitySourceV2 | null {
+  if (!isRecord(value) || !has(value, "origin") || !has(value, "citySeed") || !has(value, "generation") || !has(value, "terrain")) return null;
+  const origin = decodePoint(value.origin);
+  if (origin === null || !nonEmptyText(value.citySeed)) return null;
+  const generation = decodeSchemaOneGeneration(value.generation);
+  if (generation === null) return null;
+  const terrain = decodeTerrain(value.terrain);
+  if (terrain === null) return null;
+  return { origin, citySeed: value.citySeed, generation, terrain, roads: { nodes: [], routes: [], edges: [] } };
 }
 
 function decodeSupported(raw: unknown): { state: CityStateV2 } | { reason: string } {
@@ -108,9 +229,35 @@ function decodeSupported(raw: unknown): { state: CityStateV2 } | { reason: strin
   if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
   if (!has(raw, "schemaVersion") || raw.schemaVersion !== CITY_SCHEMA_VERSION) return { reason: "invalid schema version" };
   if (!has(raw, "generatorVersion") || !positiveInteger(raw.generatorVersion)) return { reason: "invalid generator version" };
+  if (raw.generatorVersion !== GENERATOR_VERSION) return { reason: "unsupported generator version" };
   if (!has(raw, "revision") || !positiveInteger(raw.revision)) return { reason: "invalid city revision" };
   if (!has(raw, "source")) return { reason: "missing city source" };
   const source = decodeSource(raw.source);
+  if (source === null) return { reason: "invalid city source" };
+  const terrainResult = validateTerrain(source.terrain as TerrainSource);
+  if (!terrainResult.ok) return { reason: terrainResult.reason };
+  try {
+    const topology = validateRouteTopology(source.roads);
+    if (!topology.ok) return { reason: topology.problems.join(" ") };
+  } catch (error) {
+    return { reason: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    state: {
+      kind: "city-generator-2",
+      schemaVersion: CITY_SCHEMA_VERSION,
+      generatorVersion: GENERATOR_VERSION,
+      revision: raw.revision,
+      source
+    }
+  };
+}
+
+function decodeMigrated(raw: unknown): { state: CityStateV2 } | { reason: string } {
+  if (!isRecord(raw) || raw.kind !== "city-generator-2" || raw.schemaVersion !== 1 || raw.generatorVersion !== 8 || !positiveInteger(raw.revision) || !has(raw, "source")) {
+    return { reason: "invalid schema-1 state" };
+  }
+  const source = decodeSchemaOneSource(raw.source);
   if (source === null) return { reason: "invalid city source" };
   const terrainResult = validateTerrain(source.terrain as TerrainSource);
   if (!terrainResult.ok) return { reason: terrainResult.reason };
@@ -118,7 +265,7 @@ function decodeSupported(raw: unknown): { state: CityStateV2 } | { reason: strin
     state: {
       kind: "city-generator-2",
       schemaVersion: CITY_SCHEMA_VERSION,
-      generatorVersion: raw.generatorVersion,
+      generatorVersion: GENERATOR_VERSION,
       revision: raw.revision,
       source
     }
@@ -133,10 +280,27 @@ function classify(raw: unknown): CityLoadResult {
   if (!Number.isInteger(raw.schemaVersion)) {
     return { kind: "malformed", raw, reason: "schemaVersion must be an integer" };
   }
+  if (raw.schemaVersion === 1) {
+    if (!positiveInteger(raw.generatorVersion)) return { kind: "malformed", raw, reason: "invalid generator version" };
+    if (raw.generatorVersion !== 8) {
+      return { kind: "unsupported", raw, schemaVersion: raw.schemaVersion, generatorVersion: raw.generatorVersion };
+    }
+    const migrated = decodeMigrated(raw);
+    return "state" in migrated
+      ? {
+          kind: "supported",
+          state: migrated.state,
+          migratedFrom: { schemaVersion: 1, generatorVersion: 8, revision: migrated.state.revision }
+        }
+      : { kind: "malformed", raw, reason: migrated.reason };
+  }
   if (raw.schemaVersion !== CITY_SCHEMA_VERSION) {
     return { kind: "unsupported", raw, schemaVersion: raw.schemaVersion as number };
   }
-  if (positiveInteger(raw.generatorVersion) && raw.generatorVersion !== GENERATOR_VERSION) {
+  if (!positiveInteger(raw.generatorVersion)) {
+    return { kind: "malformed", raw, reason: "invalid generator version" };
+  }
+  if (raw.generatorVersion !== GENERATOR_VERSION) {
     return {
       kind: "unsupported",
       raw,
@@ -171,7 +335,13 @@ export async function saveCityState(
   const state = validateCandidate(candidate);
   const scene = requireScene();
   const current = classify(scene.getFlag(MODULE_ID, FLAG_CITY));
-  const expectedRevision = expectation === "absent" || expectation === "legacy" ? 1 : expectation + 1;
+  const expectedBaseRevision =
+    typeof expectation === "number"
+      ? expectation
+      : typeof expectation === "object"
+        ? expectation.revision
+        : null;
+  const expectedRevision = expectedBaseRevision === null ? 1 : expectedBaseRevision + 1;
   if (state.revision !== expectedRevision) {
     throw new Error(`Expected revision ${expectedRevision}, received ${state.revision}.`);
   }
@@ -181,8 +351,24 @@ export async function saveCityState(
   if (expectation === "legacy" && current.kind !== "legacy") {
     throw new Error("Legacy city replacement is stale; retry from the current Scene.");
   }
-  if (typeof expectation === "number" && (current.kind !== "supported" || current.state.revision !== expectation)) {
-    throw new Error("City revision changed before save; retry from the current Scene.");
+  if (typeof expectation === "number") {
+    if (
+      current.kind !== "supported" ||
+      current.migratedFrom !== undefined ||
+      current.state.revision !== expectation
+    ) {
+      throw new Error("City revision changed before save; retry from the current Scene.");
+    }
+  }
+  if (typeof expectation === "object") {
+    if (
+      current.kind !== "supported" ||
+      current.migratedFrom?.schemaVersion !== 1 ||
+      current.migratedFrom.generatorVersion !== 8 ||
+      current.migratedFrom.revision !== expectation.revision
+    ) {
+      throw new Error("Migrated City Generator state changed before save; retry from the current Scene.");
+    }
   }
   await scene.setFlag(MODULE_ID, FLAG_CITY, state);
   return state;

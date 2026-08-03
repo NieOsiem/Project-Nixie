@@ -11,19 +11,45 @@ import {
 } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
 import { chunksCovering, chunkId, type ChunkKey } from "../core/gen/chunks.js";
-import { buildTerrainChunk } from "../core/gen/terrain-chunk.js";
+import {
+  buildCityChunksSync,
+  type CityChunkBuild
+} from "../core/gen/city-chunk.js";
 import {
   coastalLand,
   normalizeCitySeed,
   normalizeRing,
   rectangleLand,
   validateTerrain,
-  type CityStateV2,
   type CoastEdge,
   type TerrainMode
 } from "../core/gen/terrain.js";
+import {
+  ROUTE_CLASS_REGISTRY,
+  type CitySourceV2,
+  type CityStateV2,
+  type RoadCurvePreset,
+  type RoadOrigin,
+  type RouteClassId
+} from "../core/gen/city.js";
+import {
+  generateInitialRoadNetwork,
+  type GeneratedRoadNetwork,
+  type RoadGenerationInput,
+  type RoadGenerationDiagnostics
+} from "../core/gen/road-generator.js";
+import {
+  appendRoute,
+  deleteEdges,
+  deleteJunction,
+  moveNode,
+  validateRouteTopology,
+  weldNodes
+} from "../core/graph/topology.js";
+import { compileRouteNetwork } from "../core/graph/compiler.js";
+import { difference, intersection, ringAsMulti } from "../core/geom/boolean.js";
 import { emptyMesh, type MeshBuffers } from "../core/geom/mesh.js";
-import type { Rect, Ring, Vec2 } from "../core/geom/types.js";
+import { rectRing, ringArea, type Rect, type Ring, type Vec2 } from "../core/geom/types.js";
 import {
   BANK_COUNT,
   CITY_BANK,
@@ -40,7 +66,7 @@ import {
 } from "../render/city-renderer.js";
 import { FrameQualityController } from "../render/frame-quality.js";
 import { WorkerClient } from "../worker/client.js";
-import type { BuildTerrainChunkResult } from "../worker/protocol.js";
+import type { BuildCityChunksResult } from "../worker/protocol.js";
 import {
   deleteGeneratedWalls,
   isSceneEnabled,
@@ -76,7 +102,46 @@ interface TerrainChunkRecord {
   boundsM: Rect;
   landTriangleCount: number;
   waterTriangleCount: number;
+  markingTriangleCount: number;
   bytes: number;
+}
+
+export interface RoadSelection {
+  edgeIds: string[];
+  nodeIds: string[];
+}
+
+export interface RoadInspector {
+  edgeIds: string[];
+  classId: RouteClassId | "multiple";
+  name: string | null | "multiple";
+  locked: boolean | "multiple";
+  origin: RoadOrigin | "multiple";
+  curvePreset: RoadCurvePreset | "multiple";
+  routeIds: string[];
+}
+
+export interface RoadBuildStats {
+  requested: number;
+  built: number;
+  compiledRoutes: number;
+  compiledSegments: number;
+  markingTriangleCount: number;
+  totalTriangles: number;
+  totalBytes: number;
+  roundTripMs: number;
+  workerMode: "worker" | "fallback";
+  dirty: boolean;
+  scope: "none" | "dirty" | "all";
+}
+
+export interface InitialGenerationStats {
+  planningRoundTripMs: number;
+  workerMode: "worker" | "fallback";
+  diagnostics: RoadGenerationDiagnostics;
+  nodes: number;
+  edges: number;
+  routes: number;
 }
 
 const session = new TerrainSession();
@@ -91,9 +156,15 @@ let workerWarned = false;
 const cityListeners = new Set<() => void>();
 let layerCityListener: (() => void) | null = null;
 let draftCancelListener: (() => void) | null = null;
+let roadDraftCancelListener: (() => void) | null = null;
 let localWriteRevision: number | null = null;
 let localEnabledWrite: boolean | null = null;
 let lastBuild: RebuildResult | null = null;
+let lastRoadBuild: RoadBuildStats | null = null;
+let lastInitialGeneration: InitialGenerationStats | null = null;
+let roadSelection: RoadSelection = { edgeIds: [], nodeIds: [] };
+let roadSnapToFoundryGrid = false;
+let roadActionSequence = 0;
 
 let cameraHeightM = DEFAULT_CAMERA_HEIGHT_M;
 let cameraZoomMode: CameraZoomMode = CAMERA_ZOOM_MODE.DOLLY;
@@ -207,8 +278,17 @@ export function setTerrainDraftCancelListener(listener: (() => void) | null): vo
   draftCancelListener = listener;
 }
 
+export function setRoadDraftCancelListener(listener: (() => void) | null): void {
+  roadDraftCancelListener = listener;
+}
+
+export function cancelRoadDraft(): void {
+  roadDraftCancelListener?.();
+}
+
 export function cancelTerrainDraft(): void {
   draftCancelListener?.();
+  cancelRoadDraft();
 }
 
 export function cityLoadStatus(): CityLoadResult {
@@ -291,6 +371,7 @@ export function mount(): void {
   if (!canvas?.ready) return;
   unmountRenderer();
   session.reset(loadCityState());
+  roadSelection = { edgeIds: [], nodeIds: [] };
   if (session.current !== null) {
     mountRenderer();
     void rebuildGeometry().catch((error) =>
@@ -304,7 +385,8 @@ export function unmount(): void {
   unmountRenderer();
   session.reset({ kind: "absent" });
   localWriteRevision = null;
-  draftCancelListener?.();
+  cancelTerrainDraft();
+  roadSelection = { edgeIds: [], nodeIds: [] };
   notifyCityChanged();
 }
 
@@ -335,8 +417,14 @@ function newState(seed: string, mode: TerrainMode, edge: CoastEdge | null): City
     source: {
       origin,
       citySeed,
-      generation: { terrainMode: mode, coastEdge: edge },
-      terrain: { land, urbanFootprint: null }
+      generation: {
+        terrainMode: mode,
+        coastEdge: edge,
+        roadLayout: "european",
+        hubMode: "single-centre"
+      },
+      terrain: { land, urbanFootprint: null },
+      roads: { nodes: [], routes: [], edges: [] }
     }
   };
 }
@@ -353,24 +441,99 @@ function generatedCandidate(seed: string, mode: TerrainMode, edge: CoastEdge | n
     source: {
       ...current.source,
       citySeed,
-      generation: { terrainMode: mode, coastEdge: edge },
+      generation: {
+        ...current.source.generation,
+        terrainMode: mode,
+        coastEdge: edge
+      },
       terrain: { ...current.source.terrain, land }
     }
   };
 }
 
-function validateCandidate(candidate: CityStateV2): void {
+const ROAD_CLEARANCE_AREA_EPSILON = 1e-7;
+
+function edgeQuad(a: Vec2, b: Vec2, halfWidth: number): Ring {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const length = Math.hypot(dx, dy);
+  if (length <= 0 || halfWidth <= 0) return [];
+  const nx = (-dy / length) * halfWidth;
+  const ny = (dx / length) * halfWidth;
+  return [
+    { x: a.x + nx, y: a.y + ny },
+    { x: b.x + nx, y: b.y + ny },
+    { x: b.x - nx, y: b.y - ny },
+    { x: a.x - nx, y: a.y - ny }
+  ];
+}
+
+function nodeDisc(center: Vec2, radius: number, count = 24): Ring {
+  if (radius <= 0) return [];
+  const ring: Ring = [];
+  for (let index = 0; index < count; index++) {
+    const angle = (index / count) * Math.PI * 2;
+    ring.push({ x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius });
+  }
+  return ring;
+}
+
+function multiArea(multi: ReturnType<typeof ringAsMulti>): number {
+  return multi.reduce(
+    (total, polygon) => total + polygon.reduce((area, ring, index) => area + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0),
+    0
+  );
+}
+
+export function roadClearanceBlockers(
+  roads: CitySourceV2["roads"],
+  land: Ring,
+  sceneBounds: Rect
+): string[] {
+  const scene = ringAsMulti(rectRing(sceneBounds));
+  const water = difference(scene, [ringAsMulti(normalizeRing(land))]);
+  if (water.length === 0) return [];
+  const network = compileRouteNetwork(roads);
+  const blocked = new Set<string>();
+  for (const segment of network.segments) {
+    const corridor = edgeQuad(segment.a, segment.b, segment.clearanceM);
+    const parts = corridor.length >= 3 ? [corridor] : [];
+    const aDisc = nodeDisc(segment.a, segment.clearanceM);
+    const bDisc = nodeDisc(segment.b, segment.clearanceM);
+    if (aDisc.length >= 3) parts.push(aDisc);
+    if (bDisc.length >= 3) parts.push(bDisc);
+    for (const part of parts) {
+      const overlap = intersection(water, ringAsMulti(part));
+      if (multiArea(overlap) > ROAD_CLEARANCE_AREA_EPSILON) {
+        blocked.add(segment.edgeId);
+        break;
+      }
+    }
+  }
+  return [...blocked].sort((left, right) => left.localeCompare(right));
+}
+
+function validateCandidate(candidate: CityStateV2, geometryPrebuilt = false): void {
   const result = validateTerrain(candidate.source.terrain);
   if (!result.ok) throw new Error(result.reason);
-  const bounds = sceneBoundsM(candidate.source.origin);
-  const ppm = pixelsPerMetre();
-  for (const key of chunksCovering(bounds)) {
-    const build = buildTerrainChunk(candidate.source, key, bounds, ppm);
-    if (
-      build.mesh.vertices.some((value) => !Number.isFinite(value)) ||
-      build.mesh.indices.length !== build.mesh.triangleCount * 3
-    ) {
-      throw new Error(`Terrain preflight failed in chunk ${build.id}.`);
+  const topology = validateRouteTopology(candidate.source.roads);
+  if (!topology.ok) throw new Error(topology.problems.join(" "));
+  const compiled = topology.ok ? compileRouteNetwork(candidate.source.roads) : null;
+  if (compiled !== null) {
+    const blockers = roadClearanceBlockers(candidate.source.roads, candidate.source.terrain.land, sceneBoundsM(candidate.source.origin));
+    if (blockers.length > 0) throw new Error(`Roads ${blockers.join(", ")} cross water or leave the land mask.`);
+  }
+  if (!geometryPrebuilt) {
+    const bounds = sceneBoundsM(candidate.source.origin);
+    const ppm = pixelsPerMetre();
+    const builds = buildCityChunksSync(candidate.source, chunksCovering(bounds), bounds, ppm).chunks;
+    for (const build of builds) {
+      if (
+        build.mesh.vertices.some((value) => !Number.isFinite(value)) ||
+        build.mesh.indices.length !== build.mesh.triangleCount * 3
+      ) {
+        throw new Error(`Terrain preflight failed in chunk ${build.id}.`);
+      }
     }
   }
 }
@@ -385,12 +548,18 @@ function warnLargeScene(candidate: CityStateV2): void {
 
 async function guardedSave(
   candidate: CityStateV2,
-  expectation: SaveExpectation
+  expectation: SaveExpectation,
+  geometryPrebuilt = false
 ): Promise<CityStateV2> {
-  validateCandidate(candidate);
+  validateCandidate(candidate, geometryPrebuilt);
+  const status = session.status;
+  const saveExpectation =
+    status.kind === "supported" && status.migratedFrom !== undefined
+      ? { kind: "migrated-schema-1" as const, revision: status.migratedFrom.revision }
+      : expectation;
   localWriteRevision = candidate.revision;
   try {
-    return await saveCityState(candidate, expectation);
+    return await saveCityState(candidate, saveExpectation);
   } finally {
     localWriteRevision = null;
   }
@@ -488,13 +657,454 @@ async function commitSource(source: CityStateV2["source"]): Promise<RebuildResul
   return rebuildAfterCommit();
 }
 
+function nextRoadSequence(): number {
+  roadActionSequence += 1;
+  return roadActionSequence;
+}
+
+function validateRoadEdgeSelection(
+  source: CitySourceV2["roads"],
+  edgeIds: readonly string[]
+): Set<string> {
+  if (edgeIds.length === 0) throw new Error("Select at least one road segment.");
+  const selected = new Set(edgeIds);
+  const existing = new Set(source.edges.map((edge) => edge.id));
+  if (selected.size !== edgeIds.length || edgeIds.some((id) => !existing.has(id))) {
+    throw new Error("Road selection is stale; select the roads again.");
+  }
+  return selected;
+}
+
+function roadEdgesForSelection(
+  source: CitySourceV2["roads"],
+  edgeIds: readonly string[],
+  contiguousName: boolean
+): Set<string> {
+  const selected = new Set(edgeIds);
+  if (!contiguousName || selected.size === 0) return selected;
+  if (selected.size !== 1) throw new Error("Contiguous same-name edits require one selected segment.");
+  const first = source.edges.find((edge) => selected.has(edge.id));
+  if (!first) return selected;
+  const name = first.name;
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  const connected = new Set<string>(selected);
+  const queue = [...selected];
+  while (queue.length > 0) {
+    const edgeId = queue.shift()!;
+    const edge = source.edges.find((candidate) => candidate.id === edgeId);
+    if (!edge || edge.name !== name) continue;
+    for (const candidate of source.edges) {
+      if (candidate.name !== name || connected.has(candidate.id)) continue;
+      const shares = candidate.routeId === edge.routeId && (candidate.a === edge.a || candidate.a === edge.b || candidate.b === edge.a || candidate.b === edge.b);
+      if (shares && nodes.has(candidate.a) && nodes.has(candidate.b)) {
+        connected.add(candidate.id);
+        queue.push(candidate.id);
+      }
+    }
+  }
+  return connected;
+}
+
+function dirtyRoadKeys(before: CitySourceV2["roads"], after: CitySourceV2["roads"], sceneBounds: Rect): ChunkKey[] {
+  const oldRoutes = new Map(before.routes.map((route) => [route.id, route.curvePreset]));
+  const newRoutes = new Map(after.routes.map((route) => [route.id, route.curvePreset]));
+  const changedRoutes = new Set<string>();
+  for (const [id, preset] of oldRoutes) if (newRoutes.get(id) !== preset) changedRoutes.add(id);
+  for (const [id, preset] of newRoutes) if (oldRoutes.get(id) !== preset) changedRoutes.add(id);
+  const oldEdges = new Map(before.edges.map((edge) => [edge.id, edge]));
+  const newEdges = new Map(after.edges.map((edge) => [edge.id, edge]));
+  const changedEdges = new Set<string>();
+  for (const [id, edge] of oldEdges) if (JSON.stringify(edge) !== JSON.stringify(newEdges.get(id))) changedEdges.add(id);
+  for (const id of newEdges.keys()) if (!oldEdges.has(id)) changedEdges.add(id);
+  const oldNodes = new Map(before.nodes.map((node) => [node.id, node]));
+  const newNodes = new Map(after.nodes.map((node) => [node.id, node]));
+  const changedNodes = new Set<string>();
+  for (const [id, node] of oldNodes) if (JSON.stringify(node) !== JSON.stringify(newNodes.get(id))) changedNodes.add(id);
+  for (const id of newNodes.keys()) if (!oldNodes.has(id)) changedNodes.add(id);
+  for (const edge of [...before.edges, ...after.edges]) {
+    if (!changedNodes.has(edge.a) && !changedNodes.has(edge.b)) continue;
+    changedEdges.add(edge.id);
+    changedRoutes.add(edge.routeId);
+  }
+  const oldNetwork = compileRouteNetwork(before);
+  const newNetwork = compileRouteNetwork(after);
+  const segments = [...oldNetwork.segments, ...newNetwork.segments].filter((segment) => changedEdges.has(segment.edgeId) || changedRoutes.has(segment.routeId));
+  if (segments.length === 0) return chunksCovering(sceneBounds);
+  const margin = Math.max(16, oldNetwork.maxClearanceM, newNetwork.maxClearanceM) + 26;
+  const x0 = Math.max(sceneBounds.x, Math.min(...segments.flatMap((segment) => [segment.a.x, segment.b.x])) - margin);
+  const y0 = Math.max(sceneBounds.y, Math.min(...segments.flatMap((segment) => [segment.a.y, segment.b.y])) - margin);
+  const x1 = Math.min(sceneBounds.x + sceneBounds.width, Math.max(...segments.flatMap((segment) => [segment.a.x, segment.b.x])) + margin);
+  const y1 = Math.min(sceneBounds.y + sceneBounds.height, Math.max(...segments.flatMap((segment) => [segment.a.y, segment.b.y])) + margin);
+  if (x1 <= x0 || y1 <= y0) return chunksCovering(sceneBounds);
+  return chunksCovering({ x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+}
+
+export function chunkCoverageComplete(availableChunkIds: readonly string[], sceneBounds: Rect): boolean {
+  const available = new Set(availableChunkIds);
+  return chunksCovering(sceneBounds).every((key) => available.has(chunkId(key)));
+}
+
+async function preflightCity(candidate: CityStateV2, token: number, keysOverride?: ChunkKey[]): Promise<{ batch: Awaited<ReturnType<typeof buildBatch>>; keys: ChunkKey[] }> {
+  const bounds = sceneBoundsM(candidate.source.origin);
+  const keys = keysOverride ?? chunksCovering(bounds);
+  const batch = await buildBatch(ensureWorker(), candidate, keys, bounds, pixelsPerMetre(), token, token);
+  if (batch.records.length !== keys.length) throw new Error("City preflight did not build every affected chunk.");
+  for (const record of batch.records) {
+    if (record.mesh.vertices.some((value) => !Number.isFinite(value)) || record.mesh.indices.length !== record.mesh.triangleCount * 3) {
+      throw new Error(`City preflight failed in chunk ${record.id}.`);
+    }
+  }
+  return { batch, keys };
+}
+
+function installBatch(
+  city: CityStateV2,
+  records: TerrainChunkRecord[],
+  keys: ChunkKey[],
+  revision: number,
+  actionToken: number,
+  batch?: CityBatchBuild,
+  full = true
+): RebuildResult {
+  const renderer = cityRenderer;
+  if (renderer === null) throw new Error("The city renderer is unavailable.");
+  const current = session.current;
+  if (current?.revision !== revision || actionToken !== roadActionSequence) {
+    return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: true };
+  }
+  const started = performance.now();
+  const ppm = pixelsPerMetre();
+  renderer.pixelsPerMetre = ppm;
+  const live = new Set(keys.map(chunkId));
+  if (full) {
+    for (const id of [...chunks.keys()]) {
+      if (!live.has(id)) {
+        chunks.delete(id);
+        renderer.removeChunk(id);
+      }
+    }
+  }
+  for (const record of records) {
+    chunks.set(record.id, record);
+    renderer.setChunk(chunkGeometry(city, record, ppm));
+  }
+  frameQuality.reset();
+  const result: RebuildResult = {
+    full: true,
+    chunks: records.length,
+    triangles: [...chunks.values()].reduce((sum, record) => sum + record.mesh.triangleCount, 0),
+    bytes: [...chunks.values()].reduce((sum, record) => sum + record.bytes, 0),
+    ms: performance.now() - started,
+    stale: false
+  };
+  lastBuild = result;
+  const counters = batch?.counters;
+  lastRoadBuild = {
+    requested: keys.length,
+    built: records.length,
+    compiledRoutes: counters?.compiledRoutes ?? 0,
+    compiledSegments: counters?.compiledSegments ?? 0,
+    markingTriangleCount: counters?.markingTriangleCount ?? records.reduce((sum, record) => sum + record.markingTriangleCount, 0),
+    totalTriangles: counters?.triangleCount ?? records.reduce((sum, record) => sum + record.mesh.triangleCount, 0),
+    totalBytes: counters?.bytes ?? records.reduce((sum, record) => sum + record.bytes, 0),
+    roundTripMs: batch?.roundTripMs ?? 0,
+    workerMode: batch?.workerMode ?? "fallback",
+    dirty: !full,
+    scope: full ? "all" : "dirty"
+  };
+  return result;
+}
+
+async function commitRoadSource(source: CitySourceV2["roads"], generation?: Partial<CitySourceV2["generation"]>, metadataOnly = false, fullRebuild = false): Promise<RebuildResult> {
+  const current = session.current;
+  if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
+  const candidate: CityStateV2 = {
+    ...current,
+    revision: current.revision + 1,
+    source: {
+      ...current.source,
+      generation: { ...current.source.generation, ...generation },
+      roads: source
+    }
+  };
+  if (metadataOnly) {
+    validateCandidate(candidate, true);
+    const saved = await guardedSave(candidate, current.revision, true);
+    session.publishCommit(saved);
+    roadSelection = { edgeIds: [], nodeIds: [] };
+    lastRoadBuild = {
+      requested: 0,
+      built: 0,
+      compiledRoutes: 0,
+      compiledSegments: 0,
+      markingTriangleCount: 0,
+      totalTriangles: 0,
+      totalBytes: 0,
+      roundTripMs: 0,
+      workerMode: workerClient === null ? "fallback" : "worker",
+      dirty: false,
+      scope: "none"
+    };
+    cancelTerrainDraft();
+    notifyCityChanged();
+    const existing = [...chunks.values()];
+    return { full: true, chunks: 0, triangles: existing.reduce((sum, chunk) => sum + chunk.mesh.triangleCount, 0), bytes: existing.reduce((sum, chunk) => sum + chunk.bytes, 0), ms: 0, stale: false };
+  }
+  const actionToken = nextRoadSequence();
+  const bounds = sceneBoundsM(candidate.source.origin);
+  const completeCoverage = chunkCoverageComplete([...chunks.keys()], bounds);
+  const installFull = fullRebuild || !completeCoverage;
+  const keys = installFull ? chunksCovering(bounds) : dirtyRoadKeys(current.source.roads, source, bounds);
+  const prebuilt = await preflightCity(candidate, actionToken, keys);
+  const saved = await guardedSave(candidate, current.revision, true);
+  session.publishCommit(saved);
+  let result: RebuildResult;
+  try {
+    mountRenderer();
+    result = installBatch(saved, prebuilt.batch.records, prebuilt.keys, saved.revision, actionToken, prebuilt.batch, installFull);
+  } catch (error) {
+    console.error(`${MODULE_ID} | committed road presentation failed`, error);
+    ui.notifications?.error(`Nixie: roads were saved, but presentation failed — ${error instanceof Error ? error.message : String(error)}`);
+    result = { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: false, degraded: true };
+  }
+  roadSelection = { edgeIds: [], nodeIds: [] };
+  cancelTerrainDraft();
+  notifyCityChanged();
+  return result;
+}
+
+export function getRoadSelection(): RoadSelection {
+  return { edgeIds: [...roadSelection.edgeIds], nodeIds: [...roadSelection.nodeIds] };
+}
+
+export function clearRoadSelection(): void {
+  roadSelection = { edgeIds: [], nodeIds: [] };
+  notifyCityChanged();
+}
+
+export function selectRoad(edgeId: string, additive = false): RoadSelection {
+  const city = session.current;
+  if (city === null || !city.source.roads.edges.some((edge) => edge.id === edgeId)) return getRoadSelection();
+  const selected = additive ? new Set(roadSelection.edgeIds) : new Set<string>();
+  if (selected.has(edgeId)) selected.delete(edgeId);
+  else selected.add(edgeId);
+  roadSelection = { edgeIds: [...selected], nodeIds: [] };
+  notifyCityChanged();
+  return getRoadSelection();
+}
+
+export function selectRoadNode(nodeId: string, additive = false): RoadSelection {
+  const city = session.current;
+  if (city === null || !city.source.roads.nodes.some((node) => node.id === nodeId)) return getRoadSelection();
+  const selected = additive ? new Set(roadSelection.nodeIds) : new Set<string>();
+  if (selected.has(nodeId)) selected.delete(nodeId);
+  else selected.add(nodeId);
+  roadSelection = { edgeIds: [], nodeIds: [...selected] };
+  notifyCityChanged();
+  return getRoadSelection();
+}
+
+export function roadInspector(edgeIds: readonly string[] = roadSelection.edgeIds): RoadInspector | null {
+  const city = session.current;
+  if (city === null) return null;
+  const edges = city.source.roads.edges.filter((edge) => edgeIds.includes(edge.id));
+  if (edges.length === 0) return null;
+  const classId = edges.every((edge) => edge.classId === edges[0]!.classId) ? edges[0]!.classId : "multiple";
+  const name = edges.every((edge) => edge.name === edges[0]!.name) ? edges[0]!.name : "multiple";
+  const locked = edges.every((edge) => edge.locked === edges[0]!.locked) ? edges[0]!.locked : "multiple";
+  const origin = edges.every((edge) => edge.origin === edges[0]!.origin) ? edges[0]!.origin : "multiple";
+  const routePresets = new Map(city.source.roads.routes.map((route) => [route.id, route.curvePreset]));
+  const presets = edges.map((edge) => routePresets.get(edge.routeId)).filter((preset): preset is RoadCurvePreset => preset !== undefined);
+  const curvePreset = presets.length > 0 && presets.every((preset) => preset === presets[0]) ? presets[0]! : "multiple";
+  return {
+    edgeIds: edges.map((edge) => edge.id),
+    classId,
+    name,
+    locked,
+    origin,
+    curvePreset,
+    routeIds: [...new Set(edges.map((edge) => edge.routeId))]
+  };
+}
+
+export function setRoadGridSnap(enabled: boolean): boolean {
+  roadSnapToFoundryGrid = enabled;
+  return roadSnapToFoundryGrid;
+}
+
+export function roadGridSnapEnabled(): boolean {
+  return roadSnapToFoundryGrid;
+}
+
+function snapRoadPoint(point: Vec2): Vec2 {
+  if (!roadSnapToFoundryGrid) return point;
+  const grid = canvas?.grid;
+  if (grid?.getSnappedPoint && canvas?.dimensions?.type !== 0) {
+    try {
+      const mode = (globalThis as any).CONST?.GRID_SNAPPING_MODES?.VERTEX;
+      const snapped = grid.getSnappedPoint(point, mode === undefined ? undefined : { mode, resolution: 1 });
+      if (snapped && Number.isFinite(snapped.x) && Number.isFinite(snapped.y)) return { x: snapped.x, y: snapped.y };
+    } catch {
+      return point;
+    }
+  }
+  return point;
+}
+
+export function appendRoad(
+  points: readonly Vec2[],
+  classId: RouteClassId = "street",
+  curvePreset: RoadCurvePreset = "standard",
+  name: string | null = null
+): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (!ROUTE_CLASS_REGISTRY.has(classId)) throw new Error(`Unknown route class "${classId}".`);
+    const snapped = points.map((point) => worldToMetres(snapRoadPoint(metresToWorld(point))));
+    const source = appendRoute(city.source.roads, snapped, {
+      classId,
+      curvePreset,
+      name,
+      origin: "authored",
+      revision: city.revision + 1,
+      sequence: nextRoadSequence()
+    });
+    return commitRoadSource(source);
+  });
+}
+
+export function generateRoads(
+  layout: CitySourceV2["generation"]["roadLayout"] = "european",
+  hubMode: CitySourceV2["generation"]["hubMode"] = "single-centre"
+): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (city.source.roads.edges.length > 0) throw new Error("Initial road generation is available only on an empty road source.");
+    const mask = city.source.terrain.urbanFootprint ?? city.source.terrain.land;
+    const input: RoadGenerationInput = {
+      citySeed: city.source.citySeed,
+      mask,
+      land: city.source.terrain.land,
+      layout,
+      hubMode,
+      sceneBounds: sceneBoundsM(city.source.origin)
+    };
+    const actionToken = roadActionSequence + 1;
+    const buildToken = session.buildEpoch;
+    const generated = await planInitialRoadNetwork(input, city.revision, actionToken, buildToken);
+    if (
+      session.current?.revision !== city.revision ||
+      session.buildEpoch !== buildToken ||
+      roadActionSequence + 1 !== actionToken
+    ) throw new Error("Initial road generation was superseded by newer Scene state.");
+    return commitRoadSource(generated.roads, { roadLayout: layout, hubMode }, false, true);
+  });
+}
+
+export function moveRoadNode(nodeId: string, point: Vec2): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const source = moveNode(city.source.roads, nodeId, worldToMetres(snapRoadPoint(metresToWorld(point))), {
+      revision: city.revision + 1,
+      sequence: nextRoadSequence()
+    });
+    return commitRoadSource(source);
+  });
+}
+
+export function weldRoadNodes(fromId: string, intoId: string): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    return commitRoadSource(weldNodes(city.source.roads, fromId, intoId));
+  });
+}
+
+export function deleteRoadJunction(nodeId: string): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    return commitRoadSource(deleteJunction(city.source.roads, nodeId, { revision: city.revision + 1, sequence: nextRoadSequence() }));
+  });
+}
+
+export function deleteRoads(edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const result = deleteEdges(city.source.roads, edgeIds);
+    if (result.disconnectedVehicleNetwork) ui.notifications?.warn("Nixie: deleting these roads disconnected the vehicle network.");
+    return commitRoadSource(result.source);
+  });
+}
+
+export function setRoadLocked(locked: boolean, edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const selected = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const source = {
+      ...city.source.roads,
+      edges: city.source.roads.edges.map((edge) => selected.has(edge.id) ? { ...edge, locked } : edge)
+    };
+    return commitRoadSource(source, undefined, true);
+  });
+}
+
+export function setRoadCurvePreset(curvePreset: RoadCurvePreset, edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (!(["tight", "standard", "broad"] as const).includes(curvePreset)) throw new Error(`Unknown curve preset "${curvePreset}".`);
+    const selected = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const routeIds = new Set(city.source.roads.edges.filter((edge) => selected.has(edge.id)).map((edge) => edge.routeId));
+    const source = { ...city.source.roads, routes: city.source.roads.routes.map((route) => routeIds.has(route.id) ? { ...route, curvePreset } : route) };
+    return commitRoadSource(source);
+  });
+}
+
+export function renameRoad(name: string | null, contiguousName = false, edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const selectedIds = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const selected = selectedIds.size === 1 && contiguousName
+      ? roadEdgesForSelection(city.source.roads, edgeIds, true)
+      : selectedIds;
+    const source = { ...city.source.roads, edges: city.source.roads.edges.map((edge) => selected.has(edge.id) ? { ...edge, name: name === null || name.trim() === "" ? null : name.trim() } : edge) };
+    return commitRoadSource(source, undefined, true);
+  });
+}
+
+export function reclassifyRoad(classId: RouteClassId, contiguousName = false, edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (!ROUTE_CLASS_REGISTRY.has(classId)) throw new Error(`Unknown route class "${classId}".`);
+    const selectedIds = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const selected = selectedIds.size === 1 && contiguousName
+      ? roadEdgesForSelection(city.source.roads, edgeIds, true)
+      : selectedIds;
+    const source = { ...city.source.roads, edges: city.source.roads.edges.map((edge) => selected.has(edge.id) ? { ...edge, classId } : edge) };
+    return commitRoadSource(source);
+  });
+}
+
 export function replaceLand(ring: Ring): Promise<RebuildResult> {
   return terrainActions.run(() => {
     const current = session.current;
     if (current === null) throw new Error("Create a 2.0 terrain first.");
     return commitSource({
       ...current.source,
-      generation: { terrainMode: "custom", coastEdge: null },
+      generation: {
+        ...current.source.generation,
+        terrainMode: "custom",
+        coastEdge: null
+      },
       terrain: { ...current.source.terrain, land: normalizeRing(ring) }
     });
   });
@@ -531,7 +1141,7 @@ export function moveTerrainVertex(
       ...current.source,
       generation:
         target === "land"
-          ? ({ terrainMode: "custom", coastEdge: null } as const)
+          ? ({ ...current.source.generation, terrainMode: "custom", coastEdge: null } as const)
           : current.source.generation,
       terrain: { ...current.source.terrain, [target]: normalizeRing(moved) }
     };
@@ -588,45 +1198,113 @@ function ensureWorker(): WorkerClient | null {
 function noteWorkerFailure(error: unknown): void {
   if (workerWarned) return;
   workerWarned = true;
-  console.warn(`${MODULE_ID} | terrain worker unusable, falling back to the main thread`, error);
+  console.warn(`${MODULE_ID} | city worker unusable, falling back to the main thread`, error);
 }
 
-function recordFromResult(result: BuildTerrainChunkResult): TerrainChunkRecord {
+async function planInitialRoadNetwork(
+  input: RoadGenerationInput,
+  sourceRevision: number,
+  actionToken: number,
+  buildToken: number
+): Promise<GeneratedRoadNetwork> {
+  const started = performance.now();
+  const record = (generated: GeneratedRoadNetwork, workerMode: "worker" | "fallback"): GeneratedRoadNetwork => {
+    lastInitialGeneration = {
+      planningRoundTripMs: performance.now() - started,
+      workerMode,
+      diagnostics: generated.diagnostics,
+      nodes: generated.roads.nodes.length,
+      edges: generated.roads.edges.length,
+      routes: generated.roads.routes.length
+    };
+    return generated;
+  };
+  const client = ensureWorker();
+  if (client === null) return record(generateInitialRoadNetwork(input), "fallback");
+  let result;
+  try {
+    result = await client.generateInitialRoadNetwork({ input, sourceRevision, actionToken, buildToken });
+  } catch (workerError) {
+    let fallback: GeneratedRoadNetwork;
+    try {
+      fallback = generateInitialRoadNetwork(input);
+    } catch (generationError) {
+      throw generationError;
+    }
+    noteWorkerFailure(workerError);
+    if (client === workerClient) {
+      workerClient.terminate();
+      workerClient = null;
+      workerUnavailable = true;
+    }
+    return record(fallback, "fallback");
+  }
+  if (
+    result.sourceRevision !== sourceRevision ||
+    result.actionToken !== actionToken ||
+    result.buildToken !== buildToken ||
+    result.config.layout !== input.layout ||
+    result.config.hubMode !== input.hubMode
+  ) throw new Error("Worker returned stale initial road generation.");
+  return record({ roads: result.roads, diagnostics: result.diagnostics }, "worker");
+}
+
+function recordFromBuild(result: CityChunkBuild): TerrainChunkRecord {
   return {
-    id: result.chunkId,
+    id: result.id,
     mesh: {
-      vertices: result.vertices,
-      indices: result.indices,
-      vertexCount: result.vertexCount,
-      triangleCount: result.triangleCount
+      vertices: result.mesh.vertices,
+      indices: result.mesh.indices,
+      vertexCount: result.mesh.vertexCount,
+      triangleCount: result.mesh.triangleCount
     },
     boundsM: result.boundsM,
-    landTriangleCount: result.landTriangleCount,
+    landTriangleCount: result.exposedLandTriangleCount,
     waterTriangleCount: result.waterTriangleCount,
-    bytes: result.vertices.byteLength + result.indices.byteLength
+    markingTriangleCount: result.markingTriangleCount,
+    bytes: result.mesh.vertices.byteLength + result.mesh.indices.byteLength
   };
 }
 
-async function buildOne(
+interface CityBatchBuild {
+  records: TerrainChunkRecord[];
+  counters: BuildCityChunksResult["counters"];
+  roundTripMs: number;
+  workerMode: "worker" | "fallback";
+}
+
+async function buildBatch(
   client: WorkerClient | null,
   city: CityStateV2,
-  key: ChunkKey,
+  keys: ChunkKey[],
   bounds: Rect,
-  ppm: number
-): Promise<TerrainChunkRecord> {
+  ppm: number,
+  actionToken: number,
+  buildToken: number
+): Promise<CityBatchBuild> {
+  const started = performance.now();
   if (client !== null) {
     try {
-      const result = await client.buildTerrainChunk({
-          source: city.source,
-          sourceRevision: city.revision,
-          key,
-          sceneBoundsM: bounds,
-          pixelsPerMetre: ppm
-        });
-      if (result.sourceRevision !== city.revision) {
-        throw new Error(`Worker returned stale revision ${result.sourceRevision}.`);
-      }
-      return recordFromResult(result);
+      const result = await client.buildCityChunks({
+        source: city.source,
+        sourceRevision: city.revision,
+        actionToken,
+        buildToken,
+        sceneBoundsM: bounds,
+        pixelsPerMetre: ppm,
+        keys
+      });
+      if (
+        result.sourceRevision !== city.revision ||
+        result.actionToken !== actionToken ||
+        result.buildToken !== buildToken
+      ) throw new Error("Worker returned a stale city-chunk batch.");
+      return {
+        records: result.chunks.map(recordFromBuild),
+        counters: result.counters,
+        roundTripMs: performance.now() - started,
+        workerMode: "worker"
+      };
     } catch (error) {
       noteWorkerFailure(error);
       if (client === workerClient) {
@@ -636,14 +1314,21 @@ async function buildOne(
       }
     }
   }
-  const build = buildTerrainChunk(city.source, key, bounds, ppm);
+  const build = buildCityChunksSync(city.source, keys, bounds, ppm);
   return {
-    id: build.id,
-    mesh: build.mesh,
-    boundsM: build.boundsM,
-    landTriangleCount: build.landTriangleCount,
-    waterTriangleCount: build.waterTriangleCount,
-    bytes: build.mesh.vertices.byteLength + build.mesh.indices.byteLength
+    records: build.chunks.map(recordFromBuild),
+    counters: {
+      requested: keys.length,
+      built: build.chunks.length,
+      vertexCount: build.chunks.reduce((sum, chunk) => sum + chunk.mesh.vertexCount, 0),
+      triangleCount: build.chunks.reduce((sum, chunk) => sum + chunk.mesh.triangleCount, 0),
+      bytes: build.chunks.reduce((sum, chunk) => sum + chunk.mesh.vertices.byteLength + chunk.mesh.indices.byteLength, 0),
+      compiledRoutes: build.compiledRoutes,
+      compiledSegments: build.compiledSegments,
+      markingTriangleCount: build.markingTriangleCount
+    },
+    roundTripMs: performance.now() - started,
+    workerMode: "fallback"
   };
 }
 
@@ -681,20 +1366,17 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
   }
 
   const client = ensureWorker();
+  const batch = await buildBatch(client, city, keys, bounds, ppm, revision, epoch);
   let installed = 0;
-  await Promise.all(
-    keys.map(async (key) => {
-      const record = await buildOne(client, city, key, bounds, ppm);
-      const current = session.current;
-      if (!terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
-        return;
-      }
+  const current = session.current;
+  if (terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+    for (const record of batch.records) {
       chunks.set(record.id, record);
       renderer.setChunk(chunkGeometry(city, record, ppm));
       frameQuality.reset();
       installed++;
-    })
-  );
+    }
+  }
 
   const stale = !terrainBuildIsCurrent(
     revision,
@@ -711,6 +1393,19 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
     stale
   };
   lastBuild = result;
+  lastRoadBuild = {
+    requested: batch.counters.requested,
+    built: batch.counters.built,
+    compiledRoutes: batch.counters.compiledRoutes,
+    compiledSegments: batch.counters.compiledSegments,
+    markingTriangleCount: batch.counters.markingTriangleCount,
+    totalTriangles: batch.counters.triangleCount,
+    totalBytes: batch.counters.bytes,
+    roundTripMs: batch.roundTripMs,
+    workerMode: batch.workerMode,
+    dirty: false,
+    scope: "all"
+  };
   console.log(
     `${MODULE_ID} | terrain rebuild — ${installed}/${keys.length} chunks, ${result.triangles} triangles, ${result.bytes} bytes in ${result.ms.toFixed(1)}ms${stale ? " — superseded" : ""}`
   );
@@ -850,6 +1545,7 @@ export function getRenderer(): CityRenderer | null {
 export function stats(): Record<string, unknown> | null {
   const city = session.current;
   if (city === null) return null;
+  const serializedFlagBytes = new TextEncoder().encode(JSON.stringify(city)).byteLength;
   return {
     ...cityRenderer?.stats(),
     revision: city.revision,
@@ -859,6 +1555,13 @@ export function stats(): Record<string, unknown> | null {
     citySeed: city.source.citySeed,
     landVertices: city.source.terrain.land.length,
     urbanFootprintVertices: city.source.terrain.urbanFootprint?.length ?? 0,
+    roadNodes: city.source.roads.nodes.length,
+    roadEdges: city.source.roads.edges.length,
+    roadRoutes: city.source.roads.routes.length,
+    serializedFlagBytes,
+    roadSelection: getRoadSelection(),
+    roadBuild: lastRoadBuild,
+    initialGeneration: lastInitialGeneration,
     buildEpoch: session.buildEpoch,
     undoDepth: session.historyDepth,
     canRedo: session.canRedo,
@@ -900,6 +1603,7 @@ function handleExternalFlagChange(): void {
   if (result.kind === "supported" && result.state.revision === localWriteRevision) return;
   if (result.kind !== "supported") {
     session.reset(result);
+    roadSelection = { edgeIds: [], nodeIds: [] };
     unmountRenderer();
     cancelTerrainDraft();
     notifyCityChanged();
@@ -907,6 +1611,7 @@ function handleExternalFlagChange(): void {
     return;
   }
   if (!session.adoptExternal(result)) return;
+  roadSelection = { edgeIds: [], nodeIds: [] };
   cancelTerrainDraft();
   notifyCityChanged();
   ui.notifications?.warn("Nixie: a newer Scene revision was loaded; local history and drafts were cleared.");

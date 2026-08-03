@@ -1,5 +1,6 @@
 import type { CityLoadResult } from "./documents.js";
-import type { CityStateV2 } from "../core/gen/terrain.js";
+import type { CityStateV2 } from "../core/gen/city.js";
+import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
 import { History } from "../core/history.js";
 
 function copy<T>(value: T): T {
@@ -157,8 +158,12 @@ export class TerrainSession {
   }
 
   #assertSaved(saved: CityStateV2, revision: number): void {
-    if (saved.kind !== "city-generator-2" || saved.schemaVersion !== 1) {
-      throw new Error("Saved state is not City Generator 2.0 schema 1.");
+    if (
+      saved.kind !== "city-generator-2" ||
+      saved.schemaVersion !== CITY_SCHEMA_VERSION ||
+      saved.generatorVersion !== GENERATOR_VERSION
+    ) {
+      throw new Error(`Saved state is not City Generator 2.0 schema ${CITY_SCHEMA_VERSION}.`);
     }
     if (!Number.isInteger(saved.revision) || saved.revision !== revision) {
       throw new Error(`Saved revision must be ${revision}.`);

@@ -1,21 +1,37 @@
 import {
   adjustLeanAtCurrentZoom,
   cityLoadStatus,
+  clearRoadSelection,
   clearLeanCalibration,
   createCoastalTerrain,
   createRectangleTerrain,
+  appendRoad,
+  deleteRoadJunction,
+  deleteRoads,
   currentWeather,
   deleteUrbanFootprint,
   getCity,
   getLeanCalibrationReport,
+  getRoadSelection,
+  generateRoads,
   isSceneEnabled,
   lookDials,
   moveTerrainVertex,
+  moveRoadNode,
   rebuildGeometry,
   redo,
   registerHooks,
   replaceLand,
   replaceUrbanFootprint,
+  renameRoad,
+  reclassifyRoad,
+  roadInspector,
+  setRoadLocked,
+  setRoadCurvePreset,
+  setRoadGridSnap,
+  selectRoad,
+  selectRoadNode,
+  weldRoadNodes,
   saveLeanCalibrationPoint,
   setLeanAtCurrentZoom,
   setLookDials,
@@ -37,6 +53,9 @@ import { WEATHER_PRESETS } from "./render/look-dials.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerSceneControls } from "./ui/controls.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
+import { registerRoadSceneControls } from "./ui/road-controls.js";
+import { ROAD_LAYER_NAME, roadLayerClass } from "./ui/road-layer.js";
+import { openRoadApp } from "./ui/road-app.js";
 import { openTerrainApp } from "./ui/terrain-app.js";
 
 const CONTROL = "Control";
@@ -44,7 +63,7 @@ const SHIFT = "Shift";
 
 function registerKeybindings(): void {
   const whenEditing = (action: () => Promise<unknown>) => (): boolean => {
-    if (canvas?.activeLayer?.options?.name !== LAYER_NAME) return false;
+    if (![LAYER_NAME, ROAD_LAYER_NAME].includes(canvas?.activeLayer?.options?.name)) return false;
     void action();
     return true;
   };
@@ -64,8 +83,10 @@ function registerKeybindings(): void {
 
 Hooks.once("init", () => {
   CONFIG.Canvas.layers[LAYER_NAME] = { layerClass: nixieLayerClass(), group: "interface" };
+  CONFIG.Canvas.layers[ROAD_LAYER_NAME] = { layerClass: roadLayerClass(), group: "interface" };
   registerSettings();
   registerSceneControls();
+  registerRoadSceneControls();
   registerKeybindings();
   registerHooks();
 
@@ -82,11 +103,28 @@ Hooks.once("init", () => {
     createCoastal: createCoastalTerrain,
     replaceLand,
     replaceUrbanFootprint,
+    generateRoads,
+    appendRoad,
+    getRoadSelection,
+    clearRoadSelection,
+    roadInspector,
+    moveRoadNode,
+    weldRoadNodes,
+    deleteRoadJunction,
+    renameRoad,
+    reclassifyRoad,
+    setRoadLocked,
+    setRoadCurvePreset,
+    setRoadGridSnap,
+    selectRoad,
+    selectRoadNode,
+    deleteRoads,
     moveTerrainVertex,
     deleteUrbanFootprint,
     undo,
     redo,
     openTerrainApp,
+    openRoadApp,
     setRenderScale: async (value: number) => {
       await setSettingValue(SETTING_RENDER_SCALE, value);
       return settingValue<number>(SETTING_RENDER_SCALE);

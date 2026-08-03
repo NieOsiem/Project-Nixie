@@ -1,7 +1,11 @@
 import { MODULE_ID } from "../constants.js";
 import type {
+  BuildCityChunksRequest,
+  BuildCityChunksResult,
   BuildTerrainChunkRequest,
   BuildTerrainChunkResult,
+  GenerateInitialRoadNetworkRequest,
+  GenerateInitialRoadNetworkResult,
   WorkerRequest,
   WorkerResponse
 } from "./protocol.js";
@@ -58,6 +62,18 @@ export class WorkerClient {
     body: Omit<BuildTerrainChunkRequest, "id" | "type">
   ): Promise<BuildTerrainChunkResult> {
     return this.request({ ...body, type: "buildTerrainChunk" }) as Promise<BuildTerrainChunkResult>;
+  }
+
+  buildCityChunks(
+    body: Omit<BuildCityChunksRequest, "id" | "type">
+  ): Promise<BuildCityChunksResult> {
+    return this.request({ ...body, type: "buildCityChunks" }) as Promise<BuildCityChunksResult>;
+  }
+
+  generateInitialRoadNetwork(
+    body: Omit<GenerateInitialRoadNetworkRequest, "id" | "type">
+  ): Promise<GenerateInitialRoadNetworkResult> {
+    return this.request({ ...body, type: "generateInitialRoadNetwork" }) as Promise<GenerateInitialRoadNetworkResult>;
   }
 
   terminate(): void {
