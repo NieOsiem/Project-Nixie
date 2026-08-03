@@ -1,5 +1,5 @@
 import { hash2 } from "./hash.js";
-import { allocateGeneratedId, ROUTE_CLASS_REGISTRY, type HubMode, type RoadLayout, type RoadSource, type RouteClassId } from "./city.js";
+import { allocateGeneratedId, ROUTE_CLASS_REGISTRY, validateRoadSource, type HubMode, type RoadLayout, type RoadSource, type RouteClassId } from "./city.js";
 import { deriveLabelledSeed } from "./terrain.js";
 import { difference, intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, type Rect, type Ring, type Vec2 } from "../geom/types.js";
@@ -29,7 +29,28 @@ export interface GeneratedRoadNetwork {
   diagnostics: RoadGenerationDiagnostics;
 }
 
+type CurvePreset = "tight" | "standard" | "broad";
+
 const EPS = 0.001;
+const NEAR_PARALLEL_SIN = 0.1;
+const JUNCTION_TOLERANCE_M = 1;
+const CLIP_MARGIN_M = 1;
+const PARALLEL_MARGIN_M = 2;
+const DEG = Math.PI / 180;
+
+function clamp(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, value));
+}
+
+function clearanceOf(classId: RouteClassId): number {
+  const cls = ROUTE_CLASS_REGISTRY.get(classId);
+  if (!cls) return 3;
+  return cls.widthM / 2 + cls.sidewalkM;
+}
+
+function minLengthOf(classId: RouteClassId): number {
+  return classId === "highway" || classId === "arterial" || classId === "street" || classId === "narrow" ? 10 : 6;
+}
 
 function bounds(ring: Ring): Rect {
   const xs = ring.map((point) => point.x);
@@ -53,32 +74,678 @@ function pointInRing(point: Vec2, ring: Ring): boolean {
   return inside;
 }
 
-function segmentInside(ring: Ring, a: Vec2, b: Vec2, clearanceM: number): boolean {
+function pointInRect(point: Vec2, rect: Rect): boolean {
+  return point.x >= rect.x - EPS && point.x <= rect.x + rect.width + EPS && point.y >= rect.y - EPS && point.y <= rect.y + rect.height + EPS;
+}
+
+function dist(a: Vec2, b: Vec2): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function lerpPoint(a: Vec2, b: Vec2, t: number): Vec2 {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+/** Sample the corridor (centreline + both offsets every 2 m, plus endpoint discs) against mask and land.
+ *  Samples outside the scene rect are ignored (roads may run to the map edge). */
+function corridorFits(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds?: Rect): boolean {
   const length = Math.hypot(b.x - a.x, b.y - a.y);
-  const count = Math.max(2, Math.ceil(length / 5));
-  const nx = length > EPS ? (-(b.y - a.y) / length) * clearanceM : 0;
-  const ny = length > EPS ? ((b.x - a.x) / length) * clearanceM : 0;
+  if (length <= EPS) return false;
+  const clearance = clearanceM + CLIP_MARGIN_M;
+  const count = Math.max(1, Math.ceil(length / 2));
+  const nx = (-(b.y - a.y) / length) * clearance;
+  const ny = ((b.x - a.x) / length) * clearance;
+  const check = (point: Vec2): boolean => {
+    if (sceneBounds && !pointInRect(point, sceneBounds)) return true;
+    return pointInRing(point, mask) && pointInRing(point, land);
+  };
   for (let i = 0; i <= count; i++) {
     const t = i / count;
-    const centre = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
-    if (!pointInRing(centre, ring) || !pointInRing({ x: centre.x + nx, y: centre.y + ny }, ring) || !pointInRing({ x: centre.x - nx, y: centre.y - ny }, ring)) return false;
+    const centre = lerpPoint(a, b, t);
+    if (!check(centre) || !check({ x: centre.x + nx, y: centre.y + ny }) || !check({ x: centre.x - nx, y: centre.y - ny })) return false;
+  }
+  for (const point of [a, b]) {
+    for (let k = 0; k < 24; k++) {
+      const angle = (k / 24) * Math.PI * 2;
+      if (!check({ x: point.x + Math.cos(angle) * clearance, y: point.y + Math.sin(angle) * clearance })) return false;
+    }
   }
   return true;
 }
 
-function generationSegmentInside(mask: Ring, land: Ring, a: Vec2, b: Vec2, clearanceM: number, sceneBounds?: Rect, allowSceneEdge = false): boolean {
-  if (!allowSceneEdge && (!segmentInside(mask, a, b, clearanceM) || !segmentInside(land, a, b, clearanceM))) return false;
-  const clippedScene = allowSceneEdge ? sceneBounds : undefined;
-  return shapeInsideMasks(edgeQuad(a, b, clearanceM), mask, land, clippedScene) &&
-    shapeInsideMasks(nodeDisc(a, clearanceM), mask, land, clippedScene) &&
-    shapeInsideMasks(nodeDisc(b, clearanceM), mask, land, clippedScene);
+function segmentIntersectionParam(a: Vec2, b: Vec2, c: Vec2, d: Vec2): { t: number; u: number } | null {
+  const rx = b.x - a.x;
+  const ry = b.y - a.y;
+  const sx = d.x - c.x;
+  const sy = d.y - c.y;
+  const denom = rx * sy - ry * sx;
+  if (Math.abs(denom) <= 1e-12) return null;
+  const t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / denom;
+  const u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / denom;
+  return { t, u };
 }
 
-function polygonArea(multi: ReturnType<typeof ringAsMulti>): number {
-  return multi.reduce(
-    (total, polygon) => total + polygon.reduce((area, ring, index) => area + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0),
-    0
-  );
+function projectPoint(a: Vec2, b: Vec2, p: Vec2): { t: number; point: Vec2; dist: number } | null {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 <= 1e-12) return null;
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+  const point = { x: a.x + dx * t, y: a.y + dy * t };
+  return { t, point, dist: Math.hypot(p.x - point.x, p.y - point.y) };
+}
+
+/** True when the candidate segment runs within corridor sums (+ margin) of a near-parallel barrier
+ *  over overlapping projections. This is the geometry the topology validator flags. */
+function parallelConflict(a: Vec2, b: Vec2, clearanceA: number, barriers: readonly { a: Vec2; b: Vec2; clearance: number }[]): boolean {
+  const ux = b.x - a.x;
+  const uy = b.y - a.y;
+  const len = Math.hypot(ux, uy);
+  if (len <= EPS) return false;
+  const dx = ux / len;
+  const dy = uy / len;
+  for (const barrier of barriers) {
+    if (dist(a, barrier.a) <= EPS || dist(a, barrier.b) <= EPS || dist(b, barrier.a) <= EPS || dist(b, barrier.b) <= EPS) continue;
+    const vx = barrier.b.x - barrier.a.x;
+    const vy = barrier.b.y - barrier.a.y;
+    const vlen = Math.hypot(vx, vy);
+    if (vlen <= EPS) continue;
+    const ex = vx / vlen;
+    const ey = vy / vlen;
+    if (Math.abs(dx * ey - dy * ex) > NEAR_PARALLEL_SIN) continue;
+    const sep = Math.abs(dx * (barrier.a.y - a.y) - dy * (barrier.a.x - a.x));
+    if (sep >= clearanceA + barrier.clearance + PARALLEL_MARGIN_M) continue;
+    const ta0 = dx * a.x + dy * a.y;
+    const ta1 = dx * b.x + dy * b.y;
+    const tb0 = dx * barrier.a.x + dy * barrier.a.y;
+    const tb1 = dx * barrier.b.x + dy * barrier.b.y;
+    const lo = Math.max(Math.min(ta0, ta1), Math.min(tb0, tb1));
+    const hi = Math.min(Math.max(ta0, ta1), Math.max(tb0, tb1));
+    if (lo <= hi + EPS) return true;
+  }
+  return false;
+}
+
+/** Clip segment to land/mask: keep the inside intervals, then shrink/refine until corridors fit. */
+function clipSegment(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[]): void {
+  const length = Math.hypot(b.x - a.x, b.y - a.y);
+  if (length < minLen) return;
+  const ts = [0, 1];
+  for (const ring of [mask, land]) {
+    for (let i = 0; i < ring.length; i++) {
+      const c = ring[i]!;
+      const d = ring[(i + 1) % ring.length]!;
+      const x = segmentIntersectionParam(a, b, c, d);
+      if (x && x.t > 1e-6 && x.t < 1 - 1e-6 && x.u > 1e-6 && x.u < 1 - 1e-6) ts.push(x.t);
+    }
+  }
+  ts.sort((p, q) => p - q);
+  const unique: number[] = [];
+  for (const t of ts) if (unique.length === 0 || t - unique[unique.length - 1]! > 1e-6) unique.push(t);
+  for (let i = 0; i + 1 < unique.length; i++) {
+    const t0 = unique[i]!;
+    const t1 = unique[i + 1]!;
+    const mid = lerpPoint(a, b, (t0 + t1) / 2);
+    if (!pointInRing(mid, mask) || !pointInRing(mid, land)) continue;
+    fitInterval(a, b, t0, t1, clearanceM, mask, land, sceneBounds, minLen, out);
+  }
+}
+
+function fitInterval(a: Vec2, b: Vec2, t0: number, t1: number, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[]): void {
+  const p0 = lerpPoint(a, b, t0);
+  const p1 = lerpPoint(a, b, t1);
+  if (corridorFits(p0, p1, clearanceM, mask, land, sceneBounds)) {
+    out.push(p0, p1);
+    return;
+  }
+  const length = Math.hypot(b.x - a.x, b.y - a.y);
+  if ((t1 - t0) * length < minLen) return;
+  const tm = (t0 + t1) / 2;
+  fitInterval(a, b, t0, tm, clearanceM, mask, land, sceneBounds, minLen, out);
+  fitInterval(a, b, tm, t1, clearanceM, mask, land, sceneBounds, minLen, out);
+}
+
+interface PlannedLine {
+  points: Vec2[];
+  classId: RouteClassId;
+  preset: CurvePreset;
+  role: string;
+  closed?: boolean;
+}
+
+interface Barrier {
+  a: Vec2;
+  b: Vec2;
+  clearance: number;
+}
+
+interface PlanState {
+  mask: Ring;
+  land: Ring;
+  sceneBounds: Rect;
+  box: Rect;
+  centre: Vec2;
+  minDim: number;
+  seed: number;
+  lines: PlannedLine[];
+  barriers: Barrier[];
+  hubPoints: Vec2[];
+  warnings: string[];
+  rejected: number;
+}
+
+/** Add a planned polyline unless any of its segments would run near-parallel-close to an existing line.
+ *  Optionally bends long straight lines at a hash-chosen point for an organic curve. */
+function pushLine(state: PlanState, points: Vec2[], classId: RouteClassId, preset: CurvePreset, role: string, opts: { closed?: boolean } = {}): boolean {
+  if (points.length < 2) return false;
+  const pts = points;
+  const clearance = clearanceOf(classId);
+  const pairs: [Vec2, Vec2][] = [];
+  for (let i = 0; i + 1 < pts.length; i++) pairs.push([pts[i]!, pts[i + 1]!]);
+  if (opts.closed && pts.length > 2) pairs.push([pts[pts.length - 1]!, pts[0]!]);
+  for (const [a, b] of pairs) {
+    if (parallelConflict(a, b, clearance, state.barriers)) {
+      state.rejected++;
+      return false;
+    }
+  }
+  state.lines.push({ points: pts, classId, preset, role, closed: opts.closed });
+  for (const [a, b] of pairs) state.barriers.push({ a, b, clearance });
+  return true;
+}
+
+function axisLines(state: PlanState): { verticals: number[]; horizontals: number[] } {
+  const verticals: number[] = [state.box.x, state.box.x + state.box.width];
+  const horizontals: number[] = [state.box.y, state.box.y + state.box.height];
+  for (const line of state.lines) {
+    const pts = line.points;
+    if (line.closed || pts.length < 2) continue;
+    const xMin = Math.min(...pts.map((p) => p.x));
+    const xMax = Math.max(...pts.map((p) => p.x));
+    const yMin = Math.min(...pts.map((p) => p.y));
+    const yMax = Math.max(...pts.map((p) => p.y));
+    if (xMax - xMin <= EPS && yMax - yMin > EPS) verticals.push(xMin);
+    else if (yMax - yMin <= EPS && xMax - xMin > EPS) horizontals.push(yMin);
+  }
+  const dedupe = (values: number[]): number[] => [...new Set(values.map((v) => Math.round(v / 1e-3) / 1e3))].sort((p, q) => p - q);
+  return { verticals: dedupe(verticals), horizontals: dedupe(horizontals) };
+}
+
+function planArterials(state: PlanState): { verticals: number[]; horizontals: number[] } {
+  const verticals: number[] = [];
+  const horizontals: number[] = [];
+  const spacing = Math.min(clamp(state.minDim / 3, 220, 420), state.minDim * 0.45);
+  for (const axis of ["x", "y"] as const) {
+    const extent = axis === "x" ? state.box.width : state.box.height;
+    const start = axis === "x" ? state.box.x : state.box.y;
+    const centre = axis === "x" ? state.centre.x : state.centre.y;
+    const out = axis === "x" ? verticals : horizontals;
+    for (let k = 0; ; k++) {
+      const offset = (k + 0.5) * spacing;
+      if (offset > extent / 2 - 8) break;
+      for (const sign of [1, -1]) {
+        const pos = centre + sign * offset;
+        if (pos < start + 4 || pos > start + extent - 4) continue;
+        const a = axis === "x" ? { x: pos, y: state.box.y } : { x: state.box.x, y: pos };
+        const b = axis === "x" ? { x: pos, y: state.box.y + state.box.height } : { x: state.box.x + state.box.width, y: pos };
+        if (pushLine(state, [a, b], "arterial", "broad", `arterial/${axis}/${k}/${sign}`)) out.push(pos);
+      }
+    }
+    out.sort((p, q) => p - q);
+  }
+  return { verticals, horizontals };
+}
+
+function planAvenues(state: PlanState): void {
+  const diag = Math.hypot(state.box.width, state.box.height) / 2 + 100;
+  const theta1 = (15 + hash2(1, 1, state.seed) * 20) * DEG;
+  const theta2 = (15 + hash2(1, 2, state.seed) * 20) * DEG;
+  const c = state.centre;
+  pushLine(state, [
+    { x: c.x + Math.cos(theta1) * diag, y: c.y + Math.sin(theta1) * diag },
+    { x: c.x - Math.cos(theta1) * diag, y: c.y - Math.sin(theta1) * diag }
+  ], "arterial", "broad", "avenue/0");
+  pushLine(state, [
+    { x: c.x + Math.cos(-theta2) * diag, y: c.y + Math.sin(-theta2) * diag },
+    { x: c.x - Math.cos(-theta2) * diag, y: c.y - Math.sin(-theta2) * diag }
+  ], "arterial", "broad", "avenue/1");
+}
+
+/** Ring road (one route per side, so corners stay sharp and nothing can sweep into the diagonals)
+ *  plus a cycleway loop 18 m further out. All-or-nothing: a side that would run parallel-close
+ *  to the mesh kills the whole ring. */
+function planRings(state: PlanState): void {
+  const inset = clamp(state.minDim * 0.07, 24, 70);
+  const rw = state.box.width - 2 * inset;
+  const rh = state.box.height - 2 * inset;
+  if (rw < 80 || rh < 80) return;
+  const x0 = state.box.x + inset;
+  const x1 = state.box.x + state.box.width - inset;
+  const y0 = state.box.y + inset;
+  const y1 = state.box.y + state.box.height - inset;
+  const classId: RouteClassId = state.minDim >= 600 ? "arterial" : "street";
+  const clearance = clearanceOf(classId);
+  const sides: [Vec2, Vec2][] = [
+    [{ x: x0, y: y0 }, { x: x1, y: y0 }],
+    [{ x: x1, y: y0 }, { x: x1, y: y1 }],
+    [{ x: x1, y: y1 }, { x: x0, y: y1 }],
+    [{ x: x0, y: y1 }, { x: x0, y: y0 }]
+  ];
+  for (const [a, b] of sides) {
+    if (parallelConflict(a, b, clearance, state.barriers)) return;
+  }
+  const names = ["ring/n", "ring/e", "ring/s", "ring/w"] as const;
+  for (let i = 0; i < 4; i++) {
+    const [a, b] = sides[i]! as [Vec2, Vec2];
+    state.lines.push({ points: [a, b], classId, preset: "broad", role: names[i]! });
+    state.barriers.push({ a, b, clearance });
+  }
+  if (inset >= 30) {
+    const cx0 = x0 - 18;
+    const cx1 = x1 + 18;
+    const cy0 = y0 - 18;
+    const cy1 = y1 + 18;
+    if (cx0 < state.box.x + 4 || cy0 < state.box.y + 4) return;
+    const cycleClearance = clearanceOf("cycleway");
+    const cycleSides: [Vec2, Vec2][] = [
+      [{ x: cx0, y: cy0 }, { x: cx1, y: cy0 }],
+      [{ x: cx1, y: cy0 }, { x: cx1, y: cy1 }],
+      [{ x: cx1, y: cy1 }, { x: cx0, y: cy1 }],
+      [{ x: cx0, y: cy1 }, { x: cx0, y: cy0 }]
+    ];
+    for (const [a, b] of cycleSides) {
+      if (parallelConflict(a, b, cycleClearance, state.barriers)) return;
+    }
+    const cycleNames = ["cycle/n", "cycle/e", "cycle/s", "cycle/w"] as const;
+    for (let i = 0; i < 4; i++) {
+      const [a, b] = cycleSides[i]!;
+      state.lines.push({ points: [a, b], classId: "cycleway", preset: "tight", role: cycleNames[i]! });
+      state.barriers.push({ a, b, clearance: cycleClearance });
+    }
+  }
+}
+
+/** Old-town: a sharp-cornered square of narrow streets around the central crossing with a
+ *  pedestrian plaza X across it. */
+function planOldTown(state: PlanState): void {
+  if (state.minDim < 320) return;
+  const half = clamp(state.minDim * 0.075, 28, 75);
+  const c = state.centre;
+  const clearance = clearanceOf("narrow");
+  const sides: [Vec2, Vec2][] = [
+    [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y - half }],
+    [{ x: c.x + half, y: c.y - half }, { x: c.x + half, y: c.y + half }],
+    [{ x: c.x + half, y: c.y + half }, { x: c.x - half, y: c.y + half }],
+    [{ x: c.x - half, y: c.y + half }, { x: c.x - half, y: c.y - half }]
+  ];
+  for (const [a, b] of sides) {
+    if (parallelConflict(a, b, clearance, state.barriers)) return;
+  }
+  const names = ["oldtown/n", "oldtown/e", "oldtown/s", "oldtown/w"] as const;
+  for (let i = 0; i < 4; i++) {
+    const [a, b] = sides[i]! as [Vec2, Vec2];
+    state.lines.push({ points: [a, b], classId: "narrow", preset: "tight", role: names[i]! });
+    state.barriers.push({ a, b, clearance });
+  }
+  // Two full diagonals crossing at the centre (the four half-diagonals would be collinear
+  // pairs on the same line, which the junction pass cannot distinguish).
+  pushLine(state, [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y + half }], "plaza-route", "standard", "plaza/0");
+  pushLine(state, [{ x: c.x + half, y: c.y - half }, { x: c.x - half, y: c.y + half }], "plaza-route", "standard", "plaza/1");
+  state.hubPoints.push(c);
+}
+
+/** A 24-gon ring rotated 15° so no edge is axis-parallel. One route per edge: the curve
+ *  compiler rounds degree-2 same-route nodes, and its arc spans carry misaligned node ids,
+ *  so a single closed route would fail topology validation around every crossing. */
+function roundaboutAt(state: PlanState, centre: Vec2, role: string): boolean {
+  const R = clamp(state.minDim * 0.035, 18, 42);
+  if (centre.x - R - 8 < state.box.x || centre.x + R + 8 > state.box.x + state.box.width || centre.y - R - 8 < state.box.y || centre.y + R + 8 > state.box.y + state.box.height) return false;
+  const vertices = Array.from({ length: 24 }, (_, k) => {
+    const angle = (15 + k * 15) * DEG;
+    return { x: centre.x + Math.cos(angle) * R, y: centre.y + Math.sin(angle) * R };
+  });
+  for (let k = 0; k < vertices.length; k++) {
+    const a = vertices[k]!;
+    const b = vertices[(k + 1) % vertices.length]!;
+    if (!pushLine(state, [a, b], "street", "tight", `${role}/${k}`)) return false;
+  }
+  return true;
+}
+
+function planRoundabouts(state: PlanState, hubMode: HubMode, gridCrossings?: { verticals: number[]; horizontals: number[] }): void {
+  const R = clamp(state.minDim * 0.035, 18, 42);
+  const picked: Vec2[] = [];
+  const tryRing = (centre: Vec2, role: string): boolean => {
+    if (picked.some((p) => dist(p, centre) < Math.max(2.2 * R, 80))) return false;
+    if (roundaboutAt(state, centre, role)) {
+      picked.push(centre);
+      state.hubPoints.push(centre);
+      return true;
+    }
+    return false;
+  };
+  if (gridCrossings) {
+    tryRing(state.centre, "roundabout/0");
+    if (hubMode === "multiple-hubs") {
+      const target = hash2(5, 1, state.seed) < 0.5 ? 2 : 1;
+      const candidates: Vec2[] = [];
+      for (const x of gridCrossings.verticals) {
+        for (const y of gridCrossings.horizontals) {
+          const c = { x, y };
+          if (dist(c, state.centre) >= Math.max(2.2 * R, 60)) candidates.push(c);
+        }
+      }
+      const order = candidates.map((c, i) => ({ c, t: hash2(i, 41, state.seed) })).sort((p, q) => p.t - q.t);
+      for (const { c } of order) {
+        if (picked.length - 1 >= target) break;
+        tryRing(c, `roundabout/${picked.length}`);
+      }
+    }
+    return;
+  }
+  // european / mixed: one roundabout at an outer mesh crossing, far from the avenues.
+  const verticals: number[] = [];
+  const horizontals: number[] = [];
+  for (const line of state.lines) {
+    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
+    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
+  }
+  const crossings: Vec2[] = [];
+  for (const x of verticals) {
+    for (const y of horizontals) crossings.push({ x, y });
+  }
+  const candidates = crossings.filter((c) => dist(c, state.centre) >= Math.max(state.minDim * 0.2, 90));
+  const order = candidates.map((c, i) => ({ c, t: hash2(i, 43, state.seed) })).sort((p, q) => p.t - q.t);
+  for (const { c } of order) {
+    if (tryRing(c, "roundabout/0")) break;
+  }
+}
+
+/** Secondary market squares for multiple-hubs: small sharp squares of streets in far cells. */
+function planSecondaryHubs(state: PlanState, hubMode: HubMode, layout: RoadLayout): void {
+  if (hubMode !== "multiple-hubs" || layout === "grid") return;
+  const verticals: number[] = [];
+  const horizontals: number[] = [];
+  for (const line of state.lines) {
+    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
+    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
+  }
+  verticals.sort((p, q) => p - q);
+  horizontals.sort((p, q) => p - q);
+  const half = clamp(state.minDim * 0.045, 22, 45);
+  const cells: Rect[] = [];
+  {
+    const xs = [state.box.x, ...verticals, state.box.x + state.box.width];
+    const ys = [state.box.y, ...horizontals, state.box.y + state.box.height];
+    for (let i = 0; i + 1 < xs.length; i++) {
+      for (let j = 0; j + 1 < ys.length; j++) {
+        cells.push({ x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! });
+      }
+    }
+  }
+  const candidates = cells
+    .map((cell) => ({ x: cell.x + cell.width / 2, y: cell.y + cell.height / 2, cell }))
+    .filter(({ x, y, cell }) => Math.min(cell.width, cell.height) / 2 >= half + 25 && dist({ x, y }, state.centre) >= state.minDim * 0.2);
+  const order = candidates.map((c, i) => ({ c, t: hash2(i, 47, state.seed) })).sort((p, q) => p.t - q.t);
+  const target = hash2(7, 1, state.seed) < 0.5 ? 2 : 1;
+  const placed: Vec2[] = [];
+  const clearance = clearanceOf("street");
+  for (const { c } of order) {
+    if (placed.length >= target) break;
+    if (placed.some((p) => dist(p, c) < state.minDim * 0.25)) continue;
+    const sides: [Vec2, Vec2][] = [
+      [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y - half }],
+      [{ x: c.x + half, y: c.y - half }, { x: c.x + half, y: c.y + half }],
+      [{ x: c.x + half, y: c.y + half }, { x: c.x - half, y: c.y + half }],
+      [{ x: c.x - half, y: c.y + half }, { x: c.x - half, y: c.y - half }]
+    ];
+    if (sides.some(([a, b]) => parallelConflict(a, b, clearance, state.barriers))) continue;
+    const names = [`secondary/${placed.length}/n`, `secondary/${placed.length}/e`, `secondary/${placed.length}/s`, `secondary/${placed.length}/w`];
+    for (let i = 0; i < 4; i++) {
+      const [a, b] = sides[i]! as [Vec2, Vec2];
+      state.lines.push({ points: [a, b], classId: "street", preset: "tight", role: names[i]! });
+      state.barriers.push({ a, b, clearance });
+    }
+    placed.push(c);
+    state.hubPoints.push(c);
+  }
+}
+
+function planStreets(state: PlanState, layout: RoadLayout): void {
+  const verticals: number[] = [];
+  const horizontals: number[] = [];
+  for (const line of state.lines) {
+    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
+    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
+  }
+  verticals.sort((p, q) => p - q);
+  horizontals.sort((p, q) => p - q);
+  const xs = [state.box.x, ...verticals, state.box.x + state.box.width];
+  const ys = [state.box.y, ...horizontals, state.box.y + state.box.height];
+  const centreIn = (cell: Rect): boolean => state.centre.x >= cell.x && state.centre.x <= cell.x + cell.width && state.centre.y >= cell.y && state.centre.y <= cell.y + cell.height;
+  let cellIndex = 0;
+  for (let i = 0; i + 1 < xs.length; i++) {
+    for (let j = 0; j + 1 < ys.length; j++) {
+      const cell = { x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! };
+      if (layout === "mixed" && centreIn(cell)) {
+        // strict grid core: both orientations across the central cell, centre pair = arterial
+        const s = clamp(state.minDim / 9, 70, 110);
+        for (const axis of ["x", "y"] as const) {
+          const lo = axis === "x" ? cell.x + 24 : cell.y + 24;
+          const hi = axis === "x" ? cell.x + cell.width - 24 : cell.y + cell.height - 24;
+          const c = axis === "x" ? state.centre.x : state.centre.y;
+          for (let k = 0; k < 8; k++) {
+            const offset = (k + 0.5) * s;
+            for (const sign of [1, -1]) {
+              const pos = c + sign * offset;
+              if (pos < lo || pos > hi) continue;
+              const a = axis === "x" ? { x: pos, y: cell.y } : { x: cell.x, y: pos };
+              const b = axis === "x" ? { x: pos, y: cell.y + cell.height } : { x: cell.x + cell.width, y: pos };
+              pushLine(state, [a, b], Math.abs(pos - c) <= s ? "arterial" : "street", "tight", `lattice/${axis}/${k}/${sign}`);
+            }
+          }
+        }
+        if (roundaboutAt(state, state.centre, "roundabout/core")) state.hubPoints.push(state.centre);
+        cellIndex++;
+        continue;
+      }
+      const w = cell.width;
+      const h = cell.height;
+      if (Math.min(w, h) < 60) {
+        cellIndex++;
+        continue;
+      }
+      const vertical = hash2(cellIndex, 3, state.seed) < 0.7;
+      const both = hash2(cellIndex, 5, state.seed) < 0.15;
+      const span = vertical ? h : w;
+      const n = Math.max(0, Math.min(4, Math.round(span / 120) - 1 + (hash2(cellIndex, 7, state.seed) < 0.4 ? 1 : 0)));
+      const placed: number[] = [];
+      for (let k = 0; k < n; k++) {
+        const t = hash2(cellIndex, 9 + k, state.seed);
+        const off = 24 + t * Math.max(1, span - 48);
+        if (placed.some((o) => Math.abs(o - off) < 90)) continue;
+        const classId = hash2(cellIndex, 13 + k, state.seed) < 0.45 ? "narrow" : "street";
+        const a = vertical ? { x: cell.x + off, y: cell.y } : { x: cell.x, y: cell.y + off };
+        const b = vertical ? { x: cell.x + off, y: cell.y + cell.height } : { x: cell.x + cell.width, y: cell.y + off };
+        if (pushLine(state, [a, b], classId, "standard", `street/${cellIndex}/${k}`)) placed.push(off);
+      }
+      if (both) {
+        const t = hash2(cellIndex, 21, state.seed);
+        const spanOther = vertical ? w : h;
+        const off = 24 + t * Math.max(1, spanOther - 48);
+        const classId = hash2(cellIndex, 23, state.seed) < 0.45 ? "narrow" : "street";
+        const a = vertical ? { x: cell.x, y: cell.y + off } : { x: cell.x + off, y: cell.y };
+        const b = vertical ? { x: cell.x + cell.width, y: cell.y + off } : { x: cell.x + off, y: cell.y + cell.height };
+        pushLine(state, [a, b], classId, "standard", `street/${cellIndex}/x`);
+      }
+      cellIndex++;
+    }
+  }
+}
+
+/** Mid-block lanes/alleys in every block formed by the axis-aligned network, some as cul-de-sacs. */
+function planLanes(state: PlanState): void {
+  const { verticals, horizontals } = axisLines(state);
+  let blockIndex = 0;
+  for (let i = 0; i + 1 < verticals.length; i++) {
+    for (let j = 0; j + 1 < horizontals.length; j++) {
+      const x0 = verticals[i]!;
+      const x1 = verticals[i + 1]!;
+      const y0 = horizontals[j]!;
+      const y1 = horizontals[j + 1]!;
+      const w = x1 - x0;
+      const h = y1 - y0;
+      const p = hash2(blockIndex, 1, state.seed);
+      // Keep the old-town core clear: lanes there would T-junction centimetres from the
+      // plaza diagonals' crossings and manufacture degenerate twin junctions.
+      if (Math.min(w, h) < 50 || p >= 0.45 || dist({ x: (x0 + x1) / 2, y: (y0 + y1) / 2 }, state.centre) < 40) {
+        blockIndex++;
+        continue;
+      }
+      const vertical = p < 0.225;
+      const off = (vertical ? (x0 + x1) / 2 : (y0 + y1) / 2) + (hash2(blockIndex, 3, state.seed) - 0.5) * 12;
+      const classId = hash2(blockIndex, 5, state.seed) < 0.5 ? "lane" : "alley";
+      const cul = hash2(blockIndex, 7, state.seed) < 0.25;
+      const depth = 0.55 + hash2(blockIndex, 9, state.seed) * 0.3;
+      const a = vertical ? { x: off, y: y0 } : { x: x0, y: off };
+      const b = vertical ? { x: off, y: cul ? y0 + h * depth : y1 } : { x: cul ? x0 + w * depth : x1, y: off };
+      pushLine(state, [a, b], classId, "tight", `lane/${blockIndex}`);
+      blockIndex++;
+    }
+  }
+}
+
+/** Highways from the ring to the map edge, one per side, placed in the gaps between parallel roads. */
+function planHighways(state: PlanState): void {
+  const inset = clamp(state.minDim * 0.07, 24, 70);
+  const rw = state.box.width - 2 * inset;
+  const rh = state.box.height - 2 * inset;
+  if (rw < 80 || rh < 80) return;
+  const count = state.minDim >= 450 ? 3 + (hash2(9, 1, state.seed) < 0.5 ? 1 : 0) : 2;
+  const sides = ["w", "e", "n", "s"] as const;
+  const chosen: { side: string; pos: number }[] = [];
+  let guard = 0;
+  while (chosen.length < count && guard++ < 80) {
+    const side = sides[Math.floor(hash2(9, 2 + chosen.length * 2, state.seed) * 4)]!;
+    const isH = side === "w" || side === "e";
+    const extent = isH ? state.box.height : state.box.width;
+    const lo = inset + 40;
+    const hi = extent - inset - 40;
+    if (hi <= lo) break;
+    const pos = lo + hash2(9, 3 + chosen.length * 2, state.seed) * (hi - lo);
+    if (chosen.some((c) => c.side === side && Math.abs(c.pos - pos) < 100)) continue;
+    const a = side === "w" ? { x: state.box.x + inset, y: state.box.y + pos } : side === "e" ? { x: state.box.x + state.box.width - inset, y: state.box.y + pos } : side === "n" ? { x: state.box.x + pos, y: state.box.y + inset } : { x: state.box.x + pos, y: state.box.y + state.box.height - inset };
+    const b = side === "w" ? { x: state.box.x, y: state.box.y + pos } : side === "e" ? { x: state.box.x + state.box.width, y: state.box.y + pos } : side === "n" ? { x: state.box.x + pos, y: state.box.y } : { x: state.box.x + pos, y: state.box.y + state.box.height };
+    if (pushLine(state, [a, b], "highway", "standard", `highway/${side}/${chosen.length}`)) chosen.push({ side, pos });
+  }
+  if (chosen.length === 0) state.warnings.push("no highway position fit");
+}
+
+/** Waterfront promenade: the land-ring edges whose outward probe is inside the scene but outside
+ *  the land are the coast; offset the coast 6 m inland and keep only pieces that stay clear. */
+function planPromenade(state: PlanState): void {
+  const land = state.land;
+  const signed = ringArea(land);
+  const ccw = signed > 0;
+  interface CoastEdge { a: Vec2; b: Vec2; nx: number; ny: number; }
+  const coasts: CoastEdge[] = [];
+  for (let i = 0; i < land.length; i++) {
+    const a = land[i]!;
+    const b = land[(i + 1) % land.length]!;
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len < EPS) continue;
+    const dx = (b.x - a.x) / len;
+    const dy = (b.y - a.y) / len;
+    const nx = ccw ? dy : -dy;
+    const ny = ccw ? -dx : dx;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const probe = { x: mid.x + nx * 2, y: mid.y + ny * 2 };
+    if (pointInRect(probe, state.sceneBounds) && !pointInRing(probe, land)) coasts.push({ a, b, nx, ny });
+  }
+  if (coasts.length === 0) return;
+  const verts: Vec2[] = [];
+  for (let i = 0; i < coasts.length; i++) {
+    const e = coasts[i]!;
+    const prev = coasts[(i - 1 + coasts.length) % coasts.length]!;
+    const ix = -(prev.nx + e.nx);
+    const iy = -(prev.ny + e.ny);
+    const il = Math.hypot(ix, iy) || 1;
+    verts.push({ x: e.a.x + (ix / il) * 6, y: e.a.y + (iy / il) * 6 });
+  }
+  const last = coasts[coasts.length - 1]!;
+  verts.push({ x: last.b.x - last.nx * 6, y: last.b.y - last.ny * 6 });
+  const clearance = clearanceOf("waterfront-promenade");
+  const pieces: Vec2[][] = [];
+  for (let i = 0; i + 1 < verts.length; i++) {
+    const a = verts[i]!;
+    const b = verts[i + 1]!;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (!pointInRing(mid, state.mask) || !pointInRing(mid, state.land)) continue;
+    if (parallelConflict(a, b, clearance, state.barriers)) continue;
+    if (!corridorFits(a, b, clearance, state.mask, state.land, state.sceneBounds)) continue;
+    pieces.push([a, b]);
+    state.barriers.push({ a, b, clearance });
+  }
+  if (pieces.length === 0) return;
+  // run ends: chain vertices whose neighbour piece was dropped
+  const runEnds = new Set<Vec2>();
+  const first = pieces[0]!;
+  const lastP = pieces[pieces.length - 1]!;
+  runEnds.add(first[0]!);
+  runEnds.add(lastP[1]!);
+  for (let i = 1; i < pieces.length; i++) {
+    const prevEnd = pieces[i - 1]![1]!;
+    const curStart = pieces[i]![0]!;
+    if (dist(prevEnd, curStart) > JUNCTION_TOLERANCE_M) {
+      runEnds.add(prevEnd);
+      runEnds.add(curStart);
+    }
+  }
+  for (let i = 0; i < pieces.length; i++) {
+    const [a, b] = pieces[i]! as [Vec2, Vec2];
+    if (pushLine(state, [a, b], "waterfront-promenade", "tight", `promenade/${i}`)) {
+      for (const end of [a, b]) {
+        if (!runEnds.has(end)) continue;
+        // connect the run end to the nearest planned road
+        let best: { point: Vec2; d: number } | null = null;
+        for (const line of state.lines) {
+          const pts = line.points;
+          for (let k = 0; k + 1 < pts.length; k++) {
+            const proj = projectPoint(pts[k]!, pts[k + 1]!, end);
+            if (proj && proj.t > 1e-3 && proj.t < 1 - 1e-3 && proj.dist < 80 && (!best || proj.dist < best.d)) best = { point: proj.point, d: proj.dist };
+          }
+        }
+        if (!best) continue;
+        if (parallelConflict(end, best.point, clearance, state.barriers)) continue;
+        if (!corridorFits(end, best.point, clearance, state.mask, state.land, state.sceneBounds)) continue;
+        pushLine(state, [end, best.point], "waterfront-promenade", "tight", `promenade/conn/${i}`);
+      }
+    }
+  }
+}
+
+function planGrid(state: PlanState, hubMode: HubMode): void {
+  const s = clamp(state.minDim / 7.5, 90, 130);
+  const countX = Math.max(2, Math.round(state.box.width / s));
+  const sX = state.box.width / countX;
+  const countY = Math.max(2, Math.round(state.box.height / s));
+  const sY = state.box.height / countY;
+  const verticals: number[] = [];
+  const horizontals: number[] = [];
+  for (let k = 0; k <= countX; k++) {
+    const x = state.box.x + k * sX;
+    const a = { x, y: state.box.y };
+    const b = { x, y: state.box.y + state.box.height };
+    if (pushLine(state, [a, b], Math.abs(x - state.centre.x) <= sX ? "arterial" : "street", "tight", `grid/v/${k}`)) verticals.push(x);
+  }
+  for (let k = 0; k <= countY; k++) {
+    const y = state.box.y + k * sY;
+    const a = { x: state.box.x, y };
+    const b = { x: state.box.x + state.box.width, y };
+    if (pushLine(state, [a, b], Math.abs(y - state.centre.y) <= sY ? "arterial" : "street", "tight", `grid/h/${k}`)) horizontals.push(y);
+  }
+  planRoundabouts(state, hubMode, { verticals, horizontals });
+  planLanes(state);
 }
 
 function edgeQuad(a: Vec2, b: Vec2, halfWidth: number): Ring {
@@ -107,6 +774,13 @@ function clippedShape(shape: Ring, sceneBounds?: Rect): ReturnType<typeof ringAs
   return intersection(ringAsMulti(shape), ringAsMulti(rectRing(sceneBounds)));
 }
 
+function polygonArea(multi: ReturnType<typeof ringAsMulti>): number {
+  return multi.reduce(
+    (total, polygon) => total + polygon.reduce((area, ring, index) => area + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0),
+    0
+  );
+}
+
 function shapeInsideMasks(shape: Ring, mask: Ring, land: Ring, sceneBounds?: Rect): boolean {
   if (shape.length < 3) return true;
   const clipped = clippedShape(shape, sceneBounds);
@@ -120,7 +794,13 @@ function corridorsInsideMask(source: RoadSource, mask: Ring, sceneBounds: Rect):
   const network = compileRouteNetwork(source);
   for (const span of network.segments) {
     const corridor = edgeQuad(span.a, span.b, span.clearanceM);
-    if (corridor.length >= 3 && !shapeInsideMasks(corridor, mask, mask, sceneBounds)) return false;
+    if (corridor.length >= 3 && !shapeInsideMasks(corridor, mask, mask, sceneBounds)) {
+      if (process.env.NIXIE_DEBUG_ROADS) {
+        const { writeFileSync } = require("node:fs");
+        writeFileSync(process.env.NIXIE_DEBUG_ROADS, JSON.stringify({ span, mask, sceneBounds }));
+      }
+      return false;
+    }
     for (const point of [span.a, span.b]) {
       const disc = nodeDisc(point, span.clearanceM);
       if (disc.length < 3) continue;
@@ -130,203 +810,24 @@ function corridorsInsideMask(source: RoadSource, mask: Ring, sceneBounds: Rect):
   return true;
 }
 
-function centroid(ring: Ring): Vec2 {
-  let signed = 0;
-  let x = 0;
-  let y = 0;
-  for (let i = 0; i < ring.length; i++) {
-    const a = ring[i]!;
-    const b = ring[(i + 1) % ring.length]!;
-    const cross = a.x * b.y - b.x * a.y;
-    signed += cross;
-    x += (a.x + b.x) * cross;
-    y += (a.y + b.y) * cross;
-  }
-  if (Math.abs(signed) <= EPS) {
-    const box = bounds(ring);
-    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-  }
-  return { x: x / (3 * signed), y: y / (3 * signed) };
-}
-
-function interiorPoint(mask: Ring, land: Ring, seed: number, index: number, clearanceM: number): Vec2 {
-  const box = bounds(mask);
-  const centre = centroid(mask);
-  // WHY: Reusing the centroid for later hubs would make multiple-hubs silently single-centre.
-  if (index === 0 && pointInRing(centre, mask) && shapeInsideMasks(nodeDisc(centre, clearanceM), mask, land)) return centre;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const x = box.x + hash2(index * 29 + attempt, 7, seed) * box.width;
-    const y = box.y + hash2(index * 31 + attempt, 11, seed) * box.height;
-    const point = { x, y };
-    if (pointInRing(point, mask) && shapeInsideMasks(nodeDisc(point, clearanceM), mask, land)) return point;
-  }
-  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-}
-
-function addNode(nodes: Map<string, Vec2>, point: Vec2, seed: string, role: string): string {
-  for (const [id, existing] of nodes) if (Math.hypot(existing.x - point.x, existing.y - point.y) <= EPS) return id;
-  const id = allocateGeneratedId("node", seed, role, nodes.size, new Set(nodes.keys()));
-  nodes.set(id, { x: point.x, y: point.y });
-  return id;
-}
-
-interface DraftEdge { a: string; b: string; routeId: string; classId: RouteClassId; name: string | null; }
-
-function properIntersection(a: Vec2, b: Vec2, c: Vec2, d: Vec2): { t: number; u: number; point: Vec2 } | null {
-  const rx = b.x - a.x;
-  const ry = b.y - a.y;
-  const sx = d.x - c.x;
-  const sy = d.y - c.y;
-  const denominator = rx * sy - ry * sx;
-  if (Math.abs(denominator) <= EPS) return null;
-  const qx = c.x - a.x;
-  const qy = c.y - a.y;
-  const t = (qx * sy - qy * sx) / denominator;
-  const u = (qx * ry - qy * rx) / denominator;
-  if (t <= EPS || t >= 1 - EPS || u <= EPS || u >= 1 - EPS) return null;
-  return { t, u, point: { x: a.x + rx * t, y: a.y + ry * t } };
-}
-
-function planarize(nodes: Map<string, Vec2>, edges: DraftEdge[], seed: string): DraftEdge[] {
-  const nodeIdAt = (point: Vec2): string => addNode(nodes, point, seed, "crossing");
-  const byId = (): Map<string, Vec2> => nodes;
-  const splits = new Map<number, { t: number; nodeId: string }[]>();
-  for (let i = 0; i < edges.length; i++) {
-    const left = edges[i]!;
-    const a = byId().get(left.a);
-    const b = byId().get(left.b);
-    if (!a || !b) continue;
-    for (let j = i + 1; j < edges.length; j++) {
-      const right = edges[j]!;
-      if (left.a === right.a || left.a === right.b || left.b === right.a || left.b === right.b) continue;
-      const c = byId().get(right.a);
-      const d = byId().get(right.b);
-      if (!c || !d) continue;
-      const hit = properIntersection(a, b, c, d);
-      if (!hit) continue;
-      const nodeId = nodeIdAt(hit.point);
-      const l = splits.get(i) ?? [];
-      l.push({ t: hit.t, nodeId });
-      splits.set(i, l);
-      const r = splits.get(j) ?? [];
-      r.push({ t: hit.u, nodeId });
-      splits.set(j, r);
-    }
-  }
-  if (splits.size === 0) return edges;
-  const out: DraftEdge[] = [];
-  for (let i = 0; i < edges.length; i++) {
-    const edge = edges[i]!;
-    const points = [{ t: 0, nodeId: edge.a }, ...(splits.get(i) ?? []), { t: 1, nodeId: edge.b }].sort((a, b) => a.t - b.t);
-    for (let part = 0; part + 1 < points.length; part++) {
-      const a = points[part]!.nodeId;
-      const b = points[part + 1]!.nodeId;
-      if (a !== b) out.push({ ...edge, a, b });
-    }
-  }
-  return out;
-}
-
-function collinearOverlap(a: Vec2, b: Vec2, c: Vec2, d: Vec2): boolean {
-  const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-  const crossD = (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
-  if (Math.abs(cross) > EPS || Math.abs(crossD) > EPS) return false;
-  const length = Math.hypot(b.x - a.x, b.y - a.y);
-  if (length <= EPS) return true;
-  const t0 = ((c.x - a.x) * (b.x - a.x) + (c.y - a.y) * (b.y - a.y)) / (length * length);
-  const t1 = ((d.x - a.x) * (b.x - a.x) + (d.y - a.y) * (b.y - a.y)) / (length * length);
-  return Math.min(1, Math.max(t0, t1)) - Math.max(0, Math.min(t0, t1)) > EPS;
-}
-
-function discardGeneratedOverlaps(nodes: Map<string, Vec2>, edges: DraftEdge[]): DraftEdge[] {
-  const keep: DraftEdge[] = [];
-  const discardedRoutes = new Set<string>();
-  for (const edge of edges) {
-    if (discardedRoutes.has(edge.routeId)) continue;
-    const a = nodes.get(edge.a);
-    const b = nodes.get(edge.b);
-    if (!a || !b) continue;
-    const duplicate = keep.some((other) => {
-      const c = nodes.get(other.a);
-      const d = nodes.get(other.b);
-      if (!c || !d) return false;
-      if (collinearOverlap(a, b, c, d)) return true;
-      if (edge.a === other.a || edge.a === other.b || edge.b === other.a || edge.b === other.b) return false;
-      const vx = b.x - a.x;
-      const vy = b.y - a.y;
-      const length = Math.hypot(vx, vy);
-      const rvx = d.x - c.x;
-      const rvy = d.y - c.y;
-      const rightLength = Math.hypot(rvx, rvy);
-      if (length <= EPS || rightLength <= EPS || Math.abs(vx * rvy - vy * rvx) / (length * rightLength) > 0.1) return false;
-      const leftClearance = (ROUTE_CLASS_REGISTRY.get(edge.classId)?.widthM ?? 0) / 2 + (ROUTE_CLASS_REGISTRY.get(edge.classId)?.sidewalkM ?? 0);
-      const rightClearance = (ROUTE_CLASS_REGISTRY.get(other.classId)?.widthM ?? 0) / 2 + (ROUTE_CLASS_REGISTRY.get(other.classId)?.sidewalkM ?? 0);
-      const separation = Math.abs(vx * (c.y - a.y) - vy * (c.x - a.x)) / length;
-      if (separation >= leftClearance + rightClearance - EPS) return false;
-      const t0 = ((c.x - a.x) * vx + (c.y - a.y) * vy) / (length * length);
-      const t1 = ((d.x - a.x) * vx + (d.y - a.y) * vy) / (length * length);
-      return Math.min(1, Math.max(t0, t1)) - Math.max(0, Math.min(t0, t1)) > EPS;
-    });
-    if (!duplicate) keep.push(edge);
-    else discardedRoutes.add(edge.routeId);
-  }
-  return keep.filter((edge) => !discardedRoutes.has(edge.routeId));
-}
-
-function cleanupGeneratedTopology(roads: RoadSource, cleanupSeed: number, protectedNodeIds: ReadonlySet<string> = new Set()): RoadSource {
-  let current = roads;
-  for (let attempt = 0; attempt < roads.edges.length; attempt++) {
-    const validation = validateRouteTopology(current, compileRouteNetwork(current));
-    if (validation.ok) return current;
-    const edgeIds = new Set<string>();
-    for (const problem of validation.problems) {
-      for (const match of problem.matchAll(/(?:spans|corridors) "([^"]+)"/g)) {
-        const spanId = match[1]!;
-        edgeIds.add(spanId.includes(":") ? spanId.slice(0, spanId.indexOf(":")) : spanId);
-      }
-      const duplicate = problem.match(/Duplicate corridor between nodes "([^"]+)" and "([^"]+)"/);
-      if (duplicate) {
-        for (const edge of current.edges) {
-          if ((edge.a === duplicate[1] && edge.b === duplicate[2]) || (edge.a === duplicate[2] && edge.b === duplicate[1])) edgeIds.add(edge.id);
-        }
-      }
-    }
-    const candidateRoutes = [...new Set([...edgeIds]
-      .map((id) => current.edges.find((edge) => edge.id === id)?.routeId)
-      .filter((id): id is string => id !== undefined))];
-    const removableRoutes = candidateRoutes.filter((routeId) => !current.edges.some((edge) => edge.routeId === routeId && (protectedNodeIds.has(edge.a) || protectedNodeIds.has(edge.b))));
-    const removeRoute = (removableRoutes.length > 0 ? removableRoutes : candidateRoutes)
-      .sort((a, b) => {
-        const rankA = deriveLabelledSeed(`${cleanupSeed}\0${a}`, "roads/cleanup");
-        const rankB = deriveLabelledSeed(`${cleanupSeed}\0${b}`, "roads/cleanup");
-        return rankA - rankB || a.localeCompare(b);
-      })
-      .at(-1) ?? current.edges.at(-1)?.routeId;
-    if (!removeRoute) break;
-    const edges = current.edges.filter((edge) => edge.routeId !== removeRoute);
-    const usedNodes = new Set(edges.flatMap((edge) => [edge.a, edge.b]));
-    const usedRoutes = new Set(edges.map((edge) => edge.routeId));
-    current = { nodes: current.nodes.filter((node) => usedNodes.has(node.id)), routes: current.routes.filter((route) => usedRoutes.has(route.id)), edges };
-  }
-  return current;
-}
-
 function majorVehicleComponents(source: RoadSource): Map<string, number> {
   const adjacency = new Map<string, string[]>();
   for (const edge of source.edges) {
     if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
-    adjacency.set(edge.a, [...(adjacency.get(edge.a) ?? []), edge.b]);
-    adjacency.set(edge.b, [...(adjacency.get(edge.b) ?? []), edge.a]);
+    for (const node of [edge.a, edge.b]) {
+      if (!adjacency.has(node)) adjacency.set(node, []);
+      adjacency.get(node)!.push(edge.a === node ? edge.b : edge.a);
+    }
   }
   const components = new Map<string, number>();
   let next = 0;
-  for (const start of [...adjacency.keys()].sort((a, b) => a.localeCompare(b))) {
+  for (const start of adjacency.keys()) {
     if (components.has(start)) continue;
     const queue = [start];
     components.set(start, next);
-    while (queue.length > 0) {
-      const node = queue.shift()!;
-      for (const neighbour of [...(adjacency.get(node) ?? [])].sort((a, b) => a.localeCompare(b))) {
+    for (let qi = 0; qi < queue.length; qi++) {
+      const node = queue[qi]!;
+      for (const neighbour of adjacency.get(node) ?? []) {
         if (components.has(neighbour)) continue;
         components.set(neighbour, next);
         queue.push(neighbour);
@@ -338,322 +839,60 @@ function majorVehicleComponents(source: RoadSource): Map<string, number> {
 }
 
 function nearestVehicleNodeId(source: RoadSource, point: Vec2): string | undefined {
-  const vehicleNodeIds = new Set(source.edges
-    .filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle)
-    .flatMap((edge) => [edge.a, edge.b]));
-  let best: { id: string; distance: number } | undefined;
+  const vehicleNodeIds = new Set(source.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle).flatMap((edge) => [edge.a, edge.b]));
+  let best: string | undefined;
+  let bestD = Infinity;
   for (const node of source.nodes) {
     if (!vehicleNodeIds.has(node.id)) continue;
-    const distance = Math.hypot(node.x - point.x, node.y - point.y);
-    if (best === undefined || distance < best.distance || distance === best.distance && node.id.localeCompare(best.id) < 0) {
-      best = { id: node.id, distance };
+    const d = Math.hypot(node.x - point.x, node.y - point.y);
+    if (d < bestD) {
+      bestD = d;
+      best = node.id;
     }
   }
-  return best?.id;
+  return best;
 }
 
+function nearestNodeId(source: RoadSource, point: Vec2, maxD: number): string | undefined {
+  let best: string | undefined;
+  let bestD = maxD;
+  for (const node of source.nodes) {
+    const d = Math.hypot(node.x - point.x, node.y - point.y);
+    if (d <= bestD) {
+      bestD = d;
+      best = node.id;
+    }
+  }
+  return best;
+}
+
+/** Construction rule, not repair: everything vehicle must reach the city centre. Clipping can
+ *  strand a lane whose bounding streets were eaten by the coast; drop only those pieces. */
 function pruneDisconnectedVehicleComponents(source: RoadSource, rootPoint: Vec2): RoadSource {
   const rootId = nearestVehicleNodeId(source, rootPoint);
   if (!rootId) return source;
   const components = majorVehicleComponents(source);
-  const rootComponent = components.get(rootId);
-  if (rootComponent === undefined) return source;
+  const root = components.get(rootId);
+  if (root === undefined) return source;
+  const keep = new Set<string>();
+  for (const [nodeId, component] of components) {
+    if (component === root) keep.add(nodeId);
+  }
   const edges = source.edges.filter((edge) => {
-    if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) return true;
-    return components.get(edge.a) === rootComponent && components.get(edge.b) === rootComponent;
+    const cls = ROUTE_CLASS_REGISTRY.get(edge.classId);
+    if (!cls?.vehicle) return true;
+    return keep.has(edge.a) && keep.has(edge.b);
   });
-  if (edges.length === source.edges.length) return source;
   const usedNodes = new Set(edges.flatMap((edge) => [edge.a, edge.b]));
-  const usedRoutes = new Set(edges.map((edge) => edge.routeId));
   return {
     nodes: source.nodes.filter((node) => usedNodes.has(node.id)),
-    routes: source.routes.filter((route) => usedRoutes.has(route.id)),
+    routes: source.routes.filter((route) => edges.some((edge) => edge.routeId === route.id)),
     edges
   };
 }
 
-function exactNodeId(source: RoadSource, point: Vec2): string | undefined {
-  return source.nodes.find((node) => Math.hypot(node.x - point.x, node.y - point.y) <= EPS)?.id;
-}
-
-function requireMajorConnectivity(source: RoadSource, hubs: readonly Vec2[], entrances: readonly Vec2[]): void {
-  const components = majorVehicleComponents(source);
-  const hubComponents = hubs.map((point) => {
-    const nodeId = exactNodeId(source, point);
-    return nodeId === undefined ? undefined : components.get(nodeId);
-  });
-  const entranceComponents = entrances
-    .map((point) => {
-      const nodeId = exactNodeId(source, point);
-      return nodeId === undefined ? undefined : components.get(nodeId);
-    })
-    .filter((component): component is number => component !== undefined);
-  const targetComponents = [...hubComponents, ...entranceComponents];
-  if (targetComponents.length === 0) return;
-  if (hubComponents.some((component) => component === undefined) || new Set(targetComponents).size !== 1) {
-    throw new Error("Generated major vehicle skeleton is disconnected.");
-  }
-}
-
-function addPath(nodes: Map<string, Vec2>, edges: DraftEdge[], routes: Map<string, { curvePreset: "tight" | "standard" | "broad" }>, points: Vec2[], seed: string, role: string, classId: RouteClassId, curvePreset: "tight" | "standard" | "broad" = "standard"): string | undefined {
-  if (points.length < 2) return undefined;
-  const routeId = allocateGeneratedId("route", seed, role, routes.size, new Set(routes.keys()));
-  routes.set(routeId, { curvePreset });
-  const ids = points.map((point) => addNode(nodes, point, seed, `${role}/node`));
-  for (let i = 0; i + 1 < ids.length; i++) {
-    const a = ids[i]!;
-    const b = ids[i + 1]!;
-    if (a === b || edges.some((edge) => edge.a === a && edge.b === b || edge.a === b && edge.b === a)) continue;
-    edges.push({ a, b, routeId, classId, name: null });
-  }
-  return routeId;
-}
-
-interface SkeletonEndpoint {
-  point: Vec2;
-  hubIndex: number;
-}
-
-function tryAddPath(
-  nodes: Map<string, Vec2>,
-  edges: DraftEdge[],
-  routes: Map<string, { curvePreset: "tight" | "standard" | "broad" }>,
-  points: Vec2[],
-  mask: Ring,
-  land: Ring,
-  clearanceM: number,
-  seed: string,
-  role: string,
-  classId: RouteClassId,
-  curvePreset: "tight" | "standard" | "broad",
-  sceneBounds?: Rect
-): boolean {
-  if (points.length < 2 || points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return false;
-  if (points.some((point, index) => index > 0 && Math.hypot(point.x - points[index - 1]!.x, point.y - points[index - 1]!.y) <= EPS)) return false;
-  for (let i = 0; i + 1 < points.length; i++) {
-    if (!generationSegmentInside(mask, land, points[i]!, points[i + 1]!, clearanceM)) return false;
-  }
-  const edgeCount = edges.length;
-  const routeId = addPath(nodes, edges, routes, points, seed, role, classId, curvePreset);
-  if (routeId === undefined || edges.length === edgeCount) {
-    if (routeId !== undefined) routes.delete(routeId);
-    return false;
-  }
-  // WHY: A quadratic curve can leave a concave mask even when its source chords fit; reject that candidate before it contaminates the graph.
-  const candidateEdges = edges.slice(edgeCount).map((edge, index) => ({ id: `draft-${edgeCount + index}`, ...edge, locked: false, origin: "generated" as const }));
-  const candidateNodes = new Set(candidateEdges.flatMap((edge) => [edge.a, edge.b]));
-  const candidateRouteIds = new Set(candidateEdges.map((edge) => edge.routeId));
-  const candidatePath: RoadSource = {
-    nodes: [...nodes.entries()].filter(([id]) => candidateNodes.has(id)).map(([id, point]) => ({ id, ...point })),
-    routes: [...routes.entries()].filter(([id]) => candidateRouteIds.has(id)).map(([id, route]) => ({ id, ...route })),
-    edges: candidateEdges
-  };
-  if (!corridorsInsideMask(candidatePath, mask, sceneBounds ?? bounds(mask))) {
-    for (let i = edges.length - 1; i >= edgeCount; i--) edges.splice(i, 1);
-    routes.delete(routeId);
-    return false;
-  }
-  return true;
-}
-
-function nearestBoundaryPoints(mask: Ring, box: Rect): Vec2[] {
-  const points: Vec2[] = [];
-  const candidates = [
-    { x: box.x + box.width / 2, y: box.y },
-    { x: box.x + box.width, y: box.y + box.height / 2 },
-    { x: box.x + box.width / 2, y: box.y + box.height },
-    { x: box.x, y: box.y + box.height / 2 }
-  ];
-  for (const candidate of candidates) if (pointInRing(candidate, mask)) points.push(candidate);
-  return points;
-}
-
-function addIrregularSkeleton(
-  nodes: Map<string, Vec2>,
-  edges: DraftEdge[],
-  routes: Map<string, { curvePreset: "tight" | "standard" | "broad" }>,
-  hubs: readonly Vec2[],
-  mask: Ring,
-  land: Ring,
-  box: Rect,
-  seed: number,
-  idSeed: string,
-  sceneBounds?: Rect,
-  radiusScale = 1,
-  withBends = true
-): SkeletonEndpoint[] {
-  const endpoints: SkeletonEndpoint[] = [];
-  const radius = Math.min(box.width, box.height) * radiusScale;
-  const armsPerHub = hubs.length === 1 ? 4 : 2;
-  for (let hubIndex = 0; hubIndex < hubs.length; hubIndex++) {
-    const hub = hubs[hubIndex]!;
-    for (let arm = 0; arm < armsPerHub; arm++) {
-      const baseAngle = hash2(hubIndex * 17 + arm, 13, seed) * Math.PI * 2;
-      const classId: RouteClassId = arm === 0 ? "arterial" : "street";
-      const classDef = ROUTE_CLASS_REGISTRY.get(classId)!;
-      let added = false;
-      for (let attempt = 0; attempt < 10 && !added; attempt++) {
-        const angle = baseAngle + attempt * 0.47;
-        const length = radius * (0.22 + hash2(hubIndex * 31 + arm * 7 + attempt, 23, seed) * 0.14);
-        const direction = { x: Math.cos(angle), y: Math.sin(angle) };
-        const normal = { x: -direction.y, y: direction.x };
-        const endpoint = { x: hub.x + direction.x * length, y: hub.y + direction.y * length };
-        const bendDistance = length * (0.45 + hash2(hubIndex * 37 + arm * 11 + attempt, 29, seed) * 0.15);
-        const bendOffset = radius * (0.035 + hash2(hubIndex * 41 + arm * 13 + attempt, 31, seed) * 0.035);
-        const bend = {
-          x: hub.x + direction.x * bendDistance + normal.x * bendOffset,
-          y: hub.y + direction.y * bendDistance + normal.y * bendOffset
-        };
-        const bendCandidate = withBends && (mask.length === 4 || hubIndex === 0 && arm === 0);
-        if (bendCandidate) {
-          added = tryAddPath(
-            nodes,
-            edges,
-            routes,
-            [hub, bend, endpoint],
-            mask,
-            land,
-            classDef.widthM / 2 + classDef.sidewalkM,
-            idSeed,
-            `skeleton/${hubIndex}/${arm}`,
-            classId,
-            arm === 0 ? "broad" : "standard",
-            sceneBounds
-          );
-        }
-        if (!added) {
-          added = tryAddPath(
-            nodes,
-            edges,
-            routes,
-            [hub, endpoint],
-            mask,
-            land,
-            classDef.widthM / 2 + classDef.sidewalkM,
-            idSeed,
-            `skeleton/${hubIndex}/${arm}`,
-            classId,
-            arm === 0 ? "broad" : "standard",
-            sceneBounds
-          );
-        }
-        if (added) endpoints.push({ point: endpoint, hubIndex });
-      }
-    }
-  }
-
-  for (let hubIndex = 0; hubIndex < hubs.length; hubIndex++) {
-    const hub = hubs[hubIndex]!;
-    const local = endpoints
-      .filter((endpoint) => endpoint.hubIndex === hubIndex)
-      .sort((a, b) => Math.atan2(a.point.y - hub.y, a.point.x - hub.x) - Math.atan2(b.point.y - hub.y, b.point.x - hub.x));
-    if (local.length < 2) continue;
-    for (let i = 0; i < local.length; i++) {
-      const left = local[i]!;
-      const right = local[(i + 1) % local.length]!;
-      const midpoint = { x: (left.point.x + right.point.x) / 2, y: (left.point.y + right.point.y) / 2 };
-      const normal = { x: -(right.point.y - left.point.y), y: right.point.x - left.point.x };
-      const normalLength = Math.hypot(normal.x, normal.y);
-      const offset = normalLength > EPS ? radius * 0.04 / normalLength : 0;
-      const bend = { x: midpoint.x + normal.x * offset, y: midpoint.y + normal.y * offset };
-      const added = withBends && mask.length === 4 && tryAddPath(
-        nodes,
-        edges,
-        routes,
-        [left.point, bend, right.point],
-        mask,
-        land,
-        ROUTE_CLASS_REGISTRY.get("street")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("street")!.sidewalkM,
-        idSeed,
-        `skeleton/${hubIndex}/connector/${i}`,
-        "street",
-        "standard",
-        sceneBounds
-      );
-      if (!added) {
-        tryAddPath(
-          nodes,
-          edges,
-          routes,
-          [left.point, right.point],
-          mask,
-          land,
-          ROUTE_CLASS_REGISTRY.get("street")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("street")!.sidewalkM,
-          idSeed,
-          `skeleton/${hubIndex}/connector/${i}`,
-          "street",
-          "standard",
-          sceneBounds
-        );
-      }
-    }
-  }
-  return endpoints;
-}
-
-function addIrregularLocalRoutes(
-  nodes: Map<string, Vec2>,
-  edges: DraftEdge[],
-  routes: Map<string, { curvePreset: "tight" | "standard" | "broad" }>,
-  hubs: readonly Vec2[],
-  skeleton: readonly SkeletonEndpoint[],
-  mask: Ring,
-  land: Ring,
-  box: Rect,
-  seed: number,
-  idSeed: string,
-  layout: RoadLayout,
-  withBends: boolean,
-  sceneBounds?: Rect
-): void {
-  const anchors = skeleton.length > 0 ? skeleton : hubs.map((point, hubIndex) => ({ point, hubIndex }));
-  const radius = Math.min(box.width, box.height) * (layout === "mixed" ? 0.4 : 1);
-  const count = layout === "mixed" ? 7 : 11;
-  for (let i = 0; i < count; i++) {
-    const anchor = anchors[i % anchors.length]!;
-    const angle = hash2(i, 43, seed) * Math.PI * 2;
-    const direction = { x: Math.cos(angle), y: Math.sin(angle) };
-    const normal = { x: -direction.y, y: direction.x };
-    const length = radius * (0.10 + hash2(i, 47, seed) * 0.10);
-    const endpoint = { x: anchor.point.x + direction.x * length, y: anchor.point.y + direction.y * length };
-    const bend = {
-      x: anchor.point.x + direction.x * length * 0.48 + normal.x * radius * (0.025 + hash2(i, 53, seed) * 0.025),
-      y: anchor.point.y + direction.y * length * 0.48 + normal.y * radius * (0.025 + hash2(i, 53, seed) * 0.025)
-    };
-    const classId: RouteClassId = i % 5 === 0 ? "alley" : i % 3 === 0 ? "lane" : i % 2 === 0 ? "narrow" : "street";
-    const classDef = ROUTE_CLASS_REGISTRY.get(classId)!;
-    const bendCandidate = withBends && (mask.length === 4 || i === 0);
-    const added = bendCandidate && tryAddPath(
-      nodes,
-      edges,
-      routes,
-      [anchor.point, bend, endpoint],
-      mask,
-      land,
-      classDef.widthM / 2 + classDef.sidewalkM,
-      idSeed,
-      `local/${i}`,
-      classId,
-      i % 2 === 0 ? "tight" : "standard",
-      sceneBounds
-    );
-    if (!added) {
-      tryAddPath(
-        nodes,
-        edges,
-        routes,
-        [anchor.point, endpoint],
-        mask,
-        land,
-        classDef.widthM / 2 + classDef.sidewalkM,
-        idSeed,
-        `local/${i}`,
-        classId,
-        i % 2 === 0 ? "tight" : "standard",
-        sceneBounds
-      );
-    }
-  }
+function nodeKeyOf(point: Vec2): string {
+  return `${Math.round(point.x / 1e-4) / 1e4},${Math.round(point.y / 1e-4) / 1e4}`;
 }
 
 export function generateInitialRoadNetwork(input: RoadGenerationInput): GeneratedRoadNetwork {
@@ -661,134 +900,272 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
   const layout = input.layout ?? "european";
   const hubMode = input.hubMode ?? "single-centre";
   const land = input.land ?? input.mask;
-  const majorSeed = deriveLabelledSeed(input.citySeed, "roads/major");
-  const localSeed = deriveLabelledSeed(input.citySeed, "roads/local");
-  const routesSeed = deriveLabelledSeed(input.citySeed, "roads/routes");
-  const cleanupSeed = deriveLabelledSeed(input.citySeed, "roads/cleanup");
-  const majorIdSeed = `${input.citySeed}\0roads/major`;
-  const localIdSeed = `${input.citySeed}\0roads/local`;
-  const routesIdSeed = `${input.citySeed}\0roads/routes`;
+  const sceneBounds = input.sceneBounds ?? bounds(input.mask);
   const box = bounds(input.mask);
-  const nodes = new Map<string, Vec2>();
-  const routes = new Map<string, { curvePreset: "tight" | "standard" | "broad" }>();
-  const draft: DraftEdge[] = [];
-  const acceptedEntrances: Vec2[] = [];
-  const hubClearance = ROUTE_CLASS_REGISTRY.get("arterial")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("arterial")!.sidewalkM;
-  const hubs: Vec2[] = [interiorPoint(input.mask, land, majorSeed, 0, hubClearance)];
-  if (hubMode === "multiple-hubs") {
-    for (let i = 1; i < 4; i++) {
-      const candidate = interiorPoint(input.mask, land, majorSeed, i, hubClearance);
-      if (!hubs.every((hub) => Math.hypot(hub.x - candidate.x, hub.y - candidate.y) > Math.min(box.width, box.height) * 0.2)) continue;
-      const anchor = hubs[0]!;
-      const bend = { x: (anchor.x + candidate.x) / 2 + (hash2(i, 3, majorSeed) - 0.5) * box.width * 0.12, y: (anchor.y + candidate.y) / 2 + (hash2(i, 5, majorSeed) - 0.5) * box.height * 0.12 };
-      const canConnect = generationSegmentInside(input.mask, land, anchor, candidate, hubClearance) ||
-        (generationSegmentInside(input.mask, land, anchor, bend, hubClearance) && generationSegmentInside(input.mask, land, bend, candidate, hubClearance));
-      if (canConnect) hubs.push(candidate);
-    }
-  }
-
-  for (let i = 1; i < hubs.length; i++) {
-    const a = hubs[0]!;
-    const b = hubs[i]!;
-    const bend = { x: (a.x + b.x) / 2 + (hash2(i, 3, majorSeed) - 0.5) * box.width * 0.12, y: (a.y + b.y) / 2 + (hash2(i, 5, majorSeed) - 0.5) * box.height * 0.12 };
-    if (generationSegmentInside(input.mask, land, a, bend, ROUTE_CLASS_REGISTRY.get("arterial")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("arterial")!.sidewalkM) && generationSegmentInside(input.mask, land, bend, b, ROUTE_CLASS_REGISTRY.get("arterial")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("arterial")!.sidewalkM)) addPath(nodes, draft, routes, [a, bend, b], majorIdSeed, `major/${i}`, "arterial", "broad");
-    else if (generationSegmentInside(input.mask, land, a, b, ROUTE_CLASS_REGISTRY.get("arterial")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("arterial")!.sidewalkM)) addPath(nodes, draft, routes, [a, b], majorIdSeed, `major/${i}`, "arterial", "broad");
-  }
-  const entrances = input.sceneBounds ? nearestBoundaryPoints(input.mask, input.sceneBounds) : nearestBoundaryPoints(input.mask, box);
-  for (let i = 0; i < entrances.length; i++) {
-    const entrance = entrances[i]!;
-    const hub = hubs[i % hubs.length]!;
-    if (generationSegmentInside(input.mask, land, hub, entrance, ROUTE_CLASS_REGISTRY.get("highway")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("highway")!.sidewalkM, input.sceneBounds ?? box, true)) {
-      addPath(nodes, draft, routes, [hub, entrance], majorIdSeed, `entrance/${i}`, "highway", "standard");
-      acceptedEntrances.push(entrance);
-    }
-  }
-
-  const skeleton = layout === "grid"
-    ? []
-    : addIrregularSkeleton(nodes, draft, routes, hubs, input.mask, land, box, majorSeed, majorIdSeed, input.sceneBounds ?? box, layout === "mixed" ? 0.45 : 1, layout === "european");
-
-  if (layout === "grid" || layout === "mixed") {
-    const spacing = Math.max(28, Math.min(box.width, box.height) / 5);
-    const centre = hubs[0]!;
-    const rows = layout === "grid" ? 4 : 2;
-    for (let i = -rows; i <= rows; i++) {
-      const y = centre.y + i * spacing;
-      const a = { x: box.x + spacing * 0.4, y };
-      const b = { x: box.x + box.width - spacing * 0.4, y };
-      if (generationSegmentInside(input.mask, land, a, b, ROUTE_CLASS_REGISTRY.get("street")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("street")!.sidewalkM)) addPath(nodes, draft, routes, [a, b], majorIdSeed, `grid/h/${i}`, i === 0 ? "arterial" : "street", "tight");
-    }
-    const cols = layout === "grid" ? 4 : 2;
-    for (let i = -cols; i <= cols; i++) {
-      const x = centre.x + i * spacing;
-      const a = { x, y: box.y + spacing * 0.4 };
-      const b = { x, y: box.y + box.height - spacing * 0.4 };
-      if (generationSegmentInside(input.mask, land, a, b, ROUTE_CLASS_REGISTRY.get("street")!.widthM / 2 + ROUTE_CLASS_REGISTRY.get("street")!.sidewalkM)) addPath(nodes, draft, routes, [a, b], majorIdSeed, `grid/v/${i}`, i === 0 ? "arterial" : "street", "tight");
-    }
-  }
-
-  if (layout === "european" || layout === "mixed") {
-    addIrregularLocalRoutes(nodes, draft, routes, hubs, skeleton, input.mask, land, box, localSeed, localIdSeed, layout, layout === "european", input.sceneBounds ?? box);
-  }
-
-  if (hubs.length > 0) {
-    const hub = skeleton[0]?.point ?? hubs[0]!;
-    const direction = skeleton[0] === undefined ? { x: 1, y: 0 } : { x: skeleton[0].point.x - hubs[0]!.x, y: skeleton[0].point.y - hubs[0]!.y };
-    const directionLength = Math.hypot(direction.x, direction.y) || 1;
-    const normal = { x: -direction.y / directionLength, y: direction.x / directionLength };
-    const routeLength = Math.min(box.width, box.height) * (0.1 + hash2(3, 7, routesSeed) * 0.04);
-    const cycleBend = { x: hub.x + direction.x / directionLength * routeLength * 0.5 + normal.x * routeLength * 0.15, y: hub.y + direction.y / directionLength * routeLength * 0.5 + normal.y * routeLength * 0.15 };
-    const endpoint = {
-      x: hub.x + direction.x / directionLength * routeLength,
-      y: hub.y + direction.y / directionLength * routeLength
+  const minDim = Math.min(box.width, box.height);
+  if (minDim < 45) {
+    return {
+      roads: { nodes: [], routes: [], edges: [] },
+      diagnostics: { layout, hubMode, hubs: [], attempts: 0, discarded: 0, warnings: ["mask too small for road generation"] }
     };
-    tryAddPath(
-      nodes,
-      draft,
-      routes,
-      [hub, cycleBend, endpoint],
-      input.mask,
-      land,
-      ROUTE_CLASS_REGISTRY.get("cycleway")!.widthM / 2,
-      routesIdSeed,
-      "route/cycle",
-      "cycleway",
-      "tight",
-      input.sceneBounds ?? box
-    );
+  }
+  const state: PlanState = {
+    mask: input.mask,
+    land,
+    sceneBounds,
+    box,
+    centre: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+    minDim,
+    seed: deriveLabelledSeed(input.citySeed, "roads/v2"),
+    lines: [],
+    barriers: [],
+    hubPoints: [],
+    warnings: [],
+    rejected: 0
+  };
+  if (layout === "grid") {
+    planGrid(state, hubMode);
+  } else {
+    state.hubPoints.push(state.centre);
+    planArterials(state);
+    planAvenues(state);
+    planRings(state);
+    planOldTown(state);
+    planRoundabouts(state, hubMode);
+    planSecondaryHubs(state, hubMode, layout);
+    planStreets(state, layout);
+    planLanes(state);
+    planHighways(state);
+  }
+  planPromenade(state);
+
+  // ---- clip every planned segment to the land ----
+  const segPairsOf = (line: PlannedLine): [Vec2, Vec2][] => {
+    const pairs: [Vec2, Vec2][] = [];
+    for (let i = 0; i + 1 < line.points.length; i++) pairs.push([line.points[i]!, line.points[i + 1]!]);
+    if (line.closed && line.points.length > 2) pairs.push([line.points[line.points.length - 1]!, line.points[0]!]);
+    return pairs;
+  };
+  const pieces: { a: Vec2; b: Vec2; lineIndex: number }[] = [];
+  let attempts = 0;
+  let discarded = state.rejected;
+  for (let li = 0; li < state.lines.length; li++) {
+    const line = state.lines[li]!;
+    for (const [a, b] of segPairsOf(line)) {
+      attempts++;
+      const clipped: Vec2[] = [];
+      clipSegment(a, b, clearanceOf(line.classId), input.mask, land, sceneBounds, minLengthOf(line.classId), clipped);
+      if (clipped.length === 0) {
+        discarded++;
+        continue;
+      }
+      for (let k = 0; k + 1 < clipped.length; k += 2) {
+        const piece = { a: clipped[k]!, b: clipped[k + 1]!, lineIndex: li };
+        // Merge contiguous collinear pieces of the same line: the corridor-fit recursion
+        // splits at fit boundaries, and a degree-2 same-route node there would be smoothed
+        // by the curve compiler, scrambling compiled node ids around it.
+        const last = pieces[pieces.length - 1];
+        if (last && last.lineIndex === li && dist(last.b, piece.a) <= EPS) {
+          const ux = last.b.x - last.a.x;
+          const uy = last.b.y - last.a.y;
+          const vx = piece.b.x - piece.a.x;
+          const vy = piece.b.y - piece.a.y;
+          if (Math.abs(ux * vy - uy * vx) <= EPS * Math.hypot(ux, uy) * Math.hypot(vx, vy) + 1e-9) {
+            last.b = piece.b;
+            continue;
+          }
+        }
+        pieces.push(piece);
+      }
+    }
   }
 
-  const beforeDiscard = planarize(nodes, draft, routesIdSeed);
-  const planarEdges = discardGeneratedOverlaps(nodes, beforeDiscard);
-  const used = new Set([...nodes.keys(), ...routes.keys()]);
-  const edgeIds = new Set(used);
-  const edges = planarEdges.map((edge, index) => {
-    const id = allocateGeneratedId("edge", routesIdSeed, `${edge.routeId}/${edge.classId}`, index, edgeIds);
-    edgeIds.add(id);
-    return { id, a: edge.a, b: edge.b, routeId: edge.routeId, classId: edge.classId, name: edge.name, locked: false, origin: "generated" as const };
+  // ---- junction pass: crossings, endpoint T-splits (2 m), endpoint merges (2 m) ----
+  const splits: { t: number; point: Vec2 }[][] = pieces.map((piece) => [
+    { t: 0, point: piece.a },
+    { t: 1, point: piece.b }
+  ]);
+  for (let i = 0; i < pieces.length; i++) {
+    for (let j = i + 1; j < pieces.length; j++) {
+      const x = segmentIntersectionParam(pieces[i]!.a, pieces[i]!.b, pieces[j]!.a, pieces[j]!.b);
+      if (!x || x.t < 1e-4 || x.t > 1 - 1e-4 || x.u < 1e-4 || x.u > 1 - 1e-4) continue;
+      const point = lerpPoint(pieces[i]!.a, pieces[i]!.b, x.t);
+      splits[i]!.push({ t: x.t, point });
+      splits[j]!.push({ t: x.u, point });
+    }
+  }
+  const endpoints = pieces.flatMap((piece, i) => [
+    { piece: i, end: 0, point: piece.a },
+    { piece: i, end: 1, point: piece.b }
+  ]);
+  const finalPos: Vec2[] = [];
+  for (const endpoint of endpoints) {
+    let snapped: Vec2 | null = null;
+    for (let j = 0; j < pieces.length; j++) {
+      if (j === endpoint.piece) continue;
+      const proj = projectPoint(pieces[j]!.a, pieces[j]!.b, endpoint.point);
+      if (proj && proj.t > 1e-3 && proj.t < 1 - 1e-3 && proj.dist <= JUNCTION_TOLERANCE_M) {
+        // A junction already exists within 2 m (e.g. a crossing): snap onto it instead of
+        // manufacturing a twin junction that would yield overlapping micro-edges.
+        let existing: Vec2 | undefined;
+        for (const s of splits[j]!) {
+          if (s.t <= 1e-4 || s.t >= 1 - 1e-4) continue;
+          if (dist(s.point, proj.point) <= 2) { existing = s.point; break; }
+        }
+        const snapTarget = existing ?? proj.point;
+        // Reject the snap when the endpoint's adjacent edge would end up lying along the
+        // snapped-to piece (that is exactly the overlap the topology validator flags).
+        const own = splits[endpoint.piece]!;
+        let adjacent: Vec2 | undefined;
+        if (endpoint.end === 1) {
+          let bestT = -1;
+          for (const s of own) if (s.t < 1 && s.t > bestT) { bestT = s.t; adjacent = s.point; }
+        } else {
+          let bestT = 2;
+          for (const s of own) if (s.t > 0 && s.t < bestT) { bestT = s.t; adjacent = s.point; }
+        }
+        // Coalescing onto an existing junction skips the overlap rejection: any coincident
+        // micro-edge it creates is removed by the identical-edge dedupe later.
+        const conflict = existing ? false : parallelConflict(adjacent ?? snapTarget, snapTarget, clearanceOf(state.lines[pieces[endpoint.piece]!.lineIndex]!.classId), [{ a: pieces[j]!.a, b: pieces[j]!.b, clearance: clearanceOf(state.lines[pieces[j]!.lineIndex]!.classId) }]);
+        if (!adjacent || !conflict) {
+          snapped = snapTarget;
+          if (!existing) splits[j]!.push({ t: proj.t, point: proj.point });
+        }
+        break;
+      }
+    }
+    let merged: Vec2 | null = null;
+    if (!snapped) {
+      const own = splits[endpoint.piece]!;
+      let adjacent: Vec2 | undefined;
+      if (endpoint.end === 1) {
+        let bestT = -1;
+        for (const s of own) if (s.t < 1 && s.t > bestT) { bestT = s.t; adjacent = s.point; }
+      } else {
+        let bestT = 2;
+        for (const s of own) if (s.t > 0 && s.t < bestT) { bestT = s.t; adjacent = s.point; }
+      }
+      const ownClearance = clearanceOf(state.lines[pieces[endpoint.piece]!.lineIndex]!.classId);
+      const allBarriers = pieces.map((p) => ({ a: p.a, b: p.b, clearance: clearanceOf(state.lines[p.lineIndex]!.classId) }));
+      for (const q of finalPos) {
+        if (dist(endpoint.point, q) > JUNCTION_TOLERANCE_M) continue;
+        if (adjacent && parallelConflict(adjacent, q, ownClearance, allBarriers)) continue;
+        merged = q;
+        break;
+      }
+    }
+    finalPos.push(snapped ?? merged ?? { x: endpoint.point.x, y: endpoint.point.y });
+  }
+  for (let k = 0; k < endpoints.length; k++) {
+    const { piece, end } = endpoints[k]!;
+    splits[piece]![end] = { t: end, point: finalPos[k]! };
+  }
+  // Snap-moved endpoints change the piece geometry; re-run the crossing pass on the final
+  // geometry so the adjusted edges get junctions where they now cross other pieces.
+  const finalPieces = pieces.map((piece, i) => ({
+    a: endpoints[2 * i]!.end === 0 ? finalPos[2 * i]! : piece.a,
+    b: endpoints[2 * i + 1]!.end === 1 ? finalPos[2 * i + 1]! : piece.b,
+    lineIndex: piece.lineIndex
+  }));
+  for (let i = 0; i < finalPieces.length; i++) {
+    for (let j = i + 1; j < finalPieces.length; j++) {
+      const x = segmentIntersectionParam(finalPieces[i]!.a, finalPieces[i]!.b, finalPieces[j]!.a, finalPieces[j]!.b);
+      if (!x || x.t < 1e-4 || x.t > 1 - 1e-4 || x.u < 1e-4 || x.u > 1 - 1e-4) continue;
+      const point = lerpPoint(finalPieces[i]!.a, finalPieces[i]!.b, x.t);
+      // Snap-moved pieces intersect the same roads a few centimetres from the original
+      // junction; a second junction that close just manufactures degenerate micro-edges.
+      const nearExisting = (list: { t: number; point: Vec2 }[]): boolean => list.some((s) => s.t > 1e-4 && s.t < 1 - 1e-4 && dist(s.point, point) <= 1);
+      if (nearExisting(splits[i]!) || nearExisting(splits[j]!)) continue;
+      splits[i]!.push({ t: x.t, point });
+      splits[j]!.push({ t: x.u, point });
+    }
+  }
+
+  // ---- assemble ----
+  const idSeed = `${input.citySeed}\0roads/v2`;
+  const usedIds = new Set<string>();
+  const routeIds = state.lines.map((line, i) => {
+    const id = allocateGeneratedId("route", idSeed, `route/${line.role}`, i, usedIds);
+    usedIds.add(id);
+    return id;
   });
-  const usedRouteIds = new Set(edges.map((edge) => edge.routeId));
-  const initialRoads: RoadSource = { nodes: [...nodes.entries()].filter(([id]) => edges.some((edge) => edge.a === id || edge.b === id)).sort(([a], [b]) => a.localeCompare(b)).map(([id, point]) => ({ id, ...point })), routes: [...routes.entries()].filter(([id]) => usedRouteIds.has(id)).sort(([a], [b]) => a.localeCompare(b)).map(([id, route]) => ({ id, ...route })), edges };
-  const protectedNodeIds = new Set(hubs.map((hub) => exactNodeId(initialRoads, hub)).filter((id): id is string => id !== undefined));
-  const roads = pruneDisconnectedVehicleComponents(cleanupGeneratedTopology(initialRoads, cleanupSeed, protectedNodeIds), hubs[0]!);
-  const topology = validateRouteTopology(roads, compileRouteNetwork(roads));
+  const nodeIds = new Map<string, string>();
+  const nodePos = new Map<string, Vec2>();
+  const allocateNode = (point: Vec2): string => {
+    const key = nodeKeyOf(point);
+    const existing = nodeIds.get(key);
+    if (existing) return existing;
+    for (const [otherKey, id] of nodeIds) {
+      const other = nodePos.get(otherKey)!;
+      if (Math.hypot(other.x - point.x, other.y - point.y) <= 1) return id;
+    }
+    const id = allocateGeneratedId("node", idSeed, "v2/junction", nodeIds.size, usedIds);
+    usedIds.add(id);
+    nodeIds.set(key, id);
+    nodePos.set(key, point);
+    return id;
+  };
+  const edgeIds = new Set<string>();
+  const edges: RoadSource["edges"] = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const lineIndex = pieces[i]!.lineIndex;
+    const ordered = splits[i]!.slice().sort((p, q) => p.t - q.t);
+    const uniq: { t: number; point: Vec2 }[] = [];
+    for (const s of ordered) {
+      if (uniq.length === 0 || dist(s.point, uniq[uniq.length - 1]!.point) > 1) uniq.push(s);
+    }
+    for (let k = 0; k + 1 < uniq.length; k++) {
+      const a = allocateNode(uniq[k]!.point);
+      const b = allocateNode(uniq[k + 1]!.point);
+      if (a === b) continue;
+      const id = allocateGeneratedId("edge", idSeed, `edge/${i}/${k}`, edges.length, edgeIds);
+      edgeIds.add(id);
+      edges.push({ id, a, b, routeId: routeIds[lineIndex]!, classId: state.lines[lineIndex]!.classId, name: null, locked: false, origin: "generated" });
+    }
+  }
+  // Identical node-pair edges (in either direction) are a degenerate twin of the same
+  // junction and would read as corridor overlaps; keep only the first.
+  const seenEdges = new Set<string>();
+  const dedupedEdges = edges.filter((edge) => {
+    const key = edge.a < edge.b ? `${edge.a}|${edge.b}` : `${edge.b}|${edge.a}`;
+    if (seenEdges.has(key)) return false;
+    seenEdges.add(key);
+    return true;
+  });
+  const usedNodeIds = new Set(dedupedEdges.flatMap((edge) => [edge.a, edge.b]));
+  const usedRouteIds = new Set(dedupedEdges.map((edge) => edge.routeId));
+  const roads: RoadSource = {
+    nodes: [...nodeIds.keys()]
+      .map((key) => ({ id: nodeIds.get(key)!, ...nodePos.get(key)! }))
+      .filter((node) => usedNodeIds.has(node.id))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    routes: state.lines
+      .map((line, i) => ({ id: routeIds[i]!, curvePreset: line.preset }))
+      .filter((route) => usedRouteIds.has(route.id))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    edges: dedupedEdges
+  };
+  const pruned = pruneDisconnectedVehicleComponents(roads, state.centre);
+  const sourceProblems = validateRoadSource(pruned);
+  if (sourceProblems.length > 0) throw new Error(`Generated road source is invalid: ${sourceProblems.join(" ")}`);
+  const topology = validateRouteTopology(pruned, compileRouteNetwork(pruned));
   if (!topology.ok) throw new Error(`Generated road topology is invalid: ${topology.problems.join(" ")}`);
-  if (!corridorsInsideMask(roads, input.mask, input.sceneBounds ?? bounds(input.mask))) throw new Error("Generated road corridors leave the active generation mask.");
-  const components = majorVehicleComponents(roads);
-  const rootNodeId = nearestVehicleNodeId(roads, hubs[0]!);
-  const rootComponent = rootNodeId === undefined ? undefined : components.get(rootNodeId);
-  const connectedHubIds = rootComponent === undefined ? [] : [...new Set(hubs
-    .map((hub) => nearestVehicleNodeId(roads, hub))
-    .filter((nodeId): nodeId is string => nodeId !== undefined && components.get(nodeId) === rootComponent))];
-  const connectedHubs = connectedHubIds
-    .map((nodeId) => roads.nodes.find((node) => node.id === nodeId))
-    .filter((node): node is NonNullable<typeof node> => node !== undefined);
-  const connectedEntrances = rootComponent === undefined ? [] : acceptedEntrances.filter((entrance) => {
-    const nodeId = exactNodeId(roads, entrance);
-    return nodeId !== undefined && components.get(nodeId) === rootComponent;
-  });
-  requireMajorConnectivity(roads, connectedHubs, connectedEntrances);
-  return { roads, diagnostics: { layout, hubMode, hubs: connectedHubIds, attempts: draft.length, discarded: Math.max(0, draft.length - planarEdges.length), warnings: [] } };
+  if (!corridorsInsideMask(pruned, input.mask, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask.");
+  const hubs = state.hubPoints
+    .map((point) => nearestNodeId(pruned, point, 100))
+    .filter((id): id is string => id !== undefined)
+    .filter((id, index, all) => all.indexOf(id) === index);
+  return {
+    roads: pruned,
+    diagnostics: {
+      layout,
+      hubMode,
+      hubs,
+      attempts,
+      discarded: discarded + (roads.edges.length - pruned.edges.length),
+      warnings: state.warnings
+    }
+  };
 }
 
 export const generateRoadNetwork = generateInitialRoadNetwork;

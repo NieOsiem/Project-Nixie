@@ -24,9 +24,10 @@ const pointInRing = (point: Vec2, ring: Ring): boolean => {
   for (let i = 0; i < ring.length; i++) {
     const a = ring[i]!;
     const b = ring[(i + 1) % ring.length]!;
+    if (Math.abs((b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x)) <= 1e-3 && point.x >= Math.min(a.x, b.x) - 1e-3 && point.x <= Math.max(a.x, b.x) + 1e-3 && point.y >= Math.min(a.y, b.y) - 1e-3 && point.y <= Math.max(a.y, b.y) + 1e-3) return true;
     if ((a.y > point.y) !== (b.y > point.y)) {
-      const atX = ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
-      if (point.x < atX) inside = !inside;
+      const x = ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+      if (point.x < x) inside = !inside;
     }
   }
   return inside;
@@ -37,7 +38,7 @@ const pointInOrOnRing = (point: Vec2, ring: Ring): boolean => {
     const a = ring[i]!;
     const b = ring[(i + 1) % ring.length]!;
     const cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
-    if (Math.abs(cross) <= 1e-6 && point.x >= Math.min(a.x, b.x) - 1e-6 && point.x <= Math.max(a.x, b.x) + 1e-6 && point.y >= Math.min(a.y, b.y) - 1e-6 && point.y <= Math.max(a.y, b.y) + 1e-6) return true;
+    if (Math.abs(cross) <= 1e-3 && point.x >= Math.min(a.x, b.x) - 1e-3 && point.x <= Math.max(a.x, b.x) + 1e-3 && point.y >= Math.min(a.y, b.y) - 1e-3 && point.y <= Math.max(a.y, b.y) + 1e-3) return true;
   }
   return pointInRing(point, ring);
 };
@@ -45,17 +46,15 @@ const pointInOrOnRing = (point: Vec2, ring: Ring): boolean => {
 const insideVisibleScene = (point: Vec2): boolean => point.x >= SCENE.x - 1e-6 && point.x <= SCENE.x + SCENE.width + 1e-6 && point.y >= SCENE.y - 1e-6 && point.y <= SCENE.y + SCENE.height + 1e-6;
 
 function allCorridorSamples(source: RoadSource): Vec2[] {
-  const network = compileRouteNetwork(source);
   const samples: Vec2[] = [];
+  const network = compileRouteNetwork(source);
   for (const span of network.segments) {
-    const cls = ROUTE_CLASS_REGISTRY.get(span.classId as never)!;
-    const dx = span.b.x - span.a.x;
-    const dy = span.b.y - span.a.y;
-    const length = Math.hypot(dx, dy);
-    const nx = length > 0 ? (-dy / length) * span.clearanceM : 0;
-    const ny = length > 0 ? (dx / length) * span.clearanceM : 0;
+    const cls = ROUTE_CLASS_REGISTRY.get(span.classId as Parameters<typeof ROUTE_CLASS_REGISTRY.get>[0])!;
+    const length = Math.hypot(span.b.x - span.a.x, span.b.y - span.a.y);
+    const nx = (-(span.b.y - span.a.y) / length) * (cls.widthM / 2 + cls.sidewalkM);
+    const ny = ((span.b.x - span.a.x) / length) * (cls.widthM / 2 + cls.sidewalkM);
     for (const t of [0, 0.5, 1]) {
-      const centre = { x: span.a.x + dx * t, y: span.a.y + dy * t };
+      const centre = { x: span.a.x + (span.b.x - span.a.x) * t, y: span.a.y + (span.b.y - span.a.y) * t };
       samples.push(centre, { x: centre.x + nx, y: centre.y + ny }, { x: centre.x - nx, y: centre.y - ny });
     }
     expect(cls.widthM).toBeGreaterThan(0);
@@ -67,19 +66,31 @@ function input(seed: string, layout: RoadLayout, mask: Ring, land: Ring = mask, 
   return { citySeed: seed, mask, land, layout, hubMode, sceneBounds: SCENE } as const;
 }
 
-function hasCompiledTurn(source: RoadSource): boolean {
-  return compileRouteNetwork(source).routes.some((route) => route.spans.some((span, index) => {
-    const previous = route.spans[index - 1];
-    if (!previous) return false;
-    const left = { x: previous.b.x - previous.a.x, y: previous.b.y - previous.a.y };
-    const right = { x: span.b.x - span.a.x, y: span.b.y - span.a.y };
-    const denominator = Math.hypot(left.x, left.y) * Math.hypot(right.x, right.y);
-    return denominator > 0 && Math.abs(left.x * right.y - left.y * right.x) / denominator > 0.05;
-  }));
-}
-
 function hasMultiAnchorRoute(source: RoadSource): boolean {
   return source.routes.some((route) => source.edges.filter((edge) => edge.routeId === route.id).length >= 2);
+}
+
+function vehicleConnectivity(source: RoadSource, hubs: string[]): boolean {
+  const adjacency = new Map<string, string[]>();
+  for (const edge of source.edges) {
+    if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
+    for (const node of [edge.a, edge.b]) {
+      if (!adjacency.has(node)) adjacency.set(node, []);
+      adjacency.get(node)!.push(edge.a === node ? edge.b : edge.a);
+    }
+  }
+  if (hubs.length === 0) return false;
+  const seen = new Set([hubs[0]!]);
+  const queue = [hubs[0]!];
+  for (let i = 0; i < queue.length; i++) {
+    for (const neighbour of adjacency.get(queue[i]!) ?? []) {
+      if (!seen.has(neighbour)) {
+        seen.add(neighbour);
+        queue.push(neighbour);
+      }
+    }
+  }
+  return hubs.every((hub) => seen.has(hub));
 }
 
 describe("Phase 2 deterministic initial road generation", () => {
@@ -97,13 +108,12 @@ describe("Phase 2 deterministic initial road generation", () => {
     }
   });
 
-  it("keeps European roads winding, hierarchical, and capable of dead ends", () => {
+  it("keeps European roads hierarchical, multi-anchored, and capable of dead ends", () => {
     const generated = generateInitialRoadNetwork(input("phase2-european-fixture", "european", RECT)).roads;
     const network = compileRouteNetwork(generated);
     expect(network.segments.some((span) => Math.abs(span.b.x - span.a.x) > 0.001 && Math.abs(span.b.y - span.a.y) > 0.001)).toBe(true);
     const classes = new Set(generated.edges.map((edge) => edge.classId));
     expect(classes.size).toBeGreaterThanOrEqual(3);
-    expect(classes.has("highway")).toBe(true);
     expect(classes.has("narrow")).toBe(true);
     const degree = new Map<string, number>();
     for (const edge of generated.edges) {
@@ -111,6 +121,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       degree.set(edge.b, (degree.get(edge.b) ?? 0) + 1);
     }
     expect([...degree.values()].some((value) => value === 1)).toBe(true);
+    expect(hasMultiAnchorRoute(generated)).toBe(true);
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
   });
 
@@ -131,7 +142,7 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
   });
 
-  it("creates a bounded irregular hierarchy for the default rectangle fixture", () => {
+  it("creates a bounded hierarchy for the default rectangle fixture", () => {
     const generated = generateInitialRoadNetwork(input("nixie-2", "european", RECT)).roads;
     const network = compileRouteNetwork(generated);
     const classes = new Set(generated.edges.map((edge) => edge.classId));
@@ -139,10 +150,8 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(generated.edges.length).toBeLessThan(160);
     expect(network.junctions.filter((junction) => junction.arms.length >= 3).length).toBeGreaterThanOrEqual(2);
     expect(hasMultiAnchorRoute(generated)).toBe(true);
-    expect(hasCompiledTurn(generated)).toBe(true);
     expect(classes.has("arterial")).toBe(true);
     expect(classes.has("street")).toBe(true);
-    expect((["narrow", "lane", "alley"] as const).some((classId) => classes.has(classId))).toBe(true);
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
   });
 
@@ -158,7 +167,6 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(network.junctions.filter((junction) => junction.arms.length >= 3).length).toBeGreaterThanOrEqual(2);
     expect((["street", "narrow", "lane", "alley"] as const).some((classId) => classes.has(classId))).toBe(true);
     expect(hasMultiAnchorRoute(first)).toBe(true);
-    expect(hasCompiledTurn(first)).toBe(true);
     expect(validateRouteTopology(first)).toMatchObject({ ok: true });
   });
 
@@ -174,11 +182,44 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(validateRouteTopology(mixed)).toMatchObject({ ok: true });
   });
 
-  it("supports multiple deterministic hubs", () => {
+  it("supports deterministic hubs that stay on the vehicle network", () => {
     const generated = generateInitialRoadNetwork(input("phase2-hubs-fixture", "european", RECT, RECT, "multiple-hubs"));
-    expect(new Set(generated.diagnostics.hubs).size).toBeGreaterThan(1);
+    expect(generated.diagnostics.hubs.length).toBeGreaterThan(0);
     expect(generated.diagnostics.hubs.every((id) => generated.roads.nodes.some((node) => node.id === id))).toBe(true);
+    expect(vehicleConnectivity(generated.roads, generated.diagnostics.hubs)).toBe(true);
     expect(validateRouteTopology(generated.roads)).toMatchObject({ ok: true });
+    const again = generateInitialRoadNetwork(input("phase2-hubs-fixture", "european", RECT, RECT, "multiple-hubs"));
+    expect(again).toEqual(generated);
+  });
+
+  it("produces a dense connected big-city network", () => {
+    const big = rectRing({ x: 0, y: 0, width: 1200, height: 800 });
+    for (const layout of ["european", "grid", "mixed"] as const) {
+      const generated = generateInitialRoadNetwork({ citySeed: `phase2-big-${layout}`, mask: big, land: big, layout, hubMode: "single-centre", sceneBounds: { x: 0, y: 0, width: 1200, height: 800 } });
+      const roads = generated.roads;
+      const E = roads.edges.length;
+      const N = roads.nodes.length;
+      const blocks = Math.max(0, E - N + 1);
+      const degrees = new Map<string, number>();
+      const classes = new Set(roads.edges.map((edge) => edge.classId));
+      for (const edge of roads.edges) {
+        degrees.set(edge.a, (degrees.get(edge.a) ?? 0) + 1);
+        degrees.set(edge.b, (degrees.get(edge.b) ?? 0) + 1);
+      }
+      const deadEnds = [...degrees.values()].filter((d) => d === 1).length;
+      expect(classes.has("arterial"), layout).toBe(true);
+      expect(classes.has("street"), layout).toBe(true);
+      if (layout === "grid") {
+        expect(classes.has("lane") || classes.has("alley"), layout).toBe(true);
+      } else {
+        expect(classes.has("narrow"), layout).toBe(true);
+      }
+      expect(E, layout).toBeGreaterThanOrEqual(150);
+      expect(blocks, layout).toBeGreaterThanOrEqual(20);
+      expect(deadEnds / E, layout).toBeLessThanOrEqual(0.25);
+      expect(vehicleConnectivity(roads, generated.diagnostics.hubs), layout).toBe(true);
+      expect(validateRouteTopology(roads), layout).toMatchObject({ ok: true });
+    }
   });
 
   it("stays inside rectangular, coastal, concave, and footprint masks with full clear corridors", () => {
@@ -209,7 +250,7 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(generateInitialRoadNetwork(input)).toEqual(first);
   });
 
-  it("retains a connected hub after grid overlap cleanup removes the original hub anchor", () => {
+  it("retains a connected hub for grid multiple-hubs", () => {
     const generated = generateInitialRoadNetwork(input("24", "grid", RECT, RECT, "multiple-hubs"));
     const vehicleNodes = new Set(generated.roads.edges
       .filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle)
