@@ -106,6 +106,136 @@ function geometrySignature(source: RoadSource): string[] {
   }).sort();
 }
 
+
+function angleBins(source: RoadSource, binSizeDeg = 10): Set<number> {
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  const bins = new Set<number>();
+  for (const edge of source.edges) {
+    if (!(edge.classId === "arterial" || edge.classId === "street" || edge.classId === "narrow")) continue;
+    const a = nodes.get(edge.a)!;
+    const b = nodes.get(edge.b)!;
+    let angle = Math.atan2(b.y - a.y, b.x - a.x);
+    while (angle < 0) angle += Math.PI;
+    while (angle >= Math.PI) angle -= Math.PI;
+    bins.add(Math.round((angle * 180 / Math.PI) / binSizeDeg));
+  }
+  return bins;
+}
+
+
+function bentRouteCount(source: RoadSource): number {
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  const angles = new Map<string, number[]>();
+  for (const edge of source.edges) {
+    const a = nodes.get(edge.a)!;
+    const b = nodes.get(edge.b)!;
+    let angle = Math.atan2(b.y - a.y, b.x - a.x);
+    while (angle < 0) angle += Math.PI;
+    while (angle >= Math.PI) angle -= Math.PI;
+    if (!angles.has(edge.routeId)) angles.set(edge.routeId, []);
+    angles.get(edge.routeId)!.push(angle);
+  }
+  let count = 0;
+  for (const routeAngles of angles.values()) {
+    if (routeAngles.length < 2) continue;
+    const base = routeAngles[0]!;
+    if (routeAngles.some((angle) => {
+      const delta = Math.abs(angle - base);
+      return Math.min(delta, Math.PI - delta) > 5 * Math.PI / 180;
+    })) count++;
+  }
+  return count;
+}
+
+function axisAlignedFraction(source: RoadSource): number {
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  let aligned = 0;
+  let total = 0;
+  for (const edge of source.edges) {
+    if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
+    const a = nodes.get(edge.a)!;
+    const b = nodes.get(edge.b)!;
+    const angle = Math.abs(Math.atan2(b.y - a.y, b.x - a.x));
+    const quarter = Math.PI / 2;
+    const fromAxis = Math.min(angle % quarter, quarter - (angle % quarter));
+    if (fromAxis <= 2 * Math.PI / 180) aligned++;
+    total++;
+  }
+  return total === 0 ? 1 : aligned / total;
+}
+
+function vehicleEdges(source: RoadSource): RoadSource["edges"] {
+  return source.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle);
+}
+
+function totalVehicleLength(source: RoadSource): number {
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  return vehicleEdges(source).reduce((total, edge) => {
+    const a = nodes.get(edge.a)!;
+    const b = nodes.get(edge.b)!;
+    return total + Math.hypot(b.x - a.x, b.y - a.y);
+  }, 0);
+}
+
+function largestVehicleComponentEdges(source: RoadSource): number {
+  const edges = vehicleEdges(source);
+  const adjacency = new Map<string, string[]>();
+  for (const edge of edges) {
+    if (!adjacency.has(edge.a)) adjacency.set(edge.a, []);
+    if (!adjacency.has(edge.b)) adjacency.set(edge.b, []);
+    adjacency.get(edge.a)!.push(edge.b);
+    adjacency.get(edge.b)!.push(edge.a);
+  }
+  const component = new Map<string, number>();
+  let next = 0;
+  for (const start of adjacency.keys()) {
+    if (component.has(start)) continue;
+    const queue = [start];
+    component.set(start, next);
+    for (let i = 0; i < queue.length; i++) {
+      for (const neighbour of adjacency.get(queue[i]!) ?? []) {
+        if (component.has(neighbour)) continue;
+        component.set(neighbour, next);
+        queue.push(neighbour);
+      }
+    }
+    next++;
+  }
+  const counts = new Map<number, number>();
+  for (const edge of edges) {
+    const id = component.get(edge.a);
+    if (id !== undefined) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return Math.max(0, ...counts.values());
+}
+
+function vehicleDegrees(source: RoadSource): Map<string, number> {
+  const degree = new Map<string, number>();
+  for (const edge of vehicleEdges(source)) {
+    degree.set(edge.a, (degree.get(edge.a) ?? 0) + 1);
+    degree.set(edge.b, (degree.get(edge.b) ?? 0) + 1);
+  }
+  return degree;
+}
+
+/** Sum the degrees of all real junctions in a neighbourhood-sized radius.
+ * A normal crossing scores four; a roundabout or compact market centre can score more,
+ * but several unrelated junctions piled into one block produce the large values this guards. */
+function maxJunctionClusterLoad(source: RoadSource, radius = 35): number {
+  const degree = vehicleDegrees(source);
+  const junctions = source.nodes.filter((node) => (degree.get(node.id) ?? 0) >= 3);
+  let maximum = 0;
+  for (const centre of junctions) {
+    let load = 0;
+    for (const junction of junctions) {
+      if (Math.hypot(junction.x - centre.x, junction.y - centre.y) <= radius) load += degree.get(junction.id) ?? 0;
+    }
+    maximum = Math.max(maximum, load);
+  }
+  return maximum;
+}
+
+
 function distanceToSegment(point: Vec2, a: Vec2, b: Vec2): number {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
@@ -179,6 +309,71 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect([...degree.values()].some((value) => value === 1)).toBe(true);
     expect(hasMultiAnchorRoute(generated)).toBe(true);
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
+  });
+
+  it("gives a full-size European city curved arterials, rotated local fabrics, and one irregular market centre", () => {
+    const scene = { x: 0, y: 0, width: 1200, height: 800 };
+    const mask = rectangleLand(scene);
+    const generated = generateInitialRoadNetwork({ citySeed: "phase2-organic-european", mask, land: mask, layout: "european", hubMode: "multiple-hubs", sceneBounds: scene });
+    const roads = generated.roads;
+    const network = compileRouteNetwork(roads);
+    const plazaRoutes = new Set(roads.edges.filter((edge) => edge.classId === "plaza-route").map((edge) => edge.routeId));
+    const vehicles = vehicleEdges(roads);
+    expect(plazaRoutes.size).toBeLessThanOrEqual(1);
+    expect(vehicles.length).toBeGreaterThan(80);
+    expect(totalVehicleLength(roads)).toBeGreaterThan(5000);
+    expect(largestVehicleComponentEdges(roads)).toBeGreaterThan(vehicles.length * 0.6);
+    expect(bentRouteCount(roads)).toBeGreaterThanOrEqual(3);
+    expect(angleBins(roads).size).toBeGreaterThanOrEqual(7);
+    expect(axisAlignedFraction(roads)).toBeLessThan(0.45);
+    expect(network.junctions.some((junction) => junction.arms.length === 3 || junction.arms.length === 5)).toBe(true);
+    expect(validateRouteTopology(roads)).toMatchObject({ ok: true });
+  });
+
+  it("generates deterministic valid European networks on maps at least 1600 m across", () => {
+    const scene = { x: -800, y: -520, width: 1600, height: 1040 };
+    const mask = rectangleLand(scene);
+    for (const seed of ["large-european-0", "large-european-1", "large-european-2", "large-european-3"]) {
+      const request = { citySeed: seed, mask, land: mask, layout: "european" as const, hubMode: "multiple-hubs" as const, sceneBounds: scene };
+      const first = generateInitialRoadNetwork(request);
+      const second = generateInitialRoadNetwork(request);
+      expect(second).toEqual(first);
+      expect(first.roads.edges.length, seed).toBeGreaterThan(150);
+      expect(first.diagnostics.hubs.length, seed).toBeGreaterThanOrEqual(2);
+      expect(vehicleConnectivity(first.roads, first.diagnostics.hubs), seed).toBe(true);
+      expect(validateRouteTopology(first.roads), seed).toMatchObject({ ok: true });
+    }
+  });
+
+  it("does not collapse European or Mixed full-size maps during topology fallback", () => {
+    const scene = { x: -600, y: -400, width: 1200, height: 800 };
+    const mask = rectangleLand(scene);
+    for (const layout of ["european", "mixed"] as const) {
+      for (const seed of ["density-floor-0", "density-floor-1", "density-floor-2"]) {
+        const generated = generateInitialRoadNetwork({ citySeed: seed, mask, land: mask, layout, hubMode: "multiple-hubs", sceneBounds: scene });
+        const vehicles = vehicleEdges(generated.roads);
+        expect(vehicles.length, `${layout}/${seed}`).toBeGreaterThan(70);
+        expect(totalVehicleLength(generated.roads), `${layout}/${seed}`).toBeGreaterThan(4500);
+        expect(largestVehicleComponentEdges(generated.roads), `${layout}/${seed}`).toBeGreaterThan(vehicles.length * 0.55);
+        expect(validateRouteTopology(generated.roads), `${layout}/${seed}`).toMatchObject({ ok: true });
+      }
+    }
+  });
+
+  it("keeps organic junctions legible instead of piling a neighbourhood into one knot", () => {
+    const scene = { x: -600, y: -400, width: 1200, height: 800 };
+    const mask = rectangleLand(scene);
+    for (const layout of ["european", "mixed"] as const) {
+      for (const seed of ["junction-spacing-1", "junction-spacing-6", "junction-spacing-10", "junction-spacing-17"]) {
+        const generated = generateInitialRoadNetwork({ citySeed: seed, mask, land: mask, layout, hubMode: "multiple-hubs", sceneBounds: scene }).roads;
+        const degree = vehicleDegrees(generated);
+        expect(vehicleEdges(generated).length, `${layout}/${seed}`).toBeGreaterThan(70);
+        expect(vehicleEdges(generated).length, `${layout}/${seed}`).toBeLessThan(540);
+        expect(Math.max(0, ...degree.values()), `${layout}/${seed}`).toBeLessThanOrEqual(6);
+        expect(maxJunctionClusterLoad(generated), `${layout}/${seed}`).toBeLessThanOrEqual(40);
+        expect(validateRouteTopology(generated), `${layout}/${seed}`).toMatchObject({ ok: true });
+      }
+    }
   });
 
   it("generates a recognisable grid with explicit junction nodes", () => {

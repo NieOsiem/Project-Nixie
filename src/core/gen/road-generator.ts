@@ -226,6 +226,47 @@ interface Barrier {
   clearance: number;
 }
 
+interface MeshGuides {
+  verticals: number[];
+  horizontals: number[];
+}
+
+interface StreetCellPlan {
+  rect: Rect;
+  angle: number;
+  index: number;
+  centre: boolean;
+}
+
+interface AttachmentReservation {
+  point: Vec2;
+  lineIndex: number;
+}
+
+interface HubExclusion {
+  point: Vec2;
+  radius: number;
+}
+
+interface NetworkAttachment {
+  point: Vec2;
+  lineIndex: number;
+  distance: number;
+}
+
+interface AttachmentOptions {
+  majorOnly: boolean;
+  maxDistance: number;
+  minApproachAngleDeg: number;
+  minAttachmentSpacing: number;
+  minJunctionSpacing: number;
+  minHubSpacing: number;
+  minEndpointRun: number;
+  minConnectorLength: number;
+  excludedLineIndexes?: ReadonlySet<number>;
+  extraReserved?: readonly Vec2[];
+}
+
 interface PlanState {
   mask: Ring;
   land: Ring;
@@ -237,6 +278,9 @@ interface PlanState {
   lines: PlannedLine[];
   barriers: Barrier[];
   hubPoints: Vec2[];
+  streetCells: StreetCellPlan[];
+  attachments: AttachmentReservation[];
+  hubExclusions: HubExclusion[];
   warnings: string[];
   rejected: number;
 }
@@ -276,6 +320,258 @@ function pushLine(state: PlanState, points: Vec2[], classId: RouteClassId, prese
   return true;
 }
 
+
+function pushComposite(state: PlanState, lines: readonly PlannedLine[]): boolean {
+  const barriers = state.barriers.slice();
+  for (const line of lines) {
+    const clearance = clearanceOf(line.classId);
+    for (const [a, b] of linePairs(line)) {
+      if (parallelConflict(a, b, clearance, barriers)) {
+        state.rejected++;
+        return false;
+      }
+      barriers.push({ a, b, clearance });
+    }
+  }
+  state.lines.push(...lines);
+  state.barriers = barriers;
+  return true;
+}
+
+function rectCentre(rect: Rect): Vec2 {
+  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+}
+
+function expandedRect(rect: Rect, margin: number): Rect {
+  return { x: rect.x - margin, y: rect.y - margin, width: rect.width + margin * 2, height: rect.height + margin * 2 };
+}
+
+function signedHash(a: number, b: number, seed: number): number {
+  return hash2(a, b, seed) * 2 - 1;
+}
+
+/** Intersect one infinite line with a rectangle. Offset is measured on the line normal from the
+ * rectangle centre, which makes it convenient to create locally rotated street families. */
+function lineAcrossRect(rect: Rect, angle: number, offset = 0, margin = 0): [Vec2, Vec2] | null {
+  const box = expandedRect(rect, margin);
+  const centre = rectCentre(rect);
+  const dx = Math.cos(angle);
+  const dy = Math.sin(angle);
+  const nx = -dy;
+  const ny = dx;
+  const origin = { x: centre.x + nx * offset, y: centre.y + ny * offset };
+  let lo = -Infinity;
+  let hi = Infinity;
+  const clipAxis = (value: number, direction: number, min: number, max: number): boolean => {
+    if (Math.abs(direction) <= 1e-12) return value >= min - EPS && value <= max + EPS;
+    const t0 = (min - value) / direction;
+    const t1 = (max - value) / direction;
+    lo = Math.max(lo, Math.min(t0, t1));
+    hi = Math.min(hi, Math.max(t0, t1));
+    return lo <= hi;
+  };
+  if (!clipAxis(origin.x, dx, box.x, box.x + box.width) || !clipAxis(origin.y, dy, box.y, box.y + box.height)) return null;
+  return [
+    { x: origin.x + dx * lo, y: origin.y + dy * lo },
+    { x: origin.x + dx * hi, y: origin.y + dy * hi }
+  ];
+}
+
+function gentlyBentLine(a: Vec2, b: Vec2, bend: number, phase: number): Vec2[] {
+  const length = dist(a, b);
+  if (length < 40 || Math.abs(bend) < 0.5) return [a, b];
+  const nx = (-(b.y - a.y) / length);
+  const ny = ((b.x - a.x) / length);
+  const first = lerpPoint(a, b, 0.34);
+  const second = lerpPoint(a, b, 0.68);
+  const b0 = bend;
+  const b1 = bend * (-0.25 + phase * 0.75);
+  return [
+    a,
+    { x: first.x + nx * b0, y: first.y + ny * b0 },
+    { x: second.x + nx * b1, y: second.y + ny * b1 },
+    b
+  ];
+}
+
+function irregularLoop(centre: Vec2, rx: number, ry: number, count: number, seed: number, salt: number, rotation = 0): Vec2[] {
+  const points: Vec2[] = [];
+  for (let i = 0; i < count; i++) {
+    const angleJitter = signedHash(salt + i, 101, seed) * (Math.PI * 2 / count) * 0.16;
+    const angle = rotation + (i / count) * Math.PI * 2 + angleJitter;
+    const radial = 0.88 + hash2(salt + i, 103, seed) * 0.24;
+    points.push({
+      x: centre.x + Math.cos(angle) * rx * radial,
+      y: centre.y + Math.sin(angle) * ry * radial
+    });
+  }
+  return points;
+}
+
+function guidePositions(start: number, extent: number, targetSpacing: number, seed: number, salt: number): number[] {
+  const count = Math.max(1, Math.min(5, Math.round(extent / targetSpacing)));
+  const spacing = extent / (count + 1);
+  const margin = Math.min(70, spacing * 0.35);
+  const positions: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const base = start + spacing * (i + 1);
+    const jitter = signedHash(salt + i, 107, seed) * Math.min(spacing * 0.18, 48);
+    positions.push(clamp(base + jitter, start + margin, start + extent - margin));
+  }
+  positions.sort((a, b) => a - b);
+  return positions;
+}
+
+function lineOffsetForPoint(rect: Rect, angle: number, point: Vec2): number {
+  const centre = rectCentre(rect);
+  const nx = -Math.sin(angle);
+  const ny = Math.cos(angle);
+  return (point.x - centre.x) * nx + (point.y - centre.y) * ny;
+}
+
+function plannedVehicleIntersections(state: PlanState, majorOnly = false): Vec2[] {
+  const lines = state.lines.filter((line) => {
+    if (!ROUTE_CLASS_REGISTRY.get(line.classId)?.vehicle) return false;
+    if (!majorOnly) return true;
+    return line.role.startsWith("arterial/") || line.role.startsWith("avenue/") || line.role.startsWith("ring/");
+  });
+  const result: Vec2[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    for (let j = i + 1; j < lines.length; j++) {
+      for (const [a, b] of linePairs(lines[i]!)) {
+        for (const [c, d] of linePairs(lines[j]!)) {
+          const hit = segmentIntersectionParam(a, b, c, d);
+          if (!hit || hit.t <= 1e-4 || hit.t >= 1 - 1e-4 || hit.u <= 1e-4 || hit.u >= 1 - 1e-4) continue;
+          const point = lerpPoint(a, b, hit.t);
+          if (!result.some((other) => dist(other, point) <= 2)) result.push(point);
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function isMajorPlanningLine(line: PlannedLine): boolean {
+  return line.role.startsWith("arterial/") || line.role.startsWith("avenue/") || line.role.startsWith("ring/");
+}
+
+function reserveAttachment(state: PlanState, attachment: NetworkAttachment | null): void {
+  if (!attachment) return;
+  state.attachments.push({ point: attachment.point, lineIndex: attachment.lineIndex });
+}
+
+/** Choose a calm attachment point rather than blindly snapping to the nearest segment.
+ * Generated local roads avoid existing major junctions, hub centres, nearby attachments,
+ * road endpoints, and shallow-angle approaches. This keeps irregular neighbourhoods while
+ * preventing several individually valid roads from collapsing into one unreadable knot. */
+function findNetworkAttachment(state: PlanState, point: Vec2, approachFrom: Vec2, options: AttachmentOptions): NetworkAttachment | null {
+  const hotspots = plannedVehicleIntersections(state, options.majorOnly);
+  const reserved = [...state.attachments.map((entry) => entry.point), ...(options.extraReserved ?? [])];
+  const minApproachSin = Math.sin(options.minApproachAngleDeg * DEG);
+  let best: NetworkAttachment | null = null;
+  let bestScore = Infinity;
+
+  for (let lineIndex = 0; lineIndex < state.lines.length; lineIndex++) {
+    if (options.excludedLineIndexes?.has(lineIndex)) continue;
+    const line = state.lines[lineIndex]!;
+    if (!ROUTE_CLASS_REGISTRY.get(line.classId)?.vehicle) continue;
+    if (options.majorOnly && !isMajorPlanningLine(line)) continue;
+
+    for (const [a, b] of linePairs(line)) {
+      const projection = projectPoint(a, b, point);
+      if (!projection || projection.t <= 1e-6 || projection.t >= 1 - 1e-6 || projection.dist > options.maxDistance || projection.dist < options.minConnectorLength) continue;
+
+      const segmentLength = dist(a, b);
+      if (segmentLength <= EPS) continue;
+      const endpointRun = Math.min(projection.t, 1 - projection.t) * segmentLength;
+      if (endpointRun < options.minEndpointRun) continue;
+
+      const approachLength = dist(approachFrom, projection.point);
+      if (approachLength <= EPS) continue;
+      const approachX = projection.point.x - approachFrom.x;
+      const approachY = projection.point.y - approachFrom.y;
+      const roadX = b.x - a.x;
+      const roadY = b.y - a.y;
+      const crossingSin = Math.abs(approachX * roadY - approachY * roadX) / (approachLength * segmentLength);
+      if (crossingSin < minApproachSin) continue;
+
+      if (hotspots.some((hotspot) => dist(hotspot, projection.point) < options.minJunctionSpacing)) continue;
+      if (state.hubPoints.some((hub) => dist(hub, projection.point) < options.minHubSpacing)) continue;
+      if (reserved.some((other) => dist(other, projection.point) < options.minAttachmentSpacing)) continue;
+
+      const score = projection.dist + Math.abs(projection.t - 0.5) * 5;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { point: projection.point, lineIndex, distance: projection.dist };
+      }
+    }
+  }
+  return best;
+}
+
+function plannedLineHitsVehicleNetwork(state: PlanState, a: Vec2, b: Vec2, majorOnly: boolean): boolean {
+  for (const line of state.lines) {
+    if (!ROUTE_CLASS_REGISTRY.get(line.classId)?.vehicle) continue;
+    if (majorOnly && !isMajorPlanningLine(line)) continue;
+    for (const [c, d] of linePairs(line)) {
+      const hit = segmentIntersectionParam(a, b, c, d);
+      if (hit && hit.t > 1e-3 && hit.t < 1 - 1e-3 && hit.u > 1e-3 && hit.u < 1 - 1e-3) return true;
+    }
+  }
+  return false;
+}
+
+function distancePointToSegment(point: Vec2, a: Vec2, b: Vec2): number {
+  const projection = projectPoint(a, b, point);
+  if (!projection) return dist(point, a);
+  return dist(point, lerpPoint(a, b, clamp(projection.t, 0, 1)));
+}
+
+function lineClearsHubExclusions(state: PlanState, points: readonly Vec2[], extraMargin = 0): boolean {
+  for (let i = 0; i + 1 < points.length; i++) {
+    for (const exclusion of state.hubExclusions) {
+      if (distancePointToSegment(exclusion.point, points[i]!, points[i + 1]!) < exclusion.radius + extraMargin) return false;
+    }
+  }
+  return true;
+}
+
+/** Old towns should sit near the city centre without being impaled by every major road.
+ * Search a small deterministic neighbourhood and choose the point with the largest clearance
+ * from the already planned arterial skeleton and its intersections. */
+function calmOldTownCentre(state: PlanState): Vec2 {
+  const candidates: Vec2[] = [state.centre];
+  const maxRadius = Math.min(105, state.minDim * 0.12);
+  for (let ring = 1; ring <= 3; ring++) {
+    const radius = (ring / 3) * maxRadius;
+    const count = 8 + ring * 2;
+    const rotation = hash2(41 + ring, 1, state.seed) * Math.PI * 2;
+    for (let i = 0; i < count; i++) {
+      const angle = rotation + (i / count) * Math.PI * 2;
+      candidates.push({ x: state.centre.x + Math.cos(angle) * radius, y: state.centre.y + Math.sin(angle) * radius });
+    }
+  }
+  const intersections = plannedVehicleIntersections(state, true);
+  let best = state.centre;
+  let bestScore = -Infinity;
+  for (const candidate of candidates) {
+    if (!pointInRect(candidate, state.box) || !pointInRing(candidate, state.mask) || !pointInRing(candidate, state.land)) continue;
+    let majorClearance = Infinity;
+    for (const line of state.lines) {
+      if (!isMajorPlanningLine(line)) continue;
+      for (const [a, b] of linePairs(line)) majorClearance = Math.min(majorClearance, distancePointToSegment(candidate, a, b) - clearanceOf(line.classId));
+    }
+    const junctionClearance = intersections.reduce((value, point) => Math.min(value, dist(candidate, point)), Infinity);
+    const displacementPenalty = dist(candidate, state.centre) * 0.08;
+    const score = Math.min(majorClearance, junctionClearance * 0.75) - displacementPenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 function axisLines(state: PlanState): { verticals: number[]; horizontals: number[] } {
   const verticals: number[] = [state.box.x, state.box.x + state.box.width];
   const horizontals: number[] = [state.box.y, state.box.y + state.box.height];
@@ -293,127 +589,158 @@ function axisLines(state: PlanState): { verticals: number[]; horizontals: number
   return { verticals: dedupe(verticals), horizontals: dedupe(horizontals) };
 }
 
-function planArterials(state: PlanState): { verticals: number[]; horizontals: number[] } {
+function planArterials(state: PlanState): MeshGuides {
+  const targetSpacing = clamp(state.minDim / 2.7, 270, 380);
+  const proposedVerticals = guidePositions(state.box.x, state.box.width, targetSpacing, state.seed, 200);
+  const proposedHorizontals = guidePositions(state.box.y, state.box.height, targetSpacing, state.seed, 300);
   const verticals: number[] = [];
   const horizontals: number[] = [];
-  const spacing = Math.min(clamp(state.minDim / 3, 220, 420), state.minDim * 0.45);
-  for (const axis of ["x", "y"] as const) {
-    const extent = axis === "x" ? state.box.width : state.box.height;
-    const start = axis === "x" ? state.box.x : state.box.y;
-    const centre = axis === "x" ? state.centre.x : state.centre.y;
-    const out = axis === "x" ? verticals : horizontals;
-    for (let k = 0; ; k++) {
-      const offset = (k + 0.5) * spacing;
-      if (offset > extent / 2 - 8) break;
-      for (const sign of [1, -1]) {
-        const pos = centre + sign * offset;
-        if (pos < start + 4 || pos > start + extent - 4) continue;
-        const a = axis === "x" ? { x: pos, y: state.box.y } : { x: state.box.x, y: pos };
-        const b = axis === "x" ? { x: pos, y: state.box.y + state.box.height } : { x: state.box.x + state.box.width, y: pos };
-        if (pushLine(state, [a, b], "arterial", "broad", `arterial/${axis}/${k}/${sign}`)) out.push(pos);
-      }
-    }
-    out.sort((p, q) => p - q);
+  const boxCentre = rectCentre(state.box);
+
+  for (let i = 0; i < proposedVerticals.length; i++) {
+    const guide = proposedVerticals[i]!;
+    const angle = Math.PI / 2 + signedHash(i, 211, state.seed) * 8 * DEG;
+    const offset = lineOffsetForPoint(state.box, angle, { x: guide, y: boxCentre.y });
+    const ends = lineAcrossRect(state.box, angle, offset, 28);
+    if (!ends) continue;
+    const bend = signedHash(i, 213, state.seed) * Math.min(42, state.minDim * 0.045);
+    if (pushLine(state, gentlyBentLine(ends[0], ends[1], bend, hash2(i, 215, state.seed)), "arterial", "broad", `arterial/x/${i}`)) verticals.push(guide);
+  }
+  for (let i = 0; i < proposedHorizontals.length; i++) {
+    const guide = proposedHorizontals[i]!;
+    const angle = signedHash(i, 217, state.seed) * 8 * DEG;
+    const offset = lineOffsetForPoint(state.box, angle, { x: boxCentre.x, y: guide });
+    const ends = lineAcrossRect(state.box, angle, offset, 28);
+    if (!ends) continue;
+    const bend = signedHash(i, 219, state.seed) * Math.min(42, state.minDim * 0.045);
+    if (pushLine(state, gentlyBentLine(ends[0], ends[1], bend, hash2(i, 221, state.seed)), "arterial", "broad", `arterial/y/${i}`)) horizontals.push(guide);
   }
   return { verticals, horizontals };
 }
 
+/** A European avenue is a historic connector, not one half of a symmetric X. One long diagonal
+ * crosses the city; a second, shorter connector curves between adjacent sides on larger maps. */
 function planAvenues(state: PlanState): void {
-  const diag = Math.hypot(state.box.width, state.box.height) / 2 + 100;
-  const theta1 = (15 + hash2(1, 1, state.seed) * 20) * DEG;
-  const theta2 = (15 + hash2(1, 2, state.seed) * 20) * DEG;
-  const c = state.centre;
-  pushLine(state, [
-    { x: c.x + Math.cos(theta1) * diag, y: c.y + Math.sin(theta1) * diag },
-    { x: c.x - Math.cos(theta1) * diag, y: c.y - Math.sin(theta1) * diag }
-  ], "arterial", "broad", "avenue/0");
-  pushLine(state, [
-    { x: c.x + Math.cos(-theta2) * diag, y: c.y + Math.sin(-theta2) * diag },
-    { x: c.x - Math.cos(-theta2) * diag, y: c.y - Math.sin(-theta2) * diag }
-  ], "arterial", "broad", "avenue/1");
+  const firstAngle = (20 + hash2(1, 1, state.seed) * 18) * DEG * (hash2(1, 2, state.seed) < 0.5 ? 1 : -1);
+  const firstPass = {
+    x: state.centre.x + signedHash(1, 3, state.seed) * Math.min(90, state.minDim * 0.1),
+    y: state.centre.y + signedHash(1, 4, state.seed) * Math.min(70, state.minDim * 0.08)
+  };
+  const first = lineAcrossRect(state.box, firstAngle, lineOffsetForPoint(state.box, firstAngle, firstPass), 45);
+  if (first) {
+    pushLine(
+      state,
+      gentlyBentLine(first[0], first[1], signedHash(1, 5, state.seed) * Math.min(55, state.minDim * 0.055), hash2(1, 6, state.seed)),
+      "arterial",
+      "broad",
+      "avenue/0"
+    );
+  }
+
+  if (state.minDim < 620) return;
+  const secondAngle = firstAngle + (hash2(2, 1, state.seed) < 0.5 ? 68 : 108) * DEG;
+  const secondPass = {
+    x: state.centre.x + signedHash(2, 2, state.seed) * Math.min(180, state.box.width * 0.18),
+    y: state.centre.y + signedHash(2, 3, state.seed) * Math.min(150, state.box.height * 0.18)
+  };
+  const full = lineAcrossRect(state.box, secondAngle, lineOffsetForPoint(state.box, secondAngle, secondPass), 25);
+  if (!full) return;
+  const reverse = hash2(2, 4, state.seed) < 0.5;
+  const a = reverse ? full[1] : full[0];
+  const far = reverse ? full[0] : full[1];
+  const b = lerpPoint(a, far, 0.72 + hash2(2, 5, state.seed) * 0.12);
+  pushLine(
+    state,
+    gentlyBentLine(a, b, signedHash(2, 6, state.seed) * Math.min(65, state.minDim * 0.065), hash2(2, 7, state.seed)),
+    "arterial",
+    "standard",
+    "avenue/1"
+  );
 }
 
-/** Ring road (one route per side, so corners stay sharp and nothing can sweep into the diagonals)
- *  plus a cycleway loop 18 m further out. All-or-nothing: a side that would run parallel-close
- *  to the mesh kills the whole ring. */
+/** An irregular orbital route gives the city a broad outer structure without drawing a rectangle
+ * around the map. Degree-two anchors are intentionally left on one route so the shared curve
+ * compiler rounds the faceted loop into a gentle, deterministic ring. */
 function planRings(state: PlanState): void {
-  const inset = clamp(state.minDim * 0.07, 24, 70);
-  const rw = state.box.width - 2 * inset;
-  const rh = state.box.height - 2 * inset;
-  if (rw < 80 || rh < 80) return;
-  const x0 = state.box.x + inset;
-  const x1 = state.box.x + state.box.width - inset;
-  const y0 = state.box.y + inset;
-  const y1 = state.box.y + state.box.height - inset;
-  const classId: RouteClassId = state.minDim >= 600 ? "arterial" : "street";
-  const clearance = clearanceOf(classId);
-  const sides: [Vec2, Vec2][] = [
-    [{ x: x0, y: y0 }, { x: x1, y: y0 }],
-    [{ x: x1, y: y0 }, { x: x1, y: y1 }],
-    [{ x: x1, y: y1 }, { x: x0, y: y1 }],
-    [{ x: x0, y: y1 }, { x: x0, y: y0 }]
-  ];
-  for (const [a, b] of sides) {
-    if (parallelConflict(a, b, clearance, state.barriers)) return;
-  }
-  const names = ["ring/n", "ring/e", "ring/s", "ring/w"] as const;
-  for (let i = 0; i < 4; i++) {
-    const [a, b] = sides[i]! as [Vec2, Vec2];
-    state.lines.push({ points: [a, b], classId, preset: "broad", role: names[i]! });
-    state.barriers.push({ a, b, clearance });
-  }
-  if (inset >= 30) {
-    const cx0 = x0 - 18;
-    const cx1 = x1 + 18;
-    const cy0 = y0 - 18;
-    const cy1 = y1 + 18;
-    if (cx0 < state.box.x + 4 || cy0 < state.box.y + 4) return;
-    const cycleClearance = clearanceOf("cycleway");
-    const cycleSides: [Vec2, Vec2][] = [
-      [{ x: cx0, y: cy0 }, { x: cx1, y: cy0 }],
-      [{ x: cx1, y: cy0 }, { x: cx1, y: cy1 }],
-      [{ x: cx1, y: cy1 }, { x: cx0, y: cy1 }],
-      [{ x: cx0, y: cy1 }, { x: cx0, y: cy0 }]
-    ];
-    for (const [a, b] of cycleSides) {
-      if (parallelConflict(a, b, cycleClearance, state.barriers)) return;
-    }
-    const cycleNames = ["cycle/n", "cycle/e", "cycle/s", "cycle/w"] as const;
-    for (let i = 0; i < 4; i++) {
-      const [a, b] = cycleSides[i]!;
-      state.lines.push({ points: [a, b], classId: "cycleway", preset: "tight", role: cycleNames[i]! });
-      state.barriers.push({ a, b, clearance: cycleClearance });
-    }
-  }
+  const rx = Math.min(state.box.width * 0.39, state.box.width / 2 - 34);
+  const ry = Math.min(state.box.height * 0.39, state.box.height / 2 - 34);
+  if (rx < 85 || ry < 85) return;
+  const count = state.minDim >= 900 ? 12 : 10;
+  const rotation = hash2(3, 1, state.seed) * Math.PI * 2;
+  const classId: RouteClassId = state.minDim >= 650 ? "arterial" : "street";
+  const ring = irregularLoop(state.centre, rx, ry, count, state.seed, 400, rotation);
+  if (!pushLine(state, ring, classId, "broad", "ring/orbital", { closed: true })) return;
+
+  const cycleRx = rx + 18;
+  const cycleRy = ry + 18;
+  if (state.centre.x - cycleRx < state.box.x + 5 || state.centre.x + cycleRx > state.box.x + state.box.width - 5 || state.centre.y - cycleRy < state.box.y + 5 || state.centre.y + cycleRy > state.box.y + state.box.height - 5) return;
+  const cycle = irregularLoop(state.centre, cycleRx, cycleRy, count, state.seed, 400, rotation);
+  pushLine(state, cycle, "cycleway", "standard", "cycle/orbital", { closed: true });
 }
 
-/** Old-town: a sharp-cornered square of narrow streets around the central crossing with a
- *  pedestrian plaza X across it. */
+/** Old-town centre: one irregular narrow-street loop, one crooked market spine, and a handful of
+ * short radial streets. It reads as accumulated urban fabric rather than a symbolic square/X. */
 function planOldTown(state: PlanState): void {
   if (state.minDim < 320) return;
-  const half = clamp(state.minDim * 0.075, 28, 75);
-  const c = state.centre;
-  const clearance = clearanceOf("narrow");
-  const sides: [Vec2, Vec2][] = [
-    [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y - half }],
-    [{ x: c.x + half, y: c.y - half }, { x: c.x + half, y: c.y + half }],
-    [{ x: c.x + half, y: c.y + half }, { x: c.x - half, y: c.y + half }],
-    [{ x: c.x - half, y: c.y + half }, { x: c.x - half, y: c.y - half }]
-  ];
-  for (const [a, b] of sides) {
-    if (parallelConflict(a, b, clearance, state.barriers)) return;
+  const townCentre = calmOldTownCentre(state);
+  const rx = clamp(state.minDim * 0.078, 36, 84);
+  const ry = rx * (0.74 + hash2(4, 1, state.seed) * 0.28);
+  const count = 7 + Math.floor(hash2(4, 2, state.seed) * 3);
+  const rotation = hash2(4, 3, state.seed) * Math.PI * 2;
+  const loop = irregularLoop(townCentre, rx, ry, count, state.seed, 500, rotation);
+  if (!pushLine(state, loop, "narrow", "standard", "oldtown/loop", { closed: true })) return;
+
+  const spineAngle = rotation + (20 + hash2(4, 4, state.seed) * 45) * DEG;
+  const dx = Math.cos(spineAngle);
+  const dy = Math.sin(spineAngle);
+  const nx = -dy;
+  const ny = dx;
+  const half = Math.max(rx, ry) * 1.05;
+  const spineA = { x: townCentre.x - dx * half, y: townCentre.y - dy * half };
+  const spineB = { x: townCentre.x + dx * half, y: townCentre.y + dy * half };
+  const mid = {
+    x: townCentre.x + nx * signedHash(4, 5, state.seed) * Math.min(14, rx * 0.22),
+    y: townCentre.y + ny * signedHash(4, 5, state.seed) * Math.min(14, rx * 0.22)
+  };
+  pushLine(state, [spineA, mid, spineB], "narrow", "tight", "oldtown/market-spine");
+
+  if (hash2(4, 6, state.seed) < 0.45) {
+    const pathAngle = spineAngle + (68 + hash2(4, 8, state.seed) * 28) * DEG;
+    const pdx = Math.cos(pathAngle);
+    const pdy = Math.sin(pathAngle);
+    const pathHalf = Math.min(rx, ry) * 0.58;
+    pushLine(state, [
+      { x: townCentre.x - pdx * pathHalf, y: townCentre.y - pdy * pathHalf },
+      { x: townCentre.x + pdx * pathHalf, y: townCentre.y + pdy * pathHalf }
+    ], "plaza-route", "tight", "oldtown/market-path");
   }
-  const names = ["oldtown/n", "oldtown/e", "oldtown/s", "oldtown/w"] as const;
-  for (let i = 0; i < 4; i++) {
-    const [a, b] = sides[i]! as [Vec2, Vec2];
-    state.lines.push({ points: [a, b], classId: "narrow", preset: "tight", role: names[i]! });
-    state.barriers.push({ a, b, clearance });
+
+  const spokeCount = state.minDim >= 700 ? 3 : 2;
+  const connectedMajorLines = new Set<number>();
+  for (let i = 0; i < spokeCount; i++) {
+    const vertexIndex = Math.floor(((i + hash2(4, 7, state.seed)) / spokeCount) * loop.length) % loop.length;
+    const start = loop[vertexIndex]!;
+    const connection = findNetworkAttachment(state, start, start, {
+      majorOnly: true,
+      maxDistance: clamp(state.minDim * 0.38, 120, 360),
+      minApproachAngleDeg: 32,
+      minAttachmentSpacing: 52,
+      minJunctionSpacing: 44,
+      minHubSpacing: Math.max(rx * 1.25, 54),
+      minEndpointRun: 24,
+      minConnectorLength: 24,
+      excludedLineIndexes: connectedMajorLines
+    });
+    if (!connection) continue;
+    const length = dist(start, connection.point);
+    const bend = signedHash(i, 513, state.seed) * Math.min(22, length * 0.1);
+    if (pushLine(state, gentlyBentLine(start, connection.point, bend, hash2(i, 515, state.seed)), i === 0 ? "street" : "narrow", "tight", `oldtown/spoke/${i}`)) {
+      connectedMajorLines.add(connection.lineIndex);
+      reserveAttachment(state, connection);
+    }
   }
-  // Two full diagonals crossing at the centre (the four half-diagonals would be collinear
-  // pairs on the same line, which the junction pass cannot distinguish).
-  pushLine(state, [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y + half }], "plaza-route", "standard", "plaza/0");
-  pushLine(state, [{ x: c.x + half, y: c.y - half }, { x: c.x - half, y: c.y + half }], "plaza-route", "standard", "plaza/1");
-  state.hubPoints.push(c);
+  state.hubPoints.push(townCentre);
+  state.hubExclusions.push({ point: townCentre, radius: Math.max(rx, ry) + 26 });
 }
 
 /** Return the segment parameters where a segment crosses a circle. */
@@ -591,18 +918,18 @@ function roundaboutAt(state: PlanState, centre: Vec2, role: string): boolean {
   return true;
 }
 
-function planRoundabouts(state: PlanState, hubMode: HubMode, gridCrossings?: { verticals: number[]; horizontals: number[] }): void {
-  const R = clamp(state.minDim * 0.035, 18, 42);
+function planRoundabouts(state: PlanState, hubMode: HubMode, gridCrossings?: MeshGuides): void {
+  const radius = clamp(state.minDim * 0.035, 18, 42);
   const picked: Vec2[] = [];
   const tryRing = (centre: Vec2, role: string): boolean => {
-    if (picked.some((p) => dist(p, centre) < Math.max(2.2 * R, 80))) return false;
-    if (roundaboutAt(state, centre, role)) {
-      picked.push(centre);
-      state.hubPoints.push(centre);
-      return true;
-    }
-    return false;
+    if (picked.some((point) => dist(point, centre) < Math.max(2.2 * radius, 80))) return false;
+    if (!roundaboutAt(state, centre, role)) return false;
+    picked.push(centre);
+    state.hubPoints.push(centre);
+    state.hubExclusions.push({ point: centre, radius: radius + 22 });
+    return true;
   };
+
   if (gridCrossings) {
     tryRing(state.centre, "roundabout/0");
     if (hubMode === "multiple-hubs") {
@@ -610,219 +937,369 @@ function planRoundabouts(state: PlanState, hubMode: HubMode, gridCrossings?: { v
       const candidates: Vec2[] = [];
       for (const x of gridCrossings.verticals) {
         for (const y of gridCrossings.horizontals) {
-          const c = { x, y };
-          if (dist(c, state.centre) >= Math.max(2.2 * R, 60)) candidates.push(c);
+          const candidate = { x, y };
+          if (dist(candidate, state.centre) >= Math.max(2.2 * radius, 60)) candidates.push(candidate);
         }
       }
-      const order = candidates.map((c, i) => ({ c, t: hash2(i, 41, state.seed) })).sort((p, q) => p.t - q.t);
-      for (const { c } of order) {
+      const order = candidates.map((candidate, index) => ({ candidate, key: hash2(index, 41, state.seed) })).sort((a, b) => a.key - b.key);
+      for (const { candidate } of order) {
         if (picked.length - 1 >= target) break;
-        tryRing(c, `roundabout/${picked.length}`);
+        tryRing(candidate, `roundabout/${picked.length}`);
       }
     }
     return;
   }
-  // european / mixed: one roundabout at an outer mesh crossing, far from the avenues.
-  const verticals: number[] = [];
-  const horizontals: number[] = [];
-  for (const line of state.lines) {
-    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
-    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
-  }
-  const crossings: Vec2[] = [];
-  for (const x of verticals) {
-    for (const y of horizontals) crossings.push({ x, y });
-  }
-  const candidates = crossings.filter((c) => dist(c, state.centre) >= Math.max(state.minDim * 0.2, 90));
-  const order = candidates.map((c, i) => ({ c, t: hash2(i, 43, state.seed) })).sort((p, q) => p.t - q.t);
-  for (const { c } of order) {
-    if (tryRing(c, "roundabout/0")) break;
+
+  // Organic layouts use actual major-road intersections. Guide-grid crossings are no longer
+  // reliable because the arterials themselves bend and rotate.
+  const candidates = plannedVehicleIntersections(state, true)
+    .filter((point) => dist(point, state.centre) >= Math.max(state.minDim * 0.22, 100))
+    .filter((point) => point.x > state.box.x + radius + 12 && point.x < state.box.x + state.box.width - radius - 12 && point.y > state.box.y + radius + 12 && point.y < state.box.y + state.box.height - radius - 12);
+  const order = candidates.map((candidate, index) => ({ candidate, key: hash2(index, 43, state.seed) })).sort((a, b) => a.key - b.key);
+  const target = hubMode === "multiple-hubs" && state.minDim >= 700 ? 2 : 1;
+  for (const { candidate } of order) {
+    if (picked.length >= target) break;
+    tryRing(candidate, `roundabout/${picked.length}`);
   }
 }
 
-/** Secondary market squares for multiple-hubs: small sharp squares of streets in far cells. */
-function planSecondaryHubs(state: PlanState, hubMode: HubMode, layout: RoadLayout): void {
+/** Secondary European hubs are small irregular market loops with two connector streets. They are
+ * staged transactionally so a rejected connector cannot leave an isolated decorative loop. */
+function planSecondaryHubs(state: PlanState, hubMode: HubMode, layout: RoadLayout, mesh: MeshGuides): void {
   if (hubMode !== "multiple-hubs" || layout === "grid") return;
-  const verticals: number[] = [];
-  const horizontals: number[] = [];
-  for (const line of state.lines) {
-    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
-    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
-  }
-  const uniqueSorted = (values: number[]): number[] => values
-    .sort((a, b) => a - b)
-    .filter((value, index, all) => index === 0 || Math.abs(value - all[index - 1]!) > EPS);
-  const arterialXs = uniqueSorted(verticals);
-  const arterialYs = uniqueSorted(horizontals);
-  const half = clamp(state.minDim * 0.045, 22, 45);
+  const xs = [state.box.x, ...mesh.verticals, state.box.x + state.box.width];
+  const ys = [state.box.y, ...mesh.horizontals, state.box.y + state.box.height];
   const cells: Rect[] = [];
-  {
-    const xs = [state.box.x, ...arterialXs, state.box.x + state.box.width];
-    const ys = [state.box.y, ...arterialYs, state.box.y + state.box.height];
-    for (let i = 0; i + 1 < xs.length; i++) {
-      for (let j = 0; j + 1 < ys.length; j++) {
-        cells.push({ x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! });
-      }
+  for (let i = 0; i + 1 < xs.length; i++) {
+    for (let j = 0; j + 1 < ys.length; j++) {
+      cells.push({ x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! });
     }
   }
   const candidates = cells
-    .map((cell) => ({ x: cell.x + cell.width / 2, y: cell.y + cell.height / 2, cell }))
-    .filter(({ x, y, cell }) => Math.min(cell.width, cell.height) / 2 >= half + 25 && dist({ x, y }, state.centre) >= state.minDim * 0.2);
-  const order = candidates.map((c, i) => ({ c, t: hash2(i, 47, state.seed) })).sort((p, q) => p.t - q.t);
-  const target = hash2(7, 1, state.seed) < 0.5 ? 2 : 1;
+    .map((cell, index) => {
+      const centre = {
+        x: cell.x + cell.width * (0.4 + hash2(index, 601, state.seed) * 0.2),
+        y: cell.y + cell.height * (0.4 + hash2(index, 603, state.seed) * 0.2)
+      };
+      return { cell, centre, index };
+    })
+    .filter(({ cell, centre }) => Math.min(cell.width, cell.height) >= 165 && dist(centre, state.centre) >= state.minDim * 0.28);
+  const order = candidates.map((candidate) => ({ candidate, key: hash2(candidate.index, 605, state.seed) })).sort((a, b) => a.key - b.key);
+  const target = state.minDim >= 900 && hash2(7, 1, state.seed) < 0.45 ? 2 : 1;
   const placed: Vec2[] = [];
-  const clearance = clearanceOf("street");
-  for (const { c } of order) {
+
+  for (const { candidate } of order) {
     if (placed.length >= target) break;
-    if (placed.some((p) => dist(p, c) < state.minDim * 0.25)) continue;
-    const sides: [Vec2, Vec2][] = [
-      [{ x: c.x - half, y: c.y - half }, { x: c.x + half, y: c.y - half }],
-      [{ x: c.x + half, y: c.y - half }, { x: c.x + half, y: c.y + half }],
-      [{ x: c.x + half, y: c.y + half }, { x: c.x - half, y: c.y + half }],
-      [{ x: c.x - half, y: c.y + half }, { x: c.x - half, y: c.y - half }]
+    if (placed.some((point) => dist(point, candidate.centre) < state.minDim * 0.3)) continue;
+    const radius = clamp(Math.min(candidate.cell.width, candidate.cell.height) * 0.17, 24, 44);
+    const loop = irregularLoop(candidate.centre, radius, radius * (0.78 + hash2(candidate.index, 607, state.seed) * 0.24), 6 + Math.floor(hash2(candidate.index, 609, state.seed) * 2), state.seed, 700 + candidate.index * 13, hash2(candidate.index, 611, state.seed) * Math.PI * 2);
+    const lines: PlannedLine[] = [{ points: loop, classId: "street", preset: "standard", role: `secondary/${placed.length}/loop`, closed: true }];
+    const attachments: NetworkAttachment[] = [];
+    const excludedMajorLines = new Set<number>();
+
+    const connectorAngles = [
+      Math.atan2(state.centre.y - candidate.centre.y, state.centre.x - candidate.centre.x),
+      Math.atan2(candidate.centre.y - state.centre.y, candidate.centre.x - state.centre.x) + signedHash(candidate.index, 613, state.seed) * 35 * DEG
     ];
-    if (sides.some(([a, b]) => parallelConflict(a, b, clearance, state.barriers))) continue;
-    const names = [`secondary/${placed.length}/n`, `secondary/${placed.length}/e`, `secondary/${placed.length}/s`, `secondary/${placed.length}/w`];
-    for (let i = 0; i < 4; i++) {
-      const [a, b] = sides[i]! as [Vec2, Vec2];
-      state.lines.push({ points: [a, b], classId: "street", preset: "tight", role: names[i]! });
-      state.barriers.push({ a, b, clearance });
+    for (let connectorIndex = 0; connectorIndex < connectorAngles.length; connectorIndex++) {
+      const angle = connectorAngles[connectorIndex]!;
+      let start = loop[0]!;
+      let best = Infinity;
+      for (const point of loop) {
+        const pointAngle = Math.atan2(point.y - candidate.centre.y, point.x - candidate.centre.x);
+        const delta = Math.abs(Math.atan2(Math.sin(pointAngle - angle), Math.cos(pointAngle - angle)));
+        if (delta < best) {
+          best = delta;
+          start = point;
+        }
+      }
+      const attachment = findNetworkAttachment(state, start, start, {
+        majorOnly: true,
+        maxDistance: clamp(Math.hypot(candidate.cell.width, candidate.cell.height) * 0.8, 110, 320),
+        minApproachAngleDeg: 30,
+        minAttachmentSpacing: 58,
+        minJunctionSpacing: 44,
+        minHubSpacing: 58,
+        minEndpointRun: 24,
+        minConnectorLength: 24,
+        excludedLineIndexes: excludedMajorLines,
+        extraReserved: attachments.map((entry) => entry.point)
+      });
+      if (!attachment) continue;
+      const length = dist(start, attachment.point);
+      const points = gentlyBentLine(start, attachment.point, signedHash(candidate.index, 615 + connectorIndex, state.seed) * Math.min(18, length * 0.1), hash2(candidate.index, 619 + connectorIndex, state.seed));
+      lines.push({ points, classId: connectorIndex === 0 ? "street" : "narrow", preset: "tight", role: `secondary/${placed.length}/connector/${connectorIndex}` });
+      attachments.push(attachment);
+      excludedMajorLines.add(attachment.lineIndex);
     }
-    placed.push(c);
-    state.hubPoints.push(c);
+    if (lines.length < 3 || !pushComposite(state, lines)) continue;
+    for (const attachment of attachments) reserveAttachment(state, attachment);
+    placed.push(candidate.centre);
+    state.hubPoints.push(candidate.centre);
+    state.hubExclusions.push({ point: candidate.centre, radius: radius + 22 });
   }
 }
 
-function planStreets(state: PlanState, layout: RoadLayout): void {
-  const verticals: number[] = [];
-  const horizontals: number[] = [];
-  for (const line of state.lines) {
-    if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
-    else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
-  }
-  const uniqueSorted = (values: number[]): number[] => values
-    .sort((a, b) => a - b)
-    .filter((value, index, all) => index === 0 || Math.abs(value - all[index - 1]!) > EPS);
-  const xs = [state.box.x, ...uniqueSorted(verticals), state.box.x + state.box.width];
-  const ys = [state.box.y, ...uniqueSorted(horizontals), state.box.y + state.box.height];
+function planStreets(state: PlanState, layout: RoadLayout, mesh: MeshGuides): void {
+  const xs = [state.box.x, ...mesh.verticals, state.box.x + state.box.width];
+  const ys = [state.box.y, ...mesh.horizontals, state.box.y + state.box.height];
   const centreIn = (cell: Rect): boolean => state.centre.x >= cell.x && state.centre.x <= cell.x + cell.width && state.centre.y >= cell.y && state.centre.y <= cell.y + cell.height;
   let cellIndex = 0;
+
   for (let i = 0; i + 1 < xs.length; i++) {
     for (let j = 0; j + 1 < ys.length; j++) {
-      const cell = { x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! };
-      if (layout === "mixed" && centreIn(cell)) {
-        // Strict local grid: the central x/y pair is explicit, with symmetric street pairs
-        // added only where the arterial-bounded cell has enough room.
+      const cell: Rect = { x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! };
+      const isCentre = centreIn(cell);
+      if (Math.min(cell.width, cell.height) < 70) {
+        cellIndex++;
+        continue;
+      }
+
+      if (layout === "mixed" && isCentre) {
         const spacing = clamp(state.minDim / 9, 70, 110);
         for (const axis of ["x", "y"] as const) {
           const lo = axis === "x" ? cell.x + 24 : cell.y + 24;
           const hi = axis === "x" ? cell.x + cell.width - 24 : cell.y + cell.height - 24;
           const centre = axis === "x" ? state.centre.x : state.centre.y;
           const positions = [centre];
-          for (let k = 1; k < 8; k++) {
-            const offset = k * spacing;
-            positions.push(centre - offset, centre + offset);
-          }
-          for (const pos of positions.sort((a, b) => a - b)) {
-            if (pos < lo || pos > hi) continue;
-            const a = axis === "x" ? { x: pos, y: cell.y } : { x: cell.x, y: pos };
-            const b = axis === "x" ? { x: pos, y: cell.y + cell.height } : { x: cell.x + cell.width, y: pos };
-            const classId: RouteClassId = Math.abs(pos - centre) <= EPS ? "arterial" : "street";
-            pushLine(state, [a, b], classId, "tight", `lattice/${axis}/${Math.round((pos - centre) / spacing)}`);
+          for (let k = 1; k < 8; k++) positions.push(centre - k * spacing, centre + k * spacing);
+          for (const position of positions.sort((a, b) => a - b)) {
+            if (position < lo || position > hi) continue;
+            const a = axis === "x" ? { x: position, y: cell.y - 24 } : { x: cell.x - 24, y: position };
+            const b = axis === "x" ? { x: position, y: cell.y + cell.height + 24 } : { x: cell.x + cell.width + 24, y: position };
+            const classId: RouteClassId = Math.abs(position - centre) <= EPS ? "arterial" : "street";
+            pushLine(state, [a, b], classId, "tight", `lattice/${axis}/${Math.round((position - centre) / spacing)}`);
           }
         }
-        roundaboutAt(state, state.centre, "roundabout/core");
+        if (roundaboutAt(state, state.centre, "roundabout/core")) {
+          state.hubExclusions.push({ point: state.centre, radius: clamp(state.minDim * 0.035, 18, 42) + 22 });
+        }
+        state.streetCells.push({ rect: cell, angle: 0, index: cellIndex, centre: true });
         cellIndex++;
         continue;
       }
-      const w = cell.width;
-      const h = cell.height;
-      if (Math.min(w, h) < 60) {
-        cellIndex++;
-        continue;
+
+      const cellCentre = rectCentre(cell);
+      const nearHub = state.hubPoints.some((hub) => dist(hub, cellCentre) < Math.max(95, Math.min(cell.width, cell.height) * 0.7));
+      const zoneIndex = Math.floor(i / 2) * 31 + Math.floor(j / 2);
+      const preferVertical = cell.width > cell.height * 1.15 || (cell.width >= cell.height * 0.85 && hash2(zoneIndex, 701, state.seed) < 0.55);
+      const base = preferVertical ? Math.PI / 2 : 0;
+      const maxRotation = layout === "european" ? 24 : 14;
+      let angle = base + signedHash(zoneIndex, 703, state.seed) * maxRotation * DEG + signedHash(cellIndex, 704, state.seed) * 4 * DEG;
+      if (layout === "european" && hash2(zoneIndex, 705, state.seed) < 0.14) angle += signedHash(zoneIndex, 707, state.seed) * (16 + hash2(zoneIndex, 709, state.seed) * 16) * DEG;
+      const normalWidth = Math.abs(Math.sin(angle)) * cell.width + Math.abs(Math.cos(angle)) * cell.height;
+      const targetSpacing = layout === "european" ? 145 + hash2(cellIndex, 711, state.seed) * 40 : 125 + hash2(cellIndex, 711, state.seed) * 30;
+      let count = Math.max(1, Math.min(layout === "european" ? 3 : 4, Math.round(normalWidth / targetSpacing) - 1));
+      if (isCentre && layout === "european") count = 0;
+      else if (nearHub && layout === "european") count = Math.min(count, 1);
+      const maxOffset = Math.max(0, normalWidth / 2 - 30);
+      const acceptedOffsets: number[] = [];
+      for (let k = 0; k < count; k++) {
+        const baseOffset = count === 1 ? signedHash(cellIndex, 713, state.seed) * maxOffset * 0.28 : -maxOffset + ((k + 1) / (count + 1)) * maxOffset * 2;
+        const offset = baseOffset + signedHash(cellIndex * 11 + k, 715, state.seed) * Math.min(22, targetSpacing * 0.18);
+        if (acceptedOffsets.some((other) => Math.abs(other - offset) < (layout === "european" ? 85 : 72))) continue;
+        const ends = lineAcrossRect(cell, angle, offset, 55);
+        if (!ends) continue;
+        const snapDistance = Math.min(135, Math.max(70, state.minDim * 0.12));
+        let attachmentA = findNetworkAttachment(state, ends[0], ends[1], {
+          majorOnly: true,
+          maxDistance: snapDistance,
+          minApproachAngleDeg: 32,
+          minAttachmentSpacing: 44,
+          minJunctionSpacing: 34,
+          minHubSpacing: nearHub ? 68 : 50,
+          minEndpointRun: 22,
+          minConnectorLength: 12
+        });
+        let attachmentB = findNetworkAttachment(state, ends[1], ends[0], {
+          majorOnly: true,
+          maxDistance: snapDistance,
+          minApproachAngleDeg: 32,
+          minAttachmentSpacing: 44,
+          minJunctionSpacing: 34,
+          minHubSpacing: nearHub ? 68 : 50,
+          minEndpointRun: 22,
+          minConnectorLength: 12,
+          extraReserved: attachmentA ? [attachmentA.point] : []
+        });
+        if (attachmentA && attachmentB && dist(attachmentA.point, attachmentB.point) < 72) {
+          if (attachmentA.distance <= attachmentB.distance) attachmentB = null;
+          else attachmentA = null;
+        }
+        const a = attachmentA?.point ?? ends[0];
+        const b = attachmentB?.point ?? ends[1];
+        if (!attachmentA && !attachmentB && !plannedLineHitsVehicleNetwork(state, a, b, true)) continue;
+        const length = dist(a, b);
+        if (length < 42) continue;
+        const bend = signedHash(cellIndex * 13 + k, 717, state.seed) * Math.min(layout === "european" ? 24 : 18, length * 0.07);
+        const classId: RouteClassId = hash2(cellIndex * 17 + k, 719, state.seed) < (layout === "european" ? 0.5 : 0.38) ? "narrow" : "street";
+        const candidatePoints = gentlyBentLine(a, b, bend, hash2(cellIndex * 19 + k, 721, state.seed));
+        if (!lineClearsHubExclusions(state, candidatePoints, clearanceOf(classId))) continue;
+        if (pushLine(state, candidatePoints, classId, hash2(cellIndex * 23 + k, 723, state.seed) < 0.55 ? "tight" : "standard", `street/${cellIndex}/${k}`)) {
+          acceptedOffsets.push(offset);
+          reserveAttachment(state, attachmentA);
+          reserveAttachment(state, attachmentB);
+        }
       }
-      const vertical = hash2(cellIndex, 3, state.seed) < 0.7;
-      const both = hash2(cellIndex, 5, state.seed) < 0.15;
-      const span = vertical ? w : h;
-      const n = Math.max(0, Math.min(4, Math.round(span / 120) - 1 + (hash2(cellIndex, 7, state.seed) < 0.4 ? 1 : 0)));
-      const placed: number[] = [];
-      for (let k = 0; k < n; k++) {
-        const t = hash2(cellIndex, 9 + k, state.seed);
-        const off = 24 + t * Math.max(1, span - 48);
-        if (placed.some((o) => Math.abs(o - off) < 90)) continue;
-        const classId = hash2(cellIndex, 13 + k, state.seed) < 0.45 ? "narrow" : "street";
-        const a = vertical ? { x: cell.x + off, y: cell.y } : { x: cell.x, y: cell.y + off };
-        const b = vertical ? { x: cell.x + off, y: cell.y + cell.height } : { x: cell.x + cell.width, y: cell.y + off };
-        if (pushLine(state, [a, b], classId, "standard", `street/${cellIndex}/${k}`)) placed.push(off);
+
+      // A minority of cells get a second, oblique family. This is what creates wedges,
+      // triangular blocks, and three/five-arm junctions instead of a uniformly perturbed grid.
+      if (!isCentre && !nearHub && hash2(cellIndex, 725, state.seed) < (layout === "european" ? 0.18 : 0.12)) {
+        const crossAngle = angle + (68 + hash2(cellIndex, 727, state.seed) * 42) * DEG;
+        const crossNormalWidth = Math.abs(Math.sin(crossAngle)) * cell.width + Math.abs(Math.cos(crossAngle)) * cell.height;
+        const offset = signedHash(cellIndex, 729, state.seed) * Math.max(0, crossNormalWidth / 2 - 40) * 0.45;
+        const ends = lineAcrossRect(cell, crossAngle, offset, 55);
+        if (ends) {
+          const snapDistance = Math.min(120, Math.max(65, state.minDim * 0.1));
+          let attachmentA = findNetworkAttachment(state, ends[0], ends[1], {
+            majorOnly: true,
+            maxDistance: snapDistance,
+            minApproachAngleDeg: 34,
+            minAttachmentSpacing: 48,
+            minJunctionSpacing: 38,
+            minHubSpacing: 54,
+            minEndpointRun: 24,
+            minConnectorLength: 14
+          });
+          let attachmentB = findNetworkAttachment(state, ends[1], ends[0], {
+            majorOnly: true,
+            maxDistance: snapDistance,
+            minApproachAngleDeg: 34,
+            minAttachmentSpacing: 48,
+            minJunctionSpacing: 38,
+            minHubSpacing: 54,
+            minEndpointRun: 24,
+            minConnectorLength: 14,
+            extraReserved: attachmentA ? [attachmentA.point] : []
+          });
+          if (attachmentA && attachmentB && dist(attachmentA.point, attachmentB.point) < 80) {
+            if (attachmentA.distance <= attachmentB.distance) attachmentB = null;
+            else attachmentA = null;
+          }
+          const a = attachmentA?.point ?? ends[0];
+          const b = attachmentB?.point ?? ends[1];
+          if ((attachmentA || attachmentB || plannedLineHitsVehicleNetwork(state, a, b, true)) && dist(a, b) >= 42) {
+            const bend = signedHash(cellIndex, 731, state.seed) * Math.min(20, dist(a, b) * 0.06);
+            const classId: RouteClassId = hash2(cellIndex, 735, state.seed) < 0.62 ? "narrow" : "street";
+            const candidatePoints = gentlyBentLine(a, b, bend, hash2(cellIndex, 733, state.seed));
+            if (lineClearsHubExclusions(state, candidatePoints, clearanceOf(classId)) && pushLine(state, candidatePoints, classId, "tight", `street/${cellIndex}/cross`)) {
+              reserveAttachment(state, attachmentA);
+              reserveAttachment(state, attachmentB);
+            }
+          }
+        }
       }
-      if (both) {
-        const t = hash2(cellIndex, 21, state.seed);
-        const spanOther = vertical ? h : w;
-        const off = 24 + t * Math.max(1, spanOther - 48);
-        const classId = hash2(cellIndex, 23, state.seed) < 0.45 ? "narrow" : "street";
-        const a = vertical ? { x: cell.x, y: cell.y + off } : { x: cell.x + off, y: cell.y };
-        const b = vertical ? { x: cell.x + cell.width, y: cell.y + off } : { x: cell.x + off, y: cell.y + cell.height };
-        pushLine(state, [a, b], classId, "standard", `street/${cellIndex}/x`);
-      }
+      state.streetCells.push({ rect: cell, angle, index: cellIndex, centre: isCentre });
       cellIndex++;
     }
   }
 }
 
-/** Mid-block lanes/alleys in every block formed by the axis-aligned network, some as cul-de-sacs. */
-function planLanes(state: PlanState): void {
-  const { verticals, horizontals } = axisLines(state);
-  let blockIndex = 0;
-  for (let i = 0; i + 1 < verticals.length; i++) {
-    for (let j = 0; j + 1 < horizontals.length; j++) {
-      const x0 = verticals[i]!;
-      const x1 = verticals[i + 1]!;
-      const y0 = horizontals[j]!;
-      const y1 = horizontals[j + 1]!;
-      const w = x1 - x0;
-      const h = y1 - y0;
-      const p = hash2(blockIndex, 1, state.seed);
-      // Keep the old-town core clear: lanes there would T-junction centimetres from the
-      // plaza diagonals' crossings and manufacture degenerate twin junctions.
-      if (Math.min(w, h) < 50 || p >= 0.45 || dist({ x: (x0 + x1) / 2, y: (y0 + y1) / 2 }, state.centre) < 40) {
+/** Lanes follow the local street fabric. Organic layouts use one-ended crooked service streets;
+ * Grid retains the old mid-block axis-aligned behaviour. */
+function planLanes(state: PlanState, layout: RoadLayout): void {
+  if (layout === "grid") {
+    const { verticals, horizontals } = axisLines(state);
+    let blockIndex = 0;
+    for (let i = 0; i + 1 < verticals.length; i++) {
+      for (let j = 0; j + 1 < horizontals.length; j++) {
+        const x0 = verticals[i]!;
+        const x1 = verticals[i + 1]!;
+        const y0 = horizontals[j]!;
+        const y1 = horizontals[j + 1]!;
+        const width = x1 - x0;
+        const height = y1 - y0;
+        const chance = hash2(blockIndex, 1, state.seed);
+        if (Math.min(width, height) < 50 || chance >= 0.45) {
+          blockIndex++;
+          continue;
+        }
+        const vertical = chance < 0.225;
+        const offset = (vertical ? (x0 + x1) / 2 : (y0 + y1) / 2) + signedHash(blockIndex, 3, state.seed) * 6;
+        const classId: RouteClassId = hash2(blockIndex, 5, state.seed) < 0.5 ? "lane" : "alley";
+        const cul = hash2(blockIndex, 7, state.seed) < 0.25;
+        const depth = 0.55 + hash2(blockIndex, 9, state.seed) * 0.3;
+        const a = vertical ? { x: offset, y: y0 } : { x: x0, y: offset };
+        const b = vertical ? { x: offset, y: cul ? y0 + height * depth : y1 } : { x: cul ? x0 + width * depth : x1, y: offset };
+        pushLine(state, [a, b], classId, "tight", `lane/${blockIndex}`);
         blockIndex++;
-        continue;
       }
-      const vertical = p < 0.225;
-      const off = (vertical ? (x0 + x1) / 2 : (y0 + y1) / 2) + (hash2(blockIndex, 3, state.seed) - 0.5) * 12;
-      const classId = hash2(blockIndex, 5, state.seed) < 0.5 ? "lane" : "alley";
-      const cul = hash2(blockIndex, 7, state.seed) < 0.25;
-      const depth = 0.55 + hash2(blockIndex, 9, state.seed) * 0.3;
-      const a = vertical ? { x: off, y: y0 } : { x: x0, y: off };
-      const b = vertical ? { x: off, y: cul ? y0 + h * depth : y1 } : { x: cul ? x0 + w * depth : x1, y: off };
-      pushLine(state, [a, b], classId, "tight", `lane/${blockIndex}`);
-      blockIndex++;
+    }
+    return;
+  }
+
+  for (const cell of state.streetCells) {
+    if (cell.centre || Math.min(cell.rect.width, cell.rect.height) < 95 || hash2(cell.index, 801, state.seed) >= 0.34) continue;
+    const angle = cell.angle + signedHash(cell.index, 803, state.seed) * 12 * DEG;
+    const normalWidth = Math.abs(Math.sin(angle)) * cell.rect.width + Math.abs(Math.cos(angle)) * cell.rect.height;
+    const offset = signedHash(cell.index, 805, state.seed) * Math.max(0, normalWidth / 2 - 24) * 0.65;
+    const ends = lineAcrossRect(cell.rect, angle, offset, 20);
+    if (!ends) continue;
+    const fromFirst = hash2(cell.index, 807, state.seed) < 0.5;
+    const rawStart = fromFirst ? ends[0] : ends[1];
+    const far = fromFirst ? ends[1] : ends[0];
+    const startAttachment = findNetworkAttachment(state, rawStart, far, {
+      majorOnly: false,
+      maxDistance: Math.min(85, Math.max(45, state.minDim * 0.075)),
+      minApproachAngleDeg: 26,
+      minAttachmentSpacing: 26,
+      minJunctionSpacing: 20,
+      minHubSpacing: 34,
+      minEndpointRun: 14,
+      minConnectorLength: 8
+    });
+    if (!startAttachment) continue;
+    const start = startAttachment.point;
+    const through = hash2(cell.index, 809, state.seed) < 0.1;
+    const rawEnd = through ? far : lerpPoint(rawStart, far, 0.48 + hash2(cell.index, 811, state.seed) * 0.3);
+    const endAttachment = through ? findNetworkAttachment(state, rawEnd, rawStart, {
+      majorOnly: false,
+      maxDistance: Math.min(70, Math.max(40, state.minDim * 0.06)),
+      minApproachAngleDeg: 26,
+      minAttachmentSpacing: 28,
+      minJunctionSpacing: 20,
+      minHubSpacing: 34,
+      minEndpointRun: 14,
+      minConnectorLength: 8,
+      extraReserved: [startAttachment.point]
+    }) : null;
+    const end = endAttachment?.point ?? rawEnd;
+    if (dist(start, end) < 22) continue;
+    const classId: RouteClassId = hash2(cell.index, 813, state.seed) < 0.55 ? "lane" : "alley";
+    const bend = signedHash(cell.index, 815, state.seed) * Math.min(12, dist(start, end) * 0.08);
+    const candidatePoints = gentlyBentLine(start, end, bend, hash2(cell.index, 817, state.seed));
+    if (lineClearsHubExclusions(state, candidatePoints, clearanceOf(classId)) && pushLine(state, candidatePoints, classId, "tight", `lane/${cell.index}`)) {
+      reserveAttachment(state, startAttachment);
+      reserveAttachment(state, endAttachment);
     }
   }
 }
 
-/** Highways from the ring to the map edge, one per side, placed in the gaps between parallel roads. */
+/** Curved radial highway approaches cross the orbital route and terminate at the Scene edge. */
 function planHighways(state: PlanState): void {
-  const inset = clamp(state.minDim * 0.07, 24, 70);
-  const rw = state.box.width - 2 * inset;
-  const rh = state.box.height - 2 * inset;
-  if (rw < 80 || rh < 80) return;
-  const count = state.minDim >= 450 ? 3 + (hash2(9, 1, state.seed) < 0.5 ? 1 : 0) : 2;
+  const count = state.minDim >= 700 ? 3 + (hash2(9, 1, state.seed) < 0.45 ? 1 : 0) : 2;
   const sides = ["w", "e", "n", "s"] as const;
-  const chosen: { side: string; pos: number }[] = [];
+  const chosen: { side: string; position: number }[] = [];
   let guard = 0;
-  while (chosen.length < count && guard++ < 80) {
-    const side = sides[Math.floor(hash2(9, 2 + chosen.length * 2, state.seed) * 4)]!;
-    const isH = side === "w" || side === "e";
-    const extent = isH ? state.box.height : state.box.width;
-    const lo = inset + 40;
-    const hi = extent - inset - 40;
-    if (hi <= lo) break;
-    const pos = lo + hash2(9, 3 + chosen.length * 2, state.seed) * (hi - lo);
-    if (chosen.some((c) => c.side === side && Math.abs(c.pos - pos) < 100)) continue;
-    const a = side === "w" ? { x: state.box.x + inset, y: state.box.y + pos } : side === "e" ? { x: state.box.x + state.box.width - inset, y: state.box.y + pos } : side === "n" ? { x: state.box.x + pos, y: state.box.y + inset } : { x: state.box.x + pos, y: state.box.y + state.box.height - inset };
-    const b = side === "w" ? { x: state.box.x, y: state.box.y + pos } : side === "e" ? { x: state.box.x + state.box.width, y: state.box.y + pos } : side === "n" ? { x: state.box.x + pos, y: state.box.y } : { x: state.box.x + pos, y: state.box.y + state.box.height };
-    if (pushLine(state, [a, b], "highway", "standard", `highway/${side}/${chosen.length}`)) chosen.push({ side, pos });
+  while (chosen.length < count && guard++ < 100) {
+    const side = sides[Math.floor(hash2(9, 2 + guard, state.seed) * sides.length)]!;
+    const horizontal = side === "w" || side === "e";
+    const extent = horizontal ? state.box.height : state.box.width;
+    const margin = Math.min(95, extent * 0.14);
+    const position = margin + hash2(9, 103 + guard, state.seed) * Math.max(1, extent - margin * 2);
+    if (chosen.some((entry) => entry.side === side && Math.abs(entry.position - position) < 120)) continue;
+    const edge = side === "w"
+      ? { x: state.box.x, y: state.box.y + position }
+      : side === "e"
+        ? { x: state.box.x + state.box.width, y: state.box.y + position }
+        : side === "n"
+          ? { x: state.box.x + position, y: state.box.y }
+          : { x: state.box.x + position, y: state.box.y + state.box.height };
+    const total = dist(edge, state.centre);
+    const depth = clamp(state.minDim * (0.2 + hash2(9, 207 + guard, state.seed) * 0.08), 125, 260);
+    const inner = lerpPoint(edge, state.centre, Math.min(0.75, depth / Math.max(total, 1)));
+    const bend = signedHash(9, 307 + guard, state.seed) * Math.min(34, depth * 0.16);
+    if (pushLine(state, gentlyBentLine(inner, edge, bend, hash2(9, 407 + guard, state.seed)), "highway", "standard", `highway/${side}/${chosen.length}`)) chosen.push({ side, position });
   }
   if (chosen.length === 0) state.warnings.push("no highway position fit");
 }
@@ -981,7 +1458,7 @@ function planGrid(state: PlanState, hubMode: HubMode): void {
     if (pushLine(state, [a, b], Math.abs(y - state.centre.y) <= EPS ? "arterial" : "street", "tight", `grid/h/${k}`)) horizontals.push(y);
   }
   planRoundabouts(state, hubMode, { verticals, horizontals });
-  planLanes(state);
+  planLanes(state, "grid");
 }
 
 function edgeQuad(a: Vec2, b: Vec2, halfWidth: number): Ring {
@@ -1046,49 +1523,6 @@ function corridorsInsideMasks(source: RoadSource, mask: Ring, land: Ring, sceneB
   return true;
 }
 
-function majorVehicleComponents(source: RoadSource): Map<string, number> {
-  const adjacency = new Map<string, string[]>();
-  for (const edge of source.edges) {
-    if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
-    for (const node of [edge.a, edge.b]) {
-      if (!adjacency.has(node)) adjacency.set(node, []);
-      adjacency.get(node)!.push(edge.a === node ? edge.b : edge.a);
-    }
-  }
-  const components = new Map<string, number>();
-  let next = 0;
-  for (const start of adjacency.keys()) {
-    if (components.has(start)) continue;
-    const queue = [start];
-    components.set(start, next);
-    for (let qi = 0; qi < queue.length; qi++) {
-      const node = queue[qi]!;
-      for (const neighbour of adjacency.get(node) ?? []) {
-        if (components.has(neighbour)) continue;
-        components.set(neighbour, next);
-        queue.push(neighbour);
-      }
-    }
-    next++;
-  }
-  return components;
-}
-
-function nearestVehicleNodeId(source: RoadSource, point: Vec2): string | undefined {
-  const vehicleNodeIds = new Set(source.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle).flatMap((edge) => [edge.a, edge.b]));
-  let best: string | undefined;
-  let bestD = Infinity;
-  for (const node of source.nodes) {
-    if (!vehicleNodeIds.has(node.id)) continue;
-    const d = Math.hypot(node.x - point.x, node.y - point.y);
-    if (d < bestD) {
-      bestD = d;
-      best = node.id;
-    }
-  }
-  return best;
-}
-
 function nearestNodeId(source: RoadSource, point: Vec2, maxD: number): string | undefined {
   let best: string | undefined;
   let bestD = maxD;
@@ -1102,29 +1536,202 @@ function nearestNodeId(source: RoadSource, point: Vec2, maxD: number): string | 
   return best;
 }
 
-/** Construction rule, not repair: everything vehicle must reach the city centre. Clipping can
- *  strand a lane whose bounding streets were eaten by the coast; drop only those pieces. */
-function pruneDisconnectedVehicleComponents(source: RoadSource, rootPoint: Vec2): RoadSource {
-  const rootId = nearestVehicleNodeId(source, rootPoint);
-  if (!rootId) return source;
-  const components = majorVehicleComponents(source);
-  const root = components.get(rootId);
-  if (root === undefined) return source;
-  const keep = new Set<string>();
-  for (const [nodeId, component] of components) {
-    if (component === root) keep.add(nodeId);
-  }
-  const edges = source.edges.filter((edge) => {
-    const cls = ROUTE_CLASS_REGISTRY.get(edge.classId);
-    if (!cls?.vehicle) return true;
-    return keep.has(edge.a) && keep.has(edge.b);
-  });
-  const usedNodes = new Set(edges.flatMap((edge) => [edge.a, edge.b]));
+function compactRoadSource(source: RoadSource): RoadSource {
+  const usedNodes = new Set(source.edges.flatMap((edge) => [edge.a, edge.b]));
+  const usedRoutes = new Set(source.edges.map((edge) => edge.routeId));
   return {
     nodes: source.nodes.filter((node) => usedNodes.has(node.id)),
-    routes: source.routes.filter((route) => edges.some((edge) => edge.routeId === route.id)),
-    edges
+    routes: source.routes.filter((route) => usedRoutes.has(route.id)),
+    edges: source.edges
   };
+}
+
+function topologyStatus(source: RoadSource): { ok: boolean; problems: string[] } {
+  try {
+    const result = validateRouteTopology(source, compileRouteNetwork(source));
+    return { ok: result.ok, problems: result.problems };
+  } catch (error) {
+    return { ok: false, problems: [error instanceof Error ? error.message : String(error)] };
+  }
+}
+
+function edgeIdsFromTopologyProblems(problems: readonly string[], source: RoadSource): Set<string> {
+  const known = new Set(source.edges.map((edge) => edge.id));
+  const result = new Set<string>();
+  for (const problem of problems) {
+    for (const match of problem.matchAll(/"([^"]+)"/g)) {
+      const raw = match[1]!;
+      const base = raw.replace(/:\d+$/, "");
+      if (known.has(base)) result.add(base);
+    }
+  }
+  return result;
+}
+
+function generatedRouteRemovalPriority(role: string | undefined): number {
+  if (!role) return 50;
+  if (role.includes("/ring/") && role.includes("roundabout/")) return 100;
+  if (role.startsWith("lane/") || role.includes("/lane/")) return 0;
+  if (role.startsWith("promenade/") || role.startsWith("plaza/") || role.includes("market-path") || role.startsWith("cycle/")) return 1;
+  if (role.startsWith("street/")) return 2;
+  if (role.startsWith("secondary/")) return 3;
+  if (role.startsWith("highway/")) return 4;
+  if (role.startsWith("oldtown/spoke/")) return 5;
+  if (role.startsWith("oldtown/")) return 7;
+  if (role.startsWith("avenue/")) return 8;
+  if (role.startsWith("ring/")) return 9;
+  if (role.startsWith("arterial/")) return 10;
+  return 6;
+}
+
+function vehicleEdgeCount(source: RoadSource): number {
+  return source.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle).length;
+}
+
+/** Give every edge of one generated route its own route record. The authoritative graph and all
+ * junctions stay intact, but the compiler can no longer round through its degree-two anchors.
+ * This is a much safer response to curve-only contacts than deleting the complete route. */
+function straightenGeneratedRoute(
+  source: RoadSource,
+  routeId: string,
+  idSeed: string,
+  usedIds: Set<string>,
+  roles: Map<string, string>
+): RoadSource | null {
+  const route = source.routes.find((candidate) => candidate.id === routeId);
+  if (!route) return null;
+  const routeEdges = source.edges.filter((edge) => edge.routeId === routeId).slice().sort((a, b) => a.id.localeCompare(b.id));
+  if (routeEdges.length === 0) return null;
+  if (routeEdges.length === 1) {
+    if (route.curvePreset === "tight") return null;
+    return {
+      nodes: source.nodes,
+      routes: source.routes.map((candidate) => candidate.id === routeId ? { ...candidate, curvePreset: "tight" as const } : candidate),
+      edges: source.edges
+    };
+  }
+
+  const role = roles.get(routeId) ?? routeId;
+  const replacements: RoadSource["routes"] = [];
+  const edgeRouteIds = new Map<string, string>();
+  for (let index = 0; index < routeEdges.length; index++) {
+    const edge = routeEdges[index]!;
+    const replacementId = index === 0
+      ? routeId
+      : allocateGeneratedId("route", idSeed, `fallback/straight/${routeId}/${edge.id}`, index, usedIds);
+    usedIds.add(replacementId);
+    edgeRouteIds.set(edge.id, replacementId);
+    replacements.push({ id: replacementId, curvePreset: "tight" });
+    roles.set(replacementId, role);
+  }
+
+  return {
+    nodes: source.nodes,
+    routes: [...source.routes.filter((candidate) => candidate.id !== routeId), ...replacements].sort((a, b) => a.id.localeCompare(b.id)),
+    edges: source.edges.map((edge) => edge.routeId === routeId ? { ...edge, routeId: edgeRouteIds.get(edge.id)! } : edge)
+  };
+}
+
+function implicatedRouteIds(problems: readonly string[], source: RoadSource): Set<string> {
+  const edgeIds = edgeIdsFromTopologyProblems(problems, source);
+  return new Set(source.edges.filter((edge) => edgeIds.has(edge.id)).map((edge) => edge.routeId));
+}
+
+/** Generated roads should be valid by construction. When the canonical compiler still finds a
+ * curve contact on a large map, preserve the graph first: straighten only implicated routes, then
+ * (if necessary) all remaining multi-edge routes. Only genuine straight-edge conflicts may remove
+ * individual edges, and a hard density floor prevents the fallback from silently erasing a city. */
+function stabilizeGeneratedSource(
+  source: RoadSource,
+  roleByRouteId: ReadonlyMap<string, string>,
+  idSeed: string
+): { source: RoadSource; removedEdges: number; warnings: string[] } {
+  let candidate = source;
+  let status = topologyStatus(candidate);
+  if (status.ok) return { source: candidate, removedEdges: 0, warnings: [] };
+
+  const originalEdgeCount = source.edges.length;
+  const originalVehicleEdges = vehicleEdgeCount(source);
+  const minimumVehicleEdges = Math.max(1, Math.floor(originalVehicleEdges * 0.72));
+  const usedIds = new Set([...source.nodes, ...source.routes, ...source.edges].map((item) => item.id));
+  const roles = new Map(roleByRouteId);
+  const straightened = new Set<string>();
+
+  const straightenOneImplicated = (): boolean => {
+    const implicated = implicatedRouteIds(status.problems, candidate);
+    const choices = candidate.routes
+      .filter((route) => implicated.has(route.id) && !straightened.has(route.id))
+      .map((route) => ({ route, edgeCount: candidate.edges.filter((edge) => edge.routeId === route.id).length }))
+      .sort((a, b) => b.edgeCount - a.edgeCount || a.route.id.localeCompare(b.route.id));
+    const selected = choices.find((choice) => choice.edgeCount > 1 || choice.route.curvePreset !== "tight");
+    if (!selected) return false;
+    const next = straightenGeneratedRoute(candidate, selected.route.id, idSeed, usedIds, roles);
+    straightened.add(selected.route.id);
+    if (!next) return false;
+    candidate = next;
+    status = topologyStatus(candidate);
+    return true;
+  };
+
+  // Most reported span contacts are introduced by smoothing one multi-anchor route.
+  const targetedLimit = Math.min(48, candidate.routes.length);
+  for (let iteration = 0; iteration < targetedLimit && !status.ok; iteration++) {
+    if (!straightenOneImplicated()) break;
+  }
+
+  // If reports bounce between interacting curves, eliminate smoothing globally while keeping every
+  // node and edge. This intentionally sacrifices some curves before sacrificing any city fabric.
+  if (!status.ok) {
+    const multi = candidate.routes
+      .map((route) => ({ route, edgeCount: candidate.edges.filter((edge) => edge.routeId === route.id).length }))
+      .filter((entry) => entry.edgeCount > 1 || entry.route.curvePreset !== "tight")
+      .sort((a, b) => b.edgeCount - a.edgeCount || a.route.id.localeCompare(b.route.id));
+    for (const entry of multi) {
+      const next = straightenGeneratedRoute(candidate, entry.route.id, idSeed, usedIds, roles);
+      if (!next) continue;
+      candidate = next;
+      straightened.add(entry.route.id);
+    }
+    status = topologyStatus(candidate);
+  }
+
+  let removedEdges = 0;
+  const maximumEdgeRemovals = Math.min(36, Math.max(6, Math.ceil(originalEdgeCount * 0.08)));
+  while (!status.ok && removedEdges < maximumEdgeRemovals) {
+    const edgeIds = edgeIdsFromTopologyProblems(status.problems, candidate);
+    let choices = candidate.edges.filter((edge) => edgeIds.has(edge.id));
+    if (choices.length === 0) break;
+    choices = choices.slice().sort((a, b) => {
+      const priority = generatedRouteRemovalPriority(roles.get(a.routeId)) - generatedRouteRemovalPriority(roles.get(b.routeId));
+      if (priority !== 0) return priority;
+      const vehicle = Number(Boolean(ROUTE_CLASS_REGISTRY.get(a.classId)?.vehicle)) - Number(Boolean(ROUTE_CLASS_REGISTRY.get(b.classId)?.vehicle));
+      return vehicle !== 0 ? vehicle : a.id.localeCompare(b.id);
+    });
+    const selected = choices[0]!;
+    const selectedVehicle = Boolean(ROUTE_CLASS_REGISTRY.get(selected.classId)?.vehicle);
+    if (selectedVehicle && vehicleEdgeCount(candidate) - 1 < minimumVehicleEdges) break;
+    candidate = compactRoadSource({
+      nodes: candidate.nodes,
+      routes: candidate.routes,
+      edges: candidate.edges.filter((edge) => edge.id !== selected.id)
+    });
+    removedEdges++;
+    status = topologyStatus(candidate);
+  }
+
+  if (!status.ok) {
+    throw new Error(
+      `Generated road topology is invalid after non-destructive fallback; refused to collapse the network below ${minimumVehicleEdges} vehicle edges: ${status.problems.join(" ")}`
+    );
+  }
+  if (vehicleEdgeCount(candidate) < minimumVehicleEdges) {
+    throw new Error(`Generated road fallback refused an implausibly sparse result (${vehicleEdgeCount(candidate)}/${originalVehicleEdges} vehicle edges).`);
+  }
+
+  const warnings: string[] = [];
+  if (straightened.size > 0) warnings.push(`large-map topology fallback straightened ${straightened.size} generated route${straightened.size === 1 ? "" : "s"}`);
+  if (removedEdges > 0) warnings.push(`large-map topology fallback removed ${removedEdges} conflicting edge${removedEdges === 1 ? "" : "s"}`);
+  return { source: candidate, removedEdges: originalEdgeCount - candidate.edges.length, warnings };
 }
 
 function nodeKeyOf(point: Vec2): string {
@@ -1145,17 +1752,28 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
       diagnostics: { layout, hubMode, hubs: [], attempts: 0, discarded: 0, warnings: ["mask too small for road generation"] }
     };
   }
+  const seed = deriveLabelledSeed(input.citySeed, "roads/v2");
+  const geometricCentre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  const centre = layout !== "european"
+    ? geometricCentre
+    : {
+        x: clamp(geometricCentre.x + signedHash(17, 1, seed) * Math.min(55, box.width * 0.045), box.x + minDim * 0.18, box.x + box.width - minDim * 0.18),
+        y: clamp(geometricCentre.y + signedHash(17, 2, seed) * Math.min(45, box.height * 0.045), box.y + minDim * 0.18, box.y + box.height - minDim * 0.18)
+      };
   const state: PlanState = {
     mask: input.mask,
     land,
     sceneBounds,
     box,
-    centre: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+    centre,
     minDim,
-    seed: deriveLabelledSeed(input.citySeed, "roads/v2"),
+    seed,
     lines: [],
     barriers: [],
     hubPoints: [],
+    streetCells: [],
+    attachments: [],
+    hubExclusions: [],
     warnings: [],
     rejected: 0
   };
@@ -1163,14 +1781,14 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
     planGrid(state, hubMode);
   } else {
     state.hubPoints.push(state.centre);
-    planArterials(state);
+    const mesh = planArterials(state);
     planAvenues(state);
     planRings(state);
     if (layout === "european") planOldTown(state);
     planRoundabouts(state, hubMode);
-    planSecondaryHubs(state, hubMode, layout);
-    planStreets(state, layout);
-    planLanes(state);
+    planSecondaryHubs(state, hubMode, layout, mesh);
+    planStreets(state, layout, mesh);
+    planLanes(state, layout);
     planHighways(state);
   }
   planPromenade(state);
@@ -1375,25 +1993,27 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
       .sort((a, b) => a.id.localeCompare(b.id)),
     edges: dedupedEdges
   };
-  const pruned = pruneDisconnectedVehicleComponents(roads, state.centre);
-  const sourceProblems = validateRoadSource(pruned);
+  const roleByRouteId = new Map(routeIds.map((id, index) => [id, state.lines[index]!.role] as const));
+  const stabilized = stabilizeGeneratedSource(roads, roleByRouteId, idSeed);
+  const finalRoads = stabilized.source;
+  const sourceProblems = validateRoadSource(finalRoads);
   if (sourceProblems.length > 0) throw new Error(`Generated road source is invalid: ${sourceProblems.join(" ")}`);
-  const topology = validateRouteTopology(pruned, compileRouteNetwork(pruned));
+  const topology = validateRouteTopology(finalRoads, compileRouteNetwork(finalRoads));
   if (!topology.ok) throw new Error(`Generated road topology is invalid: ${topology.problems.join(" ")}`);
-  if (!corridorsInsideMasks(pruned, input.mask, land, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask or land.");
+  if (!corridorsInsideMasks(finalRoads, input.mask, land, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask or land.");
   const hubs = state.hubPoints
-    .map((point) => nearestNodeId(pruned, point, 100))
+    .map((point) => nearestNodeId(finalRoads, point, 120))
     .filter((id): id is string => id !== undefined)
     .filter((id, index, all) => all.indexOf(id) === index);
   return {
-    roads: pruned,
+    roads: finalRoads,
     diagnostics: {
       layout,
       hubMode,
       hubs,
       attempts,
-      discarded: discarded + (roads.edges.length - pruned.edges.length),
-      warnings: state.warnings
+      discarded: discarded + stabilized.removedEdges,
+      warnings: [...state.warnings, ...stabilized.warnings]
     }
   };
 }
