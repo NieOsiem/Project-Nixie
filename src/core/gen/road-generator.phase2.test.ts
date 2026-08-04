@@ -93,6 +93,62 @@ function vehicleConnectivity(source: RoadSource, hubs: string[]): boolean {
   return hubs.every((hub) => seen.has(hub));
 }
 
+
+function geometrySignature(source: RoadSource): string[] {
+  const nodes = new Map(source.nodes.map((node) => [node.id, node]));
+  const point = (id: string): string => {
+    const node = nodes.get(id)!;
+    return `${Math.round(node.x * 1000) / 1000},${Math.round(node.y * 1000) / 1000}`;
+  };
+  return source.edges.map((edge) => {
+    const ends = [point(edge.a), point(edge.b)].sort();
+    return `${edge.classId}:${ends[0]}:${ends[1]}`;
+  }).sort();
+}
+
+function distanceToSegment(point: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const length2 = dx * dx + dy * dy;
+  if (length2 <= 1e-12) return Math.hypot(point.x - a.x, point.y - a.y);
+  const t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / length2));
+  return Math.hypot(point.x - (a.x + dx * t), point.y - (a.y + dy * t));
+}
+
+function centralRoundaboutNodeIds(source: RoadSource, centre: Vec2, minRadius = 16, maxRadius = 20): Set<string> {
+  const candidates = new Set(source.nodes
+    .filter((node) => {
+      const radius = Math.hypot(node.x - centre.x, node.y - centre.y);
+      return radius >= minRadius && radius <= maxRadius;
+    })
+    .map((node) => node.id));
+  const adjacency = new Map<string, string[]>();
+  for (const edge of source.edges) {
+    if (!candidates.has(edge.a) || !candidates.has(edge.b) || !ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
+    if (!adjacency.has(edge.a)) adjacency.set(edge.a, []);
+    if (!adjacency.has(edge.b)) adjacency.set(edge.b, []);
+    adjacency.get(edge.a)!.push(edge.b);
+    adjacency.get(edge.b)!.push(edge.a);
+  }
+  const visited = new Set<string>();
+  for (const start of adjacency.keys()) {
+    if (visited.has(start)) continue;
+    const component = new Set([start]);
+    const queue = [start];
+    visited.add(start);
+    for (let i = 0; i < queue.length; i++) {
+      for (const next of adjacency.get(queue[i]!) ?? []) {
+        if (visited.has(next)) continue;
+        visited.add(next);
+        component.add(next);
+        queue.push(next);
+      }
+    }
+    if (component.size >= 12 && [...component].every((id) => (adjacency.get(id)?.length ?? 0) === 2)) return component;
+  }
+  return new Set();
+}
+
 describe("Phase 2 deterministic initial road generation", () => {
   it("is deterministic for every layout and changes topology for a different seed", () => {
     for (const layout of ["european", "grid", "mixed"] as const) {
@@ -104,7 +160,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       expect(new Set(allIds).size).toBe(allIds.length);
       expect(validateRouteTopology(first.roads)).toMatchObject({ ok: true });
       const different = generateInitialRoadNetwork(input("phase2-generator-other-seed", layout, RECT));
-      expect(different.roads).not.toEqual(first.roads);
+      expect(geometrySignature(different.roads), layout).not.toEqual(geometrySignature(first.roads));
     }
   });
 
@@ -126,17 +182,50 @@ describe("Phase 2 deterministic initial road generation", () => {
   });
 
   it("generates a recognisable grid with explicit junction nodes", () => {
-    const generated = generateInitialRoadNetwork(input("phase2-grid-fixture", "grid", RECT)).roads;
+    const scene = { x: -300, y: -240, width: 600, height: 480 };
+    const mask = rectangleLand(scene);
+    const generated = generateInitialRoadNetwork({ citySeed: "phase2-grid-fixture", mask, land: mask, layout: "grid", hubMode: "single-centre", sceneBounds: scene }).roads;
     const network = compileRouteNetwork(generated);
     const axisAligned = network.segments.filter((span) => Math.abs(span.a.x - span.b.x) < 1e-9 || Math.abs(span.a.y - span.b.y) < 1e-9);
-    expect(axisAligned.length).toBeGreaterThan(4);
+    expect(axisAligned.length).toBeGreaterThan(20);
     expect([...new Set(generated.nodes.map((node) => node.id))].some((id) => generated.edges.filter((edge) => edge.a === id || edge.b === id).length >= 4)).toBe(true);
     expect(network.junctions.some((junction) => junction.arms.length >= 4)).toBe(true);
   });
 
-  it("combines an irregular skeleton and a local grid in Mixed layout", () => {
+  it("replaces the central Grid crossing with a complete connected roundabout", () => {
+    const generated = generateInitialRoadNetwork(input("phase2-grid-roundabout", "grid", RECT)).roads;
+    const centre = { x: 0, y: 0 };
+    const ring = centralRoundaboutNodeIds(generated, centre);
+    const ringEdges = generated.edges.filter((edge) => ring.has(edge.a) && ring.has(edge.b));
+    const approaches = generated.edges.filter((edge) => ring.has(edge.a) !== ring.has(edge.b));
+    expect(ring.size).toBeGreaterThanOrEqual(24);
+    expect(ringEdges.length).toBe(ring.size);
+    expect(approaches.length).toBeGreaterThanOrEqual(4);
+    const nodes = new Map(generated.nodes.map((node) => [node.id, node]));
+    for (const edge of generated.edges.filter((candidate) => ROUTE_CLASS_REGISTRY.get(candidate.classId)?.vehicle)) {
+      expect(distanceToSegment(centre, nodes.get(edge.a)!, nodes.get(edge.b)!)).toBeGreaterThan(8);
+    }
+    expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
+  });
+
+  it("combines an irregular skeleton with a real central grid in Mixed layout", () => {
     const generated = generateInitialRoadNetwork(input("phase2-mixed-fixture", "mixed", RECT)).roads;
     const network = compileRouteNetwork(generated);
+    const centre = { x: 0, y: 0 };
+    const ring = centralRoundaboutNodeIds(generated, centre);
+    const nodes = new Map(generated.nodes.map((node) => [node.id, node]));
+    const cardinalApproaches = new Set<string>();
+    for (const edge of generated.edges) {
+      if (edge.classId !== "arterial" || ring.has(edge.a) === ring.has(edge.b)) continue;
+      const a = nodes.get(edge.a)!;
+      const b = nodes.get(edge.b)!;
+      const outer = ring.has(edge.a) ? b : a;
+      if (Math.abs(a.x - b.x) <= 1e-6) cardinalApproaches.add(outer.y < centre.y ? "north" : "south");
+      if (Math.abs(a.y - b.y) <= 1e-6) cardinalApproaches.add(outer.x < centre.x ? "west" : "east");
+    }
+    expect(generated.edges.some((edge) => edge.classId === "plaza-route")).toBe(false);
+    expect(ring.size).toBeGreaterThanOrEqual(24);
+    expect(cardinalApproaches).toEqual(new Set(["north", "south", "west", "east"]));
     expect(network.segments.some((span) => Math.abs(span.a.x - span.b.x) < 1e-9 || Math.abs(span.a.y - span.b.y) < 1e-9)).toBe(true);
     expect(network.segments.some((span) => Math.abs(span.a.x - span.b.x) > 0.001 && Math.abs(span.a.y - span.b.y) > 0.001)).toBe(true);
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
@@ -168,6 +257,38 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect((["street", "narrow", "lane", "alley"] as const).some((classId) => classes.has(classId))).toBe(true);
     expect(hasMultiAnchorRoute(first)).toBe(true);
     expect(validateRouteTopology(first)).toMatchObject({ ok: true });
+  });
+
+  it("offsets disconnected coastline runs independently", () => {
+    const scene = { x: -250, y: -150, width: 500, height: 300 };
+    const land: Ring = [
+      { x: -250, y: -150 },
+      { x: 250, y: -150 },
+      { x: 250, y: 150 },
+      { x: 170, y: 150 },
+      { x: 170, y: 60 },
+      { x: 120, y: 60 },
+      { x: 120, y: 150 },
+      { x: -120, y: 150 },
+      { x: -120, y: 60 },
+      { x: -170, y: 60 },
+      { x: -170, y: 150 },
+      { x: -250, y: 150 }
+    ];
+    for (const layout of ["european", "grid", "mixed"] as const) {
+      const generated = generateInitialRoadNetwork({ citySeed: "promenade-runs", mask: land, land, layout, hubMode: "single-centre", sceneBounds: scene }).roads;
+      const nodes = new Map(generated.nodes.map((node) => [node.id, node]));
+      const midpoints = generated.edges
+        .filter((edge) => edge.classId === "waterfront-promenade")
+        .map((edge) => {
+          const a = nodes.get(edge.a)!;
+          const b = nodes.get(edge.b)!;
+          return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        });
+      expect(midpoints.some((point) => point.x > 100), `${layout} east coast run`).toBe(true);
+      expect(midpoints.some((point) => point.x < -100), `${layout} west coast run`).toBe(true);
+      expect(validateRouteTopology(generated), layout).toMatchObject({ ok: true });
+    }
   });
 
   it("keeps Mixed structurally distinct from Grid while retaining irregular roads", () => {
@@ -222,22 +343,35 @@ describe("Phase 2 deterministic initial road generation", () => {
     }
   });
 
-  it("stays inside rectangular, coastal, concave, and footprint masks with full clear corridors", () => {
+  it("keeps every layout inside rectangular, coastal, concave, and footprint masks", () => {
     const fixtures: Array<[string, Ring, Ring]> = [
       ["rectangular", RECT, RECT],
       ["coastal", COASTAL, COASTAL],
       ["concave", CONCAVE, RECT],
       ["footprint", FOOTPRINT, RECT]
     ];
-    for (const [name, mask, land] of fixtures) {
-      const generated = generateInitialRoadNetwork(input(`phase2-mask-${name}`, "european", mask, land)).roads;
-      expect(generated.edges.length, name).toBeGreaterThan(0);
-      expect(validateRouteTopology(generated), name).toMatchObject({ ok: true });
-      for (const point of allCorridorSamples(generated)) {
-        if (!insideVisibleScene(point)) continue;
-        expect(pointInOrOnRing(point, mask), `${name} mask at ${point.x},${point.y}`).toBe(true);
-        expect(pointInOrOnRing(point, land), `${name} land at ${point.x},${point.y}`).toBe(true);
+    for (const layout of ["european", "grid", "mixed"] as const) {
+      for (const [name, mask, land] of fixtures) {
+        const generated = generateInitialRoadNetwork(input(`phase2-mask-${layout}-${name}`, layout, mask, land)).roads;
+        expect(generated.edges.length, `${layout}/${name}`).toBeGreaterThan(0);
+        expect(validateRouteTopology(generated), `${layout}/${name}`).toMatchObject({ ok: true });
+        for (const point of allCorridorSamples(generated)) {
+          if (!insideVisibleScene(point)) continue;
+          expect(pointInOrOnRing(point, mask), `${layout}/${name} mask at ${point.x},${point.y}`).toBe(true);
+          expect(pointInOrOnRing(point, land), `${layout}/${name} land at ${point.x},${point.y}`).toBe(true);
+        }
       }
+    }
+  });
+
+  it("checks the independent land ring during final compiled-corridor validation", () => {
+    const land = rectRing({ x: -70, y: -55, width: 140, height: 105 });
+    const generated = generateInitialRoadNetwork(input("phase2-restricted-land", "european", RECT, land)).roads;
+    expect(generated.edges.length).toBeGreaterThan(0);
+    for (const point of allCorridorSamples(generated)) {
+      if (!insideVisibleScene(point)) continue;
+      expect(pointInOrOnRing(point, RECT), `mask at ${point.x},${point.y}`).toBe(true);
+      expect(pointInOrOnRing(point, land), `land at ${point.x},${point.y}`).toBe(true);
     }
   });
 

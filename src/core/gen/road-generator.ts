@@ -213,6 +213,13 @@ interface PlannedLine {
   closed?: boolean;
 }
 
+function minLengthOfPlannedLine(line: PlannedLine): number {
+  // Polygonal roundabout edges deliberately use short chords so approaches can attach to the
+  // ring at exact junction vertices without a decorative road continuing through the centre.
+  if (line.role.includes("roundabout/") && line.role.includes("/ring/")) return 1.25;
+  return minLengthOf(line.classId);
+}
+
 interface Barrier {
   a: Vec2;
   b: Vec2;
@@ -234,8 +241,23 @@ interface PlanState {
   rejected: number;
 }
 
-/** Add a planned polyline unless any of its segments would run near-parallel-close to an existing line.
- *  Optionally bends long straight lines at a hash-chosen point for an organic curve. */
+function linePairs(line: PlannedLine): [Vec2, Vec2][] {
+  const pairs: [Vec2, Vec2][] = [];
+  for (let i = 0; i + 1 < line.points.length; i++) pairs.push([line.points[i]!, line.points[i + 1]!]);
+  if (line.closed && line.points.length > 2) pairs.push([line.points[line.points.length - 1]!, line.points[0]!]);
+  return pairs;
+}
+
+function barriersForLines(lines: readonly PlannedLine[]): Barrier[] {
+  const barriers: Barrier[] = [];
+  for (const line of lines) {
+    const clearance = clearanceOf(line.classId);
+    for (const [a, b] of linePairs(line)) barriers.push({ a, b, clearance });
+  }
+  return barriers;
+}
+
+/** Add a planned polyline unless any of its segments would run near-parallel-close to an existing line. */
 function pushLine(state: PlanState, points: Vec2[], classId: RouteClassId, preset: CurvePreset, role: string, opts: { closed?: boolean } = {}): boolean {
   if (points.length < 2) return false;
   const pts = points;
@@ -394,21 +416,178 @@ function planOldTown(state: PlanState): void {
   state.hubPoints.push(c);
 }
 
-/** A 24-gon ring rotated 15° so no edge is axis-parallel. One route per edge: the curve
- *  compiler rounds degree-2 same-route nodes, and its arc spans carry misaligned node ids,
- *  so a single closed route would fail topology validation around every crossing. */
-function roundaboutAt(state: PlanState, centre: Vec2, role: string): boolean {
-  const R = clamp(state.minDim * 0.035, 18, 42);
-  if (centre.x - R - 8 < state.box.x || centre.x + R + 8 > state.box.x + state.box.width || centre.y - R - 8 < state.box.y || centre.y + R + 8 > state.box.y + state.box.height) return false;
-  const vertices = Array.from({ length: 24 }, (_, k) => {
-    const angle = (15 + k * 15) * DEG;
-    return { x: centre.x + Math.cos(angle) * R, y: centre.y + Math.sin(angle) * R };
-  });
-  for (let k = 0; k < vertices.length; k++) {
-    const a = vertices[k]!;
-    const b = vertices[(k + 1) % vertices.length]!;
-    if (!pushLine(state, [a, b], "street", "tight", `${role}/${k}`)) return false;
+/** Return the segment parameters where a segment crosses a circle. */
+function segmentCircleIntersections(a: Vec2, b: Vec2, centre: Vec2, radius: number): number[] {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const fx = a.x - centre.x;
+  const fy = a.y - centre.y;
+  const qa = dx * dx + dy * dy;
+  if (qa <= 1e-12) return [];
+  const qb = 2 * (fx * dx + fy * dy);
+  const qc = fx * fx + fy * fy - radius * radius;
+  const discriminant = qb * qb - 4 * qa * qc;
+  if (discriminant < -1e-9) return [];
+  const root = Math.sqrt(Math.max(0, discriminant));
+  const values = [(-qb - root) / (2 * qa), (-qb + root) / (2 * qa)]
+    .filter((t) => t > 1e-8 && t < 1 - 1e-8)
+    .sort((x, y) => x - y);
+  return values.filter((t, index) => index === 0 || Math.abs(t - values[index - 1]!) > 1e-8);
+}
+
+function snapToCircle(point: Vec2, centre: Vec2, radius: number): Vec2 {
+  const dx = point.x - centre.x;
+  const dy = point.y - centre.y;
+  const length = Math.hypot(dx, dy);
+  if (length <= EPS) return { x: centre.x + radius, y: centre.y };
+  return { x: centre.x + (dx / length) * radius, y: centre.y + (dy / length) * radius };
+}
+
+/** Remove the parts of a polyline inside a circle and return the remaining approach pieces. */
+function clipPolylineOutsideCircle(points: readonly Vec2[], centre: Vec2, radius: number): { pieces: Vec2[][]; removedInterior: boolean } {
+  const pieces: Vec2[][] = [];
+  let current: Vec2[] | null = null;
+  let removedInterior = false;
+  const flush = (): void => {
+    if (current && current.length >= 2 && dist(current[0]!, current[current.length - 1]!) > EPS) pieces.push(current);
+    current = null;
+  };
+  for (let i = 0; i + 1 < points.length; i++) {
+    const a = points[i]!;
+    const b = points[i + 1]!;
+    const ts = [0, ...segmentCircleIntersections(a, b, centre, radius), 1];
+    for (let k = 0; k + 1 < ts.length; k++) {
+      const t0 = ts[k]!;
+      const t1 = ts[k + 1]!;
+      const mid = lerpPoint(a, b, (t0 + t1) / 2);
+      const outside = dist(mid, centre) >= radius - 1e-7;
+      let p0 = lerpPoint(a, b, t0);
+      let p1 = lerpPoint(a, b, t1);
+      if (Math.abs(dist(p0, centre) - radius) <= 1e-5) p0 = snapToCircle(p0, centre, radius);
+      if (Math.abs(dist(p1, centre) - radius) <= 1e-5) p1 = snapToCircle(p1, centre, radius);
+      if (!outside) {
+        removedInterior = true;
+        flush();
+        continue;
+      }
+      if (!current) current = [p0, p1];
+      else if (dist(current[current.length - 1]!, p0) <= EPS) current.push(p1);
+      else {
+        flush();
+        current = [p0, p1];
+      }
+    }
   }
+  flush();
+  return { pieces, removedInterior };
+}
+
+/** Replace a vehicle-road crossing with a polygonal roundabout. The operation is transactional:
+ *  every through road is cut back to the ring, every approach terminates on the ring, and no
+ *  partial ring or partially cut road is published when any candidate edge conflicts. */
+function roundaboutAt(state: PlanState, centre: Vec2, role: string): boolean {
+  const radius = clamp(state.minDim * 0.035, 18, 42);
+  if (centre.x - radius - 8 < state.box.x || centre.x + radius + 8 > state.box.x + state.box.width || centre.y - radius - 8 < state.box.y || centre.y + radius + 8 > state.box.y + state.box.height) return false;
+
+  const retained: PlannedLine[] = [];
+  const approaches: PlannedLine[] = [];
+  const attachmentAngles: number[] = [];
+  let affectedLines = 0;
+  for (let lineIndex = 0; lineIndex < state.lines.length; lineIndex++) {
+    const line = state.lines[lineIndex]!;
+    if (!ROUTE_CLASS_REGISTRY.get(line.classId)?.vehicle || line.closed) {
+      retained.push(line);
+      continue;
+    }
+    const clipped = clipPolylineOutsideCircle(line.points, centre, radius);
+    if (!clipped.removedInterior) {
+      retained.push(line);
+      continue;
+    }
+    affectedLines++;
+    for (let pieceIndex = 0; pieceIndex < clipped.pieces.length; pieceIndex++) {
+      const points = clipped.pieces[pieceIndex]!;
+      for (const endpoint of [points[0]!, points[points.length - 1]!]) {
+        if (Math.abs(dist(endpoint, centre) - radius) <= 1e-4) attachmentAngles.push(Math.atan2(endpoint.y - centre.y, endpoint.x - centre.x));
+      }
+      approaches.push({ ...line, points, closed: false, role: `${line.role}/${role}/approach/${lineIndex}/${pieceIndex}` });
+    }
+  }
+  // A one-road traffic circle is not a useful hub and an isolated ring can become the pruning root.
+  if (affectedLines < 2 || attachmentAngles.length < 4) return false;
+
+  interface RingVertex { angle: number; point: Vec2; attachment: boolean; }
+  const vertices: RingVertex[] = [];
+  const normalAngle = (angle: number): number => {
+    const tau = Math.PI * 2;
+    return ((angle % tau) + tau) % tau;
+  };
+  const addVertex = (angle: number, attachment: boolean): void => {
+    const a = normalAngle(angle);
+    const existing = vertices.find((vertex) => Math.min(Math.abs(vertex.angle - a), Math.PI * 2 - Math.abs(vertex.angle - a)) <= 1e-6);
+    const point = { x: centre.x + Math.cos(a) * radius, y: centre.y + Math.sin(a) * radius };
+    if (existing) {
+      if (attachment) {
+        existing.point = point;
+        existing.attachment = true;
+      }
+      return;
+    }
+    vertices.push({ angle: a, point, attachment });
+  };
+  for (let k = 0; k < 24; k++) addVertex((15 + k * 15) * DEG, false);
+  for (const angle of attachmentAngles) addVertex(angle, true);
+  // Do not leave a tiny ring chord merely because an approach lands a few degrees from a
+  // decorative base vertex. Keep the exact attachment and drop the nearby base vertex.
+  const attachments = vertices.filter((vertex) => vertex.attachment);
+  for (let i = vertices.length - 1; i >= 0; i--) {
+    const vertex = vertices[i]!;
+    if (vertex.attachment) continue;
+    const tooClose = attachments.some((attachment) => {
+      const delta = Math.min(Math.abs(vertex.angle - attachment.angle), Math.PI * 2 - Math.abs(vertex.angle - attachment.angle));
+      return 2 * radius * Math.sin(delta / 2) < 2.5;
+    });
+    if (tooClose) vertices.splice(i, 1);
+  }
+  vertices.sort((a, b) => a.angle - b.angle);
+
+  // Snap approach endpoints onto the exact ring vertices used below.
+  for (const line of approaches) {
+    for (const index of [0, line.points.length - 1]) {
+      const point = line.points[index]!;
+      if (Math.abs(dist(point, centre) - radius) > 1e-4) continue;
+      const angle = normalAngle(Math.atan2(point.y - centre.y, point.x - centre.x));
+      let best = vertices[0]!;
+      let bestDelta = Infinity;
+      for (const vertex of vertices) {
+        const delta = Math.min(Math.abs(vertex.angle - angle), Math.PI * 2 - Math.abs(vertex.angle - angle));
+        if (delta < bestDelta) {
+          best = vertex;
+          bestDelta = delta;
+        }
+      }
+      line.points[index] = best.point;
+    }
+  }
+
+  const candidateLines = [...retained, ...approaches];
+  const candidateBarriers = barriersForLines(candidateLines);
+  const ringLines: PlannedLine[] = [];
+  const ringClearance = clearanceOf("street");
+  for (let k = 0; k < vertices.length; k++) {
+    const a = vertices[k]!.point;
+    const b = vertices[(k + 1) % vertices.length]!.point;
+    if (parallelConflict(a, b, ringClearance, candidateBarriers)) {
+      state.rejected++;
+      return false;
+    }
+    const line: PlannedLine = { points: [a, b], classId: "street", preset: "tight", role: `${role}/ring/${k}` };
+    ringLines.push(line);
+    candidateBarriers.push({ a, b, clearance: ringClearance });
+  }
+
+  state.lines = [...candidateLines, ...ringLines];
+  state.barriers = candidateBarriers;
   return true;
 }
 
@@ -470,13 +649,16 @@ function planSecondaryHubs(state: PlanState, hubMode: HubMode, layout: RoadLayou
     if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
     else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
   }
-  verticals.sort((p, q) => p - q);
-  horizontals.sort((p, q) => p - q);
+  const uniqueSorted = (values: number[]): number[] => values
+    .sort((a, b) => a - b)
+    .filter((value, index, all) => index === 0 || Math.abs(value - all[index - 1]!) > EPS);
+  const arterialXs = uniqueSorted(verticals);
+  const arterialYs = uniqueSorted(horizontals);
   const half = clamp(state.minDim * 0.045, 22, 45);
   const cells: Rect[] = [];
   {
-    const xs = [state.box.x, ...verticals, state.box.x + state.box.width];
-    const ys = [state.box.y, ...horizontals, state.box.y + state.box.height];
+    const xs = [state.box.x, ...arterialXs, state.box.x + state.box.width];
+    const ys = [state.box.y, ...arterialYs, state.box.y + state.box.height];
     for (let i = 0; i + 1 < xs.length; i++) {
       for (let j = 0; j + 1 < ys.length; j++) {
         cells.push({ x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! });
@@ -518,34 +700,38 @@ function planStreets(state: PlanState, layout: RoadLayout): void {
     if (line.role.startsWith("arterial/x")) verticals.push(line.points[0]!.x);
     else if (line.role.startsWith("arterial/y")) horizontals.push(line.points[0]!.y);
   }
-  verticals.sort((p, q) => p - q);
-  horizontals.sort((p, q) => p - q);
-  const xs = [state.box.x, ...verticals, state.box.x + state.box.width];
-  const ys = [state.box.y, ...horizontals, state.box.y + state.box.height];
+  const uniqueSorted = (values: number[]): number[] => values
+    .sort((a, b) => a - b)
+    .filter((value, index, all) => index === 0 || Math.abs(value - all[index - 1]!) > EPS);
+  const xs = [state.box.x, ...uniqueSorted(verticals), state.box.x + state.box.width];
+  const ys = [state.box.y, ...uniqueSorted(horizontals), state.box.y + state.box.height];
   const centreIn = (cell: Rect): boolean => state.centre.x >= cell.x && state.centre.x <= cell.x + cell.width && state.centre.y >= cell.y && state.centre.y <= cell.y + cell.height;
   let cellIndex = 0;
   for (let i = 0; i + 1 < xs.length; i++) {
     for (let j = 0; j + 1 < ys.length; j++) {
       const cell = { x: xs[i]!, y: ys[j]!, width: xs[i + 1]! - xs[i]!, height: ys[j + 1]! - ys[j]! };
       if (layout === "mixed" && centreIn(cell)) {
-        // strict grid core: both orientations across the central cell, centre pair = arterial
-        const s = clamp(state.minDim / 9, 70, 110);
+        // Strict local grid: the central x/y pair is explicit, with symmetric street pairs
+        // added only where the arterial-bounded cell has enough room.
+        const spacing = clamp(state.minDim / 9, 70, 110);
         for (const axis of ["x", "y"] as const) {
           const lo = axis === "x" ? cell.x + 24 : cell.y + 24;
           const hi = axis === "x" ? cell.x + cell.width - 24 : cell.y + cell.height - 24;
-          const c = axis === "x" ? state.centre.x : state.centre.y;
-          for (let k = 0; k < 8; k++) {
-            const offset = (k + 0.5) * s;
-            for (const sign of [1, -1]) {
-              const pos = c + sign * offset;
-              if (pos < lo || pos > hi) continue;
-              const a = axis === "x" ? { x: pos, y: cell.y } : { x: cell.x, y: pos };
-              const b = axis === "x" ? { x: pos, y: cell.y + cell.height } : { x: cell.x + cell.width, y: pos };
-              pushLine(state, [a, b], Math.abs(pos - c) <= s ? "arterial" : "street", "tight", `lattice/${axis}/${k}/${sign}`);
-            }
+          const centre = axis === "x" ? state.centre.x : state.centre.y;
+          const positions = [centre];
+          for (let k = 1; k < 8; k++) {
+            const offset = k * spacing;
+            positions.push(centre - offset, centre + offset);
+          }
+          for (const pos of positions.sort((a, b) => a - b)) {
+            if (pos < lo || pos > hi) continue;
+            const a = axis === "x" ? { x: pos, y: cell.y } : { x: cell.x, y: pos };
+            const b = axis === "x" ? { x: pos, y: cell.y + cell.height } : { x: cell.x + cell.width, y: pos };
+            const classId: RouteClassId = Math.abs(pos - centre) <= EPS ? "arterial" : "street";
+            pushLine(state, [a, b], classId, "tight", `lattice/${axis}/${Math.round((pos - centre) / spacing)}`);
           }
         }
-        if (roundaboutAt(state, state.centre, "roundabout/core")) state.hubPoints.push(state.centre);
+        roundaboutAt(state, state.centre, "roundabout/core");
         cellIndex++;
         continue;
       }
@@ -557,7 +743,7 @@ function planStreets(state: PlanState, layout: RoadLayout): void {
       }
       const vertical = hash2(cellIndex, 3, state.seed) < 0.7;
       const both = hash2(cellIndex, 5, state.seed) < 0.15;
-      const span = vertical ? h : w;
+      const span = vertical ? w : h;
       const n = Math.max(0, Math.min(4, Math.round(span / 120) - 1 + (hash2(cellIndex, 7, state.seed) < 0.4 ? 1 : 0)));
       const placed: number[] = [];
       for (let k = 0; k < n; k++) {
@@ -571,7 +757,7 @@ function planStreets(state: PlanState, layout: RoadLayout): void {
       }
       if (both) {
         const t = hash2(cellIndex, 21, state.seed);
-        const spanOther = vertical ? w : h;
+        const spanOther = vertical ? h : w;
         const off = 24 + t * Math.max(1, spanOther - 48);
         const classId = hash2(cellIndex, 23, state.seed) < 0.45 ? "narrow" : "street";
         const a = vertical ? { x: cell.x, y: cell.y + off } : { x: cell.x + off, y: cell.y };
@@ -641,108 +827,158 @@ function planHighways(state: PlanState): void {
   if (chosen.length === 0) state.warnings.push("no highway position fit");
 }
 
-/** Waterfront promenade: the land-ring edges whose outward probe is inside the scene but outside
- *  the land are the coast; offset the coast 6 m inland and keep only pieces that stay clear. */
+/** Waterfront promenade: find contiguous coastal runs, offset each run independently,
+ *  keep only clear pieces, then connect exposed run ends to the nearest vehicle road. */
 function planPromenade(state: PlanState): void {
   const land = state.land;
   const signed = ringArea(land);
   const ccw = signed > 0;
-  interface CoastEdge { a: Vec2; b: Vec2; nx: number; ny: number; }
-  const coasts: CoastEdge[] = [];
+  interface CoastEdge { index: number; a: Vec2; b: Vec2; nx: number; ny: number; }
+  const coastByIndex = new Map<number, CoastEdge>();
   for (let i = 0; i < land.length; i++) {
     const a = land[i]!;
     const b = land[(i + 1) % land.length]!;
-    const len = Math.hypot(b.x - a.x, b.y - a.y);
-    if (len < EPS) continue;
-    const dx = (b.x - a.x) / len;
-    const dy = (b.y - a.y) / len;
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    if (length < EPS) continue;
+    const dx = (b.x - a.x) / length;
+    const dy = (b.y - a.y) / length;
     const nx = ccw ? dy : -dy;
     const ny = ccw ? -dx : dx;
     const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     const probe = { x: mid.x + nx * 2, y: mid.y + ny * 2 };
-    if (pointInRect(probe, state.sceneBounds) && !pointInRing(probe, land)) coasts.push({ a, b, nx, ny });
+    if (pointInRect(probe, state.sceneBounds) && !pointInRing(probe, land)) coastByIndex.set(i, { index: i, a, b, nx, ny });
   }
-  if (coasts.length === 0) return;
-  const verts: Vec2[] = [];
-  for (let i = 0; i < coasts.length; i++) {
-    const e = coasts[i]!;
-    const prev = coasts[(i - 1 + coasts.length) % coasts.length]!;
-    const ix = -(prev.nx + e.nx);
-    const iy = -(prev.ny + e.ny);
-    const il = Math.hypot(ix, iy) || 1;
-    verts.push({ x: e.a.x + (ix / il) * 6, y: e.a.y + (iy / il) * 6 });
-  }
-  const last = coasts[coasts.length - 1]!;
-  verts.push({ x: last.b.x - last.nx * 6, y: last.b.y - last.ny * 6 });
-  const clearance = clearanceOf("waterfront-promenade");
-  const pieces: Vec2[][] = [];
-  for (let i = 0; i + 1 < verts.length; i++) {
-    const a = verts[i]!;
-    const b = verts[i + 1]!;
-    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    if (!pointInRing(mid, state.mask) || !pointInRing(mid, state.land)) continue;
-    if (parallelConflict(a, b, clearance, state.barriers)) continue;
-    if (!corridorFits(a, b, clearance, state.mask, state.land, state.sceneBounds)) continue;
-    pieces.push([a, b]);
-    state.barriers.push({ a, b, clearance });
-  }
-  if (pieces.length === 0) return;
-  // run ends: chain vertices whose neighbour piece was dropped
-  const runEnds = new Set<Vec2>();
-  const first = pieces[0]!;
-  const lastP = pieces[pieces.length - 1]!;
-  runEnds.add(first[0]!);
-  runEnds.add(lastP[1]!);
-  for (let i = 1; i < pieces.length; i++) {
-    const prevEnd = pieces[i - 1]![1]!;
-    const curStart = pieces[i]![0]!;
-    if (dist(prevEnd, curStart) > JUNCTION_TOLERANCE_M) {
-      runEnds.add(prevEnd);
-      runEnds.add(curStart);
-    }
-  }
-  for (let i = 0; i < pieces.length; i++) {
-    const [a, b] = pieces[i]! as [Vec2, Vec2];
-    if (pushLine(state, [a, b], "waterfront-promenade", "tight", `promenade/${i}`)) {
-      for (const end of [a, b]) {
-        if (!runEnds.has(end)) continue;
-        // connect the run end to the nearest planned road
-        let best: { point: Vec2; d: number } | null = null;
-        for (const line of state.lines) {
-          const pts = line.points;
-          for (let k = 0; k + 1 < pts.length; k++) {
-            const proj = projectPoint(pts[k]!, pts[k + 1]!, end);
-            if (proj && proj.t > 1e-3 && proj.t < 1 - 1e-3 && proj.dist < 80 && (!best || proj.dist < best.d)) best = { point: proj.point, d: proj.dist };
-          }
-        }
-        if (!best) continue;
-        if (parallelConflict(end, best.point, clearance, state.barriers)) continue;
-        if (!corridorFits(end, best.point, clearance, state.mask, state.land, state.sceneBounds)) continue;
-        pushLine(state, [end, best.point], "waterfront-promenade", "tight", `promenade/conn/${i}`);
+  if (coastByIndex.size === 0) return;
+
+  const runs: { edges: CoastEdge[]; closed: boolean }[] = [];
+  if (coastByIndex.size === land.length) {
+    runs.push({ edges: [...coastByIndex.values()].sort((a, b) => a.index - b.index), closed: true });
+  } else {
+    let nonCoast = 0;
+    while (coastByIndex.has(nonCoast)) nonCoast++;
+    let current: CoastEdge[] = [];
+    for (let step = 1; step <= land.length; step++) {
+      const index = (nonCoast + step) % land.length;
+      const edge = coastByIndex.get(index);
+      if (edge) current.push(edge);
+      else if (current.length > 0) {
+        runs.push({ edges: current, closed: false });
+        current = [];
       }
     }
+    if (current.length > 0) runs.push({ edges: current, closed: false });
+  }
+
+  const insetPoint = (point: Vec2, previous: CoastEdge | undefined, next: CoastEdge | undefined): Vec2 => {
+    if (!previous && next) return { x: point.x - next.nx * 6, y: point.y - next.ny * 6 };
+    if (previous && !next) return { x: point.x - previous.nx * 6, y: point.y - previous.ny * 6 };
+    const ix = -(previous!.nx + next!.nx);
+    const iy = -(previous!.ny + next!.ny);
+    const length = Math.hypot(ix, iy);
+    if (length <= 1e-6) return { x: point.x - next!.nx * 6, y: point.y - next!.ny * 6 };
+    const ux = ix / length;
+    const uy = iy / length;
+    const inwardX = -next!.nx;
+    const inwardY = -next!.ny;
+    const projection = Math.max(0.35, ux * inwardX + uy * inwardY);
+    const miter = Math.min(18, 6 / projection);
+    return { x: point.x + ux * miter, y: point.y + uy * miter };
+  };
+
+  const clearance = clearanceOf("waterfront-promenade");
+  const vehicleLines = state.lines.filter((line) => ROUTE_CLASS_REGISTRY.get(line.classId)?.vehicle);
+  const accepted: { a: Vec2; b: Vec2; role: string }[] = [];
+  for (let runIndex = 0; runIndex < runs.length; runIndex++) {
+    const run = runs[runIndex]!;
+    const vertices: Vec2[] = [];
+    if (run.closed) {
+      for (let i = 0; i < run.edges.length; i++) {
+        const edge = run.edges[i]!;
+        const previous = run.edges[(i - 1 + run.edges.length) % run.edges.length]!;
+        vertices.push(insetPoint(edge.a, previous, edge));
+      }
+    } else {
+      vertices.push(insetPoint(run.edges[0]!.a, undefined, run.edges[0]!));
+      for (let i = 1; i < run.edges.length; i++) vertices.push(insetPoint(run.edges[i]!.a, run.edges[i - 1]!, run.edges[i]!));
+      vertices.push(insetPoint(run.edges[run.edges.length - 1]!.b, run.edges[run.edges.length - 1]!, undefined));
+    }
+    const pairCount = run.closed ? vertices.length : vertices.length - 1;
+    for (let i = 0; i < pairCount; i++) {
+      const a = vertices[i]!;
+      const b = vertices[(i + 1) % vertices.length]!;
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      if (!pointInRing(mid, state.mask) || !pointInRing(mid, state.land)) continue;
+      if (!corridorFits(a, b, clearance, state.mask, state.land, state.sceneBounds)) continue;
+      const role = `promenade/${runIndex}/${i}`;
+      if (pushLine(state, [a, b], "waterfront-promenade", "tight", role)) accepted.push({ a, b, role });
+    }
+  }
+  if (accepted.length === 0) return;
+
+  const endpointCounts = new Map<string, { point: Vec2; count: number; role: string }>();
+  const endpointKey = (point: Vec2): string => `${Math.round(point.x * 1e4)},${Math.round(point.y * 1e4)}`;
+  for (const piece of accepted) {
+    for (const point of [piece.a, piece.b]) {
+      const key = endpointKey(point);
+      const current = endpointCounts.get(key);
+      if (current) current.count++;
+      else endpointCounts.set(key, { point, count: 1, role: piece.role });
+    }
+  }
+  let connectorIndex = 0;
+  for (const endpoint of endpointCounts.values()) {
+    if (endpoint.count !== 1) continue;
+    let best: { point: Vec2; d: number } | null = null;
+    for (const line of vehicleLines) {
+      for (const [a, b] of linePairs(line)) {
+        const projection = projectPoint(a, b, endpoint.point);
+        if (!projection || projection.t <= 1e-3 || projection.t >= 1 - 1e-3 || projection.dist <= JUNCTION_TOLERANCE_M || projection.dist >= 80) continue;
+        if (!best || projection.dist < best.d) best = { point: projection.point, d: projection.dist };
+      }
+    }
+    if (!best) continue;
+    if (!corridorFits(endpoint.point, best.point, clearance, state.mask, state.land, state.sceneBounds)) continue;
+    pushLine(state, [endpoint.point, best.point], "waterfront-promenade", "tight", `promenade/connector/${connectorIndex++}`);
   }
 }
 
 function planGrid(state: PlanState, hubMode: HubMode): void {
-  const s = clamp(state.minDim / 7.5, 90, 130);
-  const countX = Math.max(2, Math.round(state.box.width / s));
-  const sX = state.box.width / countX;
-  const countY = Math.max(2, Math.round(state.box.height / s));
-  const sY = state.box.height / countY;
+  const targetSpacing = clamp(state.minDim / 7.5, 90, 130);
+  const countX = Math.max(2, Math.round(state.box.width / targetSpacing));
+  const countY = Math.max(2, Math.round(state.box.height / targetSpacing));
+  const positions = (start: number, extent: number, count: number, centre: number): number[] => {
+    const spacing = extent / count;
+    const end = start + extent;
+    const values = [centre];
+    for (let k = 1; ; k++) {
+      const lo = centre - k * spacing;
+      const hi = centre + k * spacing;
+      let added = false;
+      if (lo >= start - EPS) {
+        values.push(Math.max(start, lo));
+        added = true;
+      }
+      if (hi <= end + EPS) {
+        values.push(Math.min(end, hi));
+        added = true;
+      }
+      if (!added) break;
+    }
+    return values
+      .sort((a, b) => a - b)
+      .filter((value, index, all) => index === 0 || Math.abs(value - all[index - 1]!) > EPS);
+  };
   const verticals: number[] = [];
   const horizontals: number[] = [];
-  for (let k = 0; k <= countX; k++) {
-    const x = state.box.x + k * sX;
+  for (const [k, x] of positions(state.box.x, state.box.width, countX, state.centre.x).entries()) {
     const a = { x, y: state.box.y };
     const b = { x, y: state.box.y + state.box.height };
-    if (pushLine(state, [a, b], Math.abs(x - state.centre.x) <= sX ? "arterial" : "street", "tight", `grid/v/${k}`)) verticals.push(x);
+    if (pushLine(state, [a, b], Math.abs(x - state.centre.x) <= EPS ? "arterial" : "street", "tight", `grid/v/${k}`)) verticals.push(x);
   }
-  for (let k = 0; k <= countY; k++) {
-    const y = state.box.y + k * sY;
+  for (const [k, y] of positions(state.box.y, state.box.height, countY, state.centre.y).entries()) {
     const a = { x: state.box.x, y };
     const b = { x: state.box.x + state.box.width, y };
-    if (pushLine(state, [a, b], Math.abs(y - state.centre.y) <= sY ? "arterial" : "street", "tight", `grid/h/${k}`)) horizontals.push(y);
+    if (pushLine(state, [a, b], Math.abs(y - state.centre.y) <= EPS ? "arterial" : "street", "tight", `grid/h/${k}`)) horizontals.push(y);
   }
   planRoundabouts(state, hubMode, { verticals, horizontals });
   planLanes(state);
@@ -790,21 +1026,21 @@ function shapeInsideMasks(shape: Ring, mask: Ring, land: Ring, sceneBounds?: Rec
   return polygonArea(difference(clipped, [maskMulti])) <= 1e-6 && polygonArea(difference(clipped, [landMulti])) <= 1e-6;
 }
 
-function corridorsInsideMask(source: RoadSource, mask: Ring, sceneBounds: Rect): boolean {
+function corridorsInsideMasks(source: RoadSource, mask: Ring, land: Ring, sceneBounds: Rect): boolean {
   const network = compileRouteNetwork(source);
   for (const span of network.segments) {
     const corridor = edgeQuad(span.a, span.b, span.clearanceM);
-    if (corridor.length >= 3 && !shapeInsideMasks(corridor, mask, mask, sceneBounds)) {
+    if (corridor.length >= 3 && !shapeInsideMasks(corridor, mask, land, sceneBounds)) {
       if (process.env.NIXIE_DEBUG_ROADS) {
         const { writeFileSync } = require("node:fs");
-        writeFileSync(process.env.NIXIE_DEBUG_ROADS, JSON.stringify({ span, mask, sceneBounds }));
+        writeFileSync(process.env.NIXIE_DEBUG_ROADS, JSON.stringify({ span, mask, land, sceneBounds }));
       }
       return false;
     }
     for (const point of [span.a, span.b]) {
       const disc = nodeDisc(point, span.clearanceM);
       if (disc.length < 3) continue;
-      if (!shapeInsideMasks(disc, mask, mask, sceneBounds)) return false;
+      if (!shapeInsideMasks(disc, mask, land, sceneBounds)) return false;
     }
   }
   return true;
@@ -930,7 +1166,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
     planArterials(state);
     planAvenues(state);
     planRings(state);
-    planOldTown(state);
+    if (layout === "european") planOldTown(state);
     planRoundabouts(state, hubMode);
     planSecondaryHubs(state, hubMode, layout);
     planStreets(state, layout);
@@ -940,21 +1176,15 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
   planPromenade(state);
 
   // ---- clip every planned segment to the land ----
-  const segPairsOf = (line: PlannedLine): [Vec2, Vec2][] => {
-    const pairs: [Vec2, Vec2][] = [];
-    for (let i = 0; i + 1 < line.points.length; i++) pairs.push([line.points[i]!, line.points[i + 1]!]);
-    if (line.closed && line.points.length > 2) pairs.push([line.points[line.points.length - 1]!, line.points[0]!]);
-    return pairs;
-  };
   const pieces: { a: Vec2; b: Vec2; lineIndex: number }[] = [];
   let attempts = 0;
   let discarded = state.rejected;
   for (let li = 0; li < state.lines.length; li++) {
     const line = state.lines[li]!;
-    for (const [a, b] of segPairsOf(line)) {
+    for (const [a, b] of linePairs(line)) {
       attempts++;
       const clipped: Vec2[] = [];
-      clipSegment(a, b, clearanceOf(line.classId), input.mask, land, sceneBounds, minLengthOf(line.classId), clipped);
+      clipSegment(a, b, clearanceOf(line.classId), input.mask, land, sceneBounds, minLengthOfPlannedLine(line), clipped);
       if (clipped.length === 0) {
         discarded++;
         continue;
@@ -1150,7 +1380,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
   if (sourceProblems.length > 0) throw new Error(`Generated road source is invalid: ${sourceProblems.join(" ")}`);
   const topology = validateRouteTopology(pruned, compileRouteNetwork(pruned));
   if (!topology.ok) throw new Error(`Generated road topology is invalid: ${topology.problems.join(" ")}`);
-  if (!corridorsInsideMask(pruned, input.mask, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask.");
+  if (!corridorsInsideMasks(pruned, input.mask, land, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask or land.");
   const hubs = state.hubPoints
     .map((point) => nearestNodeId(pruned, point, 100))
     .filter((id): id is string => id !== undefined)
