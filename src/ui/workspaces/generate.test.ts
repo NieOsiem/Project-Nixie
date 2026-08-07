@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { allRoadEdgeIds, roadGenerationActionsHTML, roadGenerationAvailability, roadSelectionActionsEnabled } from "./road-app.js";
+import { allRoadEdgeIds, roadGenerationActionsHTML, roadGenerationAvailability } from "./generate.js";
 
-describe("Roads application generation state", () => {
+describe("Generate workspace road generation state", () => {
   it("requires terrain before enabling initial road generation", () => {
     expect(roadGenerationAvailability("supported", true, null)).toEqual({
       enabled: false,
@@ -27,10 +27,12 @@ describe("Roads application generation state", () => {
     });
   });
 
-  it("keeps road actions enabled for a multi-selection", () => {
-    expect(roadSelectionActionsEnabled(true, 2)).toBe(true);
-    expect(roadSelectionActionsEnabled(true, 0)).toBe(false);
-    expect(roadSelectionActionsEnabled(false, 2)).toBe(false);
+  it("keeps generation disabled until the Scene is enabled", () => {
+    expect(roadGenerationAvailability("supported", false, null)).toEqual({
+      enabled: false,
+      reason: "Enable Nixie on this Scene first.",
+      roadCount: 0
+    });
   });
 
   it("collects every persisted edge for delete-all", () => {

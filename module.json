@@ -8,5 +8,6 @@
     "verified": "14"
   },
   "esmodules": ["dist/project-nixie.mjs"],
+  "styles": ["styles/nixie.css"],
   "authors": [{ "name": "Vira" }]
 }

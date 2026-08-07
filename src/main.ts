@@ -51,19 +51,18 @@ import {
 } from "./constants.js";
 import { WEATHER_PRESETS } from "./render/look-dials.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
-import { registerSceneControls } from "./ui/controls.js";
+import { registerEditorSceneControls } from "./ui/editor-controls.js";
+import { installEditorShellController, openRoadApp, openTerrainApp } from "./ui/editor-shell.js";
+import { isEditorOpen } from "./ui/editor-state.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
-import { registerRoadSceneControls } from "./ui/road-controls.js";
 import { ROAD_LAYER_NAME, roadLayerClass } from "./ui/road-layer.js";
-import { openRoadApp } from "./ui/road-app.js";
-import { openTerrainApp } from "./ui/terrain-app.js";
 
 const CONTROL = "Control";
 const SHIFT = "Shift";
 
 function registerKeybindings(): void {
   const whenEditing = (action: () => Promise<unknown>) => (): boolean => {
-    if (![LAYER_NAME, ROAD_LAYER_NAME].includes(canvas?.activeLayer?.options?.name)) return false;
+    if (!isEditorOpen()) return false;
     void action();
     return true;
   };
@@ -85,8 +84,8 @@ Hooks.once("init", () => {
   CONFIG.Canvas.layers[LAYER_NAME] = { layerClass: nixieLayerClass(), group: "interface" };
   CONFIG.Canvas.layers[ROAD_LAYER_NAME] = { layerClass: roadLayerClass(), group: "interface" };
   registerSettings();
-  registerSceneControls();
-  registerRoadSceneControls();
+  installEditorShellController();
+  registerEditorSceneControls();
   registerKeybindings();
   registerHooks();
 

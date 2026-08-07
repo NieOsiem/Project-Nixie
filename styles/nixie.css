@@ -1,0 +1,370 @@
+/* Project Nixie — City Generator 2.0 editor shell.
+   Foundry-adjacent visual language (UI spec §33): dark charcoal/navy translucent surfaces,
+   warm beige/gold borders and accents, off-white text, compact controls. Semantic Nixie
+   variables map onto Foundry theme variables with literal fallbacks for exotic themes. */
+
+.nixie-editor {
+  --nixie-bg: var(--color-cool-5-90, rgba(11, 10, 19, 0.9));
+  --nixie-bg-raised: var(--color-cool-4, #302831);
+  --nixie-border: var(--color-border-light-tertiary, #7a7971);
+  --nixie-border-strong: var(--color-border-light-secondary, #c9c7b8);
+  --nixie-text: var(--color-text-light-heading, #c9c7b8);
+  --nixie-text-bright: var(--color-text-light-highlight, #f0f0e0);
+  --nixie-accent: var(--color-warm-1, #ee9b3a);
+  --nixie-disabled: var(--color-text-dark-inactive, #7a7971);
+  --nixie-success: #9dbb8a;
+  --nixie-error: #d99a9a;
+
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 150;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: max-content;
+  max-width: min(920px, calc(100vw - 24px));
+  font-family: var(--font-body, "Signika", "Palatino Linotype", sans-serif);
+  font-size: var(--font-size-13, 0.8125rem);
+  color: var(--nixie-text);
+}
+
+.nixie-editor *,
+.nixie-editor *::before,
+.nixie-editor *::after {
+  box-sizing: border-box;
+}
+
+.nixie-editor button {
+  font-family: inherit;
+}
+
+/* ── Workspace Bar ─────────────────────────────────────────────── */
+
+.nixie-workspace-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 40px;
+  padding: 3px;
+  background: var(--nixie-bg);
+  border: 1px solid var(--nixie-border);
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+}
+
+.nixie-brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 6px;
+  color: var(--nixie-accent);
+  font-size: var(--font-size-14, 0.875rem);
+  font-weight: 600;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+.nixie-workspaces {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  justify-content: center;
+}
+
+.nixie-workspace {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nixie-workspace:hover {
+  background: var(--nixie-bg-raised);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-workspace.active {
+  background: var(--nixie-bg-raised);
+  border-color: var(--nixie-border);
+  color: var(--nixie-text-bright);
+  box-shadow: inset 0 -2px 0 var(--nixie-accent);
+}
+
+.nixie-workspace.unavailable {
+  opacity: 0.55;
+}
+
+.nixie-shell-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 6px;
+}
+
+.nixie-shell-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+}
+
+.nixie-shell-actions button:hover:not(:disabled) {
+  border-color: var(--nixie-border);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-shell-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── Tool Shelf ────────────────────────────────────────────────── */
+
+.nixie-tool-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  background: var(--nixie-bg);
+  border: 1px solid var(--nixie-border);
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+}
+
+.nixie-shelf-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.nixie-shelf-row > button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 12px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nixie-shelf-row > button:hover:not(:disabled) {
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-shelf-row > button.active {
+  border-color: var(--nixie-accent);
+  color: var(--nixie-text-bright);
+  box-shadow: inset 0 0 0 1px var(--nixie-accent);
+}
+
+.nixie-shelf-row > button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.nixie-shelf-row select,
+.nixie-shelf-row input[type="text"] {
+  height: 28px;
+  padding: 0 6px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+}
+
+.nixie-shelf-row select:focus,
+.nixie-shelf-row input[type="text"]:focus {
+  outline: none;
+  border-color: var(--nixie-border-strong);
+}
+
+.nixie-shelf-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.nixie-shelf-field input[type="checkbox"] {
+  accent-color: var(--nixie-accent);
+}
+
+.nixie-shelf-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--nixie-border);
+  opacity: 0.5;
+}
+
+.nixie-shelf-summary {
+  color: var(--nixie-accent);
+  font-size: var(--font-size-12, 0.75rem);
+}
+
+.nixie-placeholder {
+  margin: 2px;
+  padding: 6px 10px;
+  color: var(--nixie-disabled);
+  font-style: italic;
+}
+
+/* ── Context Tray ──────────────────────────────────────────────── */
+
+.nixie-context-tray {
+  width: min(760px, calc(100vw - 24px));
+  max-height: calc(100vh - 150px);
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: var(--nixie-bg);
+  border: 1px solid var(--nixie-border);
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+}
+
+.nixie-context-tray.nixie-tray-generate {
+  width: min(860px, calc(100vw - 24px));
+}
+
+.nixie-context-tray h3 {
+  margin: 4px 0 6px;
+  color: var(--nixie-text-bright);
+  font-family: var(--font-h3, "Signika", sans-serif);
+  font-size: var(--font-size-16, 1rem);
+}
+
+.nixie-note {
+  margin: 4px 0;
+  color: var(--nixie-disabled);
+  font-size: var(--font-size-12, 0.75rem);
+}
+
+.nixie-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 6px 14px;
+}
+
+.nixie-context-tray .form-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.nixie-context-tray .form-group > label {
+  flex: 0 0 auto;
+  min-width: 110px;
+  color: var(--nixie-text);
+}
+
+.nixie-context-tray .form-group .form-fields {
+  flex: 1;
+}
+
+.nixie-context-tray select,
+.nixie-context-tray input[type="text"] {
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+}
+
+.nixie-context-tray select:focus,
+.nixie-context-tray input[type="text"]:focus {
+  outline: none;
+  border-color: var(--nixie-border-strong);
+}
+
+.nixie-context-tray input[type="checkbox"] {
+  accent-color: var(--nixie-accent);
+}
+
+.nixie-context-tray .form-footer {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 8px 0 4px;
+}
+
+.nixie-context-tray .form-footer button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 12px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+}
+
+.nixie-context-tray .form-footer button:hover:not(:disabled) {
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-context-tray .form-footer button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.nixie-context-tray [data-status-kind="success"] {
+  color: var(--nixie-success);
+}
+
+.nixie-context-tray [data-status-kind="error"] {
+  color: var(--nixie-error);
+}
+
+/* ── Responsive (UI spec §34) ──────────────────────────────────── */
+
+@media (max-width: 1100px) {
+  .nixie-workspace span {
+    display: none;
+  }
+
+  .nixie-workspace {
+    padding: 0 9px;
+  }
+
+  .nixie-brand span {
+    display: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .nixie-context-tray {
+    width: calc(100vw - 24px);
+  }
+
+  .nixie-form-grid {
+    grid-template-columns: 1fr;
+  }
+}

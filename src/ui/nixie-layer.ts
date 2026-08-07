@@ -12,15 +12,9 @@ import {
   worldToMetres
 } from "../adapter/canvas.js";
 import type { Ring, Vec2 } from "../core/geom/types.js";
+import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_NIXIE, TOOL } from "./editor-state.js";
 
-export const LAYER_NAME = "nixie";
-
-export const TOOL = {
-  LAND_DRAW: "land-draw",
-  FOOTPRINT_DRAW: "footprint-draw",
-  LAND_EDIT: "land-edit",
-  FOOTPRINT_EDIT: "footprint-edit"
-} as const;
+export const LAYER_NAME = LAYER_NIXIE;
 
 type Target = "land" | "urbanFootprint";
 type Draft = { target: Target; points: Vec2[] };
@@ -49,13 +43,13 @@ function terrainOf(city: any): { land: Ring | null; urbanFootprint: Ring | null 
   };
 }
 
-function targetForTool(tool: string): Target | null {
+function targetForTool(tool: string | null): Target | null {
   if (tool === TOOL.LAND_DRAW || tool === TOOL.LAND_EDIT) return "land";
   if (tool === TOOL.FOOTPRINT_DRAW || tool === TOOL.FOOTPRINT_EDIT) return "urbanFootprint";
   return null;
 }
 
-function isDrawTool(tool: string): boolean {
+function isDrawTool(tool: string | null): boolean {
   return tool === TOOL.LAND_DRAW || tool === TOOL.FOOTPRINT_DRAW;
 }
 
@@ -114,6 +108,7 @@ export function nixieLayerClass(): any {
 
     async _tearDown(options: any): Promise<void> {
       if (activeLayer === this) activeLayer = null;
+      editorLayerDeactivated(LAYER_NAME);
       setCityListener(null);
       setTerrainDraftCancelListener(null);
       this.#overlay = null;
@@ -125,6 +120,7 @@ export function nixieLayerClass(): any {
 
     _activate(): void {
       activeLayer = this;
+      editorLayerActivated(LAYER_NAME);
       setCityListener(() => this.refresh());
       setTerrainDraftCancelListener(() => this.cancelDraft());
       this.visible = true;
@@ -132,6 +128,7 @@ export function nixieLayerClass(): any {
     }
 
     _deactivate(): void {
+      editorLayerDeactivated(LAYER_NAME);
       setCityListener(null);
       setTerrainDraftCancelListener(null);
       this.#draft = null;
@@ -222,7 +219,7 @@ export function nixieLayerClass(): any {
 
     #drawHandles(g: any, ring: Ring | null, target: Target): void {
       if (ring === null) return;
-      const radius = canvas.dimensions.size * (targetForTool(game.activeTool) === target ? 0.18 : 0.11);
+      const radius = canvas.dimensions.size * (targetForTool(canvasTool()) === target ? 0.18 : 0.11);
       g.lineStyle(0);
       g.beginFill(target === "land" ? COLOR_HANDLE : COLOR_FOOTPRINT, 0.95);
       for (const point of ring) {
@@ -290,12 +287,12 @@ export function nixieLayerClass(): any {
     }
 
     _canDragLeftStart(): boolean {
-      return isSceneEnabled() && getCity() !== null && !isDrawTool(game.activeTool) && targetForTool(game.activeTool) !== null;
+      return isSceneEnabled() && getCity() !== null && !isDrawTool(canvasTool()) && targetForTool(canvasTool()) !== null;
     }
 
     _onDragLeftStart(event: any): void {
       if (!this._canDragLeftStart()) return;
-      const target = targetForTool(game.activeTool);
+      const target = targetForTool(canvasTool());
       if (target === null) return;
       const point = this.#pointer(event);
       const nearest = this.#nearestVertex(target, point);
@@ -325,7 +322,7 @@ export function nixieLayerClass(): any {
 
     _onClickLeft(event: any): void {
       if (!isSceneEnabled() || getCity() === null) return;
-      const tool = game.activeTool;
+      const tool = canvasTool();
       if (!isDrawTool(tool)) return;
       const target = targetForTool(tool);
       if (target === null) return;

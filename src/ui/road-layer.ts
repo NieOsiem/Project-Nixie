@@ -16,16 +16,12 @@ import {
 import type { Vec2 } from "../core/geom/types.js";
 import { ROUTE_CLASS_REGISTRY, type RoadSource, type RouteClassId } from "../core/gen/city.js";
 import { compileRouteNetwork } from "../core/graph/compiler.js";
+import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_ROADS, ROAD_TOOL } from "./editor-state.js";
 
-export const ROAD_LAYER_NAME = "nixie-roads";
+export const ROAD_LAYER_NAME = LAYER_ROADS;
 
-export const ROAD_TOOL = {
-  DRAW: "road-draw",
-  SELECT: "road-select",
-  EDIT: "road-edit"
-} as const;
+export { ROAD_TOOL, type RoadTool } from "./editor-state.js";
 
-export type RoadTool = (typeof ROAD_TOOL)[keyof typeof ROAD_TOOL];
 export type RoadDraftConfig = Partial<{
   classId: RouteClassId;
   curvePreset: "tight" | "standard" | "broad";
@@ -52,24 +48,6 @@ function report(label: string, work: Promise<unknown>, then?: () => void): void 
 }
 
 let activeLayer: any = null;
-
-function activateLayerTool(tool?: RoadTool): void {
-  const layer = canvas?.[ROAD_LAYER_NAME];
-  if (typeof layer?.activate === "function") {
-    if (tool === undefined) layer.activate();
-    else layer.activate({ tool });
-  } else {
-    const initialize = ui?.controls?.initialize;
-    if (typeof initialize === "function") {
-      initialize.call(ui.controls, tool === undefined ? { layer: ROAD_LAYER_NAME } : { layer: ROAD_LAYER_NAME, tool });
-    }
-  }
-  activeLayer?.refresh?.();
-}
-
-export function activateRoadTool(tool: RoadTool): void {
-  activateLayerTool(tool);
-}
 
 export function finishRoadDraft(): Promise<boolean> {
   const layer = activeLayer as { finishDraft?: () => Promise<boolean> } | null;
@@ -119,6 +97,7 @@ export function roadLayerClass(): any {
 
     async _tearDown(options: any): Promise<void> {
       if (activeLayer === this) activeLayer = null;
+      editorLayerDeactivated(ROAD_LAYER_NAME);
       this.#removeCityListener?.();
       this.#removeCityListener = null;
       setRoadDraftCancelListener(null);
@@ -131,6 +110,7 @@ export function roadLayerClass(): any {
 
     _activate(): void {
       activeLayer = this;
+      editorLayerActivated(ROAD_LAYER_NAME);
       this.#removeCityListener ??= addCityListener(() => this.refresh());
       setRoadDraftCancelListener(() => this.cancelDraft());
       this.visible = true;
@@ -138,6 +118,7 @@ export function roadLayerClass(): any {
     }
 
     _deactivate(): void {
+      editorLayerDeactivated(ROAD_LAYER_NAME);
       this.#removeCityListener?.();
       this.#removeCityListener = null;
       setRoadDraftCancelListener(null);
@@ -323,7 +304,7 @@ export function roadLayerClass(): any {
     }
 
     _canDragLeftStart(): boolean {
-      return game.activeTool === ROAD_TOOL.EDIT && isSceneEnabled() && getCity() !== null;
+      return canvasTool() === ROAD_TOOL.EDIT && isSceneEnabled() && getCity() !== null;
     }
 
     _onDragLeftStart(event: any): void {
@@ -355,7 +336,7 @@ export function roadLayerClass(): any {
 
     _onClickLeft(event: any): void {
       if (!isSceneEnabled() || getCity() === null) return;
-      const tool = game.activeTool;
+      const tool = canvasTool();
       if (tool === ROAD_TOOL.SELECT) {
         const edgeId = this.#nearestRoadEdge(this.#pointer(event));
         if (edgeId !== null) selectRoad(edgeId, Boolean(event.shiftKey || event.data?.originalEvent?.shiftKey));
@@ -377,11 +358,11 @@ export function roadLayerClass(): any {
     }
 
     _onClickLeft2(): void {
-      if (game.activeTool === ROAD_TOOL.DRAW && this.#roadDraft !== null) void this.finishDraft();
+      if (canvasTool() === ROAD_TOOL.DRAW && this.#roadDraft !== null) void this.finishDraft();
     }
 
     _onClickRight(): void {
-      if (game.activeTool === ROAD_TOOL.DRAW && this.#roadDraft !== null && this.#roadDraft.points.length > 0) {
+      if (canvasTool() === ROAD_TOOL.DRAW && this.#roadDraft !== null && this.#roadDraft.points.length > 0) {
         this.#roadDraft.points.pop();
         this.#refreshPreview();
         return;
