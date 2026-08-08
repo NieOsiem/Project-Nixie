@@ -63,6 +63,7 @@ function shellHTML(): string {
     <div class="nixie-shell-actions">
       <button type="button" data-action="undo"${canUndo() ? "" : " disabled"} title="Undo city edit"><i class="fa-solid fa-rotate-left"></i></button>
       <button type="button" data-action="redo"${canRedo() ? "" : " disabled"} title="Redo city edit"><i class="fa-solid fa-rotate-right"></i></button>
+      <span class="nixie-shell-sep"></span>
       <button type="button" data-action="close-editor" title="Close the Nixie editor"><i class="fa-solid fa-xmark"></i></button>
     </div>
   </header>

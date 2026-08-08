@@ -6,12 +6,17 @@ import { TerrainSession } from "./terrain-session.js";
 import {
   configuredPixelsPerMetre,
   chunkCoverageComplete,
+  deleteRoadJunction,
+  deleteRoads,
   enabledFlagChanged,
+  getRoadSelection,
   mount,
   reclassifyRoad,
   renameRoad,
   roadClearanceBlockers,
   sceneBoundsFromPixels,
+  selectRoad,
+  selectRoadNode,
   setRoadCurvePreset,
   setRoadLocked,
   unmount
@@ -237,5 +242,30 @@ describe("road bulk mutation selection", () => {
     await expect(setRoadLocked(true, ["edge-a", "edge-a"])).rejects.toThrow("Road selection is stale");
     await expect(setRoadLocked(true, ["missing"])).rejects.toThrow("Road selection is stale");
     expect(saved).toEqual(before);
+  });
+
+  it("keeps a selected edge across a metadata-only commit", async () => {
+    selectRoad("edge-a");
+    await setRoadLocked(true);
+    expect(getRoadSelection().edgeIds).toEqual(["edge-a"]);
+  });
+
+  it("keeps a selected edge across a full rebuild commit", async () => {
+    selectRoad("edge-a");
+    await setRoadCurvePreset("broad", ["edge-a"]);
+    expect(getRoadSelection().edgeIds).toEqual(["edge-a"]);
+  });
+
+  it("drops deleted roads from the selection", async () => {
+    selectRoad("edge-a");
+    selectRoad("edge-b", true);
+    await deleteRoads(["edge-a"]);
+    expect(getRoadSelection().edgeIds).toEqual(["edge-b"]);
+  });
+
+  it("drops deleted junctions from the selection", async () => {
+    selectRoadNode("a1");
+    await deleteRoadJunction("a1");
+    expect(getRoadSelection().nodeIds).toEqual([]);
   });
 });

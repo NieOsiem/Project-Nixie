@@ -11,6 +11,7 @@ import {
   selectRoad,
   selectRoadNode,
   setRoadDraftCancelListener,
+  weldRoadNodes,
   worldToMetres
 } from "../adapter/canvas.js";
 import type { Vec2 } from "../core/geom/types.js";
@@ -257,13 +258,14 @@ export function roadLayerClass(): any {
       return { x: point.x, y: point.y };
     }
 
-    #nearestRoadNode(point: Vec2): { id: string; at: Vec2 } | null {
+    #nearestRoadNode(point: Vec2, excludeId: string | null = null): { id: string; at: Vec2 } | null {
       const city = getCity();
       if (city === null) return null;
       const reach = canvas.dimensions.size * 0.45;
       let nearest: { id: string; at: Vec2 } | null = null;
       let distance = reach * reach;
       for (const node of city.source.roads.nodes) {
+        if (node.id === excludeId) continue;
         const at = metresToWorld(node);
         const dx = at.x - point.x;
         const dy = at.y - point.y;
@@ -328,7 +330,13 @@ export function roadLayerClass(): any {
       const drag = this.#roadDrag;
       this.#roadDrag = null;
       this.#refreshPreview();
-      report("road anchor move", moveRoadNode(drag.nodeId, worldToMetres(this.#pointer(event))), () => this.refresh());
+      const at = this.#pointer(event);
+      const target = this.#nearestRoadNode(at, drag.nodeId);
+      if (target !== null) {
+        report("road weld", weldRoadNodes(drag.nodeId, target.id), () => this.refresh());
+        return;
+      }
+      report("road anchor move", moveRoadNode(drag.nodeId, worldToMetres(at)), () => this.refresh());
     }
 
     _onDragLeftCancel(): void {

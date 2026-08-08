@@ -139,6 +139,14 @@
   cursor: default;
 }
 
+.nixie-shell-sep {
+  width: 1px;
+  height: 20px;
+  margin: 0 2px;
+  background: var(--nixie-border);
+  opacity: 0.5;
+}
+
 /* ── Tool Shelf ────────────────────────────────────────────────── */
 
 .nixie-tool-shelf {
@@ -231,6 +239,80 @@
   font-size: var(--font-size-12, 0.75rem);
 }
 
+.nixie-shelf-hint {
+  margin: 0 4px 2px;
+  color: var(--nixie-disabled);
+  font-size: var(--font-size-12, 0.75rem);
+  white-space: nowrap;
+}
+
+.nixie-class-group-switch {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+}
+
+.nixie-class-group-switch button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  color: var(--nixie-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nixie-class-group-switch button:hover:not(:disabled) {
+  color: var(--nixie-text-bright);
+}
+
+.nixie-class-group-switch button.active {
+  background: var(--nixie-bg-raised);
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-class-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nixie-class-chip:hover:not(:disabled) {
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-class-chip.active {
+  border-color: var(--nixie-accent);
+  color: var(--nixie-text-bright);
+  box-shadow: inset 0 0 0 1px var(--nixie-accent);
+}
+
+.nixie-class-silhouette {
+  display: inline-block;
+  flex: 0 0 auto;
+  height: 3px;
+  background: currentColor;
+  opacity: 0.85;
+}
+
 .nixie-placeholder {
   margin: 2px;
   padding: 6px 10px;
@@ -261,6 +343,46 @@
   color: var(--nixie-text-bright);
   font-family: var(--font-h3, "Signika", sans-serif);
   font-size: var(--font-size-16, 1rem);
+}
+
+.nixie-inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.nixie-inspector-head h3 {
+  margin: 4px 0 2px;
+}
+
+.nixie-inspector-head button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 10px;
+  background: var(--color-cool-5, #0b0a13);
+  border: 1px solid var(--nixie-border);
+  border-radius: 3px;
+  color: var(--nixie-text);
+  cursor: pointer;
+}
+
+.nixie-inspector-head button:hover:not(:disabled) {
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-inspector-head button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.nixie-inspector-sub {
+  margin: 2px 0 8px;
+  color: var(--nixie-disabled);
+  font-size: var(--font-size-12, 0.75rem);
 }
 
 .nixie-note {

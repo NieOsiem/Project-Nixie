@@ -675,6 +675,16 @@ function validateRoadEdgeSelection(
   return selected;
 }
 
+/** Keep the selection across commits, dropping any road or junction the commit removed. */
+function pruneRoadSelection(selection: RoadSelection, source: CitySourceV2["roads"]): RoadSelection {
+  const edgeIds = new Set(source.edges.map((edge) => edge.id));
+  const nodeIds = new Set(source.nodes.map((node) => node.id));
+  return {
+    edgeIds: selection.edgeIds.filter((id) => edgeIds.has(id)),
+    nodeIds: selection.nodeIds.filter((id) => nodeIds.has(id))
+  };
+}
+
 function roadEdgesForSelection(
   source: CitySourceV2["roads"],
   edgeIds: readonly string[],
@@ -831,7 +841,7 @@ async function commitRoadSource(source: CitySourceV2["roads"], generation?: Part
     validateCandidate(candidate, true);
     const saved = await guardedSave(candidate, current.revision, true);
     session.publishCommit(saved);
-    roadSelection = { edgeIds: [], nodeIds: [] };
+    roadSelection = pruneRoadSelection(roadSelection, source);
     lastRoadBuild = {
       requested: 0,
       built: 0,
@@ -867,7 +877,7 @@ async function commitRoadSource(source: CitySourceV2["roads"], generation?: Part
     ui.notifications?.error(`Nixie: roads were saved, but presentation failed — ${error instanceof Error ? error.message : String(error)}`);
     result = { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: false, degraded: true };
   }
-  roadSelection = { edgeIds: [], nodeIds: [] };
+  roadSelection = pruneRoadSelection(roadSelection, source);
   cancelTerrainDraft();
   notifyCityChanged();
   return result;
@@ -1055,12 +1065,15 @@ export function setRoadLocked(locked: boolean, edgeIds: readonly string[] = road
   });
 }
 
-export function setRoadCurvePreset(curvePreset: RoadCurvePreset, edgeIds: readonly string[] = roadSelection.edgeIds): Promise<RebuildResult> {
+export function setRoadCurvePreset(curvePreset: RoadCurvePreset, edgeIds: readonly string[] = roadSelection.edgeIds, contiguousName = false): Promise<RebuildResult> {
   return terrainActions.run(async () => {
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
     if (!(["tight", "standard", "broad"] as const).includes(curvePreset)) throw new Error(`Unknown curve preset "${curvePreset}".`);
-    const selected = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const selectedIds = validateRoadEdgeSelection(city.source.roads, edgeIds);
+    const selected = selectedIds.size === 1 && contiguousName
+      ? roadEdgesForSelection(city.source.roads, edgeIds, true)
+      : selectedIds;
     const routeIds = new Set(city.source.roads.edges.filter((edge) => selected.has(edge.id)).map((edge) => edge.routeId));
     const source = { ...city.source.roads, routes: city.source.roads.routes.map((route) => routeIds.has(route.id) ? { ...route, curvePreset } : route) };
     return commitRoadSource(source);
