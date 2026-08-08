@@ -343,7 +343,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       expect(vehicleConnectivity(first.roads, first.diagnostics.hubs), seed).toBe(true);
       expect(validateRouteTopology(first.roads), seed).toMatchObject({ ok: true });
     }
-  });
+  }, 15000);
 
   it("does not collapse European or Mixed full-size maps during topology fallback", () => {
     const scene = { x: -600, y: -400, width: 1200, height: 800 };

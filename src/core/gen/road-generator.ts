@@ -1523,10 +1523,11 @@ function corridorsInsideMasks(source: RoadSource, mask: Ring, land: Ring, sceneB
   return true;
 }
 
-function nearestNodeId(source: RoadSource, point: Vec2, maxD: number): string | undefined {
+function nearestNodeId(source: RoadSource, point: Vec2, maxD: number, eligible?: ReadonlySet<string>): string | undefined {
   let best: string | undefined;
   let bestD = maxD;
   for (const node of source.nodes) {
+    if (eligible && !eligible.has(node.id)) continue;
     const d = Math.hypot(node.x - point.x, node.y - point.y);
     if (d <= bestD) {
       bestD = d;
@@ -2001,8 +2002,15 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
   const topology = validateRouteTopology(finalRoads, compileRouteNetwork(finalRoads));
   if (!topology.ok) throw new Error(`Generated road topology is invalid: ${topology.problems.join(" ")}`);
   if (!corridorsInsideMasks(finalRoads, input.mask, land, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask or land.");
+  // Hubs must land on the vehicle network: a decorative loop (cycleway/promenade) can run closer to a hub point than the hub's own ring.
+  const vehicleNodeIds = new Set<string>();
+  for (const edge of finalRoads.edges) {
+    if (!ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle) continue;
+    vehicleNodeIds.add(edge.a);
+    vehicleNodeIds.add(edge.b);
+  }
   const hubs = state.hubPoints
-    .map((point) => nearestNodeId(finalRoads, point, 120))
+    .map((point) => nearestNodeId(finalRoads, point, 120, vehicleNodeIds))
     .filter((id): id is string => id !== undefined)
     .filter((id, index, all) => all.indexOf(id) === index);
   return {
