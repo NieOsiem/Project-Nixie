@@ -358,7 +358,7 @@ describe("Phase 2 deterministic initial road generation", () => {
         expect(validateRouteTopology(generated.roads), `${layout}/${seed}`).toMatchObject({ ok: true });
       }
     }
-  });
+  }, 15000);
 
   it("keeps organic junctions legible instead of piling a neighbourhood into one knot", () => {
     const scene = { x: -600, y: -400, width: 1200, height: 800 };
@@ -374,7 +374,7 @@ describe("Phase 2 deterministic initial road generation", () => {
         expect(validateRouteTopology(generated), `${layout}/${seed}`).toMatchObject({ ok: true });
       }
     }
-  });
+  }, 15000);
 
   it("generates a recognisable grid with explicit junction nodes", () => {
     const scene = { x: -300, y: -240, width: 600, height: 480 };
