@@ -34,6 +34,12 @@ function interactionLayerBase(): any {
   return typeof InteractionLayer === "undefined" ? null : InteractionLayer;
 }
 
+/** Convert a zoom-1 size to scene pixels so hit areas and drag thresholds stay constant on screen. */
+function screenPx(size: number): number {
+  const zoom = canvas?.stage?.scale?.x;
+  return typeof zoom === "number" && Number.isFinite(zoom) && zoom > 0 ? size / zoom : size;
+}
+
 function terrainOf(city: any): { land: Ring | null; urbanFootprint: Ring | null } {
   const source = city?.source ?? city;
   const terrain = source?.terrain ?? city?.terrain;
@@ -93,6 +99,7 @@ export function nixieLayerClass(): any {
     #preview: any = null;
     #draft: Draft | null = null;
     #drag: VertexDrag | null = null;
+    #panHookId: string | null = null;
 
     async _draw(options: any): Promise<void> {
       await super._draw(options);
@@ -109,6 +116,7 @@ export function nixieLayerClass(): any {
     async _tearDown(options: any): Promise<void> {
       if (activeLayer === this) activeLayer = null;
       editorLayerDeactivated(LAYER_NAME);
+      this.#unwatchPan();
       setCityListener(null);
       setTerrainDraftCancelListener(null);
       this.#overlay = null;
@@ -123,18 +131,41 @@ export function nixieLayerClass(): any {
       editorLayerActivated(LAYER_NAME);
       setCityListener(() => this.refresh());
       setTerrainDraftCancelListener(() => this.cancelDraft());
+      this.#syncDragResistance();
+      this.#panHookId ??= Hooks.on("canvasPan", () => this.#syncDragResistance());
       this.visible = true;
       this.refresh();
     }
 
     _deactivate(): void {
       editorLayerDeactivated(LAYER_NAME);
+      this.#unwatchPan();
       setCityListener(null);
       setTerrainDraftCancelListener(null);
       this.#draft = null;
       this.#drag = null;
       this.#preview?.clear();
       this.visible = false;
+    }
+
+    #unwatchPan(): void {
+      if (this.#panHookId !== null) {
+        Hooks.off("canvasPan", this.#panHookId);
+        this.#panHookId = null;
+      }
+      this.#syncDragResistance();
+    }
+
+    /** Foundry's drag threshold is scene-space; keep it constant on screen while this layer is active. */
+    #syncDragResistance(): void {
+      const manager = canvas?.mouseInteractionManager;
+      if (manager === undefined || manager === null) return;
+      const options: Record<string, unknown> = manager.options ?? (manager.options = {});
+      if (!this.active) {
+        delete options.dragResistance;
+        return;
+      }
+      options.dragResistance = screenPx(canvas.dimensions.size / 4);
     }
 
     hasDraft(): boolean {
@@ -273,7 +304,7 @@ export function nixieLayerClass(): any {
 
     #nearestVertex(target: Target, point: Vec2): { index: number; at: Vec2 } | null {
       const ring = this.#ringWorld(target);
-      const reach = canvas.dimensions.size * 0.35;
+      const reach = screenPx(canvas.dimensions.size * 0.35);
       let nearest: { index: number; at: Vec2 } | null = null;
       let distance = reach * reach;
       ring.forEach((at, index) => {
@@ -296,7 +327,12 @@ export function nixieLayerClass(): any {
       if (!this._canDragLeftStart()) return;
       const target = targetForTool(canvasTool());
       if (target === null) return;
-      const point = this.#pointer(event);
+      // WHY: drag start fires only after the drag threshold is crossed, so the pointer has
+      // already moved off the vertex — anchor the grab on the original press position instead.
+      const origin = event?.interactionData?.origin;
+      const point = origin !== undefined && Number.isFinite(origin.x) && Number.isFinite(origin.y)
+        ? { x: origin.x, y: origin.y }
+        : this.#pointer(event);
       const nearest = this.#nearestVertex(target, point);
       if (nearest === null) return;
       this.#drag = { target, index: nearest.index, origin: nearest.at, current: nearest.at };
