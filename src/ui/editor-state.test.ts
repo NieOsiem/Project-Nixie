@@ -11,6 +11,7 @@ import {
   editorLayerActivated,
   editorLayerDeactivated,
   isEditorOpen,
+  notifyEditorInteraction,
   openEditor,
   ownedLayerName,
   ROAD_TOOL,
@@ -188,5 +189,11 @@ describe("session preferences", () => {
     closeEditor();
     openEditor();
     expect(currentObjectCategory()).toBe("props");
+  });
+
+  it("notifies the controller on canvas draft interaction", () => {
+    openEditor();
+    notifyEditorInteraction();
+    expect(controller.onStateChanged).toHaveBeenCalled();
   });
 });

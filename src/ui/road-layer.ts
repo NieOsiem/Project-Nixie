@@ -16,7 +16,7 @@ import {
 import type { Vec2 } from "../core/geom/types.js";
 import { ROUTE_CLASS_REGISTRY, type RoadSource, type RouteClassId } from "../core/gen/city.js";
 import { compileRouteNetwork } from "../core/graph/compiler.js";
-import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_ROADS, ROAD_TOOL } from "./editor-state.js";
+import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_ROADS, notifyEditorInteraction, ROAD_TOOL } from "./editor-state.js";
 
 export const ROAD_LAYER_NAME = LAYER_ROADS;
 
@@ -143,6 +143,7 @@ export function roadLayerClass(): any {
       this.#roadDrag = null;
       this.#preview?.clear();
       this.refresh();
+      notifyEditorInteraction();
     }
 
     async finishDraft(): Promise<boolean> {
@@ -166,6 +167,7 @@ export function roadLayerClass(): any {
       if (this.#roadDraft === draft) this.#roadDraft = null;
       this.#preview?.clear();
       this.refresh();
+      notifyEditorInteraction();
       return true;
     }
 
@@ -353,6 +355,7 @@ export function roadLayerClass(): any {
       const connecting = this.#roadDraft.points.length > 0 && (this.#nearestRoadNode(point) !== null || this.#nearestRoadEdge(point) !== null);
       this.#roadDraft.points.push(point);
       this.#refreshPreview();
+      notifyEditorInteraction();
       const original = event.data?.originalEvent ?? event;
       if (original.detail >= 2 || connecting) void this.finishDraft();
     }
@@ -365,6 +368,7 @@ export function roadLayerClass(): any {
       if (canvasTool() === ROAD_TOOL.DRAW && this.#roadDraft !== null && this.#roadDraft.points.length > 0) {
         this.#roadDraft.points.pop();
         this.#refreshPreview();
+        notifyEditorInteraction();
         return;
       }
       cancelRoadDraft();

@@ -299,6 +299,15 @@ export function setCanvasTool(next: string | null): void {
   controller?.onStateChanged();
 }
 
+/**
+ * The canvas layers call this after draft or selection state changes that do not
+ * commit a revision (drawing an anchor, backtracking, starting a draft) so the shell
+ * can refresh button enabled states immediately.
+ */
+export function notifyEditorInteraction(): void {
+  controller?.onStateChanged();
+}
+
 export function setObjectCategory(next: ObjectCategory): void {
   if (objectCategory === next) return;
   objectCategory = next;

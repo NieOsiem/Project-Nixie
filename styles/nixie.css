@@ -38,6 +38,10 @@
 
 .nixie-editor button {
   font-family: inherit;
+  /* WHY: Foundry's global `button { display: flex }` makes every button a block-level
+     flex container, which stretches to the container width in flow and in flex rows.
+     Pin the width to the label so shelves/trays stay compact. */
+  width: max-content;
 }
 
 /* ── Workspace Bar ─────────────────────────────────────────────── */
@@ -141,6 +145,9 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+  align-self: center;
+  width: max-content;
+  max-width: 100%;
   padding: 4px;
   background: var(--nixie-bg);
   border: 1px solid var(--nixie-border);
@@ -234,6 +241,7 @@
 /* ── Context Tray ──────────────────────────────────────────────── */
 
 .nixie-context-tray {
+  align-self: center;
   width: min(760px, calc(100vw - 24px));
   max-height: calc(100vh - 150px);
   overflow-y: auto;

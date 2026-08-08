@@ -12,7 +12,7 @@ import {
   worldToMetres
 } from "../adapter/canvas.js";
 import type { Ring, Vec2 } from "../core/geom/types.js";
-import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_NIXIE, TOOL } from "./editor-state.js";
+import { canvasTool, editorLayerActivated, editorLayerDeactivated, LAYER_NIXIE, notifyEditorInteraction, TOOL } from "./editor-state.js";
 
 export const LAYER_NAME = LAYER_NIXIE;
 
@@ -146,6 +146,7 @@ export function nixieLayerClass(): any {
       this.#drag = null;
       this.#preview?.clear();
       this.refresh();
+      notifyEditorInteraction();
     }
 
     async finishDraft(): Promise<boolean> {
@@ -167,6 +168,7 @@ export function nixieLayerClass(): any {
       this.#draft = null;
       this.#preview?.clear();
       this.refresh();
+      notifyEditorInteraction();
       return true;
     }
 
@@ -340,6 +342,7 @@ export function nixieLayerClass(): any {
       }
       this.#draft.points.push(point);
       this.#refreshPreview();
+      notifyEditorInteraction();
     }
 
     _onClickRight(): void {
