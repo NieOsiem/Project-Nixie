@@ -34,6 +34,12 @@ const COLOR_PREVIEW = 0x74ffa8;
 const COLOR_HANDLE = 0xffc94a;
 const COLOR_ROAD = 0x6ad8d2;
 
+/** Convert a zoom-1 size to scene pixels so hit areas and drag thresholds stay constant on screen. */
+function screenPx(size: number): number {
+  const zoom = canvas?.stage?.scale?.x;
+  return typeof zoom === "number" && Number.isFinite(zoom) && zoom > 0 ? size / zoom : size;
+}
+
 function interactionLayerBase(): any {
   const namespaced = foundry?.canvas?.layers?.InteractionLayer;
   if (namespaced) return namespaced;
@@ -82,6 +88,7 @@ export function roadLayerClass(): any {
     #finishing = false;
     #roadDrag: { nodeId: string; origin: Vec2; current: Vec2 } | null = null;
     #removeCityListener: (() => void) | null = null;
+    #panHookId: string | null = null;
 
     async _draw(options: any): Promise<void> {
       await super._draw(options);
@@ -99,6 +106,7 @@ export function roadLayerClass(): any {
     async _tearDown(options: any): Promise<void> {
       if (activeLayer === this) activeLayer = null;
       editorLayerDeactivated(ROAD_LAYER_NAME);
+      this.#unwatchPan();
       this.#removeCityListener?.();
       this.#removeCityListener = null;
       setRoadDraftCancelListener(null);
@@ -114,12 +122,15 @@ export function roadLayerClass(): any {
       editorLayerActivated(ROAD_LAYER_NAME);
       this.#removeCityListener ??= addCityListener(() => this.refresh());
       setRoadDraftCancelListener(() => this.cancelDraft());
+      this.#syncDragResistance();
+      this.#panHookId ??= Hooks.on("canvasPan", () => this.#syncDragResistance());
       this.visible = true;
       this.refresh();
     }
 
     _deactivate(): void {
       editorLayerDeactivated(ROAD_LAYER_NAME);
+      this.#unwatchPan();
       this.#removeCityListener?.();
       this.#removeCityListener = null;
       setRoadDraftCancelListener(null);
@@ -127,6 +138,26 @@ export function roadLayerClass(): any {
       this.#roadDrag = null;
       this.#preview?.clear();
       this.visible = false;
+    }
+
+    #unwatchPan(): void {
+      if (this.#panHookId !== null) {
+        Hooks.off("canvasPan", this.#panHookId);
+        this.#panHookId = null;
+      }
+      this.#syncDragResistance();
+    }
+
+    /** Foundry's drag threshold is scene-space; keep it constant on screen while this layer is active. */
+    #syncDragResistance(): void {
+      const manager = canvas?.mouseInteractionManager;
+      if (manager === undefined || manager === null) return;
+      const options: Record<string, unknown> = manager.options ?? (manager.options = {});
+      if (!this.active) {
+        delete options.dragResistance;
+        return;
+      }
+      options.dragResistance = screenPx(canvas.dimensions.size / 4);
     }
 
     hasDraft(): boolean {
@@ -204,9 +235,10 @@ export function roadLayerClass(): any {
       }
       g.lineStyle(0);
       g.beginFill(COLOR_HANDLE, 0.95);
+      const handleRadius = Math.max(3, canvas.dimensions.size * 0.12);
       for (const node of city.source.roads.nodes) {
         const at = metresToWorld(node);
-        g.drawCircle(at.x, at.y, Math.max(3, canvas.dimensions.size * 0.12));
+        g.drawCircle(at.x, at.y, handleRadius);
       }
       g.endFill();
     }
@@ -238,7 +270,8 @@ export function roadLayerClass(): any {
         }
         g.lineStyle(0);
         g.beginFill(COLOR_PREVIEW, 0.95);
-        for (const point of draft.points) g.drawCircle(point.x, point.y, canvas.dimensions.size * 0.13);
+        const anchorRadius = canvas.dimensions.size * 0.13;
+        for (const point of draft.points) g.drawCircle(point.x, point.y, anchorRadius);
         g.endFill();
       }
       const drag = this.#roadDrag;
@@ -261,7 +294,7 @@ export function roadLayerClass(): any {
     #nearestRoadNode(point: Vec2, excludeId: string | null = null): { id: string; at: Vec2 } | null {
       const city = getCity();
       if (city === null) return null;
-      const reach = canvas.dimensions.size * 0.45;
+      const reach = screenPx(canvas.dimensions.size * 0.45);
       let nearest: { id: string; at: Vec2 } | null = null;
       let distance = reach * reach;
       for (const node of city.source.roads.nodes) {
@@ -288,7 +321,7 @@ export function roadLayerClass(): any {
         return null;
       }
       let best: string | null = null;
-      let distance = canvas.dimensions.size * 0.45;
+      let distance = screenPx(canvas.dimensions.size * 0.45);
       for (const span of network.segments) {
         const from = metresToWorld(span.a);
         const to = metresToWorld(span.b);
@@ -313,7 +346,13 @@ export function roadLayerClass(): any {
 
     _onDragLeftStart(event: any): void {
       if (!this._canDragLeftStart()) return;
-      const nearest = this.#nearestRoadNode(this.#pointer(event));
+      // WHY: drag start fires only after the drag threshold is crossed, so the pointer has
+      // already moved off the node — anchor the grab on the original press position instead.
+      const origin = event?.interactionData?.origin;
+      const point = origin !== undefined && Number.isFinite(origin.x) && Number.isFinite(origin.y)
+        ? { x: origin.x, y: origin.y }
+        : this.#pointer(event);
+      const nearest = this.#nearestRoadNode(point);
       if (nearest === null) return;
       this.#roadDrag = { nodeId: nearest.id, origin: nearest.at, current: nearest.at };
       this.#refreshPreview();
