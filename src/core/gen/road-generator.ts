@@ -1680,22 +1680,8 @@ function stabilizeGeneratedSource(
     if (!straightenOneImplicated()) break;
   }
 
-  // If reports bounce between interacting curves, eliminate smoothing globally while keeping every
-  // node and edge. This intentionally sacrifices some curves before sacrificing any city fabric.
-  if (!status.ok) {
-    const multi = candidate.routes
-      .map((route) => ({ route, edgeCount: candidate.edges.filter((edge) => edge.routeId === route.id).length }))
-      .filter((entry) => entry.edgeCount > 1 || entry.route.curvePreset !== "tight")
-      .sort((a, b) => b.edgeCount - a.edgeCount || a.route.id.localeCompare(b.route.id));
-    for (const entry of multi) {
-      const next = straightenGeneratedRoute(candidate, entry.route.id, idSeed, usedIds, roles);
-      if (!next) continue;
-      candidate = next;
-      straightened.add(entry.route.id);
-    }
-    status = topologyStatus(candidate);
-  }
-
+  // Residual straight-edge conflicts (routes already straight) cannot be fixed by straightening;
+  // remove the conflicting edge first, before any curve-sacrificing global pass runs.
   let removedEdges = 0;
   const maximumEdgeRemovals = Math.min(36, Math.max(6, Math.ceil(originalEdgeCount * 0.08)));
   while (!status.ok && removedEdges < maximumEdgeRemovals) {
@@ -1717,6 +1703,25 @@ function stabilizeGeneratedSource(
       edges: candidate.edges.filter((edge) => edge.id !== selected.id)
     });
     removedEdges++;
+    status = topologyStatus(candidate);
+    if (status.ok) break;
+    // Removing an edge can expose a curve contact on a still-smoothed route; straighten it before removing more.
+    straightenOneImplicated();
+  }
+
+  // Only as the very last resort: eliminate smoothing globally while keeping every node and edge.
+  // This intentionally sacrifices some curves before sacrificing any city fabric.
+  if (!status.ok) {
+    const multi = candidate.routes
+      .map((route) => ({ route, edgeCount: candidate.edges.filter((edge) => edge.routeId === route.id).length }))
+      .filter((entry) => entry.edgeCount > 1 || entry.route.curvePreset !== "tight")
+      .sort((a, b) => b.edgeCount - a.edgeCount || a.route.id.localeCompare(b.route.id));
+    for (const entry of multi) {
+      const next = straightenGeneratedRoute(candidate, entry.route.id, idSeed, usedIds, roles);
+      if (!next) continue;
+      candidate = next;
+      straightened.add(entry.route.id);
+    }
     status = topologyStatus(candidate);
   }
 
