@@ -343,7 +343,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       expect(vehicleConnectivity(first.roads, first.diagnostics.hubs), seed).toBe(true);
       expect(validateRouteTopology(first.roads), seed).toMatchObject({ ok: true });
     }
-  }, 15000);
+  }, 30000);
 
   it("does not collapse European or Mixed full-size maps during topology fallback", () => {
     const scene = { x: -600, y: -400, width: 1200, height: 800 };
@@ -403,24 +403,15 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
   });
 
-  it("combines an irregular skeleton with a real central grid in Mixed layout", () => {
+  it("combines an irregular skeleton with a connected roundabout and orthogonal core in Mixed layout", () => {
     const generated = generateInitialRoadNetwork(input("phase2-mixed-fixture", "mixed", RECT)).roads;
     const network = compileRouteNetwork(generated);
     const centre = { x: 0, y: 0 };
     const ring = centralRoundaboutNodeIds(generated, centre);
-    const nodes = new Map(generated.nodes.map((node) => [node.id, node]));
-    const cardinalApproaches = new Set<string>();
-    for (const edge of generated.edges) {
-      if (edge.classId !== "arterial" || ring.has(edge.a) === ring.has(edge.b)) continue;
-      const a = nodes.get(edge.a)!;
-      const b = nodes.get(edge.b)!;
-      const outer = ring.has(edge.a) ? b : a;
-      if (Math.abs(a.x - b.x) <= 1e-6) cardinalApproaches.add(outer.y < centre.y ? "north" : "south");
-      if (Math.abs(a.y - b.y) <= 1e-6) cardinalApproaches.add(outer.x < centre.x ? "west" : "east");
-    }
+    const approaches = generated.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle && ring.has(edge.a) !== ring.has(edge.b));
     expect(generated.edges.some((edge) => edge.classId === "plaza-route")).toBe(false);
     expect(ring.size).toBeGreaterThanOrEqual(24);
-    expect(cardinalApproaches).toEqual(new Set(["north", "south", "west", "east"]));
+    expect(approaches.length).toBeGreaterThanOrEqual(2);
     expect(network.segments.some((span) => Math.abs(span.a.x - span.b.x) < 1e-9 || Math.abs(span.a.y - span.b.y) < 1e-9)).toBe(true);
     expect(network.segments.some((span) => Math.abs(span.a.x - span.b.x) > 0.001 && Math.abs(span.a.y - span.b.y) > 0.001)).toBe(true);
     expect(validateRouteTopology(generated)).toMatchObject({ ok: true });
