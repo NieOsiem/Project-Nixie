@@ -1,5 +1,8 @@
 import type { Vec2 } from "../geom/types.js";
-import { validateTerrain, type TerrainGeneration, type TerrainSource } from "./terrain.js";
+import { intersection, ringAsMulti } from "../geom/boolean.js";
+import { ringArea, type Ring } from "../geom/types.js";
+import { validateTerrain, validateRing, type TerrainGeneration, type TerrainSource } from "./terrain.js";
+import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
 
 export type RoadCurvePreset = "tight" | "standard" | "broad";
 export type RoadOrigin = "generated" | "authored";
@@ -99,6 +102,68 @@ export interface CityStateV2 {
   source: CitySourceV2;
 }
 
+export type DistrictPaletteId = string;
+export type DistrictOpenSpaceProfile = "none" | "very-low" | "low" | "medium" | "high";
+export type DistrictOpenSpaceOverride = {
+  rate: number;
+  categoryWeights: Record<OpenSpaceCategory, number>;
+  sizeWeights: Record<OpenSpaceSize, number>;
+};
+export type OpenSpaceCategory =
+  | "park"
+  | "plaza"
+  | "parking"
+  | "vacant"
+  | "utility"
+  | "landscaping"
+  | "service-yard";
+export type OpenSpaceSize = "pocket" | "small" | "large" | "whole-block";
+
+export const OPEN_SPACE_CATEGORIES: readonly OpenSpaceCategory[] = [
+  "park",
+  "plaza",
+  "parking",
+  "vacant",
+  "utility",
+  "landscaping",
+  "service-yard"
+];
+export const OPEN_SPACE_SIZES: readonly OpenSpaceSize[] = ["pocket", "small", "large", "whole-block"];
+export const OPEN_SPACE_PROFILES: readonly DistrictOpenSpaceProfile[] = ["none", "very-low", "low", "medium", "high"];
+
+export interface DistrictSource {
+  id: string;
+  polygon: Ring;
+  seed: string;
+  typeId: DistrictTypeId;
+  paletteId: DistrictPaletteId;
+  origin: "generated" | "authored";
+  locked: boolean;
+  openSpaceOverride: DistrictOpenSpaceOverride | null;
+}
+
+export interface CitySourceV3 {
+  origin: Vec2;
+  citySeed: string;
+  generation: TerrainGeneration & {
+    roadLayout: RoadLayout;
+    hubMode: HubMode;
+    districtPool: DistrictTypeId[];
+    openSpaceProfile: DistrictOpenSpaceProfile;
+  };
+  terrain: TerrainSource;
+  roads: RoadSource;
+  districts: DistrictSource[];
+}
+
+export interface CityStateV3 {
+  kind: "city-generator-2";
+  schemaVersion: 3;
+  generatorVersion: 10;
+  revision: number;
+  source: CitySourceV3;
+}
+
 export interface LegacyCitySourceV1 {
   origin: Vec2;
   citySeed: string;
@@ -129,6 +194,10 @@ function finiteVec(value: unknown): value is Vec2 {
 
 function nonEmptyId(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function nonEmptyText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value;
 }
 
 function enumValue<T extends string>(value: unknown, values: readonly T[]): value is T {
@@ -208,6 +277,204 @@ export function validateCitySourceV2(source: unknown): string[] {
   }
   problems.push(...validateRoadSource(source.roads));
   return problems;
+}
+
+function weightTableProblems(value: unknown, keys: readonly string[], label: string): string[] {
+  const problems: string[] = [];
+  if (!isRecord(value)) return [`${label} must be an object.`];
+  const expected = new Set(keys);
+  for (const key of Object.keys(value)) if (!expected.has(key)) problems.push(`${label} has unknown key "${key}".`);
+  for (const key of keys) {
+    const weight = value[key];
+    if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) {
+      problems.push(`${label}.${key} must be a finite non-negative number.`);
+    }
+  }
+  const total = keys.reduce((sum, key) => sum + (typeof value[key] === "number" ? value[key] : 0), 0);
+  if (!Number.isFinite(total) || total <= 0) problems.push(`${label} must not be all zero.`);
+  return problems;
+}
+
+export function validateDistrictOpenSpaceOverride(value: unknown): string[] {
+  const problems: string[] = [];
+  if (!isRecord(value)) return ["District open-space override must be an object."];
+  if (typeof value.rate !== "number" || !Number.isFinite(value.rate) || value.rate < 0 || value.rate > 1) {
+    problems.push("District open-space rate must be finite and between 0 and 1.");
+  }
+  problems.push(...weightTableProblems(value.categoryWeights, OPEN_SPACE_CATEGORIES, "District category weights"));
+  problems.push(...weightTableProblems(value.sizeWeights, OPEN_SPACE_SIZES, "District size weights"));
+  return problems;
+}
+
+function normalizeWeightTable(value: unknown, keys: readonly string[], label: string): Record<string, number> {
+  const problems = weightTableProblems(value, keys, label);
+  if (problems.length > 0) throw new Error(problems.join(" "));
+  const input = value as Record<string, unknown>;
+  const total = keys.reduce((sum, key) => sum + (input[key] as number), 0);
+  return Object.fromEntries(keys.map((key) => [key, (input[key] as number) / total]));
+}
+
+export function normalizeDistrictOpenSpaceOverride(value: DistrictOpenSpaceOverride): DistrictOpenSpaceOverride {
+  const problems = validateDistrictOpenSpaceOverride(value);
+  if (problems.length > 0) throw new Error(problems.join(" "));
+  return {
+    rate: value.rate,
+    categoryWeights: normalizeWeightTable(value.categoryWeights, OPEN_SPACE_CATEGORIES, "District category weights") as Record<OpenSpaceCategory, number>,
+    sizeWeights: normalizeWeightTable(value.sizeWeights, OPEN_SPACE_SIZES, "District size weights") as Record<OpenSpaceSize, number>
+  };
+}
+
+function districtTypeKnown(value: unknown): value is DistrictTypeId {
+  return typeof value === "string" && (DISTRICT_TYPE_IDS as readonly string[]).includes(value);
+}
+
+function validateDistrictPool(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) return ["District pool must be a non-empty array."];
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const id of value) {
+    if (!districtTypeKnown(id)) {
+      problems.push(`Unknown district type "${String(id)}".`);
+      continue;
+    }
+    if (seen.has(id)) problems.push(`Duplicate district type "${id}".`);
+    seen.add(id);
+  }
+  const order = new Map(DISTRICT_TYPE_IDS.map((id, index) => [id, index]));
+  const sorted = [...value].filter(districtTypeKnown).sort((a, b) => order.get(a)! - order.get(b)!);
+  if (sorted.some((id, index) => id !== value[index])) problems.push("District pool must use stable built-in ID order.");
+  return problems;
+}
+
+function multiArea(multi: ReturnType<typeof ringAsMulti>): number {
+  return multi.reduce(
+    (total, polygon) => total + polygon.reduce((sum, ring, index) => sum + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0),
+    0
+  );
+}
+
+export function validateDistrictSource(value: unknown): string[] {
+  const problems: string[] = [];
+  if (!isRecord(value)) return ["District source must be an object."];
+  if (!nonEmptyId(value.id)) problems.push("District id must be non-empty text.");
+  if (!Array.isArray(value.polygon)) problems.push("District polygon must be a ring.");
+  else {
+    const ring = validateRing(value.polygon as Ring);
+    if (!ring.ok) problems.push(`District polygon: ${ring.reason}`);
+  }
+  if (!nonEmptyText(value.seed)) problems.push("District seed must be non-empty text.");
+  if (!districtTypeKnown(value.typeId)) problems.push(`Unknown district type "${String(value.typeId)}".`);
+  if (!nonEmptyText(value.paletteId) || !(DISTRICT_PALETTE_IDS as readonly string[]).includes(value.paletteId)) problems.push(`Unknown district palette id "${String(value.paletteId)}".`);
+  if (value.origin !== "generated" && value.origin !== "authored") problems.push("District origin is invalid.");
+  if (typeof value.locked !== "boolean") problems.push("District locked must be boolean.");
+  if (value.openSpaceOverride !== null) problems.push(...validateDistrictOpenSpaceOverride(value.openSpaceOverride));
+  return problems;
+}
+
+export function validateCitySourceV3(source: unknown): string[] {
+  const problems: string[] = [];
+  if (!isRecord(source)) return ["City source must be an object."];
+  if (!finiteVec(source.origin)) problems.push("City origin must have finite x/y.");
+  if (!nonEmptyText(source.citySeed)) problems.push("City seed must be non-empty text.");
+  const generation = source.generation;
+  if (!isRecord(generation)) problems.push("City generation must be an object.");
+  else {
+    if (!enumValue(generation.terrainMode, ["rectangle", "coastal", "custom"] as const)) problems.push("Invalid terrain mode.");
+    if (!(generation.coastEdge === null || enumValue(generation.coastEdge, ["north", "east", "south", "west"] as const))) problems.push("Invalid coast edge.");
+    if ((generation.terrainMode === "coastal") !== (generation.coastEdge !== null)) problems.push("Coastal terrain requires exactly one coast edge.");
+    if (!enumValue(generation.roadLayout, ROAD_LAYOUTS)) problems.push("Invalid road layout.");
+    if (!enumValue(generation.hubMode, HUB_MODES)) problems.push("Invalid hub mode.");
+    problems.push(...validateDistrictPool(generation.districtPool));
+    if (!enumValue(generation.openSpaceProfile, OPEN_SPACE_PROFILES)) problems.push("Invalid open-space profile.");
+  }
+  const terrain = source.terrain;
+  if (!isRecord(terrain)) problems.push("City terrain must be an object.");
+  else {
+    const terrainProblems = validateTerrain(terrain as unknown as TerrainSource);
+    if (!terrainProblems.ok) problems.push(terrainProblems.reason);
+  }
+  problems.push(...validateRoadSource(source.roads));
+  if (!Array.isArray(source.districts)) problems.push("Districts must be an array.");
+  else {
+    const ids = new Set<string>();
+    for (const district of source.districts) {
+      problems.push(...validateDistrictSource(district).map((problem) => `District: ${problem}`));
+      if (!isRecord(district) || !nonEmptyId(district.id)) continue;
+      if (ids.has(district.id)) problems.push(`Duplicate district id "${district.id}".`);
+      ids.add(district.id);
+    }
+    for (let i = 0; i < source.districts.length; i++) {
+      const left = source.districts[i];
+      if (!isRecord(left) || !Array.isArray(left.polygon)) continue;
+      for (let j = i + 1; j < source.districts.length; j++) {
+        const right = source.districts[j];
+        if (!isRecord(right) || !Array.isArray(right.polygon)) continue;
+        try {
+          if (multiArea(intersection(ringAsMulti(left.polygon as Ring), ringAsMulti(right.polygon as Ring))) > 1e-6) {
+            problems.push(`Districts "${String(left.id)}" and "${String(right.id)}" overlap.`);
+          }
+        } catch {
+          problems.push(`Districts "${String(left.id)}" and "${String(right.id)}" have invalid overlap geometry.`);
+        }
+      }
+    }
+  }
+  return problems;
+}
+
+export function validateCityStateV3(state: unknown): string[] {
+  const problems: string[] = [];
+  if (!isRecord(state)) return ["City state must be an object."];
+  if (state.kind !== "city-generator-2") problems.push("Invalid city kind.");
+  if (state.schemaVersion !== 3) problems.push("Unsupported city schema version.");
+  if (state.generatorVersion !== 10) problems.push("Unsupported city generator version.");
+  if (typeof state.revision !== "number" || !Number.isInteger(state.revision) || state.revision < 1) problems.push("City revision must be a positive integer.");
+  problems.push(...validateCitySourceV3(state.source));
+  return problems;
+}
+
+function defaultDistrictGeneration(generation: CitySourceV2["generation"]): CitySourceV3["generation"] {
+  return {
+    terrainMode: generation.terrainMode,
+    coastEdge: generation.coastEdge,
+    roadLayout: generation.roadLayout,
+    hubMode: generation.hubMode,
+    districtPool: [...DISTRICT_TYPE_IDS],
+    openSpaceProfile: "medium"
+  };
+}
+
+export function migrateSchema2ToSchema3(input: CityStateV2 | { source: CitySourceV2; revision: number } | CitySourceV2, revision?: number): CityStateV3 {
+  const isEnvelope = isRecord(input) && "source" in input;
+  const source = (isEnvelope ? input.source : input) as CitySourceV2;
+  const migratedRevision = isEnvelope ? (input as { revision: number }).revision : revision;
+  if (migratedRevision === undefined || !Number.isInteger(migratedRevision) || migratedRevision < 1) throw new Error("Schema-2 revision must be a positive integer.");
+  const migrated: CityStateV3 = {
+    kind: "city-generator-2",
+    schemaVersion: 3,
+    generatorVersion: 10,
+    revision: migratedRevision,
+    source: {
+      origin: { ...source.origin },
+      citySeed: source.citySeed,
+      generation: defaultDistrictGeneration(source.generation),
+      terrain: {
+        land: source.terrain.land.map((point) => ({ ...point })),
+        urbanFootprint: source.terrain.urbanFootprint?.map((point) => ({ ...point })) ?? null
+      },
+      roads: {
+        nodes: source.roads.nodes.map((node) => ({ ...node })),
+        routes: source.roads.routes.map((route) => ({ ...route })),
+        edges: source.roads.edges.map((edge) => ({ ...edge }))
+      },
+      districts: []
+    }
+  };
+  return migrated;
+}
+
+export function migrateSchema1ToSchema3(input: LegacyCityStateV1 | LegacyStateEnvelope | LegacyCitySourceV1, revision?: number): CityStateV3 {
+  return migrateSchema2ToSchema3(migrateSchema1ToSchema2(input, revision));
 }
 
 export function validateCityStateV2(state: unknown): string[] {

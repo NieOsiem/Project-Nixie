@@ -2,17 +2,24 @@ import {
   addCityListener,
   canRedo,
   canUndo,
+  cancelDistrictDraft,
   cancelTerrainDraft,
+  clearDistrictSelection,
   clearRoadSelection,
+  getDistrictSelection,
+  getRoadSelection,
   redo,
   undo
 } from "../adapter/canvas.js";
 import {
   closeEditor,
   currentWorkspace,
+  clearEditorActionError,
+  currentEditorActionError,
   isEditorOpen,
   openEditor,
   ownedLayerName,
+  setEditorActionError,
   setEditorController,
   setWorkspace,
   WORKSPACE_IDS,
@@ -20,6 +27,7 @@ import {
   type WorkspaceId
 } from "./editor-state.js";
 import { workspaceModule } from "./workspaces/index.js";
+import { escapeHTML } from "./workspaces/shared.js";
 import type { WorkspaceContext } from "./workspaces/types.js";
 
 const SHELL_ID = "nixie-editor-shell";
@@ -30,9 +38,14 @@ function applicationBase(): any {
 
 function run(label: string, work: Promise<unknown>, then?: () => void): void {
   void work
-    .then(then)
+    .then(() => {
+      clearEditorActionError();
+      then?.();
+      refreshShell();
+    })
     .catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
+      setEditorActionError(label, err);
       console.error(`nixie | ${label} failed`, err);
       ui.notifications?.error(`Nixie: ${label} failed — ${message}`);
     });
@@ -57,6 +70,9 @@ function shellHTML(): string {
   }).join("");
   const shelf = module.renderShelf();
   const tray = module.renderTray();
+  const actionError = currentEditorActionError();
+  const error = actionError === null ? "" : `<section class="nixie-action-error" data-panel="action-error"><h3>${escapeHTML(actionError.label)} failed</h3><p>${escapeHTML(actionError.message)}</p>${actionError.affectedIds.length === 0 ? "" : `<p class="nixie-note">Affected IDs: ${actionError.affectedIds.map((id) => escapeHTML(id)).join(", ")}</p>`}</section>`;
+  const trayContent = actionError === null ? tray : error;
   return `<header class="nixie-workspace-bar">
     <div class="nixie-brand"><i class="fa-solid fa-city"></i><span>NIXIE</span></div>
     <nav class="nixie-workspaces">${tabs}</nav>
@@ -68,12 +84,13 @@ function shellHTML(): string {
     </div>
   </header>
   ${shelf === "" ? "" : `<div class="nixie-tool-shelf">${shelf}</div>`}
-  ${tray === "" ? "" : `<div class="nixie-context-tray${activeWorkspace === "generate" ? " nixie-tray-generate" : ""}">${tray}</div>`}`;
+  ${trayContent === "" ? "" : `<div class="nixie-context-tray${activeWorkspace === "generate" && actionError === null ? " nixie-tray-generate" : ""}">${trayContent}</div>`}`;
 }
 
 let cachedClass: any = null;
 let instance: any = null;
 let cityUnsubscribe: (() => void) | null = null;
+let lastWorkspace: WorkspaceId | null = null;
 
 function editorShellClass(): any {
   if (cachedClass !== null) return cachedClass;
@@ -118,6 +135,7 @@ function editorShellClass(): any {
       const action = target.closest<HTMLElement>("[data-action]") ?? target;
       const name = action.dataset.action ?? "";
       if (name === "workspace") {
+        clearEditorActionError();
         setWorkspace(action.dataset.workspace as WorkspaceId);
         return;
       }
@@ -145,6 +163,7 @@ function ensureInstance(): void {
 
 function showShell(): void {
   ensureInstance();
+  lastWorkspace = currentWorkspace();
   cityUnsubscribe ??= addCityListener(() => {
     if (isEditorOpen()) void instance.render({ force: true });
   });
@@ -152,11 +171,29 @@ function showShell(): void {
 }
 
 function hideShell(): void {
+  clearEditorActionError();
   cancelTerrainDraft();
+  cancelDistrictDraft();
   clearRoadSelection();
+  clearDistrictSelection();
   cityUnsubscribe?.();
   cityUnsubscribe = null;
+  lastWorkspace = null;
   if (instance?.rendered === true) void instance.close();
+}
+
+function clearDepartedWorkspaceState(): void {
+  const next = currentWorkspace();
+  const previous = lastWorkspace;
+  lastWorkspace = next;
+  if (previous === "districts" && next !== "districts") {
+    cancelDistrictDraft();
+    if (getDistrictSelection().length > 0) clearDistrictSelection();
+  }
+  if (previous === "roads" && next !== "roads") {
+    const selection = getRoadSelection();
+    if (selection.edgeIds.length > 0 || selection.nodeIds.length > 0) clearRoadSelection();
+  }
 }
 
 function refreshShell(): void {
@@ -170,7 +207,10 @@ export function installEditorShellController(): void {
   setEditorController({
     onOpen: showShell,
     onClose: hideShell,
-    onStateChanged: refreshShell
+    onStateChanged: () => {
+      clearDepartedWorkspaceState();
+      refreshShell();
+    }
   });
 }
 
@@ -184,4 +224,9 @@ export function openTerrainApp(): void {
 export function openRoadApp(): void {
   openEditor();
   setWorkspace("roads");
+}
+
+export function openDistrictApp(): void {
+  openEditor();
+  setWorkspace("districts");
 }

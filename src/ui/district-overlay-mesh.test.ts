@@ -1,0 +1,151 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  DISTRICT_OVERLAY_LINE_FRAG,
+  DISTRICT_OVERLAY_LINE_VERT,
+  DistrictOverlayLineMesh,
+  DistrictOverlayLineMeshBuilder
+} from "./district-overlay-mesh.js";
+
+describe("DistrictOverlayLineMeshBuilder", () => {
+  it("expands a segment into a coloured indexed quad", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    builder.add({ x: 0, y: 0 }, { x: 10, y: 0 }, 2, 0x123456, 0.5);
+
+    const data = builder.build();
+    expect(data.segmentCount).toBe(1);
+    expect(data.vertices).toEqual(Float32Array.from([
+      0, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      10, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      10, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      0, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5
+    ]));
+    expect(Array.from(data.indices)).toEqual([0, 1, 2, 0, 2, 3]);
+  });
+
+  it("uses the world-space perpendicular for any segment direction", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    builder.add({ x: 4, y: 6 }, { x: 7, y: 10 }, 2, 0xffffff, 1);
+
+    const data = builder.build();
+    expect(data.vertices.slice(0, 12)).toEqual(Float32Array.from([
+      3.2, 6.6, 1, 1, 1, 1,
+      6.2, 10.6, 1, 1, 1, 1
+    ]));
+  });
+
+  it("skips invalid and zero-length segments atomically", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    const valid = [{ x: 0, y: 0 }, { x: 2, y: 0 }] as const;
+    builder.add(valid[0], valid[1], 1, 0x112233, 0.25);
+    builder.add({ x: NaN, y: 0 }, valid[1], 1, 0x112233, 0.25);
+    builder.add(valid[0], { x: Infinity, y: 0 }, 1, 0x112233, 0.25);
+    builder.add(valid[0], valid[1], 0, 0x112233, 0.25);
+    builder.add(valid[0], valid[1], -1, 0x112233, 0.25);
+    builder.add(valid[0], valid[1], 1, 0x1000000, 0.25);
+    builder.add(valid[0], valid[1], 1, 0x112233, -0.1);
+    builder.add(valid[0], valid[1], 1, 0x112233, 1.1);
+    builder.add(valid[0], valid[0], 1, 0x112233, 0.25);
+
+    const data = builder.build();
+    expect(data.segmentCount).toBe(1);
+    expect(data.vertices).toHaveLength(24);
+    expect(data.indices).toHaveLength(6);
+  });
+
+  it("produces deterministic compact buffers for tens of thousands of segments", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    for (let index = 0; index < 20_000; index++) {
+      const x = index * 3;
+      builder.add({ x, y: index % 17 }, { x: x + 2, y: index % 17 + 1 }, 1.5, index & 0xffffff, 0.5);
+    }
+
+    const data = builder.build();
+    expect(data.segmentCount).toBe(20_000);
+    expect(data.vertices).toHaveLength(20_000 * 4 * 6);
+    expect(data.indices).toHaveLength(20_000 * 6);
+    expect(Number.isFinite(data.vertices[0])).toBe(true);
+    expect(data.vertices[5]).toBe(0.5);
+    expect(data.indices[0]).toBe(0);
+    expect(data.indices.at(-1)).toBe(20_000 * 4 - 1);
+  });
+
+});
+
+class StubBuffer {
+  constructor(public readonly data: Float32Array) {}
+}
+
+class StubGeometry {
+  readonly attributes: Array<{ name: string; buffer: StubBuffer; size: number; stride: number; offset: number }> = [];
+  indices: Uint32Array | null = null;
+
+  addAttribute(name: string, buffer: StubBuffer, size: number, _normalised: boolean, _type: number, stride: number, offset: number): this {
+    this.attributes.push({ name, buffer, size, stride, offset });
+    return this;
+  }
+
+  addIndex(indices: Uint32Array): this {
+    this.indices = indices;
+    return this;
+  }
+
+  destroy = vi.fn();
+}
+
+class StubMesh {
+  state: Record<string, unknown> = {};
+  destroy = vi.fn();
+
+  constructor(public readonly geometry: StubGeometry, public readonly shader: unknown) {}
+}
+
+const geometryInstances: StubGeometry[] = [];
+
+beforeEach(() => {
+  geometryInstances.length = 0;
+  (globalThis as { PIXI?: unknown }).PIXI = {
+    Buffer: StubBuffer,
+    Geometry: class extends StubGeometry {
+      constructor() {
+        super();
+        geometryInstances.push(this);
+      }
+    },
+    Mesh: StubMesh,
+    Shader: { from: vi.fn(() => ({ uniforms: {} })) },
+    TYPES: { FLOAT: 5126 }
+  };
+});
+
+afterEach(() => {
+  delete (globalThis as { PIXI?: unknown }).PIXI;
+});
+
+describe("DistrictOverlayLineMesh", () => {
+  it("binds one indexed geometry with interleaved position and colour attributes", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    builder.add({ x: 0, y: 0 }, { x: 4, y: 0 }, 2, 0xff0000, 0.5);
+    const data = builder.build();
+    const mesh = new DistrictOverlayLineMesh(data);
+    const geometry = geometryInstances[0]!;
+
+    expect(geometry.attributes.map(({ name, size, stride, offset }) => ({ name, size, stride, offset }))).toEqual([
+      { name: "aPosition", size: 2, stride: 24, offset: 0 },
+      { name: "aColor", size: 3, stride: 24, offset: 8 },
+      { name: "aAlpha", size: 1, stride: 24, offset: 20 }
+    ]);
+    expect(geometry.indices).toBe(data.indices);
+    expect((mesh.display as StubMesh).state.blend).toBe(true);
+    mesh.destroy();
+    expect((mesh.display as StubMesh).destroy).toHaveBeenCalledOnce();
+    expect(geometry.destroy).toHaveBeenCalledOnce();
+  });
+
+  it("keeps its shaders in GLSL ES 1.00 form", () => {
+    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("attribute vec2 aPosition;");
+    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("uniform mat3 projectionMatrix;");
+    expect(DISTRICT_OVERLAY_LINE_FRAG).toContain("varying vec4 vColor;");
+    expect(DISTRICT_OVERLAY_LINE_FRAG).toContain("vColor.rgb * vColor.a");
+    expect(DISTRICT_OVERLAY_LINE_FRAG).not.toContain("#version");
+  });
+});

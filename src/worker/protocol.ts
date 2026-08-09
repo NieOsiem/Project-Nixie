@@ -12,6 +12,9 @@ import type { ChunkKey } from "../core/gen/chunks.js";
 import type { Rect } from "../core/geom/types.js";
 import type { CitySourceV2 } from "../core/gen/terrain.js";
 import type { CitySourceV2 as CitySourceV2Roads, RoadLayout, HubMode, RoadSource } from "../core/gen/city.js";
+import type { CitySourceV3, DistrictSource } from "../core/gen/city.js";
+import { buildDistrictPlan, type DistrictPlan } from "../core/gen/district-plan.js";
+import { generateInitialDistricts } from "../core/gen/district-generator.js";
 
 export interface PingRequest {
   id: number;
@@ -50,10 +53,28 @@ export interface GenerateInitialRoadNetworkRequest {
   buildToken: number | string;
 }
 
+export interface BuildDistrictPlanRequest {
+  id: number;
+  type: "buildDistrictPlan";
+  source: CitySourceV3;
+  sourceRevision: number;
+  actionToken: number | string;
+  buildToken: number | string;
+}
+
+export interface GenerateInitialDistrictsRequest {
+  id: number;
+  type: "generateInitialDistricts";
+  source: CitySourceV3;
+  sourceRevision: number;
+  actionToken: number | string;
+  buildToken: number | string;
+}
+
 export type GenerateRoadNetworkRequest = GenerateInitialRoadNetworkRequest;
 
 /** Extend by adding an interface with its own `type` literal and unioning it here. */
-export type WorkerRequest = PingRequest | BuildTerrainChunkRequest | BuildCityChunksRequest | GenerateInitialRoadNetworkRequest;
+export type WorkerRequest = PingRequest | BuildTerrainChunkRequest | BuildCityChunksRequest | GenerateInitialRoadNetworkRequest | BuildDistrictPlanRequest | GenerateInitialDistrictsRequest;
 
 export interface BuildTerrainChunkResult {
   sourceRevision: number;
@@ -95,6 +116,20 @@ export interface GenerateInitialRoadNetworkResult {
     layout: RoadLayout;
     hubMode: HubMode;
   };
+}
+
+export interface BuildDistrictPlanResult {
+  sourceRevision: number;
+  actionToken: number | string;
+  buildToken: number | string;
+  plan: DistrictPlan;
+}
+
+export interface GenerateInitialDistrictsResult {
+  sourceRevision: number;
+  actionToken: number | string;
+  buildToken: number | string;
+  districts: DistrictSource[];
 }
 
 export interface WorkerSuccess {
@@ -192,6 +227,25 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
             layout: request.input.layout ?? "european",
             hubMode: request.input.hubMode ?? "single-centre"
           }
+        };
+        return { id: request.id, ok: true, result };
+      }
+      case "buildDistrictPlan": {
+        const plan = buildDistrictPlan(request.source);
+        const result: BuildDistrictPlanResult = {
+          sourceRevision: request.sourceRevision,
+          actionToken: request.actionToken,
+          buildToken: request.buildToken,
+          plan
+        };
+        return { id: request.id, ok: true, result };
+      }
+      case "generateInitialDistricts": {
+        const result: GenerateInitialDistrictsResult = {
+          sourceRevision: request.sourceRevision,
+          actionToken: request.actionToken,
+          buildToken: request.buildToken,
+          districts: generateInitialDistricts(request.source)
         };
         return { id: request.id, ok: true, result };
       }

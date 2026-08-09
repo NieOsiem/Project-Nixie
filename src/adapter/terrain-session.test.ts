@@ -6,9 +6,10 @@ import {
   terrainBuildIsCurrent
 } from "./terrain-session.js";
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
-import type { CityStateV2 } from "../core/gen/city.js";
+import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
+import type { CityStateV3 } from "../core/gen/city.js";
 
-function state(revision: number, seed = "session-seed"): CityStateV2 {
+function state(revision: number, seed = "session-seed"): CityStateV3 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -21,7 +22,9 @@ function state(revision: number, seed = "session-seed"): CityStateV2 {
         terrainMode: "rectangle",
         coastEdge: null,
         roadLayout: "european",
-        hubMode: "single-centre"
+        hubMode: "single-centre",
+        districtPool: [...DISTRICT_TYPE_IDS],
+        openSpaceProfile: "medium"
       },
       terrain: {
         land: [
@@ -32,12 +35,13 @@ function state(revision: number, seed = "session-seed"): CityStateV2 {
         ],
         urbanFootprint: null
       },
-      roads: { nodes: [], routes: [], edges: [] }
+      roads: { nodes: [], routes: [], edges: [] },
+      districts: []
     }
   };
 }
 
-function supported(value: CityStateV2): CityLoadResult {
+function supported(value: CityStateV3): CityLoadResult {
   return { kind: "supported", state: value };
 }
 

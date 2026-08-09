@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
-import type { CityStateV2 } from "../core/gen/city.js";
+import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
+import type { CityStateV3 } from "../core/gen/city.js";
 import { loadCityState, saveCityState } from "./documents.js";
 
 let stored: unknown;
@@ -45,7 +46,7 @@ function schemaOne(revision = 1): Record<string, unknown> {
   };
 }
 
-function state(revision = 1, roads: CityStateV2["source"]["roads"] = { nodes: [], routes: [], edges: [] }): CityStateV2 {
+function state(revision = 1, roads: CityStateV3["source"]["roads"] = { nodes: [], routes: [], edges: [] }): CityStateV3 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -58,7 +59,9 @@ function state(revision = 1, roads: CityStateV2["source"]["roads"] = { nodes: []
         terrainMode: "rectangle",
         coastEdge: null,
         roadLayout: "european",
-        hubMode: "single-centre"
+        hubMode: "single-centre",
+        districtPool: [...DISTRICT_TYPE_IDS],
+        openSpaceProfile: "medium"
       },
       terrain: {
         land: [
@@ -69,7 +72,8 @@ function state(revision = 1, roads: CityStateV2["source"]["roads"] = { nodes: []
         ],
         urbanFootprint: null
       },
-      roads: structuredClone(roads)
+      roads: structuredClone(roads),
+      districts: []
     }
   };
 }
@@ -120,8 +124,8 @@ describe("loadCityState", () => {
     expect(result.kind).toBe("supported");
     if (result.kind === "supported") {
       const source = raw.source as any;
-      expect(result.state.schemaVersion).toBe(2);
-      expect(result.state.generatorVersion).toBe(9);
+      expect(result.state.schemaVersion).toBe(3);
+      expect(result.state.generatorVersion).toBe(10);
       expect(result.state.revision).toBe(7);
       expect(result.state.source.origin).toEqual(source.origin);
       expect(result.state.source.citySeed).toBe(source.citySeed);
@@ -131,7 +135,7 @@ describe("loadCityState", () => {
     }
   });
 
-  it("round-trips schema 2 road fields and IDs", () => {
+  it("round-trips schema 3 road fields and IDs", () => {
     const raw = state(3, roads);
     installScene(raw);
     const result = loadCityState();
@@ -139,17 +143,17 @@ describe("loadCityState", () => {
   });
 
   it("rejects future schemas and unsupported generators without writing", () => {
-    const future = { ...state(), schemaVersion: 3 };
+    const future = { ...state(), schemaVersion: 4 };
     installScene(future);
-    expect(loadCityState()).toEqual({ kind: "unsupported", raw: future, schemaVersion: 3 });
+    expect(loadCityState()).toEqual({ kind: "unsupported", raw: future, schemaVersion: 4 });
 
-    const unsupported = { ...state(), generatorVersion: 10 };
+    const unsupported = { ...state(), generatorVersion: 11 };
     installScene(unsupported);
     expect(loadCityState()).toEqual({
       kind: "unsupported",
       raw: unsupported,
       schemaVersion: CITY_SCHEMA_VERSION,
-      generatorVersion: 10
+      generatorVersion: 11
     });
   });
 
@@ -210,7 +214,7 @@ describe("saveCityState", () => {
     expect(stored).toEqual(candidate);
   });
 
-  it("writes schema 2 revision plus one on the first edit to migrated schema 1", async () => {
+  it("writes schema 3 revision plus one on the first edit to migrated schema 1", async () => {
     const raw = schemaOne(4);
     installScene(raw);
     const candidate = state(5, roads);

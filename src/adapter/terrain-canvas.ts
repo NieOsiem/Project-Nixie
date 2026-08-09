@@ -26,12 +26,29 @@ import {
 } from "../core/gen/terrain.js";
 import {
   ROUTE_CLASS_REGISTRY,
-  type CitySourceV2,
-  type CityStateV2,
+  validateCitySourceV3,
+  type CitySourceV3,
+  type CityStateV3,
+  type DistrictOpenSpaceProfile,
+  type DistrictSource,
   type RoadCurvePreset,
   type RoadOrigin,
   type RouteClassId
 } from "../core/gen/city.js";
+import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
+import { buildDistrictPlan, type DistrictPlan } from "../core/gen/district-plan.js";
+import { districtGenerationAvailability, generateInitialDistricts } from "../core/gen/district-generator.js";
+import {
+  districtDeleteCandidate,
+  districtDrawCandidate,
+  districtFillCandidate,
+  districtMergeCandidate,
+  districtMoveVertexCandidate,
+  reconcileDistrictsForRoadEdit,
+  districtSplitCandidate,
+  districtUpdateCandidate,
+  type DistrictUpdatePatch
+} from "../core/gen/district-edit.js";
 import {
   generateInitialRoadNetwork,
   type GeneratedRoadNetwork,
@@ -76,6 +93,8 @@ import {
   type CityLoadResult,
   type SaveExpectation
 } from "./documents.js";
+import { replaceGeneratedWalls } from "./documents.js";
+import { WallReplacementScheduler, wallSegmentsForPlan } from "./generated-walls.js";
 import {
   TerrainActionQueue,
   TerrainSession,
@@ -135,6 +154,22 @@ export interface RoadBuildStats {
   scope: "none" | "dirty" | "all";
 }
 
+export interface DistrictInspector {
+  districtIds: string[];
+  typeId: DistrictTypeId | "multiple";
+  paletteId: string | "multiple";
+  seed: string | "multiple";
+  locked: boolean | "multiple";
+  openSpaceOverride: DistrictSource["openSpaceOverride"] | "multiple";
+}
+
+export interface DistrictSnapOptions {
+  districtVertices: boolean;
+  roadJunctions: boolean;
+  blockBoundaries: boolean;
+  foundryGrid: boolean;
+}
+
 export interface InitialGenerationStats {
   planningRoundTripMs: number;
   workerMode: "worker" | "fallback";
@@ -149,6 +184,7 @@ const terrainActions = new TerrainActionQueue();
 const frameQuality = new FrameQualityController();
 const chunks = new Map<string, TerrainChunkRecord>();
 let cityRenderer: CityRenderer | null = null;
+let districtEditorPresentation = false;
 let tickerCallback: (() => void) | null = null;
 let workerClient: WorkerClient | null = null;
 let workerUnavailable = false;
@@ -165,6 +201,25 @@ let lastInitialGeneration: InitialGenerationStats | null = null;
 let roadSelection: RoadSelection = { edgeIds: [], nodeIds: [] };
 let roadSnapToFoundryGrid = false;
 let roadActionSequence = 0;
+let districtActionSequence = 0;
+let districtPlan: DistrictPlan | null = null;
+let districtPlanRevision: number | null = null;
+let districtPlanEpoch: number | null = null;
+let districtPlanRoundTripMs = 0;
+let districtPlanWorkerMode: "worker" | "fallback" = "fallback";
+let preflightPlan: { revision: number; plan: DistrictPlan; roundTripMs: number; workerMode: "worker" | "fallback" } | null = null;
+let districtSelection: string[] = [];
+let districtDraftCancelListener: (() => void) | null = null;
+let districtSnapOptionsState = {
+  districtVertices: true,
+  roadJunctions: true,
+  blockBoundaries: true,
+  foundryGrid: false
+};
+let wallDiagnostic: { kind: "degraded"; reason: string; revision: number } | null = null;
+let wallNotifyRevision: number | null = null;
+let lastWallBuild: { scheduled: number; created: number; deleted: number; ms: number; stale: boolean; degraded?: boolean } | null = null;
+const wallScheduler = new WallReplacementScheduler();
 
 let cameraHeightM = DEFAULT_CAMERA_HEIGHT_M;
 let cameraZoomMode: CameraZoomMode = CAMERA_ZOOM_MODE.DOLLY;
@@ -177,6 +232,76 @@ let bloomEnabled = true;
 let bloomStrength = 1;
 let rainStrength = 1;
 let weather: Weather = WEATHER.RAIN;
+
+function applyDistrictEditorPresentation(): void {
+  if (cityRenderer === null) return;
+  const alpha = districtEditorPresentation ? 0.48 : 1;
+  cityRenderer.display.alpha = alpha;
+  cityRenderer.overlay.alpha = alpha;
+  cityRenderer.weather.alpha = alpha;
+}
+
+export function setDistrictsPresentation(active: boolean): void {
+  districtEditorPresentation = active;
+  applyDistrictEditorPresentation();
+}
+
+function cancelScheduledWalls(): void {
+  wallScheduler.cancel();
+}
+
+async function installGeneratedWalls(city: CityStateV3, plan: DistrictPlan, sourceRevision: number, sourceEpoch: number, replacementToken: number): Promise<void> {
+  const started = performance.now();
+  if (replacementToken !== wallScheduler.token || !terrainBuildIsCurrent(sourceRevision, sourceEpoch, session.current?.revision ?? null, session.buildEpoch)) {
+    if (replacementToken === wallScheduler.token) lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: 0, stale: true };
+    return;
+  }
+  try {
+    const segments = wallSegmentsForPlan(plan, city.source.origin, pixelsPerMetre());
+    const result = await replaceGeneratedWalls(segments, () => replacementToken === wallScheduler.token && terrainBuildIsCurrent(sourceRevision, sourceEpoch, session.current?.revision ?? null, session.buildEpoch));
+    if (replacementToken !== wallScheduler.token || !terrainBuildIsCurrent(sourceRevision, sourceEpoch, session.current?.revision ?? null, session.buildEpoch)) {
+      if (replacementToken === wallScheduler.token) lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: performance.now() - started, stale: true };
+      if (replacementToken === wallScheduler.token) {
+        const latest = session.current;
+        if (latest !== null && districtPlan !== null && districtPlanRevision === latest.revision && districtPlanEpoch === session.buildEpoch) {
+          scheduleGeneratedWallRebuild(latest, districtPlan);
+        } else {
+          wallDiagnostic = { kind: "degraded", reason: "Generated walls were superseded before the latest plan was available.", revision: latest?.revision ?? sourceRevision };
+        }
+      } else if (session.current === null) {
+        wallDiagnostic = { kind: "degraded", reason: "Generated walls were superseded before the latest plan was available.", revision: sourceRevision };
+      }
+      return;
+    }
+    wallDiagnostic = null;
+    wallNotifyRevision = null;
+    lastWallBuild = { scheduled: sourceRevision, created: result.created, deleted: result.deleted, ms: performance.now() - started, stale: false };
+  } catch (error) {
+    if (replacementToken !== wallScheduler.token) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    wallDiagnostic = { kind: "degraded", reason, revision: sourceRevision };
+    lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: performance.now() - started, stale: false, degraded: true };
+    if (wallNotifyRevision !== sourceRevision) {
+      wallNotifyRevision = sourceRevision;
+      ui.notifications?.warn(`Nixie: generated walls degraded — ${reason}`);
+    }
+  }
+}
+
+function scheduleGeneratedWallRebuild(city: CityStateV3, plan: DistrictPlan, immediate = false): void {
+  const sourceRevision = city.revision;
+  const sourceEpoch = session.buildEpoch;
+  lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: 0, stale: false };
+  const task = (token: number): Promise<void> => installGeneratedWalls(city, plan, sourceRevision, sourceEpoch, token);
+  if (immediate) void wallScheduler.runNow(task);
+  else wallScheduler.schedule(task, 400);
+}
+
+function scheduleCurrentPlanWalls(): void {
+  const city = session.current;
+  if (city === null || districtPlan === null || districtPlanRevision !== city.revision || districtPlanEpoch !== session.buildEpoch) return;
+  scheduleGeneratedWallRebuild(city, districtPlan);
+}
 
 function readCamera(): CameraState {
   return {
@@ -263,6 +388,22 @@ function notifyCityChanged(): void {
   for (const listener of cityListeners) listener();
 }
 
+function publishPreflightPlan(revision: number): DistrictPlan | null {
+  if (preflightPlan === null || preflightPlan.revision !== revision) return null;
+  districtPlan = preflightPlan.plan;
+  districtPlanRevision = revision;
+  districtPlanEpoch = session.buildEpoch;
+  districtPlanRoundTripMs = preflightPlan.roundTripMs;
+  districtPlanWorkerMode = preflightPlan.workerMode;
+  const published = preflightPlan.plan;
+  preflightPlan = null;
+  if (wallDiagnostic?.reason.startsWith("Generated walls were superseded") && wallDiagnostic.revision === revision && session.current !== null) {
+    wallDiagnostic = null;
+    scheduleGeneratedWallRebuild(session.current, published);
+  }
+  return published;
+}
+
 export function setCityListener(listener: (() => void) | null): void {
   if (layerCityListener !== null) cityListeners.delete(layerCityListener);
   layerCityListener = listener;
@@ -289,13 +430,14 @@ export function cancelRoadDraft(): void {
 export function cancelTerrainDraft(): void {
   draftCancelListener?.();
   cancelRoadDraft();
+  districtDraftCancelListener?.();
 }
 
 export function cityLoadStatus(): CityLoadResult {
   return session.status;
 }
 
-export function getCity(): CityStateV2 | null {
+export function getCity(): CityStateV3 | null {
   return session.current;
 }
 
@@ -336,6 +478,7 @@ function mountRenderer(): void {
   cityRenderer.weather.sort = 0;
   canvas.primary.addChild(cityRenderer.weather);
   canvas.primary.sortDirty = true;
+  applyDistrictEditorPresentation();
 
   tickerCallback = () => {
     const renderer = cityRenderer;
@@ -374,7 +517,7 @@ export function mount(): void {
   roadSelection = { edgeIds: [], nodeIds: [] };
   if (session.current !== null) {
     mountRenderer();
-    void rebuildGeometry().catch((error) =>
+    void rebuildGeometry().then(() => scheduleCurrentPlanWalls()).catch((error) =>
       console.error(`${MODULE_ID} | terrain rebuild failed`, error)
     );
   }
@@ -384,8 +527,15 @@ export function mount(): void {
 export function unmount(): void {
   unmountRenderer();
   session.reset({ kind: "absent" });
-  localWriteRevision = null;
   cancelTerrainDraft();
+  districtPlan = null;
+  districtPlanRevision = null;
+  districtPlanEpoch = null;
+  districtSelection = [];
+  districtDraftCancelListener = null;
+  cancelScheduledWalls();
+  wallDiagnostic = null;
+  localWriteRevision = null;
   roadSelection = { edgeIds: [], nodeIds: [] };
   notifyCityChanged();
 }
@@ -404,7 +554,7 @@ export async function setSceneEnabled(enabled: boolean): Promise<void> {
   mount();
 }
 
-function newState(seed: string, mode: TerrainMode, edge: CoastEdge | null): CityStateV2 {
+function newState(seed: string, mode: TerrainMode, edge: CoastEdge | null): CityStateV3 {
   const origin = sceneCentre();
   const bounds = sceneBoundsM(origin);
   const citySeed = normalizeCitySeed(seed);
@@ -421,15 +571,18 @@ function newState(seed: string, mode: TerrainMode, edge: CoastEdge | null): City
         terrainMode: mode,
         coastEdge: edge,
         roadLayout: "european",
-        hubMode: "single-centre"
+        hubMode: "single-centre",
+        districtPool: [...DISTRICT_TYPE_IDS],
+        openSpaceProfile: "medium"
       },
       terrain: { land, urbanFootprint: null },
-      roads: { nodes: [], routes: [], edges: [] }
+      roads: { nodes: [], routes: [], edges: [] },
+      districts: []
     }
   };
 }
 
-function generatedCandidate(seed: string, mode: TerrainMode, edge: CoastEdge | null): CityStateV2 {
+function generatedCandidate(seed: string, mode: TerrainMode, edge: CoastEdge | null): CityStateV3 {
   const current = session.current;
   if (current === null) return newState(seed, mode, edge);
   const bounds = sceneBoundsM(current.source.origin);
@@ -486,7 +639,7 @@ function multiArea(multi: ReturnType<typeof ringAsMulti>): number {
 }
 
 export function roadClearanceBlockers(
-  roads: CitySourceV2["roads"],
+  roads: CitySourceV3["roads"],
   land: Ring,
   sceneBounds: Rect
 ): string[] {
@@ -513,7 +666,9 @@ export function roadClearanceBlockers(
   return [...blocked].sort((left, right) => left.localeCompare(right));
 }
 
-function validateCandidate(candidate: CityStateV2, geometryPrebuilt = false): void {
+function validateCandidate(candidate: CityStateV3, geometryPrebuilt = false): void {
+  const sourceProblems = validateCitySourceV3(candidate.source);
+  if (sourceProblems.length > 0) throw new Error(sourceProblems.join(" "));
   const result = validateTerrain(candidate.source.terrain);
   if (!result.ok) throw new Error(result.reason);
   const topology = validateRouteTopology(candidate.source.roads);
@@ -538,7 +693,7 @@ function validateCandidate(candidate: CityStateV2, geometryPrebuilt = false): vo
   }
 }
 
-function warnLargeScene(candidate: CityStateV2): void {
+function warnLargeScene(candidate: CityStateV3): void {
   const bounds = sceneBoundsM(candidate.source.origin);
   if (Math.hypot(bounds.width, bounds.height) <= SUPPORTED_DIAGONAL_M) return;
   ui.notifications?.warn(
@@ -547,15 +702,42 @@ function warnLargeScene(candidate: CityStateV2): void {
 }
 
 async function guardedSave(
-  candidate: CityStateV2,
+  candidate: CityStateV3,
   expectation: SaveExpectation,
-  geometryPrebuilt = false
-): Promise<CityStateV2> {
+  geometryPrebuilt = false,
+  suppliedPlan: DistrictPlan | null = null,
+  skipPlan = false
+): Promise<CityStateV3> {
   validateCandidate(candidate, geometryPrebuilt);
+  if (!skipPlan) {
+    const current = session.current;
+    const statusBeforePlan = session.status;
+    const creating = current === null && (statusBeforePlan.kind === "absent" || statusBeforePlan.kind === "legacy") && candidate.revision === 1;
+    if (!creating && (current === null || current.revision + 1 !== candidate.revision)) {
+      throw new Error("City revision changed before district planning; retry from the current Scene.");
+    }
+    const planned = suppliedPlan === null
+      ? await buildPlanForCity(candidate, ++districtActionSequence, session.buildEpoch)
+      : { plan: suppliedPlan, roundTripMs: 0, workerMode: districtPlanWorkerMode };
+    const currentAfterPlan = session.current;
+    const statusAfterPlan = session.status;
+    if (creating) {
+      if (currentAfterPlan !== null || statusAfterPlan.kind !== statusBeforePlan.kind) {
+        throw new Error("District planning was superseded by newer Scene state.");
+      }
+    } else if (currentAfterPlan?.revision !== candidate.revision - 1) {
+      throw new Error("District planning was superseded by newer Scene state.");
+    }
+    preflightPlan = { revision: candidate.revision, ...planned };
+  } else {
+    preflightPlan = null;
+  }
   const status = session.status;
   const saveExpectation =
     status.kind === "supported" && status.migratedFrom !== undefined
-      ? { kind: "migrated-schema-1" as const, revision: status.migratedFrom.revision }
+      ? status.migratedFrom.schemaVersion === 1
+        ? { kind: "migrated-schema-1" as const, revision: status.migratedFrom.revision }
+        : { kind: "migrated-schema-2" as const, revision: status.migratedFrom.revision }
       : expectation;
   localWriteRevision = candidate.revision;
   try {
@@ -606,10 +788,14 @@ async function createGeneratedTerrain(
   if (status.kind === "supported") {
     const saved = await guardedSave(candidate, status.state.revision);
     session.publishCommit(saved);
+    const plan = publishPreflightPlan(saved.revision);
+    if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   } else {
     const expected: SaveExpectation = status.kind === "legacy" ? "legacy" : "absent";
     const saved = await guardedSave(candidate, expected);
     session.publishCreation(saved);
+    const plan = publishPreflightPlan(saved.revision);
+    if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
     if (status.kind === "legacy") {
       try {
         await deleteGeneratedWalls();
@@ -646,14 +832,24 @@ export function replaceLegacyWithCoastalTerrain(
   return terrainActions.run(() => createGeneratedTerrain(seed, "coastal", edge, true));
 }
 
-async function commitSource(source: CityStateV2["source"]): Promise<RebuildResult> {
+async function commitSource(source: CityStateV3["source"], wallRelevant = true, geometryPrebuilt = false): Promise<RebuildResult> {
   const current = session.current;
   if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
-  const candidate: CityStateV2 = { ...current, revision: current.revision + 1, source };
-  const saved = await guardedSave(candidate, current.revision);
+  const candidate: CityStateV3 = { ...current, revision: current.revision + 1, source };
+  const saved = await guardedSave(candidate, current.revision, geometryPrebuilt);
   session.publishCommit(saved);
+  const districtIds = new Set(saved.source.districts.map((district) => district.id));
+  districtSelection = districtSelection.filter((id) => districtIds.has(id));
+  const plan = publishPreflightPlan(saved.revision);
+  if (wallRelevant && plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   cancelTerrainDraft();
   notifyCityChanged();
+  if (!wallRelevant) {
+    const currentBuild = lastBuild;
+    return currentBuild === null
+      ? { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: false }
+      : { ...currentBuild, ms: 0, stale: false };
+  }
   return rebuildAfterCommit();
 }
 
@@ -663,7 +859,7 @@ function nextRoadSequence(): number {
 }
 
 function validateRoadEdgeSelection(
-  source: CitySourceV2["roads"],
+  source: CitySourceV3["roads"],
   edgeIds: readonly string[]
 ): Set<string> {
   if (edgeIds.length === 0) throw new Error("Select at least one road segment.");
@@ -676,7 +872,7 @@ function validateRoadEdgeSelection(
 }
 
 /** Keep the selection across commits, dropping any road or junction the commit removed. */
-function pruneRoadSelection(selection: RoadSelection, source: CitySourceV2["roads"]): RoadSelection {
+function pruneRoadSelection(selection: RoadSelection, source: CitySourceV3["roads"]): RoadSelection {
   const edgeIds = new Set(source.edges.map((edge) => edge.id));
   const nodeIds = new Set(source.nodes.map((node) => node.id));
   return {
@@ -686,7 +882,7 @@ function pruneRoadSelection(selection: RoadSelection, source: CitySourceV2["road
 }
 
 function roadEdgesForSelection(
-  source: CitySourceV2["roads"],
+  source: CitySourceV3["roads"],
   edgeIds: readonly string[],
   contiguousName: boolean
 ): Set<string> {
@@ -715,7 +911,7 @@ function roadEdgesForSelection(
   return connected;
 }
 
-function dirtyRoadKeys(before: CitySourceV2["roads"], after: CitySourceV2["roads"], sceneBounds: Rect): ChunkKey[] {
+function dirtyRoadKeys(before: CitySourceV3["roads"], after: CitySourceV3["roads"], sceneBounds: Rect): ChunkKey[] {
   const oldRoutes = new Map(before.routes.map((route) => [route.id, route.curvePreset]));
   const newRoutes = new Map(after.routes.map((route) => [route.id, route.curvePreset]));
   const changedRoutes = new Set<string>();
@@ -754,7 +950,7 @@ export function chunkCoverageComplete(availableChunkIds: readonly string[], scen
   return chunksCovering(sceneBounds).every((key) => available.has(chunkId(key)));
 }
 
-async function preflightCity(candidate: CityStateV2, token: number, keysOverride?: ChunkKey[]): Promise<{ batch: Awaited<ReturnType<typeof buildBatch>>; keys: ChunkKey[] }> {
+async function preflightCity(candidate: CityStateV3, token: number, keysOverride?: ChunkKey[]): Promise<{ batch: Awaited<ReturnType<typeof buildBatch>>; keys: ChunkKey[] }> {
   const bounds = sceneBoundsM(candidate.source.origin);
   const keys = keysOverride ?? chunksCovering(bounds);
   const batch = await buildBatch(ensureWorker(), candidate, keys, bounds, pixelsPerMetre(), token, token);
@@ -768,7 +964,7 @@ async function preflightCity(candidate: CityStateV2, token: number, keysOverride
 }
 
 function installBatch(
-  city: CityStateV2,
+  city: CityStateV3,
   records: TerrainChunkRecord[],
   keys: ChunkKey[],
   revision: number,
@@ -825,23 +1021,38 @@ function installBatch(
   return result;
 }
 
-async function commitRoadSource(source: CitySourceV2["roads"], generation?: Partial<CitySourceV2["generation"]>, metadataOnly = false, fullRebuild = false): Promise<RebuildResult> {
+async function commitRoadSource(source: CitySourceV3["roads"], generation?: Partial<CitySourceV3["generation"]>, metadataOnly = false, fullRebuild = false): Promise<RebuildResult> {
   const current = session.current;
   if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
-  const candidate: CityStateV2 = {
+  const nextSource: CityStateV3["source"] = {
+    ...current.source,
+    generation: { ...current.source.generation, ...generation },
+    roads: source
+  };
+  const candidate: CityStateV3 = {
     ...current,
     revision: current.revision + 1,
     source: {
-      ...current.source,
-      generation: { ...current.source.generation, ...generation },
-      roads: source
+      ...nextSource,
+      districts: metadataOnly ? current.source.districts : reconcileDistrictsForRoadEdit(current.source, nextSource)
     }
   };
   if (metadataOnly) {
-    validateCandidate(candidate, true);
-    const saved = await guardedSave(candidate, current.revision, true);
+    const reusablePlan = districtPlan !== null && districtPlanRevision === current.revision ? districtPlan : null;
+    const saved = await guardedSave(candidate, current.revision, true, null, true);
     session.publishCommit(saved);
+    preflightPlan = null;
+    if (reusablePlan !== null) {
+      districtPlan = reusablePlan;
+      districtPlanRevision = saved.revision;
+      districtPlanEpoch = session.buildEpoch;
+    } else {
+      districtPlan = null;
+      districtPlanRevision = null;
+      districtPlanEpoch = null;
+    }
     roadSelection = pruneRoadSelection(roadSelection, source);
+    districtSelection = districtSelection.filter((id) => saved.source.districts.some((district) => district.id === id));
     lastRoadBuild = {
       requested: 0,
       built: 0,
@@ -868,6 +1079,8 @@ async function commitRoadSource(source: CitySourceV2["roads"], generation?: Part
   const prebuilt = await preflightCity(candidate, actionToken, keys);
   const saved = await guardedSave(candidate, current.revision, true);
   session.publishCommit(saved);
+  const plan = publishPreflightPlan(saved.revision);
+  if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   let result: RebuildResult;
   try {
     mountRenderer();
@@ -878,6 +1091,8 @@ async function commitRoadSource(source: CitySourceV2["roads"], generation?: Part
     result = { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: false, degraded: true };
   }
   roadSelection = pruneRoadSelection(roadSelection, source);
+  const districtIds = new Set(saved.source.districts.map((district) => district.id));
+  districtSelection = districtSelection.filter((id) => districtIds.has(id));
   cancelTerrainDraft();
   notifyCityChanged();
   return result;
@@ -985,8 +1200,8 @@ export function appendRoad(
 }
 
 export function generateRoads(
-  layout: CitySourceV2["generation"]["roadLayout"] = "european",
-  hubMode: CitySourceV2["generation"]["hubMode"] = "single-centre"
+  layout: CitySourceV3["generation"]["roadLayout"] = "european",
+  hubMode: CitySourceV3["generation"]["hubMode"] = "single-centre"
 ): Promise<RebuildResult> {
   return terrainActions.run(async () => {
     const city = session.current;
@@ -1107,6 +1322,249 @@ export function reclassifyRoad(classId: RouteClassId, contiguousName = false, ed
   });
 }
 
+function districtPointInRing(point: Vec2, ring: Ring): boolean {
+  let inside = false;
+  for (let index = 0; index < ring.length; index++) {
+    const a = ring[index]!;
+    const b = ring[(index + 1) % ring.length]!;
+    if ((a.y > point.y) !== (b.y > point.y) && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+function districtManualId(city: CityStateV3, lineage: string): string {
+  let hash = 0x811c9dc5;
+  const material = `${city.source.citySeed}\0districts/manual/${city.revision}/${lineage}`;
+  for (let index = 0; index < material.length; index++) hash = Math.imul(hash ^ material.charCodeAt(index), 0x01000193);
+  const base = `district_manual_${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  const used = new Set(city.source.districts.map((district) => district.id));
+  if (!used.has(base)) return base;
+  for (let suffix = 1; ; suffix++) {
+    const id = `${base}_${suffix}`;
+    if (!used.has(id)) return id;
+  }
+}
+
+function districtSeed(city: CityStateV3, lineage: string): string {
+  return `${city.source.citySeed}/district/${city.revision}/${lineage}`;
+}
+
+function districtRecord(city: CityStateV3, polygon: Ring, typeId: DistrictTypeId, lineage: string, paletteId?: string): DistrictSource {
+  if (!DISTRICT_TYPE_REGISTRY.has(typeId)) throw new Error(`Unknown district type "${typeId}".`);
+  const resolvedPaletteId = paletteId ?? DISTRICT_TYPE_REGISTRY.get(typeId)!.defaultPaletteId;
+  if (!DISTRICT_PALETTE_IDS.includes(resolvedPaletteId)) throw new Error(`Unknown district palette "${resolvedPaletteId}".`);
+  return {
+    id: districtManualId(city, lineage),
+    polygon: normalizeRing(polygon),
+    seed: districtSeed(city, lineage),
+    typeId,
+    paletteId: resolvedPaletteId,
+    origin: "authored",
+    locked: false,
+    openSpaceOverride: null
+  };
+}
+
+function districtSourceCommit(source: CityStateV3["source"]): Promise<RebuildResult> {
+  return commitSource(source, false, true);
+}
+
+export function getDistrictPlan(): DistrictPlan | null {
+  return districtPlan === null ? null : structuredClone(districtPlan);
+}
+
+// WHY: Cloning tens of thousands of derived cells blocks interactive overlay frames; callers must not mutate this view.
+export function getDistrictPlanView(): Readonly<DistrictPlan> | null {
+  return districtPlan;
+}
+
+export function getDistrictSelection(): string[] {
+  return [...districtSelection];
+}
+
+export function clearDistrictSelection(): void {
+  districtSelection = [];
+  notifyCityChanged();
+}
+
+export function selectDistrict(id: string, additive = false): string[] {
+  const city = session.current;
+  if (city === null || !city.source.districts.some((district) => district.id === id)) return getDistrictSelection();
+  const selected = additive ? new Set(districtSelection) : new Set<string>();
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  districtSelection = [...selected].filter((candidate) => city.source.districts.some((district) => district.id === candidate)).sort();
+  notifyCityChanged();
+  return getDistrictSelection();
+}
+
+export function districtInspector(ids: readonly string[] = districtSelection): DistrictInspector | null {
+  const city = session.current;
+  if (city === null) return null;
+  const selected = city.source.districts.filter((district) => ids.includes(district.id));
+  if (selected.length === 0) return null;
+  const same = <T>(pick: (district: DistrictSource) => T): T | "multiple" => {
+    const first = pick(selected[0]!);
+    return selected.every((district) => JSON.stringify(pick(district)) === JSON.stringify(first)) ? first : "multiple";
+  };
+  return {
+    districtIds: selected.map((district) => district.id),
+    typeId: same((district) => district.typeId),
+    paletteId: same((district) => district.paletteId),
+    seed: same((district) => district.seed),
+    locked: same((district) => district.locked),
+    openSpaceOverride: same((district) => district.openSpaceOverride)
+  };
+}
+
+export function setDistrictSnapOptions(options: Partial<DistrictSnapOptions>): DistrictSnapOptions {
+  districtSnapOptionsState = { ...districtSnapOptionsState, ...options };
+  return districtSnapOptions();
+}
+
+export function districtSnapOptions(): DistrictSnapOptions {
+  return { ...districtSnapOptionsState };
+}
+
+export function setDistrictDraftCancelListener(listener: (() => void) | null): void {
+  districtDraftCancelListener = listener;
+}
+
+export function cancelDistrictDraft(): void {
+  districtDraftCancelListener?.();
+}
+
+export function districtDiagnostics(): Array<Record<string, unknown>> {
+  const entries: Array<Record<string, unknown>> = [];
+  if (districtPlan?.diagnostics.warnings.length) {
+    entries.push(...districtPlan.diagnostics.warnings.map((message) => ({ subsystem: "districts", message })));
+  }
+  if (wallDiagnostic !== null) entries.push({ subsystem: "walls", retry: "walls", message: wallDiagnostic.reason, revision: wallDiagnostic.revision });
+  return entries;
+}
+
+export function retryGeneratedWalls(): Promise<void> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (districtPlan === null || districtPlanRevision !== city.revision || districtPlanEpoch !== session.buildEpoch) {
+      await rebuildGeometry();
+    }
+    const latest = session.current;
+    if (latest === null || districtPlan === null) throw new Error("The current district plan is unavailable.");
+    cancelScheduledWalls();
+    wallDiagnostic = null;
+    await wallScheduler.runNow((replacementToken) => installGeneratedWalls(latest, districtPlan!, latest.revision, session.buildEpoch, replacementToken));
+    const diagnostic = wallDiagnostic as { kind: "degraded"; reason: string; revision: number } | null;
+    if (diagnostic !== null && diagnostic.revision === latest.revision) {
+      throw new Error(diagnostic.reason);
+    }
+  });
+}
+
+export function generateDistricts(options: { districtPool: DistrictTypeId[]; openSpaceProfile: DistrictOpenSpaceProfile }): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (city.source.districts.length > 0) throw new Error("Initial district generation requires an empty district source.");
+    const source: CityStateV3["source"] = {
+      ...city.source,
+      generation: {
+        ...city.source.generation,
+        districtPool: DISTRICT_TYPE_IDS.filter((id) => options.districtPool.includes(id)),
+        openSpaceProfile: options.openSpaceProfile
+      },
+      districts: []
+    };
+    const availability = districtGenerationAvailability(source);
+    if (!availability.available) throw new Error(availability.reason ?? "Initial district generation is unavailable.");
+    const actionToken = ++districtActionSequence;
+    const buildToken = session.buildEpoch;
+    const districts = await planInitialDistricts(source, city.revision, actionToken, buildToken);
+    if (
+      session.current?.revision !== city.revision ||
+      session.buildEpoch !== buildToken ||
+      districtActionSequence !== actionToken
+    ) throw new Error("Initial district generation was superseded by newer Scene state.");
+    return districtSourceCommit({ ...source, districts });
+  });
+}
+
+export function createDistrict(polygon: Ring, typeId: DistrictTypeId, paletteId?: string): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const incoming = districtRecord(city, polygon, typeId, `draw/${districtActionSequence++}`, paletteId);
+    const districts = districtDrawCandidate(city.source, incoming);
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
+export function fillDistrict(point: Vec2, typeId: DistrictTypeId, paletteId?: string): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (districtSelection.length > 1) throw new Error("Fill requires zero or one selected district.");
+    const plan = districtPlan ?? buildDistrictPlan(city.source);
+    const block = plan.blocks.find((candidate) => districtPointInRing(point, candidate.zoningFace));
+    if (block === undefined) throw new Error("Fill must target a generated road-defined block.");
+    const selected = districtSelection.length === 1 ? districtSelection[0]! : null;
+    const incoming = selected === null ? districtRecord(city, block.zoningFace, typeId, `fill/${block.id}`, paletteId) : undefined;
+    const districts = districtFillCandidate(city.source, block.zoningFace, { targetDistrictId: selected, newDistrict: incoming });
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
+export function moveDistrictVertex(id: string, index: number, point: Vec2): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const districts = districtMoveVertexCandidate(city.source, id, index, point);
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
+export function splitDistrict(id: string, points: readonly Vec2[]): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (districtSelection.length !== 1 || districtSelection[0] !== id) throw new Error("Split requires exactly one selected district.");
+    if (points.length !== 2) throw new Error("Split requires exactly two points.");
+    const districts = districtSplitCandidate(city.source, id, points[0]!, points[1]!, districtManualId(city, `split/${id}/${districtActionSequence++}`));
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
+export function mergeDistricts(ids: readonly string[], survivorId: string): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const districts = districtMergeCandidate(city.source, ids, survivorId);
+    const result = await districtSourceCommit({ ...city.source, districts });
+    districtSelection = [survivorId];
+    notifyCityChanged();
+    return result;
+  });
+}
+
+export function updateDistricts(ids: readonly string[], patch: DistrictUpdatePatch): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const districts = districtUpdateCandidate(city.source, ids, patch);
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
+export function deleteDistricts(ids: readonly string[]): Promise<RebuildResult> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    const districts = districtDeleteCandidate(city.source, ids);
+    return districtSourceCommit({ ...city.source, districts });
+  });
+}
+
 export function replaceLand(ring: Ring): Promise<RebuildResult> {
   return terrainActions.run(() => {
     const current = session.current;
@@ -1180,12 +1638,18 @@ async function applyHistory(direction: "undo" | "redo"): Promise<boolean> {
   const current = session.current;
   const target = direction === "undo" ? session.undoTarget : session.redoTarget;
   if (current === null || target === null) return false;
+  const wallRelevant = JSON.stringify(current.source.terrain) !== JSON.stringify(target.source.terrain) || JSON.stringify(current.source.roads) !== JSON.stringify(target.source.roads);
   const saved = await guardedSave(target, current.revision);
   if (direction === "undo") session.publishUndo(saved);
   else session.publishRedo(saved);
+  const plan = publishPreflightPlan(saved.revision);
+  roadSelection = pruneRoadSelection(roadSelection, saved.source.roads);
+  const districtIds = new Set(saved.source.districts.map((district) => district.id));
+  districtSelection = districtSelection.filter((id) => districtIds.has(id));
+  if (wallRelevant && plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   cancelTerrainDraft();
   notifyCityChanged();
-  await rebuildAfterCommit();
+  if (wallRelevant) await rebuildAfterCommit();
   return true;
 }
 
@@ -1212,6 +1676,63 @@ function noteWorkerFailure(error: unknown): void {
   if (workerWarned) return;
   workerWarned = true;
   console.warn(`${MODULE_ID} | city worker unusable, falling back to the main thread`, error);
+}
+
+async function buildPlanForCity(city: CityStateV3, actionToken: number, buildToken: number): Promise<{ plan: DistrictPlan; roundTripMs: number; workerMode: "worker" | "fallback" }> {
+  const started = performance.now();
+  const client = ensureWorker();
+  if (client !== null) {
+    try {
+      const result = await client.buildDistrictPlan({ source: city.source, sourceRevision: city.revision, actionToken, buildToken });
+      if (result.sourceRevision !== city.revision || result.actionToken !== actionToken || result.buildToken !== buildToken) {
+        throw new Error("Worker returned a stale district plan.");
+      }
+      return { plan: result.plan, roundTripMs: performance.now() - started, workerMode: "worker" };
+    } catch (error) {
+      if (error instanceof Error && error.message === "Worker returned a stale district plan.") throw error;
+      noteWorkerFailure(error);
+      if (client === workerClient) {
+        client.terminate();
+        workerClient = null;
+        workerUnavailable = true;
+      }
+    }
+  }
+  return { plan: buildDistrictPlan(city.source), roundTripMs: performance.now() - started, workerMode: "fallback" };
+}
+
+async function planInitialDistricts(
+  source: CitySourceV3,
+  sourceRevision: number,
+  actionToken: number,
+  buildToken: number
+): Promise<DistrictSource[]> {
+  const client = ensureWorker();
+  if (client !== null) {
+    try {
+      const result = await client.generateInitialDistricts({ source, sourceRevision, actionToken, buildToken });
+      if (result.sourceRevision !== sourceRevision || result.actionToken !== actionToken || result.buildToken !== buildToken) {
+        throw new Error("Worker returned stale initial district generation.");
+      }
+      return result.districts;
+    } catch (error) {
+      if (error instanceof Error && error.message === "Worker returned stale initial district generation.") throw error;
+      let fallback: DistrictSource[];
+      try {
+        fallback = generateInitialDistricts(source);
+      } catch (generationError) {
+        throw generationError;
+      }
+      noteWorkerFailure(error);
+      if (client === workerClient) {
+        client.terminate();
+        workerClient = null;
+        workerUnavailable = true;
+      }
+      return fallback;
+    }
+  }
+  return generateInitialDistricts(source);
 }
 
 async function planInitialRoadNetwork(
@@ -1288,7 +1809,7 @@ interface CityBatchBuild {
 
 async function buildBatch(
   client: WorkerClient | null,
-  city: CityStateV2,
+  city: CityStateV3,
   keys: ChunkKey[],
   bounds: Rect,
   ppm: number,
@@ -1346,7 +1867,7 @@ async function buildBatch(
 }
 
 function chunkGeometry(
-  city: CityStateV2,
+  city: CityStateV3,
   record: TerrainChunkRecord,
   ppm: number
 ): ChunkGeometry {
@@ -1380,9 +1901,16 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
 
   const client = ensureWorker();
   const batch = await buildBatch(client, city, keys, bounds, ppm, revision, epoch);
+  const planToken = ++districtActionSequence;
+  const planned = await buildPlanForCity(city, planToken, epoch);
   let installed = 0;
   const current = session.current;
   if (terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+    districtPlan = planned.plan;
+    districtPlanRevision = revision;
+    districtPlanEpoch = epoch;
+    districtPlanRoundTripMs = planned.roundTripMs;
+    districtPlanWorkerMode = planned.workerMode;
     for (const record of batch.records) {
       chunks.set(record.id, record);
       renderer.setChunk(chunkGeometry(city, record, ppm));
@@ -1571,6 +2099,21 @@ export function stats(): Record<string, unknown> | null {
     roadNodes: city.source.roads.nodes.length,
     roadEdges: city.source.roads.edges.length,
     roadRoutes: city.source.roads.routes.length,
+    districts: city.source.districts.length,
+    districtSelection: getDistrictSelection(),
+    districtPlan: districtPlan === null ? null : {
+      revision: districtPlanRevision,
+      workerMode: districtPlanWorkerMode,
+      roundTripMs: districtPlanRoundTripMs,
+      blocks: districtPlan.blocks.length,
+      fragments: districtPlan.blocks.reduce((sum, block) => sum + block.districtFragments.length, 0),
+      developmentCells: districtPlan.developmentCells.length,
+      openSpaceIntents: districtPlan.openSpaceIntents.length,
+      unzonedRegions: districtPlan.unzoned.length,
+      wallCells: districtPlan.wallCells.length
+    },
+    districtDiagnostics: districtDiagnostics(),
+    generatedWalls: lastWallBuild,
     serializedFlagBytes,
     roadSelection: getRoadSelection(),
     roadBuild: lastRoadBuild,
@@ -1617,6 +2160,10 @@ function handleExternalFlagChange(): void {
   if (result.kind !== "supported") {
     session.reset(result);
     roadSelection = { edgeIds: [], nodeIds: [] };
+    districtSelection = [];
+    districtPlan = null;
+    districtPlanRevision = null;
+    districtPlanEpoch = null;
     unmountRenderer();
     cancelTerrainDraft();
     notifyCityChanged();
@@ -1625,12 +2172,16 @@ function handleExternalFlagChange(): void {
   }
   if (!session.adoptExternal(result)) return;
   roadSelection = { edgeIds: [], nodeIds: [] };
+  districtSelection = [];
+  districtPlan = null;
+  districtPlanRevision = null;
+  districtPlanEpoch = null;
   cancelTerrainDraft();
   notifyCityChanged();
   ui.notifications?.warn("Nixie: a newer Scene revision was loaded; local history and drafts were cleared.");
   unmountRenderer();
   mountRenderer();
-  void rebuildGeometry().catch((error) =>
+  void rebuildGeometry().then(() => scheduleCurrentPlanWalls()).catch((error) =>
     console.error(`${MODULE_ID} | external terrain rebuild failed`, error)
   );
 }
@@ -1656,7 +2207,7 @@ export function registerHooks(): void {
       session.invalidateRenderInputs();
       cancelTerrainDraft();
       notifyCityChanged();
-      void rebuildGeometry().catch((error) =>
+      void rebuildGeometry().then(() => scheduleCurrentPlanWalls()).catch((error) =>
         console.error(`${MODULE_ID} | Scene scale terrain rebuild failed`, error)
       );
     }

@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   canvasTool,
+  clearEditorActionError,
   closeEditor,
   currentCurvePreset,
+  currentDistrictPalette,
+  currentEditorActionError,
   currentHubMode,
   currentObjectCategory,
   currentRoadClass,
   currentRoadLayout,
   currentWorkspace,
+  districtSnapOptions,
+  DISTRICT_TYPE_IDS,
+  DISTRICT_TOOL,
   editorLayerActivated,
   editorLayerDeactivated,
   isEditorOpen,
@@ -16,6 +22,10 @@ import {
   ownedLayerName,
   ROAD_TOOL,
   setCanvasTool,
+  setEditorActionError,
+  setDistrictSnapOptions,
+  setDistrictPalette,
+  setDistrictType,
   setEditorController,
   setObjectCategory,
   setWorkspace,
@@ -39,11 +49,13 @@ function stubSessionStorage(): void {
 function stubCanvas(): { nixieActivate: ReturnType<typeof vi.fn>; tokensActivate: ReturnType<typeof vi.fn> } {
   const nixieActivate = vi.fn();
   const roadsActivate = vi.fn();
+  const districtsActivate = vi.fn();
   const tokensActivate = vi.fn();
   vi.stubGlobal("canvas", {
     ready: true,
     nixie: { active: false, activate: nixieActivate, refresh: vi.fn() },
     "nixie-roads": { active: false, activate: roadsActivate, refresh: vi.fn() },
+    "nixie-districts": { active: false, activate: districtsActivate, refresh: vi.fn() },
     tokens: { active: false, activate: tokensActivate }
   });
   return { nixieActivate, tokensActivate };
@@ -60,6 +72,8 @@ beforeEach(() => {
 
 afterEach(() => {
   if (isEditorOpen()) closeEditor({ restoreDefaultLayer: false });
+  setDistrictSnapOptions({ districtVertices: true, roadJunctions: true, blockBoundaries: true, foundryGrid: false });
+  setDistrictType(DISTRICT_TYPE_IDS[0]);
   setEditorController(null);
   vi.unstubAllGlobals();
 });
@@ -98,6 +112,33 @@ describe("workspace switching", () => {
     expect(currentWorkspace()).toBe("roads");
     expect(ownedLayerName()).toBe("nixie-roads");
     expect(controller.onStateChanged).toHaveBeenCalled();
+  });
+
+  it("activates the district layer and resets to a district tool", () => {
+    openEditor();
+    setWorkspace("districts");
+    expect(currentWorkspace()).toBe("districts");
+    expect(ownedLayerName()).toBe("nixie-districts");
+    expect(canvasTool()).toBe(DISTRICT_TOOL.SELECT);
+  });
+
+  it("keeps district snapping preferences session-scoped and independent", () => {
+    openEditor();
+    setDistrictSnapOptions({ foundryGrid: true, roadJunctions: false });
+    expect(districtSnapOptions()).toMatchObject({ foundryGrid: true, roadJunctions: false, districtVertices: true });
+    closeEditor();
+    expect(JSON.parse(sessionStorage.getItem(PREFS_KEY)!)).not.toHaveProperty("districtSnap");
+    openEditor();
+    expect(districtSnapOptions()).toMatchObject({ foundryGrid: true, roadJunctions: false, districtVertices: true });
+  });
+
+  it("tracks the selected palette independently and resets to a type default when type changes", () => {
+    setDistrictType("night-market");
+    expect(currentDistrictPalette()).toBe("night-market");
+    setDistrictPalette("corporate");
+    expect(currentDistrictPalette()).toBe("corporate");
+    setDistrictType("waterfront");
+    expect(currentDistrictPalette()).toBe("waterfront");
   });
 
   it("resets an incompatible tool when switching workspace", () => {
@@ -195,5 +236,13 @@ describe("session preferences", () => {
     openEditor();
     notifyEditorInteraction();
     expect(controller.onStateChanged).toHaveBeenCalled();
+  });
+
+  it("retains action failures with affected ids until cleared", () => {
+    openEditor();
+    setEditorActionError("district edit", Object.assign(new Error("Locked district"), { affectedIds: ["d-1"] }));
+    expect(currentEditorActionError()).toEqual({ label: "district edit", message: "Locked district", affectedIds: ["d-1"] });
+    clearEditorActionError();
+    expect(currentEditorActionError()).toBeNull();
   });
 });

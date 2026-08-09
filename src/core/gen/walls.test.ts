@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { rectRing, type MultiPolygon, type Polygon } from "../geom/types.js";
-import { totalWallLength, wallSegmentsFromBlocks, type WallSegment } from "./walls.js";
+import { totalWallLength, wallSegmentsFromBlocks, wallSegmentsFromMetreCells, type WallSegment } from "./walls.js";
 
 const options = { tolerancePx: 1 };
 
@@ -117,5 +117,23 @@ describe("wallSegmentsFromBlocks", () => {
 
   it("returns nothing for no blocks", () => {
     expect(wallSegmentsFromBlocks([], options)).toEqual([]);
+  });
+
+  it("simplifies in metres before applying origin and pixel scale", () => {
+    const cells: MultiPolygon = [[[
+      { x: 0, y: 0 },
+      { x: 5, y: 0.2 },
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 }
+    ]]];
+    const segments = wallSegmentsFromMetreCells(cells, { origin: { x: 100, y: 200 }, pixelsPerMetre: 10 });
+    expect(segments).toEqual([
+      { x1: 100, y1: 200, x2: 200, y2: 200 },
+      { x1: 200, y1: 200, x2: 200, y2: 300 },
+      { x1: 200, y1: 300, x2: 100, y2: 300 },
+      { x1: 100, y1: 300, x2: 100, y2: 200 }
+    ]);
+    expect(isClosedLoop(segments)).toBe(true);
   });
 });

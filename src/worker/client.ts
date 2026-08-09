@@ -4,6 +4,10 @@ import type {
   BuildCityChunksResult,
   BuildTerrainChunkRequest,
   BuildTerrainChunkResult,
+  BuildDistrictPlanRequest,
+  BuildDistrictPlanResult,
+  GenerateInitialDistrictsRequest,
+  GenerateInitialDistrictsResult,
   GenerateInitialRoadNetworkRequest,
   GenerateInitialRoadNetworkResult,
   WorkerRequest,
@@ -74,6 +78,18 @@ export class WorkerClient {
     body: Omit<GenerateInitialRoadNetworkRequest, "id" | "type">
   ): Promise<GenerateInitialRoadNetworkResult> {
     return this.request({ ...body, type: "generateInitialRoadNetwork" }) as Promise<GenerateInitialRoadNetworkResult>;
+  }
+
+  buildDistrictPlan(
+    body: Omit<BuildDistrictPlanRequest, "id" | "type">
+  ): Promise<BuildDistrictPlanResult> {
+    return this.request({ ...body, type: "buildDistrictPlan" }) as Promise<BuildDistrictPlanResult>;
+  }
+
+  generateInitialDistricts(
+    body: Omit<GenerateInitialDistrictsRequest, "id" | "type">
+  ): Promise<GenerateInitialDistrictsResult> {
+    return this.request({ ...body, type: "generateInitialDistricts" }) as Promise<GenerateInitialDistrictsResult>;
   }
 
   terminate(): void {

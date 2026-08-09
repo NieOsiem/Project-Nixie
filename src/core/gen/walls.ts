@@ -14,6 +14,12 @@ export interface WallOptions {
   tolerancePx: number;
 }
 
+export interface MetreWallOptions {
+  origin: Vec2;
+  pixelsPerMetre: number;
+  toleranceM?: number;
+}
+
 function roundAndDedupe(ring: Vec2[]): Vec2[] {
   const out: Vec2[] = [];
   for (const p of ring) {
@@ -56,6 +62,31 @@ export function wallSegmentsFromBlocks(
     }
   }
 
+  return segments;
+}
+
+export function wallSegmentsFromMetreCells(cells: MultiPolygon, options: MetreWallOptions): WallSegment[] {
+  if (!Number.isFinite(options.pixelsPerMetre) || options.pixelsPerMetre <= 0) throw new Error("Pixels per metre must be positive and finite.");
+  if (!Number.isFinite(options.origin.x) || !Number.isFinite(options.origin.y)) throw new Error("Wall origin must be finite.");
+  const toleranceM = options.toleranceM ?? 1;
+  if (!Number.isFinite(toleranceM) || toleranceM < 0) throw new Error("Wall simplification tolerance must be finite and non-negative.");
+  const segments: WallSegment[] = [];
+  for (const polygon of cells) {
+    for (const ring of polygon) {
+      const metres = simplifyRing(ring, toleranceM);
+      const pixels = metres.map((point) => ({
+        x: options.origin.x + point.x * options.pixelsPerMetre,
+        y: options.origin.y + point.y * options.pixelsPerMetre
+      }));
+      const points = roundAndDedupe(pixels);
+      if (points.length < 3) continue;
+      for (let index = 0; index < points.length; index++) {
+        const a = points[index]!;
+        const b = points[(index + 1) % points.length]!;
+        if (a.x !== b.x || a.y !== b.y) segments.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+      }
+    }
+  }
   return segments;
 }
 

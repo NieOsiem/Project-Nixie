@@ -1,37 +1,52 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
-import type { CityStateV2 } from "../core/gen/city.js";
+import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
+import type { CityStateV3 } from "../core/gen/city.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { TerrainSession } from "./terrain-session.js";
 import {
   configuredPixelsPerMetre,
   chunkCoverageComplete,
+  cancelTerrainDraft,
+  createDistrict,
   deleteRoadJunction,
   deleteRoads,
+  districtDiagnostics,
   enabledFlagChanged,
   getRoadSelection,
+  getDistrictSelection,
+  fillDistrict,
+  generateDistricts,
+  mergeDistricts,
   mount,
   reclassifyRoad,
   renameRoad,
+  retryGeneratedWalls,
   roadClearanceBlockers,
   sceneBoundsFromPixels,
   selectRoad,
   selectRoadNode,
+  selectDistrict,
   setRoadCurvePreset,
   setRoadLocked,
+  setDistrictDraftCancelListener,
+  splitDistrict,
+  setRoadDraftCancelListener,
+  stats,
+  undo,
   unmount
 } from "./terrain-canvas.js";
 
-function state(): CityStateV2 {
+function state(): CityStateV3 {
   return {
     kind: "city-generator-2",
-    schemaVersion: 2,
-    generatorVersion: 9,
+    schemaVersion: 3,
+    generatorVersion: 10,
     revision: 1,
     source: {
       origin: { x: 500, y: 400 },
       citySeed: "scale-fixture",
-      generation: { terrainMode: "custom", coastEdge: null, roadLayout: "european", hubMode: "single-centre" },
+      generation: { terrainMode: "custom", coastEdge: null, roadLayout: "european", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
       terrain: {
         land: [
           { x: -100, y: -80 },
@@ -41,12 +56,23 @@ function state(): CityStateV2 {
         ],
         urbanFootprint: null
       },
-      roads: { nodes: [], routes: [], edges: [] }
+      roads: { nodes: [], routes: [], edges: [] },
+      districts: []
     }
   };
 }
 
 describe("terrain Scene scale mapping", () => {
+  it("cancels terrain, road, and district drafts together", () => {
+    const calls: string[] = [];
+    setDistrictDraftCancelListener(() => calls.push("district"));
+    setRoadDraftCancelListener(() => calls.push("road"));
+    cancelTerrainDraft();
+    setDistrictDraftCancelListener(null);
+    setRoadDraftCancelListener(null);
+    expect(calls).toEqual(["road", "district"]);
+  });
+
   it("detects external Scene enable changes in nested update data", () => {
     expect(enabledFlagChanged({ flags: { "project-nixie": { enabled: true } } })).toBe(true);
     expect(enabledFlagChanged({ flags: { "project-nixie": { city: {} } } })).toBe(false);
@@ -160,7 +186,7 @@ describe("road install coverage", () => {
   });
 });
 
-function bulkRoadState(): CityStateV2 {
+function bulkRoadState(): CityStateV3 {
   const city = state();
   city.source.roads = {
     nodes: [
@@ -186,17 +212,39 @@ function bulkRoadState(): CityStateV2 {
 }
 
 describe("road bulk mutation selection", () => {
-  let saved: CityStateV2;
+  let saved: CityStateV3;
+  let saveError: Error | null;
+  let wallCreateError: Error | null;
+  let wallDocuments: any[];
 
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     saved = bulkRoadState();
+    saveError = null;
+    wallCreateError = null;
+    wallDocuments = [];
     const scene = {
+      get walls(): any[] { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV2): Promise<CityStateV2> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+        if (saveError !== null) throw saveError;
         saved = structuredClone(value);
         return saved;
+      }),
+      deleteEmbeddedDocuments: vi.fn(async (_type: string, ids: string[]) => {
+        wallDocuments = wallDocuments.filter((wall) => !ids.includes(wall.id));
+        return [];
+      }),
+      createEmbeddedDocuments: vi.fn(async (_type: string, data: any[]) => {
+        if (wallCreateError !== null) throw wallCreateError;
+        const created = data.map((value, index) => ({
+          id: `wall-${index}`,
+          ...value,
+          getFlag: (module: string, flag: string) => value.flags?.[module]?.[flag]
+        }));
+        wallDocuments.push(...created);
+        return created;
       })
     };
     vi.stubGlobal("canvas", {
@@ -207,6 +255,7 @@ describe("road bulk mutation selection", () => {
     });
     vi.stubGlobal("game", { user: { isGM: true } });
     vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
+    vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
     mount();
   });
 
@@ -220,12 +269,112 @@ describe("road bulk mutation selection", () => {
     await reclassifyRoad("arterial", true, ["edge-a", "edge-c"]);
     await renameRoad("Boulevard", true, ["edge-a", "edge-c"]);
     expect(saved.revision).toBe(3);
-    expect(saved.source.roads.edges.map((edge) => [edge.id, edge.classId, edge.name])).toEqual([
+    expect(saved.source.roads.edges.map((edge: CityStateV3["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
       ["edge-a", "arterial", "Boulevard"],
       ["edge-b", "street", "A"],
       ["edge-c", "arterial", "Boulevard"],
       ["edge-d", "narrow", "C"]
     ]);
+  });
+
+  it("commits district geometry without replacing terrain chunk state", async () => {
+    await createDistrict([
+      { x: -70, y: -20 },
+      { x: -20, y: -20 },
+      { x: -20, y: 20 },
+      { x: -70, y: 20 }
+    ], "corporate-core", "night-market");
+    expect(saved.revision).toBe(2);
+    expect(saved.source.districts).toHaveLength(1);
+    expect(saved.source.districts[0]!.paletteId).toBe("night-market");
+    expect(stats()?.lastBuild).toBeNull();
+    await expect(undo()).resolves.toBe(true);
+    expect(saved.source.districts).toHaveLength(0);
+    expect(stats()?.lastBuild).toBeNull();
+  });
+
+  it("rejects Fill with more than one selected district before planning", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
+    ], "night-market");
+    const ids = saved.source.districts.map((district) => district.id);
+    selectDistrict(ids[0]!);
+    selectDistrict(ids[1]!, true);
+    await expect(fillDistrict({ x: 0, y: 0 }, "corporate-core")).rejects.toThrow("Fill requires zero or one selected district.");
+  });
+
+  it("rejects Split unless the requested district is the sole selection", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
+    ], "night-market");
+    const ids = saved.source.districts.map((district) => district.id);
+    selectDistrict(ids[0]!);
+    selectDistrict(ids[1]!, true);
+    await expect(splitDistrict(ids[0]!, [{ x: -80, y: -80 }, { x: -80, y: -40 }])).rejects.toThrow("Split requires exactly one selected district.");
+  });
+
+  it("rejects repeat initial generation without replacing existing districts", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    const before = structuredClone(saved);
+    await expect(generateDistricts({ districtPool: ["corporate-core"], openSpaceProfile: "medium" })).rejects.toThrow("requires an empty district source");
+    expect(saved).toEqual(before);
+  });
+
+  it("preserves the selected merge participants when persistence fails", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -70, y: -70 }, { x: -50, y: -70 }, { x: -50, y: -50 }, { x: -70, y: -50 }
+    ], "night-market");
+    const ids = saved.source.districts.map((district) => district.id);
+    selectDistrict(ids[0]!);
+    selectDistrict(ids[1]!, true);
+    saveError = new Error("save failed");
+    await expect(mergeDistricts(ids, ids[0]!)).rejects.toThrow("save failed");
+    expect(getDistrictSelection()).toEqual([...ids].sort());
+  });
+
+  it("retains a degraded wall diagnostic while editing and clears it after Retry succeeds", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    wallCreateError = new Error("wall creation failed");
+    await expect(retryGeneratedWalls()).rejects.toThrow("wall creation failed");
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([expect.objectContaining({ subsystem: "walls", retry: "walls", message: "wall creation failed" })]));
+    const revision = saved.revision;
+    wallCreateError = null;
+    await expect(retryGeneratedWalls()).resolves.toBeUndefined();
+    expect(saved.revision).toBe(revision);
+    expect(districtDiagnostics().some((entry) => entry.subsystem === "walls")).toBe(false);
+    expect(wallDocuments.length).toBeGreaterThan(0);
+  });
+
+  it("keeps additive selection within the district object type across district identities", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -30, y: -70 }, { x: -10, y: -70 }, { x: -10, y: -50 }, { x: -30, y: -50 }
+    ], "night-market");
+    const corporate = saved.source.districts.filter((district) => district.typeId === "corporate-core");
+    const market = saved.source.districts.find((district) => district.typeId === "night-market")!;
+    selectDistrict(corporate[0]!.id);
+    selectDistrict(corporate[1]!.id, true);
+    expect(getDistrictSelection()).toEqual(corporate.map((district) => district.id).sort());
+    selectDistrict(market.id, true);
+    expect(getDistrictSelection()).toEqual([...corporate.map((district) => district.id), market.id].sort());
   });
 
   it("applies a curve preset to every route represented by the selected edges", async () => {

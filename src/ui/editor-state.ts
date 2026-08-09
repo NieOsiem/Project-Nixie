@@ -1,4 +1,5 @@
 import { ROUTE_CLASS_IDS } from "../core/gen/city.js";
+import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
 
 /**
  * One shared editor-shell state (UI spec §37): open flag, active workspace, canvas tool,
@@ -9,6 +10,7 @@ import { ROUTE_CLASS_IDS } from "../core/gen/city.js";
 
 export const LAYER_NIXIE = "nixie";
 export const LAYER_ROADS = "nixie-roads";
+export const LAYER_DISTRICTS = "nixie-districts";
 
 export const TOOL = {
   LAND_DRAW: "land-draw",
@@ -24,6 +26,28 @@ export const ROAD_TOOL = {
 } as const;
 export type RoadTool = (typeof ROAD_TOOL)[keyof typeof ROAD_TOOL];
 
+export const DISTRICT_TOOL = {
+  SELECT: "district-select",
+  FILL: "district-fill",
+  DRAW: "district-draw",
+  EDIT: "district-edit",
+  SPLIT: "district-split",
+  MERGE: "district-merge"
+} as const;
+export type DistrictTool = (typeof DISTRICT_TOOL)[keyof typeof DISTRICT_TOOL];
+
+export interface DistrictSnapOptions {
+  districtVertices: boolean;
+  roadJunctions: boolean;
+  blockBoundaries: boolean;
+  foundryGrid: boolean;
+}
+
+export type DistrictOpenSpaceProfile = "none" | "very-low" | "low" | "medium" | "high";
+
+export { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
+export type { DistrictTypeId } from "../core/gen/district-registry.js";
+
 export const WORKSPACE_IDS = ["generate", "terrain", "roads", "districts", "objects", "regenerate", "diagnostics"] as const;
 export type WorkspaceId = (typeof WORKSPACE_IDS)[number];
 
@@ -34,7 +58,7 @@ export const WORKSPACE_META: Record<WorkspaceId, { label: string; icon: string; 
   generate: { label: "Generate", icon: "fa-solid fa-wand-magic-sparkles", phase: null },
   terrain: { label: "Terrain", icon: "fa-solid fa-water", phase: null },
   roads: { label: "Roads", icon: "fa-solid fa-road", phase: null },
-  districts: { label: "Districts", icon: "fa-solid fa-shapes", phase: "Phase 3" },
+  districts: { label: "Districts", icon: "fa-solid fa-shapes", phase: null },
   objects: { label: "Objects", icon: "fa-solid fa-boxes-stacked", phase: "Phases 5–8" },
   regenerate: { label: "Regenerate", icon: "fa-solid fa-arrows-rotate", phase: "Phase 6" },
   diagnostics: { label: "Diagnostics", icon: "fa-solid fa-triangle-exclamation", phase: null }
@@ -45,7 +69,7 @@ const WORKSPACE_LAYER: Record<WorkspaceId, string | null> = {
   generate: null,
   terrain: LAYER_NIXIE,
   roads: LAYER_ROADS,
-  districts: null,
+  districts: LAYER_DISTRICTS,
   objects: null,
   regenerate: null,
   diagnostics: null
@@ -55,7 +79,7 @@ const DEFAULT_TOOL: Record<WorkspaceId, string | null> = {
   generate: null,
   terrain: TOOL.LAND_EDIT,
   roads: ROAD_TOOL.SELECT,
-  districts: null,
+  districts: DISTRICT_TOOL.SELECT,
   objects: null,
   regenerate: null,
   diagnostics: null
@@ -68,6 +92,7 @@ function isToolForWorkspace(tool: string | null, workspace: WorkspaceId): boolea
   if (workspace === "roads") {
     return tool === ROAD_TOOL.DRAW || tool === ROAD_TOOL.SELECT || tool === ROAD_TOOL.EDIT;
   }
+  if (workspace === "districts") return Object.values(DISTRICT_TOOL).includes(tool as DistrictTool);
   return tool === null;
 }
 
@@ -96,6 +121,13 @@ const DEFAULT_PREFS: EditorPrefs = {
   curvePreset: "standard",
   roadLayout: "european",
   hubMode: "single-centre"
+};
+
+const DEFAULT_DISTRICT_SNAP: DistrictSnapOptions = {
+  districtVertices: true,
+  roadJunctions: true,
+  blockBoundaries: true,
+  foundryGrid: false
 };
 
 function prefsStorage(): Storage | null {
@@ -166,6 +198,17 @@ let roadName = "";
 let roadScope: "segment" | "contiguous-name" = "segment";
 let roadLayout: RoadLayout = DEFAULT_PREFS.roadLayout;
 let hubMode: HubMode = DEFAULT_PREFS.hubMode;
+let districtSnap: DistrictSnapOptions = { ...DEFAULT_DISTRICT_SNAP };
+let districtType: DistrictTypeId = DISTRICT_TYPE_IDS[0];
+let districtPalette = DISTRICT_TYPE_REGISTRY.get(districtType)!.defaultPaletteId;
+let districtPool: DistrictTypeId[] = [...DISTRICT_TYPE_IDS];
+let openSpaceProfile: DistrictOpenSpaceProfile = "medium";
+export interface EditorActionError {
+  label: string;
+  message: string;
+  affectedIds: string[];
+}
+let actionError: EditorActionError | null = null;
 let coastEdge: CoastEdge = "west";
 let seed = "nixie-2";
 let ownedLayer: string | null = null;
@@ -248,14 +291,14 @@ export function closeEditor(options: { restoreDefaultLayer?: boolean } = {}): vo
  * Opening the editor by clicking the Nixie control flows through here.
  */
 export function editorLayerActivated(layer: string): void {
-  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS) return;
+  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS && layer !== LAYER_DISTRICTS) return;
   if (!editorOpen) {
     openEditor();
     return;
   }
   if (ownedLayer === layer) return;
   // The control icon clicked while editing on the other layer: adopt that layer's workspace.
-  setWorkspace(layer === LAYER_ROADS ? "roads" : "terrain");
+  setWorkspace(layer === LAYER_ROADS ? "roads" : layer === LAYER_DISTRICTS ? "districts" : "terrain");
 }
 
 /**
@@ -305,6 +348,25 @@ export function setCanvasTool(next: string | null): void {
  * can refresh button enabled states immediately.
  */
 export function notifyEditorInteraction(): void {
+  controller?.onStateChanged();
+}
+
+export function currentEditorActionError(): EditorActionError | null {
+  return actionError === null ? null : { ...actionError, affectedIds: [...actionError.affectedIds] };
+}
+
+export function clearEditorActionError(): void {
+  if (actionError === null) return;
+  actionError = null;
+  controller?.onStateChanged();
+}
+
+export function setEditorActionError(label: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const affectedIds = Array.isArray((error as any)?.affectedIds)
+    ? (error as any).affectedIds.filter((id: unknown): id is string => typeof id === "string")
+    : [];
+  actionError = { label, message, affectedIds };
   controller?.onStateChanged();
 }
 
@@ -367,6 +429,59 @@ export function currentHubMode(): HubMode {
 export function setHubMode(next: HubMode): void {
   hubMode = next;
   writePrefs();
+}
+
+export function districtSnapOptions(): DistrictSnapOptions {
+  return { ...districtSnap };
+}
+
+export function setDistrictSnapOptions(next: Partial<DistrictSnapOptions>): DistrictSnapOptions {
+  districtSnap = { ...districtSnap, ...next };
+  controller?.onStateChanged();
+  return districtSnapOptions();
+}
+
+export function currentDistrictType(): DistrictTypeId {
+  return districtType;
+}
+
+export function setDistrictType(next: DistrictTypeId): void {
+  if ((DISTRICT_TYPE_IDS as readonly string[]).includes(next)) {
+    districtType = next;
+    districtPalette = DISTRICT_TYPE_REGISTRY.get(next)!.defaultPaletteId;
+  }
+  controller?.onStateChanged();
+}
+
+export function currentDistrictPalette(): string {
+  return districtPalette;
+}
+
+export function setDistrictPalette(next: string): void {
+  if (DISTRICT_PALETTE_IDS.includes(next)) districtPalette = next;
+  controller?.onStateChanged();
+}
+
+export function currentDistrictPool(): DistrictTypeId[] {
+  return [...districtPool];
+}
+
+export function setDistrictPool(next: readonly DistrictTypeId[]): DistrictTypeId[] {
+  const allowed = new Set<DistrictTypeId>(DISTRICT_TYPE_IDS);
+  districtPool = [...new Set(next)].filter((id): id is DistrictTypeId => allowed.has(id)).sort(
+    (left, right) => DISTRICT_TYPE_IDS.indexOf(left) - DISTRICT_TYPE_IDS.indexOf(right)
+  );
+  controller?.onStateChanged();
+  return currentDistrictPool();
+}
+
+export function currentOpenSpaceProfile(): DistrictOpenSpaceProfile {
+  return openSpaceProfile;
+}
+
+export function setOpenSpaceProfile(next: DistrictOpenSpaceProfile): void {
+  if (["none", "very-low", "low", "medium", "high"].includes(next)) openSpaceProfile = next;
+  controller?.onStateChanged();
 }
 
 export function currentCoastEdge(): CoastEdge {

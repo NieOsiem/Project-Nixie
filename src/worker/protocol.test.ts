@@ -8,11 +8,19 @@ import {
   type BuildTerrainChunkResult,
   type GenerateInitialRoadNetworkRequest,
   type GenerateInitialRoadNetworkResult,
+  type BuildDistrictPlanRequest,
+  type BuildDistrictPlanResult,
+  type GenerateInitialDistrictsRequest,
+  type GenerateInitialDistrictsResult,
   handleRequest,
   type WorkerRequest,
   type WorkerSuccess
 } from "./protocol.js";
 import type { CitySourceV2 as CitySourceV2Roads } from "../core/gen/city.js";
+import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
+import type { CitySourceV3 } from "../core/gen/city.js";
+import { buildDistrictPlan } from "../core/gen/district-plan.js";
+import { generateInitialDistricts } from "../core/gen/district-generator.js";
 
 const TERRAIN_SOURCE: CitySourceV2 = {
   origin: { x: 5000, y: 4000 },
@@ -31,6 +39,18 @@ const CITY_SOURCE: CitySourceV2Roads = {
     routes: [{ id: "r", curvePreset: "standard" }],
     edges: [{ id: "e", a: "a", b: "b", routeId: "r", classId: "street", name: null, locked: false, origin: "authored" }]
   }
+};
+
+const DISTRICT_SOURCE: CitySourceV3 = {
+  origin: { x: 5000, y: 4000 },
+  citySeed: "protocol-district-fixture",
+  generation: {
+    terrainMode: "rectangle", coastEdge: null, roadLayout: "european", hubMode: "single-centre",
+    districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium"
+  },
+  terrain: { land: rectangleLand({ x: -96, y: -96, width: 192, height: 192 }), urbanFootprint: null },
+  roads: structuredClone(CITY_SOURCE.roads),
+  districts: []
 };
 
 describe("handleRequest", () => {
@@ -197,5 +217,50 @@ describe("handleRequest generateInitialRoadNetwork", () => {
       ok: false,
       error: "Road generation requires a non-empty mask."
     });
+  });
+});
+
+describe("handleRequest buildDistrictPlan", () => {
+  const request: BuildDistrictPlanRequest = {
+    id: 91,
+    type: "buildDistrictPlan",
+    source: DISTRICT_SOURCE,
+    sourceRevision: 12,
+    actionToken: "district-action-2",
+    buildToken: "epoch-7"
+  };
+
+  it("echoes revision and action/build tokens", () => {
+    const response = handleRequest(request) as WorkerSuccess;
+    expect(response.ok).toBe(true);
+    const result = response.result as BuildDistrictPlanResult;
+    expect(result.sourceRevision).toBe(request.sourceRevision);
+    expect(result.actionToken).toBe(request.actionToken);
+    expect(result.buildToken).toBe(request.buildToken);
+    expect(result.plan.blocks.length).toBeGreaterThan(0);
+    expect(result.plan).toEqual(buildDistrictPlan(DISTRICT_SOURCE));
+    expect(response.transfer).toBeUndefined();
+  });
+});
+
+describe("handleRequest generateInitialDistricts", () => {
+  const request: GenerateInitialDistrictsRequest = {
+    id: 92,
+    type: "generateInitialDistricts",
+    source: DISTRICT_SOURCE,
+    sourceRevision: 12,
+    actionToken: "district-generation-3",
+    buildToken: "epoch-8"
+  };
+
+  it("echoes stale-work tokens and matches fallback generation", () => {
+    const response = handleRequest(request) as WorkerSuccess;
+    expect(response.ok).toBe(true);
+    const result = response.result as GenerateInitialDistrictsResult;
+    expect(result.sourceRevision).toBe(request.sourceRevision);
+    expect(result.actionToken).toBe(request.actionToken);
+    expect(result.buildToken).toBe(request.buildToken);
+    expect(result.districts).toEqual(generateInitialDistricts(DISTRICT_SOURCE));
+    expect(response.transfer).toBeUndefined();
   });
 });

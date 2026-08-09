@@ -4,10 +4,12 @@ import { flatMesh } from "../geom/tessellate.js";
 import { rectRing, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV2, type RouteClassId } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV2, type CitySourceV3, type RouteClassId } from "./city.js";
 import { chunkId, chunkRect, type ChunkKey } from "./chunks.js";
 import { buildCityMarkings } from "./city-markings.js";
 import { normalizeRing, validateTerrain } from "./terrain.js";
+
+type CitySource = CitySourceV2 | CitySourceV3;
 
 export interface CitySurfacePartitions {
   water: MultiPolygon;
@@ -61,7 +63,7 @@ function emptyRect(rect: Rect): boolean {
   return rect.width <= 0 || rect.height <= 0;
 }
 
-function sceneSurfaces(source: CitySourceV2, sceneBoundsM: Rect): { land: MultiPolygon; water: MultiPolygon } {
+function sceneSurfaces(source: CitySource, sceneBoundsM: Rect): { land: MultiPolygon; water: MultiPolygon } {
   const validation = validateTerrain(source.terrain);
   if (!validation.ok) throw new Error(validation.reason);
   const scene = ringAsMulti(rectRing(sceneBoundsM));
@@ -178,7 +180,7 @@ function clipSurfaces(surfaces: CitySurfacePartitions, clip: Rect): CitySurfaceP
   };
 }
 
-function toPixels(surfaces: CitySurfacePartitions, source: CitySourceV2, pixelsPerMetre: number): CitySurfacePartitions {
+function toPixels(surfaces: CitySurfacePartitions, source: CitySource, pixelsPerMetre: number): CitySurfacePartitions {
   const convert = (multi: MultiPolygon): MultiPolygon => multi.map((polygon) => polygon.map((ring) => ring.map((p) => ({ x: source.origin.x + p.x * pixelsPerMetre, y: source.origin.y + p.y * pixelsPerMetre }))));
   return {
     water: convert(surfaces.water),
@@ -193,7 +195,7 @@ function toPixels(surfaces: CitySurfacePartitions, source: CitySourceV2, pixelsP
   };
 }
 
-function buildMeshes(surfaces: CitySurfacePartitions, source: CitySourceV2, ppm: number): { mesh: MeshBuffers; counts: number[] } {
+function buildMeshes(surfaces: CitySurfacePartitions, source: CitySource, ppm: number): { mesh: MeshBuffers; counts: number[] } {
   const px = toPixels(surfaces, source, ppm);
   const parts = [
     flatMesh(px.water, 0, MATERIAL.WATER, 1),
@@ -211,7 +213,7 @@ function buildMeshes(surfaces: CitySurfacePartitions, source: CitySourceV2, ppm:
   };
 }
 
-function fullSurfaces(source: CitySourceV2, sceneBoundsM: Rect, network: CompiledRouteNetwork): CitySurfacePartitions {
+function fullSurfaces(source: CitySource, sceneBoundsM: Rect, network: CompiledRouteNetwork): CitySurfacePartitions {
   const terrain = sceneSurfaces(source, sceneBoundsM);
   const roads = routeParts(network);
   // WHY: Candidate preflight must stay disjoint even before water validation rejects the route.
@@ -238,12 +240,12 @@ function fullSurfaces(source: CitySourceV2, sceneBoundsM: Rect, network: Compile
   };
 }
 
-export function citySurfaces(source: CitySourceV2, sceneBoundsM: Rect): CitySurfacePartitions {
+export function citySurfaces(source: CitySource, sceneBoundsM: Rect): CitySurfacePartitions {
   return fullSurfaces(source, sceneBoundsM, compileRouteNetwork(source.roads, ROUTE_CLASS_REGISTRY));
 }
 
 export function buildCityChunk(
-  source: CitySourceV2,
+  source: CitySource,
   network: CompiledRouteNetwork,
   key: ChunkKey,
   sceneBoundsM: Rect,
@@ -272,7 +274,7 @@ export function buildCityChunk(
 }
 
 export function buildCityChunks(
-  source: CitySourceV2,
+  source: CitySource,
   keys: ChunkKey[],
   sceneBoundsM: Rect,
   pixelsPerMetre: number
