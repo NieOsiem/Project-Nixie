@@ -6,25 +6,31 @@ export interface DistrictOverlayLineMeshData {
   segmentCount: number;
 }
 
-const FLOATS_PER_VERTEX = 6;
+const FLOATS_PER_VERTEX = 9;
 const VERTEX_STRIDE_BYTES = FLOATS_PER_VERTEX * Float32Array.BYTES_PER_ELEMENT;
 const COLOR_SCALE = 1 / 255;
 
 export const DISTRICT_OVERLAY_LINE_VERT = `
 precision highp float;
 
-attribute vec2 aPosition;
+attribute vec2 aBase;
+attribute vec2 aNormal;
+attribute float aSignedHalfWidth;
 attribute vec3 aColor;
 attribute float aAlpha;
 
 uniform mat3 projectionMatrix;
 uniform mat3 translationMatrix;
+uniform float uInvZoom;
 
 varying vec4 vColor;
 
 void main() {
   vColor = vec4(aColor, aAlpha);
-  gl_Position = vec4((projectionMatrix * translationMatrix * vec3(aPosition, 1.0)).xy, 0.0, 1.0);
+  // WHY: width is stored in screen pixels and scaled by 1/zoom in the shader, so
+  // the geometry is zoom-independent and never needs rebuilding when the canvas zooms.
+  vec2 offset = aNormal * (aSignedHalfWidth * uInvZoom);
+  gl_Position = vec4((projectionMatrix * translationMatrix * vec3(aBase + offset, 1.0)).xy, 0.0, 1.0);
 }
 `;
 
@@ -47,6 +53,7 @@ export class DistrictOverlayLineMeshBuilder {
     return this.#segmentCount;
   }
 
+  /** `width` is a screen-pixel width; the vertex shader applies the inverse zoom. */
   add(start: Vec2, end: Vec2, width: number, color: number, alpha: number): void {
     if (!Number.isFinite(start.x) || !Number.isFinite(start.y) || !Number.isFinite(end.x) || !Number.isFinite(end.y)) return;
     if (!Number.isFinite(width) || width <= 0 || !Number.isInteger(color) || color < 0 || color > 0xffffff) return;
@@ -56,27 +63,23 @@ export class DistrictOverlayLineMeshBuilder {
     const length = Math.hypot(dx, dy);
     if (!Number.isFinite(length) || length === 0) return;
     const halfWidth = width * 0.5;
-    const nx = (-dy / length) * halfWidth;
-    const ny = (dx / length) * halfWidth;
+    const nx = -dy / length;
+    const ny = dx / length;
     if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
-    if (!Number.isFinite(start.x + nx) || !Number.isFinite(start.y + ny)
-      || !Number.isFinite(end.x + nx) || !Number.isFinite(end.y + ny)
-      || !Number.isFinite(end.x - nx) || !Number.isFinite(end.y - ny)
-      || !Number.isFinite(start.x - nx) || !Number.isFinite(start.y - ny)) return;
     const base = this.#segmentCount * 4;
     const red = ((color >>> 16) & 0xff) * COLOR_SCALE;
     const green = ((color >>> 8) & 0xff) * COLOR_SCALE;
     const blue = (color & 0xff) * COLOR_SCALE;
-    this.#vertex(start.x + nx, start.y + ny, red, green, blue, alpha);
-    this.#vertex(end.x + nx, end.y + ny, red, green, blue, alpha);
-    this.#vertex(end.x - nx, end.y - ny, red, green, blue, alpha);
-    this.#vertex(start.x - nx, start.y - ny, red, green, blue, alpha);
+    this.#vertex(start.x, start.y, nx, ny, halfWidth, red, green, blue, alpha);
+    this.#vertex(end.x, end.y, nx, ny, halfWidth, red, green, blue, alpha);
+    this.#vertex(end.x, end.y, nx, ny, -halfWidth, red, green, blue, alpha);
+    this.#vertex(start.x, start.y, nx, ny, -halfWidth, red, green, blue, alpha);
     this.#indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
     this.#segmentCount++;
   }
 
-  #vertex(x: number, y: number, red: number, green: number, blue: number, alpha: number): void {
-    this.#vertices.push(x, y, red, green, blue, alpha);
+  #vertex(x: number, y: number, nx: number, ny: number, signedHalfWidth: number, red: number, green: number, blue: number, alpha: number): void {
+    this.#vertices.push(x, y, nx, ny, signedHalfWidth, red, green, blue, alpha);
   }
 
   build(): DistrictOverlayLineMeshData {
@@ -92,18 +95,25 @@ export class DistrictOverlayLineMesh {
   readonly display: any;
 
   #geometry: any;
+  #shader: any;
 
   constructor(data: DistrictOverlayLineMeshData) {
     const vertexBuffer = new PIXI.Buffer(data.vertices);
     const F = PIXI.TYPES.FLOAT;
     this.#geometry = new PIXI.Geometry()
-      .addAttribute("aPosition", vertexBuffer, 2, false, F, VERTEX_STRIDE_BYTES, 0)
-      .addAttribute("aColor", vertexBuffer, 3, false, F, VERTEX_STRIDE_BYTES, 2 * Float32Array.BYTES_PER_ELEMENT)
-      .addAttribute("aAlpha", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, 5 * Float32Array.BYTES_PER_ELEMENT)
+      .addAttribute("aBase", vertexBuffer, 2, false, F, VERTEX_STRIDE_BYTES, 0)
+      .addAttribute("aNormal", vertexBuffer, 2, false, F, VERTEX_STRIDE_BYTES, 2 * Float32Array.BYTES_PER_ELEMENT)
+      .addAttribute("aSignedHalfWidth", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, 4 * Float32Array.BYTES_PER_ELEMENT)
+      .addAttribute("aColor", vertexBuffer, 3, false, F, VERTEX_STRIDE_BYTES, 5 * Float32Array.BYTES_PER_ELEMENT)
+      .addAttribute("aAlpha", vertexBuffer, 1, false, F, VERTEX_STRIDE_BYTES, 8 * Float32Array.BYTES_PER_ELEMENT)
       .addIndex(data.indices);
-    const shader = PIXI.Shader.from(DISTRICT_OVERLAY_LINE_VERT, DISTRICT_OVERLAY_LINE_FRAG);
-    this.display = new PIXI.Mesh(this.#geometry, shader);
+    this.#shader = PIXI.Shader.from(DISTRICT_OVERLAY_LINE_VERT, DISTRICT_OVERLAY_LINE_FRAG);
+    this.display = new PIXI.Mesh(this.#geometry, this.#shader);
     this.display.state.blend = true;
+  }
+
+  setInvZoom(invZoom: number): void {
+    this.#shader.uniforms.uInvZoom = invZoom;
   }
 
   destroy(): void {

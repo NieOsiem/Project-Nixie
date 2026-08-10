@@ -9,6 +9,7 @@ import {
   isSceneEnabled,
   metresToWorld,
   moveDistrictVertex as adapterMoveDistrictVertex,
+  pixelsPerMetre,
   selectDistrict as adapterSelectDistrict,
   setDistrictDraftCancelListener,
   setDistrictsPresentation,
@@ -42,7 +43,6 @@ interface DistrictPlanningTask {
   epoch: number;
   plan: any;
   revision: number | null;
-  scale: number | null;
   phase: "blocks" | "cells" | "unzoned" | "intents" | "done";
   index: number;
   fragmentByKey: Map<string, any>;
@@ -51,6 +51,7 @@ interface DistrictPlanningTask {
   hatchColor: number;
   hatchSpacing: number;
   hatchWidth: number;
+  hatchesOnly: boolean;
 }
 
 function interactionLayerBase(): any {
@@ -155,8 +156,13 @@ export function districtDrawPreview(districts: readonly any[], polygon: Ring, in
   let locked = false;
   let reason: string | null = valid ? null : "Drawn district geometry is invalid.";
   if (valid) {
+    // WHY: disjoint bounds cannot overlap, so skip the expensive boolean sweep per mouse move.
+    const draftBounds = ringBounds(polygon);
     for (const district of districts) {
       if (typeof district?.id !== "string" || !ring(district.polygon)) continue;
+      const districtBounds = ringBounds(district.polygon);
+      if (districtBounds.x > draftBounds.x + draftBounds.width || draftBounds.x > districtBounds.x + districtBounds.width
+        || districtBounds.y > draftBounds.y + draftBounds.height || draftBounds.y > districtBounds.y + districtBounds.height) continue;
       let overlap: MultiPolygon;
       try { overlap = intersection(ringAsMulti(district.polygon as Ring), ringAsMulti(polygon)); }
       catch { valid = false; reason = "Drawn district geometry could not be evaluated."; break; }
@@ -272,28 +278,6 @@ function colourFor(id: string): number {
   return (r << 16) | (g << 8) | b;
 }
 
-function drawRing(g: any, source: Ring, fill: number, alpha: number, line: number, width: number): void {
-  const first = metresToWorld(source[0]!);
-  if (alpha > 0) {
-    g.lineStyle(0);
-    g.beginFill(fill, alpha);
-    g.moveTo(first.x, first.y);
-    for (const point of source.slice(1)) {
-      const at = metresToWorld(point);
-      g.lineTo(at.x, at.y);
-    }
-    g.lineTo(first.x, first.y);
-    g.endFill();
-  }
-  g.lineStyle({ width, color: line, alpha: 0.95 });
-  g.moveTo(first.x, first.y);
-  for (const point of source.slice(1)) {
-    const at = metresToWorld(point);
-    g.lineTo(at.x, at.y);
-  }
-  g.lineTo(first.x, first.y);
-}
-
 function drawPolygonWithHoles(g: any, polygon: Ring[], fill: number, alpha: number, line: number, width: number): void {
   const outer = polygon[0];
   if (!outer) return;
@@ -343,19 +327,6 @@ function fillPolygonWithHoles(g: any, polygon: Ring[], fill: number, alpha: numb
     g.endHole();
   }
   g.endFill();
-}
-
-function drawPlanRings(g: any, value: unknown, color: number, alpha: number, width: number): void {
-  if (ring(value)) {
-    drawRing(g, value, color, alpha, color, width);
-    return;
-  }
-  if (!Array.isArray(value)) return;
-  if (value.length > 0 && value.every((item) => ring(item))) {
-    drawPolygonWithHoles(g, value as Ring[], color, alpha, color, width);
-    return;
-  }
-  for (const item of value) drawPlanRings(g, item, color, alpha, width);
 }
 
 function fillPlanRings(g: any, value: unknown, color: number, alpha: number): void {
@@ -451,43 +422,6 @@ export function districtSnapTarget(point: Vec2, candidates: readonly Vec2[], rea
   return nearest;
 }
 
-function snapWorldPointInfo(point: Vec2, plan: any, excludeDistrictVertex?: { districtId: string; index: number }): { point: Vec2; target: Vec2 | null } {
-  const options = districtSnapOptions();
-  const candidates: Vec2[] = [];
-  const city = getCity() as any;
-  if (options.districtVertices) for (const district of cityDistricts()) if (ring(district.polygon)) for (const [index, vertex] of district.polygon.entries()) {
-    if (excludeDistrictVertex !== undefined && excludeDistrictVertex.districtId === district.id && excludeDistrictVertex.index === index) continue;
-    candidates.push(metresToWorld(vertex));
-  }
-  if (options.roadJunctions) for (const node of city?.source?.roads?.nodes ?? []) if (Number.isFinite(node.x) && Number.isFinite(node.y)) candidates.push(metresToWorld(node));
-  if (options.blockBoundaries) {
-    for (const block of plan?.blocks ?? []) if (ring(block?.zoningFace)) {
-      for (let index = 0; index < block.zoningFace.length; index++) {
-        const first = block.zoningFace[index]!;
-        const second = block.zoningFace[(index + 1) % block.zoningFace.length]!;
-        candidates.push(metresToWorld(first));
-        const worldFirst = metresToWorld(first);
-        const worldSecond = metresToWorld(second);
-        const dx = worldSecond.x - worldFirst.x;
-        const dy = worldSecond.y - worldFirst.y;
-        const lengthSquared = dx * dx + dy * dy;
-        const t = lengthSquared <= 0 ? 0 : Math.max(0, Math.min(1, ((point.x - worldFirst.x) * dx + (point.y - worldFirst.y) * dy) / lengthSquared));
-        candidates.push({ x: worldFirst.x + dx * t, y: worldFirst.y + dy * t });
-      }
-    }
-  }
-  if (options.foundryGrid && canvas?.grid?.getSnappedPoint) {
-    try {
-      const mode = (globalThis as any).CONST?.GRID_SNAPPING_MODES?.VERTEX;
-      const snapped = canvas.grid.getSnappedPoint(point, mode === undefined ? undefined : { mode, resolution: 1 });
-      if (snapped && Number.isFinite(snapped.x) && Number.isFinite(snapped.y)) candidates.push({ x: snapped.x, y: snapped.y });
-    } catch { /* WHY: Foundry grid snapping is optional across supported versions. */ }
-  }
-  const reach = screenPx(canvas.dimensions.size * 0.45);
-  const target = districtSnapTarget(point, candidates, reach);
-  return { point: target ?? point, target };
-}
-
 let activeLayer: any = null;
 
 export function hasDistrictDraft(): boolean {
@@ -516,11 +450,19 @@ export function districtLayerClass(): any {
       return Object.assign(super.layerOptions, { name: DISTRICT_LAYER_NAME, zIndex: 920 });
     }
 
-    #overlay: any = null;
+    #fillHost: any = null;
+    #fillIds: string[] = [];
+    #fillGraphics: any[] = [];
+    #fillPolygons = new Map<string, Ring[][]>();
+    #boundaryHost: any = null;
+    #boundaryIds: string[] = [];
+    #boundaryMeshes: DistrictOverlayLineMesh[] = [];
+    #boundaryRings = new Map<string, Ring>();
     #planningFill: any = null;
     #planningFills: any[] = [];
     #planningHost: any = null;
     #planningMeshes: DistrictOverlayLineMesh[] = [];
+    #hatchMeshes: DistrictOverlayLineMesh[] = [];
     #planningTask: DistrictPlanningTask | null = null;
     #planningFrame: number | null = null;
     #planningEpoch = 0;
@@ -536,15 +478,27 @@ export function districtLayerClass(): any {
     #planPending = false;
     #planResolved = false;
     #planningRevision: number | null = null;
-    #planningScale: number | null = null;
+    #appliedZoom: number | null = null;
+    #worldKey: string | null = null;
+    #selectionKey: string | null = null;
+    #hatchTimer: NodeJS.Timeout | null = null;
+    #pendingHatchRefresh = false;
+    #previewSignatureLast: string | null = null;
+    #snapWorldKey: string | null = null;
+    #snapHadPlan = false;
+    #snapDistrictVerts: Array<{ districtId: string; index: number; world: Vec2 }> = [];
+    #snapRoadNodes: Vec2[] = [];
+    #snapBlockEdges: Array<{ a: Vec2; b: Vec2 }> = [];
 
     async _draw(options: any): Promise<void> {
       await super._draw(options);
-      this.#overlay = this.addChild(new PIXI.Graphics());
+      this.#fillHost = this.addChild(new PIXI.Container());
+      this.#boundaryHost = this.addChild(new PIXI.Container());
       this.#planningFill = this.addChild(new PIXI.Container());
       this.#planningHost = this.addChild(new PIXI.Container());
       this.#preview = this.addChild(new PIXI.Graphics());
-      this.#overlay.eventMode = "none";
+      this.#fillHost.eventMode = "none";
+      this.#boundaryHost.eventMode = "none";
       this.#planningFill.eventMode = "none";
       this.#planningHost.eventMode = "none";
       this.#preview.eventMode = "none";
@@ -563,8 +517,10 @@ export function districtLayerClass(): any {
       this.#removeCityListener = null;
       setDistrictDraftCancelListener(null);
       setDistrictsPresentation(false);
-      this.#clearPlanning();
-      this.#overlay = null;
+      this.#clearPlanningMeshes();
+      this.#clearFillsAndBoundaries();
+      this.#fillHost = null;
+      this.#boundaryHost = null;
       this.#planningFill = null;
       this.#planningHost = null;
       this.#preview = null;
@@ -575,6 +531,10 @@ export function districtLayerClass(): any {
       this.#planRevision = null;
       this.#planPending = false;
       this.#planResolved = false;
+      this.#worldKey = null;
+      this.#selectionKey = null;
+      this.#snapWorldKey = null;
+      this.#previewSignatureLast = null;
       return super._tearDown(options);
     }
 
@@ -589,7 +549,7 @@ export function districtLayerClass(): any {
       this.#syncDragResistance();
       this.#panHookId ??= Hooks.on("canvasPan", () => {
         this.#syncDragResistance();
-        if (this.#planningScale !== canvas?.stage?.scale?.x) this.refresh();
+        if (this.#appliedZoom !== this.#currentZoom()) this.refresh();
       });
       this.visible = true;
       setDistrictsPresentation(true);
@@ -606,11 +566,16 @@ export function districtLayerClass(): any {
       this.#drag = null;
       this.#snapTarget = null;
       this.#cancelRefresh();
-      this.#clearPlanning();
+      this.#clearPlanningMeshes();
+      this.#clearFillsAndBoundaries();
       this.#plan = null;
       this.#planRevision = null;
       this.#planPending = false;
       this.#planResolved = false;
+      this.#worldKey = null;
+      this.#selectionKey = null;
+      this.#snapWorldKey = null;
+      this.#previewSignatureLast = null;
       setDistrictsPresentation(false);
       clearDistrictSelection();
       this.#preview?.clear();
@@ -631,7 +596,7 @@ export function districtLayerClass(): any {
       this.#refreshFrame = null;
     }
 
-    #clearPlanning(): void {
+    #clearPlanningMeshes(): void {
       this.#planningEpoch++;
       if (this.#planningFrame !== null) {
         cancelAnimationFrame(this.#planningFrame);
@@ -642,15 +607,58 @@ export function districtLayerClass(): any {
         mesh.destroy();
       }
       this.#planningMeshes = [];
+      for (const mesh of this.#hatchMeshes) {
+        mesh.display.parent?.removeChild(mesh.display);
+        mesh.destroy();
+      }
+      this.#hatchMeshes = [];
       for (const fill of this.#planningFills) {
         fill.parent?.removeChild(fill);
-        fill.destroy();
+        fill.destroy?.();
       }
       this.#planningFills = [];
       this.#planningTask = null;
       this.#planPending = false;
       this.#planningRevision = null;
-      this.#planningScale = null;
+      this.#pendingHatchRefresh = false;
+      this.#clearHatchTimer();
+    }
+
+    #clearHatchTimer(): void {
+      if (this.#hatchTimer !== null) {
+        clearTimeout(this.#hatchTimer);
+        this.#hatchTimer = null;
+      }
+    }
+
+    #clearFills(): void {
+      for (const fill of this.#fillGraphics) {
+        fill.parent?.removeChild(fill);
+        fill.destroy?.();
+      }
+      this.#fillGraphics = [];
+      this.#fillIds = [];
+      this.#fillPolygons.clear();
+    }
+
+    #clearBoundaries(): void {
+      for (const mesh of this.#boundaryMeshes) {
+        mesh.display.parent?.removeChild(mesh.display);
+        mesh.destroy();
+      }
+      this.#boundaryMeshes = [];
+      this.#boundaryIds = [];
+      this.#boundaryRings.clear();
+    }
+
+    #clearFillsAndBoundaries(): void {
+      this.#clearFills();
+      this.#clearBoundaries();
+    }
+
+    #clearAll(): void {
+      this.#clearPlanningMeshes();
+      this.#clearFillsAndBoundaries();
     }
 
     #syncDragResistance(): void {
@@ -723,6 +731,78 @@ export function districtLayerClass(): any {
       return { x: point.x, y: point.y };
     }
 
+    #snapWorldPointInfo(point: Vec2, excludeDistrictVertex?: { districtId: string; index: number }): { point: Vec2; target: Vec2 | null } {
+      const options = districtSnapOptions();
+      const worldKey = this.#currentWorldKey();
+      const hasPlan = this.#plan !== null;
+      if (worldKey !== this.#snapWorldKey || hasPlan !== this.#snapHadPlan) this.#rebuildSnapCache(worldKey, hasPlan);
+      const reach = screenPx(canvas.dimensions.size * 0.45);
+      let nearest: Vec2 | null = null;
+      let best = reach * reach;
+      const consider = (candidate: Vec2): void => {
+        const dx = candidate.x - point.x;
+        const dy = candidate.y - point.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= best) { best = d2; nearest = candidate; }
+      };
+      if (options.districtVertices) {
+        for (const entry of this.#snapDistrictVerts) {
+          if (excludeDistrictVertex !== undefined && excludeDistrictVertex.districtId === entry.districtId && excludeDistrictVertex.index === entry.index) continue;
+          consider(entry.world);
+        }
+      }
+      if (options.roadJunctions) for (const node of this.#snapRoadNodes) consider(node);
+      if (options.blockBoundaries) {
+        for (const edge of this.#snapBlockEdges) {
+          consider(edge.a);
+          consider(edge.b);
+          const dx = edge.b.x - edge.a.x;
+          const dy = edge.b.y - edge.a.y;
+          const lengthSquared = dx * dx + dy * dy;
+          const t = lengthSquared <= 0 ? 0 : Math.max(0, Math.min(1, ((point.x - edge.a.x) * dx + (point.y - edge.a.y) * dy) / lengthSquared));
+          consider({ x: edge.a.x + dx * t, y: edge.a.y + dy * t });
+        }
+      }
+      if (options.foundryGrid && canvas?.grid?.getSnappedPoint) {
+        try {
+          const mode = CONST?.GRID_SNAPPING_MODES?.VERTEX;
+          const snapped = canvas.grid.getSnappedPoint(point, mode === undefined ? undefined : { mode, resolution: 1 });
+          if (snapped && Number.isFinite(snapped.x) && Number.isFinite(snapped.y)) consider({ x: snapped.x, y: snapped.y });
+        } catch { /* WHY: Foundry grid snapping is optional across supported versions. */ }
+      }
+      return { point: nearest ?? point, target: nearest };
+    }
+
+    #rebuildSnapCache(worldKey: string, hasPlan: boolean): void {
+      this.#snapWorldKey = worldKey;
+      this.#snapHadPlan = hasPlan;
+      const city = getCity() as any;
+      const districtVerts: Array<{ districtId: string; index: number; world: Vec2 }> = [];
+      for (const district of cityDistrictsFrom(city)) {
+        if (!ring(district.polygon)) continue;
+        district.polygon.forEach((vertex: Vec2, index: number) => {
+          districtVerts.push({ districtId: district.id as string, index, world: metresToWorld(vertex) });
+        });
+      }
+      const roadNodes: Vec2[] = [];
+      for (const node of city?.source?.roads?.nodes ?? []) {
+        if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) continue;
+        roadNodes.push(metresToWorld(node));
+      }
+      const blockEdges: Array<{ a: Vec2; b: Vec2 }> = [];
+      for (const block of this.#plan?.blocks ?? []) {
+        if (!ring(block?.zoningFace)) continue;
+        for (let index = 0; index < block.zoningFace.length; index++) {
+          const first = block.zoningFace[index]!;
+          const second = block.zoningFace[(index + 1) % block.zoningFace.length]!;
+          blockEdges.push({ a: metresToWorld(first), b: metresToWorld(second) });
+        }
+      }
+      this.#snapDistrictVerts = districtVerts;
+      this.#snapRoadNodes = roadNodes;
+      this.#snapBlockEdges = blockEdges;
+    }
+
     #hitDistrict(point: Vec2): string | null {
       const metrePoint = worldToMetres(point);
       for (const district of cityDistricts().slice().reverse()) if (ring(district.polygon) && pointInRing(metrePoint, district.polygon)) return district.id;
@@ -766,33 +846,138 @@ export function districtLayerClass(): any {
     }
 
     #renderOverlay(): void {
-      const g = this.#overlay;
-      if (!g) return;
-      g.clear();
-      if (!isSceneEnabled() || !this.active) return;
+      if (!isSceneEnabled() || !this.active) {
+        this.#clearAll();
+        return;
+      }
       const city = getCity() as any;
+      if (city === null || city === undefined) {
+        this.#clearAll();
+        return;
+      }
       const revision = typeof city?.revision === "number" ? city.revision : null;
-      const scale = typeof canvas?.stage?.scale?.x === "number" ? canvas.stage.scale.x : null;
+      const worldKey = this.#currentWorldKey();
+      const zoom = this.#currentZoom();
+      if (zoom !== this.#appliedZoom) this.#applyZoom(zoom);
       const selected = new Set(selectedIds());
-      if (this.#planRevision !== revision) {
-        this.#clearPlanning();
+      const selectionKey = [...selected].sort().join(",");
+      if (this.#planRevision !== revision || this.#worldKey !== worldKey) {
+        this.#clearPlanningMeshes();
+        this.#clearFillsAndBoundaries();
         this.#plan = null;
         this.#planRevision = revision;
+        this.#worldKey = worldKey;
         this.#planResolved = false;
-      }
-      const plan = this.#plan;
-      const overlay = districtOverlayData(city, plan);
-      for (const fill of overlay.fills) {
-        const color = selected.has(fill.id) ? 0xffc94a : colourFor(fill.id);
-        drawPlanRings(g, fill.polygon, color, selected.has(fill.id) ? 0.34 : 0.22, screenPx(Math.max(1.5, canvas.dimensions.size * 0.04)));
-      }
-      for (const boundary of overlay.boundaries) {
-        const color = selected.has(boundary.id) ? 0xffc94a : colourFor(boundary.id);
-        drawRing(g, boundary.polygon, color, 0, color, screenPx(Math.max(2, canvas.dimensions.size * 0.07)));
+        this.#rebuildBoundaries(city, selected);
+        this.#selectionKey = selectionKey;
+        if (!this.#planPending && !this.#planResolved) this.#schedulePlanView(revision);
+      } else {
+        if (selectionKey !== this.#selectionKey) {
+          this.#applySelectionChange(selected, this.#selectionKey);
+          this.#selectionKey = selectionKey;
+        }
+        const plan = this.#plan;
+        if (plan !== null && this.#planningRevision !== revision) {
+          this.#rebuildFills(city, plan, selected);
+          this.#startPlanning(plan, revision);
+        }
       }
       this.#refreshPreview();
-      if (plan === null && !this.#planResolved) this.#schedulePlanView(revision);
-      else if (plan !== null && (this.#planningRevision !== revision || this.#planningScale !== scale)) this.#startPlanning(plan, revision, scale);
+    }
+
+    #currentZoom(): number {
+      const zoom = canvas?.stage?.scale?.x;
+      return typeof zoom === "number" && Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+    }
+
+    #currentInvZoom(): number {
+      return 1 / this.#currentZoom();
+    }
+
+    #currentWorldKey(): string {
+      const city = getCity() as any;
+      const revision = typeof city?.revision === "number" ? city.revision : null;
+      return `${String(revision)}|${pixelsPerMetre()}`;
+    }
+
+    #applyZoom(zoom: number): void {
+      this.#appliedZoom = zoom;
+      const inv = 1 / zoom;
+      for (const mesh of this.#planningMeshes) mesh.setInvZoom(inv);
+      for (const mesh of this.#hatchMeshes) mesh.setInvZoom(inv);
+      for (const mesh of this.#boundaryMeshes) mesh.setInvZoom(inv);
+      if (this.#plan !== null) this.#scheduleHatchRefresh();
+      this.#refreshPreview(true);
+    }
+
+    #rebuildBoundaries(city: any, selected: Set<string>): void {
+      this.#clearBoundaries();
+      const host = this.#boundaryHost;
+      if (host === null || host === undefined) return;
+      for (const boundary of districtOverlayData(city, null).boundaries) {
+        const builder = new DistrictOverlayLineMeshBuilder();
+        addRingLines(builder, boundary.polygon, Math.max(2, canvas.dimensions.size * 0.07), selected.has(boundary.id) ? 0xffc94a : colourFor(boundary.id), 0.95);
+        const data = builder.build();
+        if (data.segmentCount === 0) continue;
+        const mesh = new DistrictOverlayLineMesh(data);
+        mesh.setInvZoom(this.#currentInvZoom());
+        mesh.display.eventMode = "none";
+        host.addChild(mesh.display);
+        this.#boundaryMeshes.push(mesh);
+        this.#boundaryIds.push(boundary.id);
+        this.#boundaryRings.set(boundary.id, boundary.polygon);
+      }
+    }
+
+    #rebuildFills(city: any, plan: any, selected: Set<string>): void {
+      this.#clearFills();
+      const host = this.#fillHost;
+      if (host === null || host === undefined) return;
+      const byId = new Map<string, any>();
+      for (const fill of districtOverlayData(city, plan).fills) {
+        let graphics = byId.get(fill.id);
+        if (graphics === undefined) {
+          graphics = new PIXI.Graphics();
+          graphics.eventMode = "none";
+          host.addChild(graphics);
+          byId.set(fill.id, graphics);
+          this.#fillIds.push(fill.id);
+          this.#fillGraphics.push(graphics);
+          this.#fillPolygons.set(fill.id, []);
+        }
+        this.#fillPolygons.get(fill.id)!.push(fill.polygon);
+        fillPolygonWithHoles(graphics, fill.polygon, selected.has(fill.id) ? 0xffc94a : colourFor(fill.id), selected.has(fill.id) ? 0.34 : 0.22);
+      }
+    }
+
+    #applySelectionChange(selected: Set<string>, previousKey: string | null): void {
+      const previous = previousKey === null || previousKey === "" ? new Set<string>() : new Set(previousKey.split(","));
+      for (const id of new Set([...previous, ...selected])) {
+        if (previous.has(id) === selected.has(id)) continue;
+        const fillIndex = this.#fillIds.indexOf(id);
+        if (fillIndex >= 0) {
+          const graphics = this.#fillGraphics[fillIndex]!;
+          graphics.clear();
+          for (const polygon of this.#fillPolygons.get(id) ?? []) {
+            fillPolygonWithHoles(graphics, polygon, selected.has(id) ? 0xffc94a : colourFor(id), selected.has(id) ? 0.34 : 0.22);
+          }
+        }
+        const boundaryIndex = this.#boundaryIds.indexOf(id);
+        const ringSource = this.#boundaryRings.get(id);
+        if (boundaryIndex >= 0 && ringSource !== undefined && this.#boundaryHost !== null && this.#boundaryHost !== undefined) {
+          const previousMesh = this.#boundaryMeshes[boundaryIndex]!;
+          previousMesh.display.parent?.removeChild(previousMesh.display);
+          previousMesh.destroy();
+          const builder = new DistrictOverlayLineMeshBuilder();
+          addRingLines(builder, ringSource, Math.max(2, canvas.dimensions.size * 0.07), selected.has(id) ? 0xffc94a : colourFor(id), 0.95);
+          const data = builder.build();
+          const mesh = new DistrictOverlayLineMesh(data);
+          mesh.setInvZoom(this.#currentInvZoom());
+          mesh.display.eventMode = "none";
+          this.#boundaryHost.addChild(mesh.display);
+          this.#boundaryMeshes[boundaryIndex] = mesh;
+        }
+      }
     }
 
     #schedulePlanView(revision: number | null): void {
@@ -809,65 +994,130 @@ export function districtLayerClass(): any {
       });
     }
 
-    #startPlanning(plan: any, revision: number | null, scale: number | null): void {
-      this.#clearPlanning();
-      this.#planningRevision = revision;
-      this.#planningScale = scale;
+    #fragmentMap(plan: any): Map<string, any> {
       const fragmentByKey = new Map<string, any>();
       for (const block of plan?.blocks ?? []) for (const fragment of block?.districtFragments ?? []) {
         fragmentByKey.set(`${String(block.id)}\0${String(fragment.id)}`, fragment);
       }
+      return fragmentByKey;
+    }
+
+    #startPlanning(plan: any, revision: number | null): void {
+      this.#clearPlanningMeshes();
+      this.#planningRevision = revision;
       const task: DistrictPlanningTask = {
         epoch: this.#planningEpoch,
         plan,
         revision,
-        scale,
         phase: "blocks",
         index: 0,
-        fragmentByKey,
+        fragmentByKey: this.#fragmentMap(plan),
         hatchQueue: [],
         hatchIterator: null,
         hatchColor: 0,
         hatchSpacing: 0,
-        hatchWidth: 0
+        hatchWidth: 0,
+        hatchesOnly: false
       };
       this.#planningTask = task;
       this.#planningFrame = requestAnimationFrame(() => this.#stepPlanning(task.epoch));
     }
 
+    #startHatchRefresh(): void {
+      const plan = this.#plan;
+      if (plan === null) return;
+      if (this.#planningTask !== null) {
+        this.#pendingHatchRefresh = true;
+        return;
+      }
+      for (const mesh of this.#hatchMeshes) {
+        mesh.display.parent?.removeChild(mesh.display);
+        mesh.destroy();
+      }
+      this.#hatchMeshes = [];
+      const task: DistrictPlanningTask = {
+        epoch: this.#planningEpoch,
+        plan,
+        revision: this.#planRevision,
+        phase: "unzoned",
+        index: 0,
+        fragmentByKey: this.#fragmentMap(plan),
+        hatchQueue: [],
+        hatchIterator: null,
+        hatchColor: 0,
+        hatchSpacing: 0,
+        hatchWidth: 0,
+        hatchesOnly: true
+      };
+      this.#planningTask = task;
+      this.#planningFrame = requestAnimationFrame(() => this.#stepPlanning(task.epoch));
+    }
+
+    #scheduleHatchRefresh(): void {
+      if (this.#hatchTimer !== null) return;
+      this.#hatchTimer = setTimeout(() => {
+        this.#hatchTimer = null;
+        if (!this.active || !isSceneEnabled() || this.#plan === null) return;
+        this.#startHatchRefresh();
+      }, 150);
+    }
+
+    #planningItemBucket(task: DistrictPlanningTask): "planning" | "hatch" {
+      if (task.hatchesOnly) return "hatch";
+      if (task.hatchIterator !== null || task.hatchQueue.length > 0) return "hatch";
+      if (task.phase === "intents") return "hatch";
+      return "planning";
+    }
+
+    #flushPlanningBuilder(builder: DistrictOverlayLineMeshBuilder, bucket: "planning" | "hatch"): void {
+      const data = builder.build();
+      if (data.segmentCount === 0 || this.#planningHost === null || this.#planningHost === undefined) return;
+      const mesh = new DistrictOverlayLineMesh(data);
+      mesh.setInvZoom(this.#currentInvZoom());
+      mesh.display.eventMode = "none";
+      this.#planningHost.addChild(mesh.display);
+      (bucket === "hatch" ? this.#hatchMeshes : this.#planningMeshes).push(mesh);
+    }
+
     #stepPlanning(epoch: number): void {
       this.#planningFrame = null;
       const task = this.#planningTask;
-      const currentScale = typeof canvas?.stage?.scale?.x === "number" ? canvas.stage.scale.x : null;
-      const currentRevision = getCity()?.revision ?? null;
-      const presentationChanged = task !== null && (currentRevision !== task.revision || currentScale !== task.scale);
-      if (task === null || task.epoch !== epoch || epoch !== this.#planningEpoch || !this.active || !isSceneEnabled() || presentationChanged) {
-        if (task !== null && task.epoch === epoch) {
-          const restart = this.active && isSceneEnabled() && presentationChanged;
-          this.#clearPlanning();
-          if (restart) this.refresh();
-        }
+      if (task === null || task.epoch !== epoch || epoch !== this.#planningEpoch || !this.active || !isSceneEnabled()) {
+        if (task !== null && task.epoch === epoch) this.#clearPlanningMeshes();
         return;
       }
-      const builder = new DistrictOverlayLineMeshBuilder();
+      if ((getCity()?.revision ?? null) !== task.revision) {
+        this.#clearPlanningMeshes();
+        return;
+      }
+      let builder: DistrictOverlayLineMeshBuilder | null = null;
+      let bucket: "planning" | "hatch" | null = null;
       const started = performance.now();
       let processed = 0;
       let hasMore = true;
-      while (builder.segmentCount < DISTRICT_OVERLAY_SEGMENTS_PER_FRAME) {
+      while (builder === null || builder.segmentCount < DISTRICT_OVERLAY_SEGMENTS_PER_FRAME) {
         if (processed > 0 && performance.now() - started >= DISTRICT_OVERLAY_CPU_BUDGET_MS) break;
+        const nextBucket = this.#planningItemBucket(task);
+        if (builder !== null && bucket !== null && bucket !== nextBucket) {
+          this.#flushPlanningBuilder(builder, bucket);
+          builder = null;
+          bucket = null;
+        }
+        if (builder === null) {
+          builder = new DistrictOverlayLineMeshBuilder();
+          bucket = nextBucket;
+        }
         hasMore = this.#processPlanningItem(task, builder);
         if (!hasMore) break;
         processed++;
       }
-      const data = builder.build();
-      if (data.segmentCount > 0 && this.#planningHost) {
-        const mesh = new DistrictOverlayLineMesh(data);
-        mesh.display.eventMode = "none";
-        this.#planningHost.addChild(mesh.display);
-        this.#planningMeshes.push(mesh);
-      }
+      if (builder !== null && bucket !== null) this.#flushPlanningBuilder(builder, bucket);
       if (!hasMore) {
         this.#planningTask = null;
+        if (this.#pendingHatchRefresh) {
+          this.#pendingHatchRefresh = false;
+          this.#startHatchRefresh();
+        }
         return;
       }
       this.#planningFrame = requestAnimationFrame(() => this.#stepPlanning(epoch));
@@ -890,31 +1140,35 @@ export function districtLayerClass(): any {
           continue;
         }
         if (task.phase === "blocks") {
+          if (task.hatchesOnly) { task.phase = "cells"; continue; }
           const blocks = task.plan?.blocks ?? [];
           if (task.index >= blocks.length) { task.phase = "cells"; task.index = 0; continue; }
           const block = blocks[task.index++]!;
-          addPlanRingLines(builder, block.zoningFace ?? block.polygon, 0x8ed9d4, 0.95, screenPx(Math.max(1.5, canvas.dimensions.size * 0.04)));
+          addPlanRingLines(builder, block.zoningFace ?? block.polygon, 0x8ed9d4, 0.95, Math.max(1.5, canvas.dimensions.size * 0.04));
           return true;
         }
         if (task.phase === "cells") {
+          if (task.hatchesOnly) { task.phase = "unzoned"; task.index = 0; continue; }
           const cells = task.plan?.developmentCells ?? [];
           if (task.index >= cells.length) { task.phase = "unzoned"; task.index = 0; continue; }
           const cell = cells[task.index++]!;
-          addPlanRingLines(builder, cell.polygon, 0xe7a7e4, 0.95, screenPx(Math.max(1, canvas.dimensions.size * 0.025)));
+          addPlanRingLines(builder, cell.polygon, 0xe7a7e4, 0.95, Math.max(1, canvas.dimensions.size * 0.025));
           const cue = districtCellOrientationCue(cell);
-          if (cue) builder.add(metresToWorld(cue.start), metresToWorld(cue.end), screenPx(Math.max(1, canvas.dimensions.size * 0.02)), 0xffd390, 0.78);
+          if (cue) builder.add(metresToWorld(cue.start), metresToWorld(cue.end), Math.max(1, canvas.dimensions.size * 0.02), 0xffd390, 0.78);
           return true;
         }
         if (task.phase === "unzoned") {
           const unzoned = task.plan?.unzoned ?? [];
           if (task.index >= unzoned.length) { task.phase = "intents"; task.index = 0; continue; }
           const polygon = unzoned[task.index++]!;
-          const fill = new PIXI.Graphics();
-          fill.eventMode = "none";
-          fillPlanRings(fill, polygon, 0x7d8796, 0.12);
-          this.#planningFill?.addChild(fill);
-          this.#planningFills.push(fill);
-          addPlanRingLines(builder, polygon, 0x7d8796, 0.95, screenPx(Math.max(1, canvas.dimensions.size * 0.025)));
+          if (!task.hatchesOnly) {
+            const fill = new PIXI.Graphics();
+            fill.eventMode = "none";
+            fillPlanRings(fill, polygon, 0x7d8796, 0.12);
+            this.#planningFill?.addChild(fill);
+            this.#planningFills.push(fill);
+            addPlanRingLines(builder, polygon, 0x7d8796, 0.95, Math.max(1, canvas.dimensions.size * 0.025));
+          }
           this.#queueHatches(task, polygon, 0x7d8796);
           return true;
         }
@@ -933,16 +1187,35 @@ export function districtLayerClass(): any {
     }
 
     #queueHatches(task: DistrictPlanningTask, value: unknown, color: number): void {
-      const spacing = screenPx(Math.max(8, canvas.dimensions.size * 0.32));
+      // WHY: spacing stays constant on screen (world spacing = screen px / zoom), so the
+      // pattern is regenerated on zoom settle instead of being baked into the geometry.
+      const screenSpacing = Math.max(8, canvas.dimensions.size * 0.32);
       task.hatchQueue.push(...polygons(value));
       task.hatchColor = color;
-      task.hatchSpacing = Math.max(spacing, 4);
-      task.hatchWidth = Math.max(1, spacing * 0.08);
+      task.hatchSpacing = Math.max(screenPx(screenSpacing), 4);
+      task.hatchWidth = Math.max(1, screenSpacing * 0.08);
     }
 
-    #refreshPreview(): void {
+    #previewSignature(): string {
+      const draft = this.#draft;
+      const drag = this.#drag;
+      const snap = this.#snapTarget;
+      let key = `${canvasTool()}|${selectedIds().join(",")}`;
+      if (draft !== null) {
+        key += `|d${draft.mode}:${draft.points.length}:${draft.points.map((point) => `${point.x},${point.y}`).join(";")}`;
+        key += `:${draft.cursor === null ? "" : `${draft.cursor.x},${draft.cursor.y}`}`;
+      }
+      if (drag !== null) key += `|g${drag.districtId}:${drag.index}:${drag.current.x},${drag.current.y}`;
+      if (snap !== null) key += `|s${snap.x},${snap.y}`;
+      return key;
+    }
+
+    #refreshPreview(force = false): void {
       const g = this.#preview;
       if (!g) return;
+      const signature = this.#previewSignature();
+      if (!force && signature === this.#previewSignatureLast) return;
+      this.#previewSignatureLast = signature;
       g.clear();
       const draft = this.#draft;
       if (draft !== null && draft.points.length > 0) {
@@ -1006,7 +1279,7 @@ export function districtLayerClass(): any {
 
     _onDragLeftMove(event: any): void {
       if (this.#drag === null) return;
-      const snapped = snapWorldPointInfo(this.#pointer(event), this.#plan, this.#drag);
+      const snapped = this.#snapWorldPointInfo(this.#pointer(event), this.#drag);
       this.#drag.current = snapped.point;
       this.#snapTarget = snapped.target;
       this.#refreshPreview();
@@ -1023,7 +1296,7 @@ export function districtLayerClass(): any {
         ui.notifications?.error("Nixie: district vertex move failed — " + message);
         return;
       }
-      const snapped = snapWorldPointInfo(this.#pointer(event), this.#plan, drag);
+      const snapped = this.#snapWorldPointInfo(this.#pointer(event), drag);
       this.#snapTarget = snapped.target;
       const at = snapped.point;
       void invoke(adapterMoveDistrictVertex, drag.districtId, drag.index, worldToMetres(at)).then(() => clearEditorActionError()).catch((error) => { setEditorActionError("district vertex move", error); ui.notifications?.error("Nixie: district vertex move failed — " + (error instanceof Error ? error.message : String(error))); });
@@ -1033,7 +1306,7 @@ export function districtLayerClass(): any {
 
     _onMouseMove(event: any): void {
       if (!isSceneEnabled() || !this.active) return;
-      const snapped = snapWorldPointInfo(this.#pointer(event), this.#plan);
+      const snapped = this.#snapWorldPointInfo(this.#pointer(event));
       this.#snapTarget = snapped.target;
       if (this.#draft !== null) this.#draft.cursor = snapped.point;
       this.#refreshPreview();
@@ -1043,7 +1316,7 @@ export function districtLayerClass(): any {
 
     _onClickLeft(event: any): void {
       if (!isSceneEnabled()) return;
-      const snapped = snapWorldPointInfo(this.#pointer(event), this.#plan);
+      const snapped = this.#snapWorldPointInfo(this.#pointer(event));
       this.#snapTarget = snapped.target;
       const point = snapped.point;
       const tool = canvasTool();

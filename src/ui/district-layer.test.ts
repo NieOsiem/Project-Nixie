@@ -153,7 +153,7 @@ describe("District overlay data", () => {
     expect(cancelAnimationFrame).toHaveBeenCalledWith(2);
   });
 
-  it("renders the base overlay before structural work and cancels stale planning", async () => {
+  it("renders the base overlay before structural work and keeps planning across zoom changes", async () => {
     class InteractionLayer {
       active = true;
       visible = true;
@@ -206,8 +206,10 @@ describe("District overlay data", () => {
     (globalThis as any).canvas.stage.scale.x = 2;
     frames.get(6)!(80);
     frames.delete(6);
-    expect(frames.has(7)).toBe(true);
+    // WHY: geometry is zoom-independent, so a zoom change neither restarts the planning
+    // build nor schedules new frames; the current build simply completes.
+    expect(frames.has(7)).toBe(false);
     await layer._tearDown({});
-    expect(cancelAnimationFrame).toHaveBeenCalledWith(7);
+    expect(cancelAnimationFrame).not.toHaveBeenCalled();
   });
 });

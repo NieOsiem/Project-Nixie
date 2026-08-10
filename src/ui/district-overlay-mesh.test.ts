@@ -7,17 +7,18 @@ import {
 } from "./district-overlay-mesh.js";
 
 describe("DistrictOverlayLineMeshBuilder", () => {
-  it("expands a segment into a coloured indexed quad", () => {
+  it("expands a segment into a coloured indexed quad with zoom-independent data", () => {
     const builder = new DistrictOverlayLineMeshBuilder();
     builder.add({ x: 0, y: 0 }, { x: 10, y: 0 }, 2, 0x123456, 0.5);
 
     const data = builder.build();
     expect(data.segmentCount).toBe(1);
+    // base, unit normal, signed screen-pixel half-width, colour, alpha
     expect(data.vertices).toEqual(Float32Array.from([
-      0, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
-      10, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
-      10, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
-      0, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5
+      0, 0, -0, 1, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      10, 0, -0, 1, 1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      10, 0, -0, 1, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5,
+      0, 0, -0, 1, -1, 0x12 / 255, 0x34 / 255, 0x56 / 255, 0.5
     ]));
     expect(Array.from(data.indices)).toEqual([0, 1, 2, 0, 2, 3]);
   });
@@ -27,9 +28,9 @@ describe("DistrictOverlayLineMeshBuilder", () => {
     builder.add({ x: 4, y: 6 }, { x: 7, y: 10 }, 2, 0xffffff, 1);
 
     const data = builder.build();
-    expect(data.vertices.slice(0, 12)).toEqual(Float32Array.from([
-      3.2, 6.6, 1, 1, 1, 1,
-      6.2, 10.6, 1, 1, 1, 1
+    expect(data.vertices.slice(0, 18)).toEqual(Float32Array.from([
+      4, 6, -0.8, 0.6, 1, 1, 1, 1, 1,
+      7, 10, -0.8, 0.6, 1, 1, 1, 1, 1
     ]));
   });
 
@@ -48,7 +49,7 @@ describe("DistrictOverlayLineMeshBuilder", () => {
 
     const data = builder.build();
     expect(data.segmentCount).toBe(1);
-    expect(data.vertices).toHaveLength(24);
+    expect(data.vertices).toHaveLength(36);
     expect(data.indices).toHaveLength(6);
   });
 
@@ -61,10 +62,10 @@ describe("DistrictOverlayLineMeshBuilder", () => {
 
     const data = builder.build();
     expect(data.segmentCount).toBe(20_000);
-    expect(data.vertices).toHaveLength(20_000 * 4 * 6);
+    expect(data.vertices).toHaveLength(20_000 * 4 * 9);
     expect(data.indices).toHaveLength(20_000 * 6);
     expect(Number.isFinite(data.vertices[0])).toBe(true);
-    expect(data.vertices[5]).toBe(0.5);
+    expect(data.vertices[8]).toBe(0.5);
     expect(data.indices[0]).toBe(0);
     expect(data.indices.at(-1)).toBe(20_000 * 4 - 1);
   });
@@ -122,7 +123,7 @@ afterEach(() => {
 });
 
 describe("DistrictOverlayLineMesh", () => {
-  it("binds one indexed geometry with interleaved position and colour attributes", () => {
+  it("binds one indexed geometry with interleaved base, normal, width and colour attributes", () => {
     const builder = new DistrictOverlayLineMeshBuilder();
     builder.add({ x: 0, y: 0 }, { x: 4, y: 0 }, 2, 0xff0000, 0.5);
     const data = builder.build();
@@ -130,20 +131,38 @@ describe("DistrictOverlayLineMesh", () => {
     const geometry = geometryInstances[0]!;
 
     expect(geometry.attributes.map(({ name, size, stride, offset }) => ({ name, size, stride, offset }))).toEqual([
-      { name: "aPosition", size: 2, stride: 24, offset: 0 },
-      { name: "aColor", size: 3, stride: 24, offset: 8 },
-      { name: "aAlpha", size: 1, stride: 24, offset: 20 }
+      { name: "aBase", size: 2, stride: 36, offset: 0 },
+      { name: "aNormal", size: 2, stride: 36, offset: 8 },
+      { name: "aSignedHalfWidth", size: 1, stride: 36, offset: 16 },
+      { name: "aColor", size: 3, stride: 36, offset: 20 },
+      { name: "aAlpha", size: 1, stride: 36, offset: 32 }
     ]);
     expect(geometry.indices).toBe(data.indices);
-    expect((mesh.display as StubMesh).state.blend).toBe(true);
+    // WHY: the stub stands in for untyped PIXI.Mesh, so the display shape is asserted once here.
+    const display = mesh.display as StubMesh;
+    expect(display.state.blend).toBe(true);
     mesh.destroy();
-    expect((mesh.display as StubMesh).destroy).toHaveBeenCalledOnce();
+    expect(display.destroy).toHaveBeenCalledOnce();
     expect(geometry.destroy).toHaveBeenCalledOnce();
   });
 
+  it("exposes the inverse-zoom uniform so widths stay screen-constant without rebuilding geometry", () => {
+    const builder = new DistrictOverlayLineMeshBuilder();
+    builder.add({ x: 0, y: 0 }, { x: 4, y: 0 }, 2, 0xff0000, 0.5);
+    const mesh = new DistrictOverlayLineMesh(builder.build());
+    // WHY: the stub stands in for untyped PIXI.Shader, so the uniform surface is asserted once here.
+    const shader = (mesh.display as StubMesh).shader as { uniforms: Record<string, unknown> };
+    expect(shader.uniforms.uInvZoom).toBeUndefined();
+    mesh.setInvZoom(0.5);
+    expect(shader.uniforms.uInvZoom).toBe(0.5);
+    mesh.destroy();
+  });
+
   it("keeps its shaders in GLSL ES 1.00 form", () => {
-    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("attribute vec2 aPosition;");
+    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("attribute vec2 aBase;");
     expect(DISTRICT_OVERLAY_LINE_VERT).toContain("uniform mat3 projectionMatrix;");
+    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("uniform float uInvZoom;");
+    expect(DISTRICT_OVERLAY_LINE_VERT).toContain("aSignedHalfWidth * uInvZoom");
     expect(DISTRICT_OVERLAY_LINE_FRAG).toContain("varying vec4 vColor;");
     expect(DISTRICT_OVERLAY_LINE_FRAG).toContain("vColor.rgb * vColor.a");
     expect(DISTRICT_OVERLAY_LINE_FRAG).not.toContain("#version");
