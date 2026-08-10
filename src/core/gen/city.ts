@@ -1,6 +1,6 @@
 import type { Vec2 } from "../geom/types.js";
-import { intersection, ringAsMulti } from "../geom/boolean.js";
-import { ringArea, type Ring } from "../geom/types.js";
+import { intersection, isSnapNoise, ringAsMulti } from "../geom/boolean.js";
+import type { Ring } from "../geom/types.js";
 import { validateTerrain, validateRing, type TerrainGeneration, type TerrainSource } from "./terrain.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
 
@@ -346,13 +346,6 @@ function validateDistrictPool(value: unknown): string[] {
   return problems;
 }
 
-function multiArea(multi: ReturnType<typeof ringAsMulti>): number {
-  return multi.reduce(
-    (total, polygon) => total + polygon.reduce((sum, ring, index) => sum + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0),
-    0
-  );
-}
-
 export function validateDistrictSource(value: unknown): string[] {
   const problems: string[] = [];
   if (!isRecord(value)) return ["District source must be an object."];
@@ -410,7 +403,7 @@ export function validateCitySourceV3(source: unknown): string[] {
         const right = source.districts[j];
         if (!isRecord(right) || !Array.isArray(right.polygon)) continue;
         try {
-          if (multiArea(intersection(ringAsMulti(left.polygon as Ring), ringAsMulti(right.polygon as Ring))) > 1e-6) {
+          if (!isSnapNoise(intersection(ringAsMulti(left.polygon as Ring), ringAsMulti(right.polygon as Ring)))) {
             problems.push(`Districts "${String(left.id)}" and "${String(right.id)}" overlap.`);
           }
         } catch {

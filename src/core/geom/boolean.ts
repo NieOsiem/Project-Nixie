@@ -1,5 +1,5 @@
 import polygonClipping from "polygon-clipping";
-import type { MultiPolygon, Polygon, Ring } from "./types.js";
+import { ringArea, ringPerimeter, type MultiPolygon, type Polygon, type Ring } from "./types.js";
 
 /**
  * Collapse float noise so points that ought to coincide actually do. Road quads meeting
@@ -8,7 +8,31 @@ import type { MultiPolygon, Polygon, Ring } from "./types.js";
  */
 const SNAP = 1e-3;
 
+/** Absolute floor below which an overlap is never treated as real. */
+const OVERLAP_AREA_FLOOR_M2 = 1e-5;
+
 const snap = (v: number): number => Math.round(v / SNAP) * SNAP;
+
+/**
+ * True when an overlay result is below the pipeline's snap precision: its mean
+ * thickness is at most SNAP (or its area is below the absolute floor), so it is
+ * numeric noise between polygons that share a boundary, not a real overlap.
+ * WHY: validation gates re-intersect recomputed cuts against stored rings, and a
+ * re-snapped cut deviates by up to SNAP, so any absolute area threshold smaller
+ * than SNAP × shared-length rejects legitimate adjacent districts.
+ */
+export function isSnapNoise(multi: MultiPolygon): boolean {
+  let area = 0;
+  let perimeter = 0;
+  for (const polygon of multi) {
+    for (let index = 0; index < polygon.length; index++) {
+      const ring = polygon[index]!;
+      area += (index === 0 ? 1 : -1) * Math.abs(ringArea(ring));
+      perimeter += ringPerimeter(ring);
+    }
+  }
+  return area <= Math.max(OVERLAP_AREA_FLOOR_M2, SNAP * perimeter);
+}
 
 type PCRing = [number, number][];
 type PCMulti = PCRing[][];

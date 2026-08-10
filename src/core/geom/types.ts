@@ -65,6 +65,16 @@ export function ringArea(ring: Ring): number {
   return sum / 2;
 }
 
+export function ringPerimeter(ring: Ring): number {
+  let total = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i]!;
+    const b = ring[(i + 1) % ring.length]!;
+    total += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  return total;
+}
+
 export function ringCentroid(ring: Ring): Vec2 {
   const area = ringArea(ring);
   if (area === 0) {

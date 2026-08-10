@@ -95,4 +95,13 @@ describe("City Generator 2.0 Phase 3 model", () => {
     ];
     expect(validateCitySourceV3(source).some((problem) => /overlap/i.test(problem))).toBe(true);
   });
+
+  it("accepts sub-snap slivers between adjacent persisted districts", () => {
+    const source = migrateSchema2ToSchema3(schema2(), 1).source;
+    source.districts = [
+      { id: "d-a", polygon: [{ x: -80, y: -40 }, { x: 40, y: -40 }, { x: 40, y: 40 }, { x: -80, y: 40 }], seed: "a", typeId: "corporate-core", paletteId: "corporate", origin: "authored", locked: false, openSpaceOverride: null },
+      { id: "d-b", polygon: [{ x: 40.0001, y: -40 }, { x: 120, y: -40 }, { x: 120, y: 40 }, { x: 40.0001, y: 40 }], seed: "b", typeId: "night-market", paletteId: "night-market", origin: "authored", locked: false, openSpaceOverride: null }
+    ];
+    expect(validateCitySourceV3(source)).toEqual([]);
+  });
 });

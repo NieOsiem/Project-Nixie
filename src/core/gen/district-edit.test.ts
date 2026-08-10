@@ -150,4 +150,41 @@ describe("district edit candidates", () => {
     const empty = { ...baseSource(), districts: before.districts };
     expect(() => reconcileDistrictsForRoadEdit(empty, before)).toThrow(/locked districts/);
   });
+
+  it("accepts sub-snap overlap noise when editing districts that share a diagonal edge", () => {
+    const diagonal: DistrictSource = {
+      ...district("old", 0, 100),
+      polygon: [
+        { x: 0, y: 0 },
+        { x: 100.37, y: 0.11 },
+        { x: 150.82, y: 40.53 },
+        { x: 100.19, y: 100.64 },
+        { x: -0.27, y: 99.88 }
+      ]
+    };
+    const neighbor: DistrictSource = {
+      ...district("nbr", 0, 100),
+      polygon: [
+        { x: 150.82, y: 40.53 },
+        { x: 300.44, y: 60.17 },
+        { x: 260.05, y: 130.9 },
+        { x: 100.19, y: 100.64 }
+      ]
+    };
+    const source = { ...baseSource(), districts: [diagonal, neighbor] };
+    const split = districtSplitCandidate(source, "old", { x: 10.17, y: -20.33 }, { x: 140.66, y: 130.21 }, "new");
+    expect(split.map((value) => value.id)).toEqual(["nbr", "new", "old"]);
+    const drawn = districtDrawCandidate(source, {
+      ...district("new", 0, 100),
+      polygon: [
+        { x: 120.05, y: 25.44 },
+        { x: 190.62, y: 45.13 },
+        { x: 185.44, y: 85.27 },
+        { x: 115.88, y: 70.09 }
+      ]
+    });
+    expect(drawn.map((value) => value.id)).toEqual(["nbr", "new", "old"]);
+    const genuine = { ...district("gen", 0, 100), polygon: rectRing({ x: 20, y: 0, width: 80, height: 100 }) };
+    expect(() => validateDistrictCandidates(source, [diagonal, neighbor, genuine])).toThrow(/must not overlap/);
+  });
 });

@@ -1,5 +1,5 @@
 import { compileRouteNetwork } from "../graph/compiler.js";
-import { difference, intersection, ringAsMulti, union } from "../geom/boolean.js";
+import { difference, intersection, isSnapNoise, ringAsMulti, union } from "../geom/boolean.js";
 import { ringArea, ringBounds, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
 import {
   ROUTE_CLASS_REGISTRY,
@@ -78,7 +78,7 @@ export function validateDistrictCandidates(source: CitySourceV3, districts: read
   }
   for (let i = 0; i < ordered.length; i++) {
     for (let j = i + 1; j < ordered.length; j++) {
-      if (area(intersection(ringAsMulti(ordered[i]!.polygon), ringAsMulti(ordered[j]!.polygon))) > 1e-5) {
+      if (!isSnapNoise(intersection(ringAsMulti(ordered[i]!.polygon), ringAsMulti(ordered[j]!.polygon)))) {
         throw new DistrictEditError("Districts must not overlap.", [ordered[i]!.id, ordered[j]!.id]);
       }
     }
@@ -301,7 +301,7 @@ export function reconcileDistrictsForRoadEdit(before: CitySourceV3, after: CityS
   const roadIds = changedRoadIds(before.roads, after.roads);
   const reclaimed = intersection(difference(oldOccupancy.all, [newOccupancy.all]), mask);
   const newlyOccupied = intersection(difference(newOccupancy.all, [oldOccupancy.all]), mask);
-  const lockedOccupied = before.districts.filter((district) => district.locked && area(intersection(ringAsMulti(district.polygon), newlyOccupied)) > 1e-5).map((district) => district.id);
+  const lockedOccupied = before.districts.filter((district) => district.locked && !isSnapNoise(intersection(ringAsMulti(district.polygon), newlyOccupied))).map((district) => district.id);
   if (lockedOccupied.length > 0) throw new DistrictEditError("Road geometry would change effective land inside locked districts.", [...lockedOccupied, ...roadIds]);
   let districts = before.districts.map(cloneDistrict).sort((a, b) => a.id.localeCompare(b.id));
   for (const region of reclaimed) {
