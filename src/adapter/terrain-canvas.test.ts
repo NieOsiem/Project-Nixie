@@ -4,6 +4,7 @@ import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
 import type { CityStateV3 } from "../core/gen/city.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { TerrainSession } from "./terrain-session.js";
+import { handleRequest, type WorkerRequest } from "../worker/protocol.js";
 import {
   configuredPixelsPerMetre,
   chunkCoverageComplete,
@@ -15,12 +16,14 @@ import {
   enabledFlagChanged,
   getRoadSelection,
   getDistrictSelection,
+  getDistrictPlanView,
   fillDistrict,
   generateDistricts,
   mergeDistricts,
   mount,
   reclassifyRoad,
   renameRoad,
+  retryDistrictPlan,
   retryGeneratedWalls,
   roadClearanceBlockers,
   sceneBoundsFromPixels,
@@ -36,6 +39,23 @@ import {
   undo,
   unmount
 } from "./terrain-canvas.js";
+
+/** WHY: the adapter builds the plan only in the worker; the fake executes the real protocol dispatcher. */
+class FakeWorker {
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onerror: unknown = null;
+  onmessageerror: unknown = null;
+  terminate = vi.fn();
+
+  constructor(_url: string, _options?: unknown) {}
+
+  postMessage(message: WorkerRequest): void {
+    queueMicrotask(() => {
+      const response = handleRequest(message);
+      this.onmessage?.({ data: response });
+    });
+  }
+}
 
 function state(): CityStateV3 {
   return {
@@ -256,6 +276,8 @@ describe("road bulk mutation selection", () => {
     vi.stubGlobal("game", { user: { isGM: true } });
     vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
     vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
+    vi.stubGlobal("document", { baseURI: "http://test.local/" });
+    vi.stubGlobal("Worker", FakeWorker);
     mount();
   });
 
@@ -416,5 +438,63 @@ describe("road bulk mutation selection", () => {
     selectRoadNode("a1");
     await deleteRoadJunction("a1");
     expect(getRoadSelection().nodeIds).toEqual([]);
+  });
+
+  it("publishes the district plan asynchronously after a district commit", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await vi.waitFor(() => {
+      expect(stats()).toEqual(expect.objectContaining({
+        districtPlan: expect.objectContaining({ revision: saved.revision })
+      }));
+    });
+    expect(getDistrictPlanView()).not.toBeNull();
+  });
+
+  it("keeps only the latest revision's plan across rapid commits", async () => {
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    await createDistrict([
+      { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
+    ], "night-market");
+    await vi.waitFor(() => {
+      expect(stats()).toEqual(expect.objectContaining({
+        districtPlan: expect.objectContaining({ revision: saved.revision })
+      }));
+    });
+    const view = getDistrictPlanView();
+    const fragmentIds = new Set((view?.blocks ?? []).flatMap((block) => block.districtFragments.map((fragment) => fragment.districtId)));
+    expect(fragmentIds.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it("makes Fill wait for the current plan and target a road-defined block", async () => {
+    // No commit has requested a plan yet; Fill must request and await it itself.
+    await fillDistrict({ x: -45, y: 0 }, "night-market");
+    expect(saved.source.districts).toHaveLength(1);
+  });
+
+  it("degrades plan builds without freezing the UI thread when the worker is unavailable", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subsystem: "districts", retry: "plan" })
+    ]));
+    await expect(fillDistrict({ x: 0, y: 0 }, "corporate-core")).rejects.toThrow("unavailable");
+  });
+
+  it("restores the plan when Retry succeeds after the worker returns", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    expect(districtDiagnostics().some((entry) => entry.retry === "plan")).toBe(true);
+    vi.stubGlobal("Worker", FakeWorker);
+    await retryDistrictPlan();
+    expect(getDistrictPlanView()).not.toBeNull();
+    expect(districtDiagnostics().some((entry) => entry.retry === "plan")).toBe(false);
   });
 });

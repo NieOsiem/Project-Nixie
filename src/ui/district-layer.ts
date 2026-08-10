@@ -884,6 +884,10 @@ export function districtLayerClass(): any {
         if (plan !== null && this.#planningRevision !== revision) {
           this.#rebuildFills(city, plan, selected);
           this.#startPlanning(plan, revision);
+        } else if (plan === null && !this.#planPending && !this.#planResolved) {
+          // WHY: the plan is derived asynchronously after a commit; keep re-fetching until it
+          // lands (the adapter notifies listeners when it publishes) instead of giving up.
+          this.#schedulePlanView(revision);
         }
       }
       this.#refreshPreview();
@@ -992,7 +996,10 @@ export function districtLayerClass(): any {
         this.#planningFrame = null;
         this.#planPending = false;
         if (epoch !== this.#planningEpoch || !this.active || !isSceneEnabled() || getCity()?.revision !== revision) return;
-        try { this.#plan = getDistrictPlanView(); } catch { this.#plan = null; }
+        let plan: any = null;
+        try { plan = getDistrictPlanView(); } catch { plan = null; }
+        if (plan === null) return;
+        this.#plan = plan;
         this.#planResolved = true;
         this.refresh();
       });

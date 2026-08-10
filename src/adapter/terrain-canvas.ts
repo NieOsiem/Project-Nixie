@@ -36,7 +36,7 @@ import {
   type RouteClassId
 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
-import { buildDistrictPlan, type DistrictPlan } from "../core/gen/district-plan.js";
+import type { DistrictPlan } from "../core/gen/district-plan.js";
 import { districtGenerationAvailability, generateInitialDistricts } from "../core/gen/district-generator.js";
 import {
   districtDeleteCandidate,
@@ -207,7 +207,10 @@ let districtPlanRevision: number | null = null;
 let districtPlanEpoch: number | null = null;
 let districtPlanRoundTripMs = 0;
 let districtPlanWorkerMode: "worker" | "fallback" = "fallback";
-let preflightPlan: { revision: number; plan: DistrictPlan; roundTripMs: number; workerMode: "worker" | "fallback" } | null = null;
+let districtPlanDiagnostic: { kind: "degraded"; reason: string; revision: number } | null = null;
+let planBuildInFlight: { revision: number; epoch: number } | null = null;
+let planBuildQueued: { revision: number; epoch: number; walls: boolean } | null = null;
+const planWaiters = new Map<number, Array<() => void>>();
 let districtSelection: string[] = [];
 let districtDraftCancelListener: (() => void) | null = null;
 let districtSnapOptionsState = {
@@ -388,20 +391,126 @@ function notifyCityChanged(): void {
   for (const listener of cityListeners) listener();
 }
 
-function publishPreflightPlan(revision: number): DistrictPlan | null {
-  if (preflightPlan === null || preflightPlan.revision !== revision) return null;
-  districtPlan = preflightPlan.plan;
+// WHY: the plan is derived state, so it never gates a save. Every structural commit
+// invalidates it, requests one worker-side build (coalesced while one is in flight), and
+// publishes asynchronously; listeners wake via notifyCityChanged once the plan lands.
+function invalidateDistrictPlan(): void {
+  districtPlan = null;
+  districtPlanRevision = null;
+  districtPlanEpoch = null;
+  districtPlanRoundTripMs = 0;
+  districtPlanWorkerMode = "fallback";
+  resolvePlanWaiters();
+}
+
+function resolvePlanWaiters(): void {
+  for (const entries of planWaiters.values()) for (const resolve of entries) resolve();
+  planWaiters.clear();
+}
+
+function waitForDistrictPlan(revision: number): Promise<boolean> {
+  if (districtPlanRevision === revision && districtPlan !== null) return Promise.resolve(true);
+  // WHY: only a build for this revision can satisfy the waiter; without one the plan can
+  // never arrive, so resolve immediately instead of parking the caller forever.
+  if (planBuildInFlight?.revision !== revision && planBuildQueued?.revision !== revision) return Promise.resolve(false);
+  // WHY: stored-resolver promises need the executor form; Promise.withResolvers requires lib es2024, and this project pins es2022.
+  return new Promise((resolve) => {
+    const entries = planWaiters.get(revision) ?? [];
+    entries.push(() => resolve(districtPlanRevision === revision && districtPlan !== null));
+    planWaiters.set(revision, entries);
+  });
+}
+
+async function currentDistrictPlan(city: CityStateV3): Promise<DistrictPlan> {
+  if (districtPlanRevision === city.revision && districtPlan !== null) return districtPlan;
+  await waitForDistrictPlan(city.revision);
+  if (districtPlanRevision === city.revision && districtPlan !== null) return districtPlan;
+  throw new Error(districtPlanDiagnostic?.reason ?? "The district plan for this revision is unavailable.");
+}
+
+function publishDistrictPlan(plan: DistrictPlan, revision: number, epoch: number, walls: boolean, workerMode: "worker", roundTripMs: number): void {
+  districtPlan = plan;
   districtPlanRevision = revision;
-  districtPlanEpoch = session.buildEpoch;
-  districtPlanRoundTripMs = preflightPlan.roundTripMs;
-  districtPlanWorkerMode = preflightPlan.workerMode;
-  const published = preflightPlan.plan;
-  preflightPlan = null;
-  if (wallDiagnostic?.reason.startsWith("Generated walls were superseded") && wallDiagnostic.revision === revision && session.current !== null) {
-    wallDiagnostic = null;
-    scheduleGeneratedWallRebuild(session.current, published);
+  districtPlanEpoch = epoch;
+  districtPlanRoundTripMs = roundTripMs;
+  districtPlanWorkerMode = workerMode;
+  if (districtPlanDiagnostic !== null && districtPlanDiagnostic.revision <= revision) districtPlanDiagnostic = null;
+  const current = session.current;
+  if (current !== null) {
+    if (walls) scheduleGeneratedWallRebuild(current, plan);
+    if (wallDiagnostic?.reason.startsWith("Generated walls were superseded") && wallDiagnostic.revision === revision) {
+      wallDiagnostic = null;
+      scheduleGeneratedWallRebuild(current, plan);
+    }
   }
-  return published;
+  resolvePlanWaiters();
+  notifyCityChanged();
+}
+
+function requestDistrictPlan(city: CityStateV3, revision: number, epoch: number, walls: boolean): void {
+  if (planBuildInFlight !== null) {
+    planBuildQueued = { revision, epoch, walls };
+    return;
+  }
+  void runDistrictPlanBuild(city, revision, epoch, walls);
+}
+
+async function runDistrictPlanBuild(city: CityStateV3, revision: number, epoch: number, walls: boolean): Promise<void> {
+  planBuildInFlight = { revision, epoch };
+  const started = performance.now();
+  const actionToken = ++districtActionSequence;
+  const client = ensureWorker();
+  if (client !== null) {
+    try {
+      const result = await client.buildDistrictPlan({ source: city.source, sourceRevision: revision, actionToken, buildToken: epoch });
+      if (result.sourceRevision !== revision || result.actionToken !== actionToken || result.buildToken !== epoch) {
+        throw new Error("Worker returned a stale district plan.");
+      }
+      const current = session.current;
+      if (current !== null && terrainBuildIsCurrent(revision, epoch, current.revision, session.buildEpoch)) {
+        publishDistrictPlan(result.plan, revision, epoch, walls, "worker", performance.now() - started);
+      } else {
+        resolvePlanWaiters();
+      }
+      planBuildInFlight = null;
+      flushPlanQueue();
+      return;
+    } catch (error) {
+      if (error instanceof Error && error.message === "Worker returned a stale district plan.") {
+        planBuildInFlight = null;
+        resolvePlanWaiters();
+        flushPlanQueue();
+        return;
+      }
+      noteWorkerFailure(error);
+      if (client === workerClient) {
+        client.terminate();
+        workerClient = null;
+        workerUnavailable = true;
+      }
+    }
+  }
+  planBuildInFlight = null;
+  // WHY: never fall back to a synchronous plan build; the UI thread must not run the
+  // whole planning pipeline. A degraded plan is surfaced in Diagnostics and retryable.
+  districtPlanDiagnostic = {
+    kind: "degraded",
+    reason: client === null
+      ? "The district plan worker is unavailable; derived district overlays and generated walls are disabled until it returns."
+      : `District planning failed; derived overlays and walls are unavailable until retried.`,
+    revision
+  };
+  resolvePlanWaiters();
+  flushPlanQueue();
+}
+
+function flushPlanQueue(): void {
+  const queued = planBuildQueued;
+  if (queued === null) return;
+  planBuildQueued = null;
+  const city = session.current;
+  if (city === null || city.revision !== queued.revision) return;
+  void runDistrictPlanBuild(city, queued.revision, queued.epoch, queued.walls);
 }
 
 export function setCityListener(listener: (() => void) | null): void {
@@ -531,6 +640,10 @@ export function unmount(): void {
   districtPlan = null;
   districtPlanRevision = null;
   districtPlanEpoch = null;
+  districtPlanDiagnostic = null;
+  planBuildInFlight = null;
+  planBuildQueued = null;
+  resolvePlanWaiters();
   districtSelection = [];
   districtDraftCancelListener = null;
   cancelScheduledWalls();
@@ -704,34 +817,9 @@ function warnLargeScene(candidate: CityStateV3): void {
 async function guardedSave(
   candidate: CityStateV3,
   expectation: SaveExpectation,
-  geometryPrebuilt = false,
-  suppliedPlan: DistrictPlan | null = null,
-  skipPlan = false
+  geometryPrebuilt = false
 ): Promise<CityStateV3> {
   validateCandidate(candidate, geometryPrebuilt);
-  if (!skipPlan) {
-    const current = session.current;
-    const statusBeforePlan = session.status;
-    const creating = current === null && (statusBeforePlan.kind === "absent" || statusBeforePlan.kind === "legacy") && candidate.revision === 1;
-    if (!creating && (current === null || current.revision + 1 !== candidate.revision)) {
-      throw new Error("City revision changed before district planning; retry from the current Scene.");
-    }
-    const planned = suppliedPlan === null
-      ? await buildPlanForCity(candidate, ++districtActionSequence, session.buildEpoch)
-      : { plan: suppliedPlan, roundTripMs: 0, workerMode: districtPlanWorkerMode };
-    const currentAfterPlan = session.current;
-    const statusAfterPlan = session.status;
-    if (creating) {
-      if (currentAfterPlan !== null || statusAfterPlan.kind !== statusBeforePlan.kind) {
-        throw new Error("District planning was superseded by newer Scene state.");
-      }
-    } else if (currentAfterPlan?.revision !== candidate.revision - 1) {
-      throw new Error("District planning was superseded by newer Scene state.");
-    }
-    preflightPlan = { revision: candidate.revision, ...planned };
-  } else {
-    preflightPlan = null;
-  }
   const status = session.status;
   const saveExpectation =
     status.kind === "supported" && status.migratedFrom !== undefined
@@ -788,14 +876,12 @@ async function createGeneratedTerrain(
   if (status.kind === "supported") {
     const saved = await guardedSave(candidate, status.state.revision);
     session.publishCommit(saved);
-    const plan = publishPreflightPlan(saved.revision);
-    if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
+    invalidateDistrictPlan();
   } else {
     const expected: SaveExpectation = status.kind === "legacy" ? "legacy" : "absent";
     const saved = await guardedSave(candidate, expected);
     session.publishCreation(saved);
-    const plan = publishPreflightPlan(saved.revision);
-    if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
+    invalidateDistrictPlan();
     if (status.kind === "legacy") {
       try {
         await deleteGeneratedWalls();
@@ -838,13 +924,14 @@ async function commitSource(source: CityStateV3["source"], wallRelevant = true, 
   const candidate: CityStateV3 = { ...current, revision: current.revision + 1, source };
   const saved = await guardedSave(candidate, current.revision, geometryPrebuilt);
   session.publishCommit(saved);
+  invalidateDistrictPlan();
   const districtIds = new Set(saved.source.districts.map((district) => district.id));
   districtSelection = districtSelection.filter((id) => districtIds.has(id));
-  const plan = publishPreflightPlan(saved.revision);
-  if (wallRelevant && plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   cancelTerrainDraft();
   notifyCityChanged();
   if (!wallRelevant) {
+    // district-only commits skip the geometry rebuild; request the derived plan directly.
+    requestDistrictPlan(saved, saved.revision, session.buildEpoch, false);
     const currentBuild = lastBuild;
     return currentBuild === null
       ? { full: true, chunks: 0, triangles: 0, bytes: 0, ms: 0, stale: false }
@@ -1039,10 +1126,10 @@ async function commitRoadSource(source: CitySourceV3["roads"], generation?: Part
   };
   if (metadataOnly) {
     const reusablePlan = districtPlan !== null && districtPlanRevision === current.revision ? districtPlan : null;
-    const saved = await guardedSave(candidate, current.revision, true, null, true);
+    const saved = await guardedSave(candidate, current.revision, true);
     session.publishCommit(saved);
-    preflightPlan = null;
     if (reusablePlan !== null) {
+      // WHY: road metadata changes do not affect the plan, so it is re-stamped rather than rebuilt.
       districtPlan = reusablePlan;
       districtPlanRevision = saved.revision;
       districtPlanEpoch = session.buildEpoch;
@@ -1079,8 +1166,8 @@ async function commitRoadSource(source: CitySourceV3["roads"], generation?: Part
   const prebuilt = await preflightCity(candidate, actionToken, keys);
   const saved = await guardedSave(candidate, current.revision, true);
   session.publishCommit(saved);
-  const plan = publishPreflightPlan(saved.revision);
-  if (plan !== null) scheduleGeneratedWallRebuild(saved, plan);
+  invalidateDistrictPlan();
+  requestDistrictPlan(saved, saved.revision, session.buildEpoch, true);
   let result: RebuildResult;
   try {
     mountRenderer();
@@ -1436,6 +1523,9 @@ export function cancelDistrictDraft(): void {
 
 export function districtDiagnostics(): Array<Record<string, unknown>> {
   const entries: Array<Record<string, unknown>> = [];
+  if (districtPlanDiagnostic !== null) {
+    entries.push({ subsystem: "districts", retry: "plan", message: districtPlanDiagnostic.reason, revision: districtPlanDiagnostic.revision });
+  }
   if (districtPlan?.diagnostics.warnings.length) {
     entries.push(...districtPlan.diagnostics.warnings.map((message) => ({ subsystem: "districts", message })));
   }
@@ -1443,18 +1533,39 @@ export function districtDiagnostics(): Array<Record<string, unknown>> {
   return entries;
 }
 
+export function retryDistrictPlan(): Promise<void> {
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    if (districtPlanRevision === city.revision && districtPlan !== null) return;
+    if (workerUnavailable && workerClient === null) {
+      // WHY: the worker is only sticky for automatic fallback; an explicit retry may re-create it.
+      workerUnavailable = false;
+    }
+    requestDistrictPlan(city, city.revision, session.buildEpoch, true);
+    if (!(await waitForDistrictPlan(city.revision))) {
+      throw new Error(districtPlanDiagnostic?.reason ?? "The district plan is unavailable.");
+    }
+  });
+}
+
 export function retryGeneratedWalls(): Promise<void> {
   return terrainActions.run(async () => {
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
     if (districtPlan === null || districtPlanRevision !== city.revision || districtPlanEpoch !== session.buildEpoch) {
-      await rebuildGeometry();
+      const ready = await waitForDistrictPlan(city.revision);
+      if (!ready || districtPlanRevision !== city.revision || districtPlanEpoch !== session.buildEpoch) {
+        await rebuildGeometry();
+        await currentDistrictPlan(city);
+      }
     }
     const latest = session.current;
-    if (latest === null || districtPlan === null) throw new Error("The current district plan is unavailable.");
+    const plan = districtPlan;
+    if (latest === null || plan === null) throw new Error("The current district plan is unavailable.");
     cancelScheduledWalls();
     wallDiagnostic = null;
-    await wallScheduler.runNow((replacementToken) => installGeneratedWalls(latest, districtPlan!, latest.revision, session.buildEpoch, replacementToken));
+    await wallScheduler.runNow((replacementToken) => installGeneratedWalls(latest, plan, latest.revision, session.buildEpoch, replacementToken));
     const diagnostic = wallDiagnostic as { kind: "degraded"; reason: string; revision: number } | null;
     if (diagnostic !== null && diagnostic.revision === latest.revision) {
       throw new Error(diagnostic.reason);
@@ -1505,7 +1616,12 @@ export function fillDistrict(point: Vec2, typeId: DistrictTypeId, paletteId?: st
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
     if (districtSelection.length > 1) throw new Error("Fill requires zero or one selected district.");
-    const plan = districtPlan ?? buildDistrictPlan(city.source);
+    // WHY: the plan is derived asynchronously; Fill needs the block faces, so it waits for
+    // the current revision's plan instead of rebuilding it on the UI thread.
+    if ((districtPlanRevision !== city.revision || districtPlan === null) && planBuildInFlight === null && planBuildQueued === null) {
+      requestDistrictPlan(city, city.revision, session.buildEpoch, false);
+    }
+    const plan = await currentDistrictPlan(city);
     const block = plan.blocks.find((candidate) => districtPointInRing(point, candidate.zoningFace));
     if (block === undefined) throw new Error("Fill must target a generated road-defined block.");
     const selected = districtSelection.length === 1 ? districtSelection[0]! : null;
@@ -1642,14 +1758,14 @@ async function applyHistory(direction: "undo" | "redo"): Promise<boolean> {
   const saved = await guardedSave(target, current.revision);
   if (direction === "undo") session.publishUndo(saved);
   else session.publishRedo(saved);
-  const plan = publishPreflightPlan(saved.revision);
+  invalidateDistrictPlan();
   roadSelection = pruneRoadSelection(roadSelection, saved.source.roads);
   const districtIds = new Set(saved.source.districts.map((district) => district.id));
   districtSelection = districtSelection.filter((id) => districtIds.has(id));
-  if (wallRelevant && plan !== null) scheduleGeneratedWallRebuild(saved, plan);
   cancelTerrainDraft();
   notifyCityChanged();
   if (wallRelevant) await rebuildAfterCommit();
+  else requestDistrictPlan(saved, saved.revision, session.buildEpoch, false);
   return true;
 }
 
@@ -1678,28 +1794,7 @@ function noteWorkerFailure(error: unknown): void {
   console.warn(`${MODULE_ID} | city worker unusable, falling back to the main thread`, error);
 }
 
-async function buildPlanForCity(city: CityStateV3, actionToken: number, buildToken: number): Promise<{ plan: DistrictPlan; roundTripMs: number; workerMode: "worker" | "fallback" }> {
-  const started = performance.now();
-  const client = ensureWorker();
-  if (client !== null) {
-    try {
-      const result = await client.buildDistrictPlan({ source: city.source, sourceRevision: city.revision, actionToken, buildToken });
-      if (result.sourceRevision !== city.revision || result.actionToken !== actionToken || result.buildToken !== buildToken) {
-        throw new Error("Worker returned a stale district plan.");
-      }
-      return { plan: result.plan, roundTripMs: performance.now() - started, workerMode: "worker" };
-    } catch (error) {
-      if (error instanceof Error && error.message === "Worker returned a stale district plan.") throw error;
-      noteWorkerFailure(error);
-      if (client === workerClient) {
-        client.terminate();
-        workerClient = null;
-        workerUnavailable = true;
-      }
-    }
-  }
-  return { plan: buildDistrictPlan(city.source), roundTripMs: performance.now() - started, workerMode: "fallback" };
-}
+
 
 async function planInitialDistricts(
   source: CitySourceV3,
@@ -1901,22 +1996,16 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
 
   const client = ensureWorker();
   const batch = await buildBatch(client, city, keys, bounds, ppm, revision, epoch);
-  const planToken = ++districtActionSequence;
-  const planned = await buildPlanForCity(city, planToken, epoch);
   let installed = 0;
   const current = session.current;
   if (terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
-    districtPlan = planned.plan;
-    districtPlanRevision = revision;
-    districtPlanEpoch = epoch;
-    districtPlanRoundTripMs = planned.roundTripMs;
-    districtPlanWorkerMode = planned.workerMode;
     for (const record of batch.records) {
       chunks.set(record.id, record);
       renderer.setChunk(chunkGeometry(city, record, ppm));
       frameQuality.reset();
       installed++;
     }
+    requestDistrictPlan(city, revision, epoch, true);
   }
 
   const stale = !terrainBuildIsCurrent(
@@ -2164,6 +2253,10 @@ function handleExternalFlagChange(): void {
     districtPlan = null;
     districtPlanRevision = null;
     districtPlanEpoch = null;
+    districtPlanDiagnostic = null;
+    planBuildInFlight = null;
+    planBuildQueued = null;
+    resolvePlanWaiters();
     unmountRenderer();
     cancelTerrainDraft();
     notifyCityChanged();
@@ -2176,6 +2269,10 @@ function handleExternalFlagChange(): void {
   districtPlan = null;
   districtPlanRevision = null;
   districtPlanEpoch = null;
+  districtPlanDiagnostic = null;
+  planBuildInFlight = null;
+  planBuildQueued = null;
+  resolvePlanWaiters();
   cancelTerrainDraft();
   notifyCityChanged();
   ui.notifications?.warn("Nixie: a newer Scene revision was loaded; local history and drafts were cleared.");
