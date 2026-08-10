@@ -75,21 +75,27 @@ function seedBlocks(component: readonly string[], citySeed: string): string[] {
     .sort();
 }
 
-function growRegions(component: readonly string[], adjacent: ReadonlyMap<string, readonly string[]>, citySeed: string): string[][] {
+function growRegions(
+  blocks: readonly DerivedBlock[],
+  component: readonly string[],
+  adjacent: ReadonlyMap<string, readonly string[]>,
+  citySeed: string
+): string[][] {
   const seeds = seedBlocks(component, citySeed);
   const owner = new Map<string, string>();
+  const regions = new Map<string, string[]>();
   const queue: { blockId: string; seedId: string; depth: number }[] = seeds.map((seedId) => ({ blockId: seedId, seedId, depth: 0 }));
   queue.sort((a, b) => a.seedId.localeCompare(b.seedId));
   while (queue.length > 0) {
     queue.sort((a, b) => a.depth - b.depth || fnv1a(`${citySeed}/districts/v3/growth/${a.seedId}/${a.blockId}`) - fnv1a(`${citySeed}/districts/v3/growth/${b.seedId}/${b.blockId}`) || a.seedId.localeCompare(b.seedId));
     const current = queue.shift()!;
     if (owner.has(current.blockId)) continue;
+    const candidate = [...(regions.get(current.seedId) ?? []), current.blockId].sort();
+    if (regionPolygon(blocks, candidate) === null) continue;
     owner.set(current.blockId, current.seedId);
+    regions.set(current.seedId, candidate);
     for (const next of adjacent.get(current.blockId) ?? []) if (!owner.has(next)) queue.push({ blockId: next, seedId: current.seedId, depth: current.depth + 1 });
   }
-  for (const id of component) if (!owner.has(id)) owner.set(id, id);
-  const regions = new Map<string, string[]>();
-  for (const [blockId, seedId] of owner) regions.set(seedId, [...(regions.get(seedId) ?? []), blockId]);
   return [...regions.values()].map((ids) => ids.sort()).sort((a, b) => a[0]!.localeCompare(b[0]!));
 }
 
@@ -111,23 +117,20 @@ export function resolveGeneratedRegions(
   for (let attempt = 0; attempt < blocks.length && regions.some((region) => regionPolygon(blocks, region) === null); attempt++) {
     const invalidIndex = regions.findIndex((region) => regionPolygon(blocks, region) === null);
     const invalid = regions[invalidIndex]!;
-    const invalidIds = new Set(invalid);
     const candidates = regions
       .map((region, index) => ({ region, index }))
       .filter(({ region, index }) => index !== invalidIndex && invalid.some((id) => (adjacent.get(id) ?? []).some((next) => region.includes(next))))
-      .sort((left, right) => {
-        const leftMerged = regionPolygon(blocks, [...invalidIds, ...left.region]) !== null ? 0 : 1;
-        const rightMerged = regionPolygon(blocks, [...invalidIds, ...right.region]) !== null ? 0 : 1;
-        return leftMerged - rightMerged ||
-          fnv1a(`${citySeed}/districts/v3/hole-cleanup/${invalid.join(",")}/${left.region.join(",")}`) - fnv1a(`${citySeed}/districts/v3/hole-cleanup/${invalid.join(",")}/${right.region.join(",")}`) ||
-          left.region[0]!.localeCompare(right.region[0]!);
-      });
+      .map(({ region, index }) => ({ region, index, merged: [...new Set([...invalid, ...region])].sort() }))
+      .filter(({ merged }) => regionPolygon(blocks, merged) !== null)
+      .sort((left, right) =>
+        fnv1a(`${citySeed}/districts/v3/hole-cleanup/${invalid.join(",")}/${left.region.join(",")}`) - fnv1a(`${citySeed}/districts/v3/hole-cleanup/${invalid.join(",")}/${right.region.join(",")}`) ||
+        left.region[0]!.localeCompare(right.region[0]!)
+      );
     const target = candidates[0];
-    if (target === undefined) throw new Error(`Generated district region "${invalid.join(",")}" has no compatible neighbor.`);
-    const merged = [...new Set([...invalid, ...target.region])].sort();
+    if (target === undefined) throw new Error(`Generated district region "${invalid.join(",")}" could not be resolved without a hole.`);
     const remove = [invalidIndex, target.index].sort((a, b) => b - a);
     for (const index of remove) regions.splice(index, 1);
-    regions.push(merged);
+    regions.push(target.merged);
     regions.sort((a, b) => a[0]!.localeCompare(b[0]!));
   }
   const invalid = regions.find((region) => regionPolygon(blocks, region) === null);
@@ -262,7 +265,7 @@ export function generateInitialDistricts(source: CitySourceV3): DistrictSource[]
   if (plan.blocks.length === 0) throw new Error("Initial district generation found no usable road-defined blocks.");
   const byId = new Map(plan.blocks.map((block) => [block.id, block]));
   const adjacent = adjacency(plan.blocks);
-  const grown = components(plan.blocks, adjacent).flatMap((component) => growRegions(component, adjacent, source.citySeed));
+  const grown = components(plan.blocks, adjacent).flatMap((component) => growRegions(plan.blocks, component, adjacent, source.citySeed));
   const regions = resolveGeneratedRegions(plan.blocks, grown, adjacent, source.citySeed);
   const pool = enabledPool(source);
   if (pool.length === 0) throw new Error("Initial district generation has no valid enabled district types.");

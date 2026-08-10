@@ -213,7 +213,11 @@ function holeFreePieces(polygon: MultiPolygon[number]): Ring[] {
     const ring = [mesh.positions[mesh.indices[index]!]!, mesh.positions[mesh.indices[index + 1]!]!, mesh.positions[mesh.indices[index + 2]!]!];
     if (Math.abs(ringArea(ring)) > GEOMETRY_EPSILON) pieces.push(ring);
   }
-  if (pieces.length === 0) throw new Error("Unsupported holed planning geometry could not be decomposed.");
+  if (pieces.length === 0) {
+    const sourceArea = multiArea([polygon]);
+    if (sourceArea >= 0 && sourceArea < MIN_CELL_AREA_M2) return [];
+    throw new Error("Unsupported holed planning geometry could not be decomposed.");
+  }
   return pieces;
 }
 

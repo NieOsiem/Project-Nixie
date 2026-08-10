@@ -5,6 +5,7 @@ import { districtGenerationAvailability, districtRegionContext, generateInitialD
 import { buildDistrictPlan, type DerivedBlock } from "./district-plan.js";
 import { DISTRICT_TYPE_IDS } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
+import { validateRing } from "./terrain.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -94,6 +95,50 @@ describe("initial district generation", () => {
       blocks.map((block) => block.id).sort()
     ]);
   });
+
+  it("never collapses incompatible holed regions through another invalid merge", () => {
+    const blocks: DerivedBlock[] = [];
+    for (let row = 0; row < 3; row++) for (let column = 0; column < 6; column++) {
+      const id = `b${row}${column}`;
+      const zoningFace = rectRing({ x: column * 10, y: row * 10, width: 10, height: 10 });
+      blocks.push({ id, zoningFace, buildable: [[zoningFace]], boundaryRoadIds: [], districtFragments: [] });
+    }
+    const adjacent = new Map<string, string[]>();
+    for (let row = 0; row < 3; row++) for (let column = 0; column < 6; column++) {
+      const neighbors: string[] = [];
+      if (row > 0) neighbors.push(`b${row - 1}${column}`);
+      if (row < 2) neighbors.push(`b${row + 1}${column}`);
+      if (column > 0) neighbors.push(`b${row}${column - 1}`);
+      if (column < 5) neighbors.push(`b${row}${column + 1}`);
+      adjacent.set(`b${row}${column}`, neighbors.sort());
+    }
+    const left = blocks.map((block) => block.id).filter((id) => Number(id[2]) < 3 && id !== "b11");
+    const right = blocks.map((block) => block.id).filter((id) => Number(id[2]) >= 3 && id !== "b14");
+    expect(() => resolveGeneratedRegions(blocks, [left, right], adjacent, "incompatible-cleanup"))
+      .toThrowError(/could not be resolved without a hole/);
+  });
+
+  it("leaves incompatible faces unzoned on a fresh full-size European network", () => {
+    const bounds = { x: 0, y: 0, width: 1_200, height: 800 };
+    const land = rectRing(bounds);
+    const citySeed = "phase2-organic-european";
+    const roads = generateInitialRoadNetwork({ citySeed, mask: land, land, layout: "european", hubMode: "multiple-hubs", sceneBounds: bounds }).roads;
+    const european: CitySourceV3 = {
+      origin: { x: 0, y: 0 },
+      citySeed,
+      generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "european", hubMode: "multiple-hubs", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
+      terrain: { land, urbanFootprint: null },
+      roads,
+      districts: []
+    };
+    const first = generateInitialDistricts(european);
+    expect(generateInitialDistricts(european)).toEqual(first);
+    expect(first.length).toBeGreaterThan(1);
+    expect(first.every((district) => validateRing(district.polygon).ok)).toBe(true);
+    const plan = buildDistrictPlan({ ...european, districts: first });
+    expect(plan.blocks.some((block) => block.districtFragments.length > 0 && block.districtFragments.every((fragment) => fragment.districtId === null))).toBe(true);
+    expect(plan.unzoned.length).toBeGreaterThan(0);
+  }, 60_000);
 
   it("plans the representative 83-block fixture with the complete 16-type pool", () => {
     const land = rectRing({ x: 0, y: 0, width: 1_000, height: 1_000 });
