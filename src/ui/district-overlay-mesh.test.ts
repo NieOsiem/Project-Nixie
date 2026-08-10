@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  coalesceDistrictOverlayData,
   DISTRICT_OVERLAY_LINE_FRAG,
   DISTRICT_OVERLAY_LINE_VERT,
   DistrictOverlayLineMesh,
@@ -68,6 +69,21 @@ describe("DistrictOverlayLineMeshBuilder", () => {
     expect(data.vertices[8]).toBe(0.5);
     expect(data.indices[0]).toBe(0);
     expect(data.indices.at(-1)).toBe(20_000 * 4 - 1);
+  });
+
+  it("coalesces chunk buffers into one indexed mesh with re-based indices", () => {
+    const first = new DistrictOverlayLineMeshBuilder();
+    first.add({ x: 0, y: 0 }, { x: 10, y: 0 }, 2, 0xff0000, 0.5);
+    const second = new DistrictOverlayLineMeshBuilder();
+    second.add({ x: 0, y: 5 }, { x: 10, y: 5 }, 2, 0x00ff00, 1);
+
+    const merged = coalesceDistrictOverlayData([first.build(), second.build()])!;
+    expect(merged.segmentCount).toBe(2);
+    expect(merged.vertices).toHaveLength(2 * 4 * 9);
+    expect(merged.vertices.slice(0, 9)).toEqual(first.build().vertices.slice(0, 9));
+    expect(merged.vertices.slice(36, 45)).toEqual(second.build().vertices.slice(0, 9));
+    expect(Array.from(merged.indices)).toEqual([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    expect(coalesceDistrictOverlayData([])).toBeNull();
   });
 
 });

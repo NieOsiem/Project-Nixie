@@ -212,4 +212,113 @@ describe("District overlay data", () => {
     await layer._tearDown({});
     expect(cancelAnimationFrame).not.toHaveBeenCalled();
   });
+
+  it("coalesces incremental planning chunks into one line mesh when the build finishes", async () => {
+    class InteractionLayer {
+      active = true;
+      visible = true;
+      addChild<T>(child: T): T { return child; }
+      async _draw(): Promise<void> {}
+      async _tearDown(): Promise<void> {}
+    }
+    class Graphics {
+      eventMode = "none";
+      clear = vi.fn();
+      destroy(): void {}
+    }
+    class Container {
+      eventMode = "none";
+      addChild<T>(child: T): T { return child; }
+    }
+    class StubBuffer {
+      constructor(public readonly data: Float32Array | Uint32Array) {}
+    }
+    const geometryInstances: StubGeometry[] = [];
+    const aliveMeshes: StubMesh[] = [];
+    class StubGeometry {
+      indices: Uint32Array | null = null;
+      addAttribute(): this { return this; }
+      addIndex(indices: Uint32Array): this { this.indices = indices; return this; }
+      destroy = vi.fn();
+    }
+    class StubMesh {
+      state: Record<string, unknown> = {};
+      shader = { uniforms: {} as Record<string, unknown> };
+      destroy = vi.fn(() => {
+        const index = aliveMeshes.indexOf(this);
+        if (index >= 0) aliveMeshes.splice(index, 1);
+      });
+      constructor(public readonly geometry: StubGeometry) {
+        aliveMeshes.push(this);
+      }
+    }
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    const cancelAnimationFrame = vi.fn((id: number) => frames.delete(id));
+    adapterMocks.getCity.mockReturnValue({ revision: 1, source: { districts: [], roads: { nodes: [] } } });
+    adapterMocks.getDistrictPlanView.mockReturnValue({
+      blocks: [{
+        id: "b1",
+        districtFragments: [],
+        zoningFace: [{ x: 100, y: 100 }, { x: 200, y: 100 }, { x: 200, y: 200 }, { x: 100, y: 200 }]
+      }],
+      developmentCells: [{
+        id: "c1",
+        blockId: "b1",
+        fragmentId: "f1",
+        districtId: null,
+        grammarId: "fine-grain-frontage",
+        polygon: [{ x: 110, y: 110 }, { x: 190, y: 110 }, { x: 190, y: 190 }, { x: 110, y: 190 }],
+        localRole: "base",
+        rotationRad: 0,
+        frontageRoadId: null
+      }],
+      unzoned: [],
+      openSpaceIntents: []
+    });
+    adapterMocks.isSceneEnabled.mockReturnValue(true);
+    vi.stubGlobal("foundry", { canvas: { layers: { InteractionLayer } } });
+    vi.stubGlobal("canvas", { dimensions: { size: 100, distance: 1, sceneRect: { x: 0, y: 0, width: 1000, height: 1000 } }, stage: { scale: { x: 1 } } });
+    vi.stubGlobal("PIXI", {
+      Container,
+      Graphics,
+      Buffer: StubBuffer,
+      Geometry: class extends StubGeometry {
+        constructor() {
+          super();
+          geometryInstances.push(this);
+        }
+      },
+      Mesh: StubMesh,
+      Shader: { from: vi.fn(() => ({ uniforms: {} })) },
+      TYPES: { FLOAT: 5126 }
+    });
+    vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
+    vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+    const Layer = districtLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    frames.get(1)!(0);
+    frames.delete(1);
+    frames.get(2)!(16);
+    frames.delete(2);
+    frames.get(3)!(32);
+    frames.delete(3);
+    frames.get(4)!(48);
+    frames.delete(4);
+    frames.get(5)!(64);
+    frames.delete(5);
+    frames.get(6)!(80);
+    frames.delete(6);
+    // one chunk mesh was flushed during the build, then replaced by the single coalesced mesh
+    expect(geometryInstances).toHaveLength(2);
+    expect(aliveMeshes).toHaveLength(1);
+    expect(aliveMeshes[0]!.geometry).toBe(geometryInstances[1]);
+    await layer._tearDown({});
+    expect(aliveMeshes).toHaveLength(0);
+  });
 });

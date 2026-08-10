@@ -91,6 +91,30 @@ export class DistrictOverlayLineMeshBuilder {
   }
 }
 
+/**
+ * Merge per-frame chunk buffers into one indexed mesh, re-basing each chunk's
+ * indices onto the accumulated vertex count. Returns null when there is nothing
+ * to draw. WHY: the incremental pipeline emits one mesh per frame chunk to bound
+ * per-frame work; coalescing after the build collapses those draw calls to one.
+ */
+export function coalesceDistrictOverlayData(chunks: readonly DistrictOverlayLineMeshData[]): DistrictOverlayLineMeshData | null {
+  const totalSegments = chunks.reduce((sum, chunk) => sum + chunk.segmentCount, 0);
+  if (totalSegments === 0) return null;
+  const vertices = new Float32Array(totalSegments * 4 * FLOATS_PER_VERTEX);
+  const indices = new Uint32Array(totalSegments * 6);
+  let vertexCursor = 0;
+  let indexCursor = 0;
+  let segmentOffset = 0;
+  for (const chunk of chunks) {
+    vertices.set(chunk.vertices, vertexCursor);
+    vertexCursor += chunk.vertices.length;
+    const indexBase = segmentOffset * 4;
+    for (let index = 0; index < chunk.indices.length; index++) indices[indexCursor++] = chunk.indices[index]! + indexBase;
+    segmentOffset += chunk.segmentCount;
+  }
+  return { vertices, indices, segmentCount: totalSegments };
+}
+
 export class DistrictOverlayLineMesh {
   readonly display: any;
 

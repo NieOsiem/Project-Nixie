@@ -24,7 +24,7 @@ import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS } from "../core/gen/district-re
 import type { DistrictSource } from "../core/gen/city.js";
 import { districtSplitCandidate } from "../core/gen/district-edit.js";
 import { canvasTool, clearEditorActionError, currentDistrictPalette, currentDistrictType, DISTRICT_TOOL, districtSnapOptions, editorLayerActivated, editorLayerDeactivated, LAYER_DISTRICTS, notifyEditorInteraction, setEditorActionError } from "./editor-state.js";
-import { DistrictOverlayLineMesh, DistrictOverlayLineMeshBuilder } from "./district-overlay-mesh.js";
+import { coalesceDistrictOverlayData, DistrictOverlayLineMesh, DistrictOverlayLineMeshBuilder, type DistrictOverlayLineMeshData } from "./district-overlay-mesh.js";
 
 export const DISTRICT_LAYER_NAME = LAYER_DISTRICTS;
 const DISTRICT_OVERLAY_SEGMENTS_PER_FRAME = 2_048;
@@ -459,10 +459,12 @@ export function districtLayerClass(): any {
     #boundaryMeshes: DistrictOverlayLineMesh[] = [];
     #boundaryRings = new Map<string, Ring>();
     #planningFill: any = null;
-    #planningFills: any[] = [];
+    #unzonedFill: any = null;
     #planningHost: any = null;
     #planningMeshes: DistrictOverlayLineMesh[] = [];
+    #planningChunkData: DistrictOverlayLineMeshData[] = [];
     #hatchMeshes: DistrictOverlayLineMesh[] = [];
+    #hatchChunkData: DistrictOverlayLineMeshData[] = [];
     #planningTask: DistrictPlanningTask | null = null;
     #planningFrame: number | null = null;
     #planningEpoch = 0;
@@ -612,11 +614,13 @@ export function districtLayerClass(): any {
         mesh.destroy();
       }
       this.#hatchMeshes = [];
-      for (const fill of this.#planningFills) {
-        fill.parent?.removeChild(fill);
-        fill.destroy?.();
+      this.#planningChunkData = [];
+      this.#hatchChunkData = [];
+      if (this.#unzonedFill !== null) {
+        this.#unzonedFill.parent?.removeChild(this.#unzonedFill);
+        this.#unzonedFill.destroy?.();
+        this.#unzonedFill = null;
       }
-      this.#planningFills = [];
       this.#planningTask = null;
       this.#planPending = false;
       this.#planningRevision = null;
@@ -1035,6 +1039,7 @@ export function districtLayerClass(): any {
         mesh.destroy();
       }
       this.#hatchMeshes = [];
+      this.#hatchChunkData = [];
       const task: DistrictPlanningTask = {
         epoch: this.#planningEpoch,
         plan,
@@ -1077,6 +1082,24 @@ export function districtLayerClass(): any {
       mesh.display.eventMode = "none";
       this.#planningHost.addChild(mesh.display);
       (bucket === "hatch" ? this.#hatchMeshes : this.#planningMeshes).push(mesh);
+      (bucket === "hatch" ? this.#hatchChunkData : this.#planningChunkData).push(data);
+    }
+
+    /** Collapse the incremental chunk meshes of one bucket into a single mesh once the build finishes. */
+    #coalesceChunks(meshes: DistrictOverlayLineMesh[], chunkData: DistrictOverlayLineMeshData[]): void {
+      const data = coalesceDistrictOverlayData(chunkData);
+      for (const mesh of meshes) {
+        mesh.display.parent?.removeChild(mesh.display);
+        mesh.destroy();
+      }
+      meshes.length = 0;
+      chunkData.length = 0;
+      if (data === null || this.#planningHost === null || this.#planningHost === undefined) return;
+      const mesh = new DistrictOverlayLineMesh(data);
+      mesh.setInvZoom(this.#currentInvZoom());
+      mesh.display.eventMode = "none";
+      this.#planningHost.addChild(mesh.display);
+      meshes.push(mesh);
     }
 
     #stepPlanning(epoch: number): void {
@@ -1114,6 +1137,12 @@ export function districtLayerClass(): any {
       if (builder !== null && bucket !== null) this.#flushPlanningBuilder(builder, bucket);
       if (!hasMore) {
         this.#planningTask = null;
+        if (task.hatchesOnly) {
+          this.#coalesceChunks(this.#hatchMeshes, this.#hatchChunkData);
+        } else {
+          this.#coalesceChunks(this.#planningMeshes, this.#planningChunkData);
+          this.#coalesceChunks(this.#hatchMeshes, this.#hatchChunkData);
+        }
         if (this.#pendingHatchRefresh) {
           this.#pendingHatchRefresh = false;
           this.#startHatchRefresh();
@@ -1162,11 +1191,13 @@ export function districtLayerClass(): any {
           if (task.index >= unzoned.length) { task.phase = "intents"; task.index = 0; continue; }
           const polygon = unzoned[task.index++]!;
           if (!task.hatchesOnly) {
-            const fill = new PIXI.Graphics();
-            fill.eventMode = "none";
-            fillPlanRings(fill, polygon, 0x7d8796, 0.12);
-            this.#planningFill?.addChild(fill);
-            this.#planningFills.push(fill);
+            // WHY: one shared Graphics keeps every unzoned patch in a single batched draw call.
+            if (this.#unzonedFill === null) {
+              this.#unzonedFill = new PIXI.Graphics();
+              this.#unzonedFill.eventMode = "none";
+              this.#planningFill?.addChild(this.#unzonedFill);
+            }
+            fillPlanRings(this.#unzonedFill, polygon, 0x7d8796, 0.12);
             addPlanRingLines(builder, polygon, 0x7d8796, 0.95, Math.max(1, canvas.dimensions.size * 0.025));
           }
           this.#queueHatches(task, polygon, 0x7d8796);
