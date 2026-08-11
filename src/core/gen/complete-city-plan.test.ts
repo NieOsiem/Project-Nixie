@@ -404,33 +404,46 @@ describe("buildCompleteCityPlan", () => {
     const plan = buildCompleteCityPlan(ringSource(4));
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const builtIds = new Set(plan.buildings.map((building) => building.parcelId));
-    const vacant = plan.openSpaces.filter((openSpace) => openSpace.parcelId !== null);
-    expect(vacant.every((openSpace) => openSpace.category === "vacant")).toBe(true);
-    const vacantByParcel = new Map(vacant.map((openSpace) => [openSpace.parcelId, openSpace]));
+    // Three kinds of parcel-linked open spaces exist (parcelId !== null):
+    //   1. Fix 3b unbuilt fallbacks: parcel that fit no grammar at all
+    //      → seed ends in "/unbuilt", category: "landscaping"
+    //   2. Residual slivers: leftover geometry after a refined building was placed
+    //      → seed contains "/residual/", category: "vacant"
+    // Both kinds need a 1-to-1 open space entry for their parcel.
+    const parcelLinked = plan.openSpaces.filter((openSpace) => openSpace.parcelId !== null);
+    const unbuiltFallbacks = parcelLinked.filter((os) => os.seed.endsWith("/unbuilt"));
+    const residualSlivers  = parcelLinked.filter((os) => !os.seed.endsWith("/unbuilt"));
+    // Fix 3b: unbuilt parcel fallbacks now use "landscaping" so they blend with
+    // the sidewalk surface instead of appearing as derelict scrub.
+    expect(unbuiltFallbacks.every((os) => os.category === "landscaping")).toBe(true);
+    expect(unbuiltFallbacks.every((os) => os.surfaceStyle === "paving" && os.detailStyle === "planters")).toBe(true);
+    // Residual slivers from refined buildings remain "vacant".
+    expect(residualSlivers.every((os) => os.category === "vacant")).toBe(true);
+    // Every unbuilt parcel (not built, regardless of how it became unbuilt) must
+    // have exactly one parcel-linked open space covering its full area.
+    const openSpaceByParcel = new Map(parcelLinked.map((os) => [os.parcelId, os]));
     let unbuiltCount = 0;
     let unbuiltAreaM2 = 0;
     for (const parcel of plan.parcels) {
       if (builtIds.has(parcel.id)) continue;
       unbuiltCount++;
       unbuiltAreaM2 += parcel.areaM2;
-      const openSpace = vacantByParcel.get(parcel.id);
+      const openSpace = openSpaceByParcel.get(parcel.id);
       expect(openSpace, parcel.id).toBeDefined();
       expect(openSpace!.areaM2).toBeCloseTo(parcel.areaM2, 4);
     }
     expect(unbuiltCount).toBeGreaterThan(0);
-    expect(vacant.length).toBe(unbuiltCount);
-    expect(vacant.some((openSpace) => openSpace.areaM2 < 25)).toBe(true);
+    expect(parcelLinked.length).toBe(unbuiltCount);
+    expect(unbuiltFallbacks.length).toBeGreaterThan(0);
     expect(unbuiltAreaM2 / plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0)).toBeLessThanOrEqual(0.1);
-    expect(vacant.every((openSpace) => openSpace.material === MATERIAL.GROUND)).toBe(true);
-    expect(vacant.every((openSpace) => openSpace.surfaceStyle === "scrub" && openSpace.detailStyle === "none")).toBe(true);
+    expect(parcelLinked.every((os) => os.material === MATERIAL.GROUND)).toBe(true);
     const intentional = plan.openSpaces.filter((openSpace) => openSpace.parcelId === null);
     expect(intentional.length).toBeGreaterThan(0);
     expect(intentional.some((openSpace) => openSpace.material !== MATERIAL.GROUND)).toBe(true);
     // The classification is deterministic.
     expect(buildCompleteCityPlan(ringSource(4))).toEqual(plan);
   }, 120_000);
-
-  it("materializes every shipping grammar and all seven archetypes through the production path", () => {
+ it("materializes every shipping grammar and all seven archetypes through the production path", () => {
     // Fixed legal breadth gallery: one deterministic parcel per grammar built from its
     // own declared limits, materialized through the same exported production path that
     // planBuildings uses, so the 24 grammars and 7 archetypes are proven as outputs.

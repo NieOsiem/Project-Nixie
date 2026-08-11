@@ -11,7 +11,11 @@ import { normalizeRing, validateRing } from "./terrain.js";
 
 const GEOMETRY_EPSILON = 1e-6;
 const KEY_SCALE = 1_000;
-const MIN_PARCEL_AREA_M2 = 20;
+// Raised from 20 to match the smallest building grammar's minAreaM2 (narrow-shopfront = 70m²).
+// Parcels below 70m² cannot fit any building grammar and were silently converting to vacant
+// open space voids. Dropping them instead lets exposed ground show through, which is
+// visually less jarring than a cluster of tiny derelict lots.
+export const MIN_PARCEL_AREA_M2 = 70;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
 
 /** Deterministic open-space material slot per category (shared with the renderer contract). */
@@ -535,8 +539,9 @@ function openSpacePolygonForIntent(base: MultiPolygon, intentSeed: string, size:
     const y = corner < 2 ? 0 : bounds.height - h;
     rect = localRect(bounds, angle, centre, x, y, w, h);
   } else if (size === "small") {
+    const areaScale = Math.sqrt(Math.min(1, targetShare * 6));
     const edge = Math.floor(random("edge") * 4);
-    const depth = 0.14 + random("depth") * 0.12;
+    const depth = (0.14 + random("depth") * 0.12) * areaScale;
     if (edge === 0 || edge === 2) {
       const h = bounds.height * depth;
       rect = localRect(bounds, angle, centre, 0, edge === 0 ? 0 : bounds.height - h, bounds.width, h);
@@ -545,8 +550,10 @@ function openSpacePolygonForIntent(base: MultiPolygon, intentSeed: string, size:
       rect = localRect(bounds, angle, centre, edge === 1 ? 0 : bounds.width - w, 0, w, bounds.height);
     }
   } else {
-    const w = bounds.width * (0.48 + random("w") * 0.16);
-    const h = bounds.height * (0.48 + random("h") * 0.16);
+    // Scale dimensions proportionally to targetShare so carved area matches profile intent.
+    const areaScale = Math.sqrt(Math.min(1, targetShare * 6));
+    const w = bounds.width * (0.48 + random("w") * 0.16) * areaScale;
+    const h = bounds.height * (0.48 + random("h") * 0.16) * areaScale;
     rect = localRect(bounds, angle, centre, (bounds.width - w) / 2, (bounds.height - h) / 2, w, h);
   }
   const piece = largestHoleFreePiece(intersection(available, ringAsMulti(rect)));
@@ -1480,6 +1487,8 @@ function planBuildings(
     }
     parcels.push(parcel);
     unbuiltCount++;
+    // Unbuilt parcels (too small or no fitting grammar) become landscaping rather
+    // than vacant scrub, so they blend with sidewalk surface instead of looking derelict.
     openSpaces.push({
       id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
       parcelId: parcel.id,
@@ -1487,11 +1496,11 @@ function planBuildings(
       fragmentId: parcel.fragmentId,
       districtId: parcel.districtId,
       landmarkId: null,
-      category: "vacant",
+      category: "landscaping",
       size: "large",
       polygon: parcel.polygon,
-      surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
-      detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
+      surfaceStyle: "paving",
+      detailStyle: OPEN_SPACE_DETAIL_STYLES.landscaping,
       lineage: parcel.seed,
       seed: `${parcel.seed}/unbuilt`,
       areaM2: parcel.areaM2,

@@ -799,12 +799,28 @@ function openSpaceIntent(source: CitySourceV3, block: DerivedBlock, fragment: Di
   const override = district.openSpaceOverride;
   const targetShare = Math.max(0, Math.min(1, override ? override.rate : PROFILE_RATES[source.generation.openSpaceProfile] * definition.openSpaceMultiplier));
   if (targetShare <= 0) return { blockId: block.id, fragmentId: fragment.id, districtId: district.id, category: null, size: null, targetShare: 0, seed };
+
+  // Gate: for very-low profiles, only ~(targetShare * 8) fraction of fragments
+  // actually generate an open space intent, preventing every block from
+  // contributing open space when the profile calls for minimal coverage.
+  if (targetShare < 0.10 && hashUnit(`${seed}/gate`) > targetShare * 8) {
+    return { blockId: block.id, fragmentId: fragment.id, districtId: district.id, category: null, size: null, targetShare: 0, seed };
+  }
+
   const categoryValues: readonly OpenSpaceCategory[] = ["park", "plaza", "parking", "vacant", "utility", "landscaping", "service-yard"];
   const sizeValues: readonly OpenSpaceSize[] = ["pocket", "small", "large", "whole-block"];
   const allowedCategories = new Set(OPEN_SPACE_PROFILE_CATEGORY_GATES[source.generation.openSpaceProfile]);
   const inheritedCategories = Object.fromEntries(categoryValues.map((category) => [category, allowedCategories.has(category) ? definition.categoryWeights[category] : 0])) as Record<OpenSpaceCategory, number>;
   const categoryWeights = override?.categoryWeights ?? inheritedCategories;
-  const sizeWeights = override?.sizeWeights ?? definition.sizeWeights;
+  const sizeWeights = { ...(override?.sizeWeights ?? definition.sizeWeights) };
+
+  // Suppress large-area sizes when targetShare is very low to prevent
+  // single open spaces from consuming entire block fragments.
+  if (targetShare < 0.05) {
+    sizeWeights["whole-block"] = 0;
+    sizeWeights["large"] = Math.min(sizeWeights["large"] ?? 0, 0.5);
+  }
+
   return {
     blockId: block.id,
     fragmentId: fragment.id,

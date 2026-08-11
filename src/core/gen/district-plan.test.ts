@@ -231,7 +231,7 @@ describe("buildDistrictPlan", () => {
     const explicit = buildDistrictPlan({ ...base, generation: { ...base.generation, openSpaceProfile: "none" }, districts: [{ ...district, openSpaceOverride: override() }] });
     expect(explicit.openSpaceIntents.filter((intent) => intent.districtId === district.id).every((intent) => intent.targetShare === 0.4 && intent.category === "park")).toBe(true);
     const veryLow = buildDistrictPlan({ ...base, generation: { ...base.generation, openSpaceProfile: "very-low" }, districts: [district] });
-    expect(veryLow.openSpaceIntents.filter((intent) => intent.districtId === district.id).every((intent) => intent.category === "park" || intent.category === "plaza")).toBe(true);
+    expect(veryLow.openSpaceIntents.filter((intent) => intent.districtId === district.id).every((intent) => intent.category === null || intent.category === "park" || intent.category === "plaza")).toBe(true);
     const profiles = ["very-low", "low", "medium", "high"] as const;
     const shares = profiles.map((profile) => buildDistrictPlan({ ...base, generation: { ...base.generation, openSpaceProfile: profile }, districts: [district] }).openSpaceIntents.find((intent) => intent.districtId === district.id)!.targetShare);
     expect(shares).toEqual([...shares].sort((a, b) => a - b));

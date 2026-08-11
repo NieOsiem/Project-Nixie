@@ -235,6 +235,12 @@ function contextualMultiplier(typeId: DistrictTypeId, context: DistrictRegionCon
   }
 }
 
+const RESIDENTIAL_TYPES = new Set<DistrictTypeId>([
+  "low-rise-residential",
+  "dense-residential",
+  "residential-megablocks"
+]);
+
 function chooseDistrictType(
   source: CitySourceV3,
   blocks: readonly DerivedBlock[],
@@ -249,7 +255,11 @@ function chooseDistrictType(
   for (let index = 0; index < pool.length; index++) {
     const id = pool[index]!;
     const randomness = 0.88 + hashUnit(`${source.citySeed}/districts/v3/type/${lineage}/${id}`) * 0.24;
-    const diversity = 1 / (1 + (counts.get(id) ?? 0) * 0.85);
+    const count = counts.get(id) ?? 0;
+    // Residential district types get a softer diversity penalty so multiple
+    // peripheral zones can be residential without being forced into industrial/derelict.
+    const diversityK = RESIDENTIAL_TYPES.has(id) ? 0.30 : 0.85;
+    const diversity = 1 / (1 + count * diversityK);
     const score = contextualMultiplier(id, context) * randomness * diversity;
     if (score > best) {
       best = score;
