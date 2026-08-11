@@ -221,7 +221,7 @@ function holeFreePieces(polygon: MultiPolygon[number]): Ring[] {
   return pieces;
 }
 
-function canonicalHoleFreePieces(polygon: MultiPolygon[number]): Ring[] {
+export function canonicalHoleFreePieces(polygon: MultiPolygon[number]): Ring[] {
   const pieces: Ring[] = [];
   let sourceArea = 0;
   for (const source of holeFreePieces(polygon)) {

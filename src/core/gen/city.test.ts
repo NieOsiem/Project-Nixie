@@ -1,29 +1,48 @@
 import { describe, expect, it } from "vitest";
-import { migrateSchema1ToSchema2, ROUTE_CLASSES, validateCitySourceV2, validateRoadSource, type LegacyCityStateV1 } from "./city.js";
+import {
+  ROUTE_CLASSES,
+  validateCityStateV3,
+  validateRoadSource,
+  type CityStateV3
+} from "./city.js";
+import { DISTRICT_TYPE_IDS } from "./district-registry.js";
 import { rectangleLand } from "./terrain.js";
 
-describe("schema-2 city road source", () => {
-  it("keeps the schema-1 source exact while adding empty roads", () => {
-    const old: LegacyCityStateV1 = {
-      kind: "city-generator-2",
-      schemaVersion: 1,
-      generatorVersion: 8,
-      revision: 7,
-      source: {
-        origin: { x: 12, y: 34 },
-        citySeed: "  alpha ",
-        generation: { terrainMode: "rectangle", coastEdge: null },
-        terrain: { land: rectangleLand({ x: 0, y: 0, width: 100, height: 80 }), urbanFootprint: null }
-      }
-    };
-    const migrated = migrateSchema1ToSchema2(old);
-    expect(migrated.schemaVersion).toBe(2);
-    expect(migrated.generatorVersion).toBe(9);
-    expect(migrated.revision).toBe(7);
-    expect(migrated.source.origin).toEqual(old.source.origin);
-    expect(migrated.source.terrain).toEqual(old.source.terrain);
-    expect(migrated.source.roads).toEqual({ nodes: [], routes: [], edges: [] });
-    expect(validateCitySourceV2(migrated.source)).toEqual([]);
+function state(generatorVersion: number, revision = 1): CityStateV3 {
+  return {
+    kind: "city-generator-2",
+    schemaVersion: 3,
+    generatorVersion: generatorVersion as CityStateV3["generatorVersion"],
+    revision,
+    source: {
+      origin: { x: 12, y: 34 },
+      citySeed: "model-fixture",
+      generation: {
+        terrainMode: "rectangle",
+        coastEdge: null,
+        roadLayout: "european",
+        hubMode: "single-centre",
+        districtPool: [...DISTRICT_TYPE_IDS],
+        openSpaceProfile: "medium"
+      },
+      terrain: { land: rectangleLand({ x: 0, y: 0, width: 100, height: 80 }), urbanFootprint: null },
+      roads: { nodes: [], routes: [], edges: [] },
+      districts: []
+    }
+  };
+}
+
+describe("City Generator 2.0 generator-11 model", () => {
+  it("keeps schema 3 with generator 11 as the current literal state", () => {
+    const current = state(11);
+    expect(current.schemaVersion).toBe(3);
+    expect(current.generatorVersion).toBe(11);
+    expect(validateCityStateV3(current)).toEqual([]);
+  });
+
+  it("rejects obsolete generator-10 and future generator-12 states", () => {
+    expect(validateCityStateV3(state(10))).toEqual(["Unsupported city generator version."]);
+    expect(validateCityStateV3(state(12))).toEqual(["Unsupported city generator version."]);
   });
 
   it("has the complete stable route-class registry", () => {
@@ -36,4 +55,3 @@ describe("schema-2 city road source", () => {
     expect(validateRoadSource({ nodes: [{ id: "a", x: 0, y: 0 }], routes: [{ id: "r", curvePreset: "standard" }], edges: [{ id: "e", a: "a", b: "b", routeId: "r", classId: "street", name: 1, locked: false, origin: "authored" }] })).toEqual(expect.arrayContaining([expect.stringContaining("unknown node"), expect.stringContaining("name")]));
   });
 });
-

@@ -5,6 +5,7 @@ import { difference, intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { compileRouteNetwork } from "../graph/compiler.js";
 import { validateRouteTopology } from "../graph/topology.js";
+import { compiledRouteOccupancy } from "./district-plan.js";
 
 export interface RoadGenerationInput {
   citySeed: string;
@@ -13,6 +14,12 @@ export interface RoadGenerationInput {
   layout?: RoadLayout;
   hubMode?: HubMode;
   sceneBounds?: Rect;
+  /**
+   * Metre-space polygons reserved for major landmark sites. Ordinary road corridors are
+   * excluded from these polygons during segment fitting; an unavoidable overlap fails
+   * generation rather than shipping roads through a reserved site.
+   */
+  reservedSites?: readonly Ring[];
 }
 
 export interface RoadGenerationDiagnostics {
@@ -86,9 +93,16 @@ function lerpPoint(a: Vec2, b: Vec2, t: number): Vec2 {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
 }
 
-/** Sample the corridor (centreline + both offsets every 2 m, plus endpoint discs) against mask and land.
+function pointInAnyReserved(point: Vec2, reservedSites: readonly Ring[]): boolean {
+  for (const site of reservedSites) {
+    if (pointInRing(point, site)) return true;
+  }
+  return false;
+}
+
+/** Sample the corridor (centreline + both offsets every 2 m, plus endpoint discs) against mask, land, and reserved sites.
  *  Samples outside the scene rect are ignored (roads may run to the map edge). */
-function corridorFits(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds?: Rect): boolean {
+function corridorFits(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds?: Rect, reservedSites?: readonly Ring[]): boolean {
   const length = Math.hypot(b.x - a.x, b.y - a.y);
   if (length <= EPS) return false;
   const clearance = clearanceM + CLIP_MARGIN_M;
@@ -96,6 +110,7 @@ function corridorFits(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ri
   const nx = (-(b.y - a.y) / length) * clearance;
   const ny = ((b.x - a.x) / length) * clearance;
   const check = (point: Vec2): boolean => {
+    if (reservedSites !== undefined && pointInAnyReserved(point, reservedSites)) return false;
     if (sceneBounds && !pointInRect(point, sceneBounds)) return true;
     return pointInRing(point, mask) && pointInRing(point, land);
   };
@@ -167,11 +182,11 @@ function parallelConflict(a: Vec2, b: Vec2, clearanceA: number, barriers: readon
 }
 
 /** Clip segment to land/mask: keep the inside intervals, then shrink/refine until corridors fit. */
-function clipSegment(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[]): void {
+function clipSegment(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[], reservedSites?: readonly Ring[]): void {
   const length = Math.hypot(b.x - a.x, b.y - a.y);
   if (length < minLen) return;
   const ts = [0, 1];
-  for (const ring of [mask, land]) {
+  for (const ring of [mask, land, ...(reservedSites ?? [])]) {
     for (let i = 0; i < ring.length; i++) {
       const c = ring[i]!;
       const d = ring[(i + 1) % ring.length]!;
@@ -187,22 +202,23 @@ function clipSegment(a: Vec2, b: Vec2, clearanceM: number, mask: Ring, land: Rin
     const t1 = unique[i + 1]!;
     const mid = lerpPoint(a, b, (t0 + t1) / 2);
     if (!pointInRing(mid, mask) || !pointInRing(mid, land)) continue;
-    fitInterval(a, b, t0, t1, clearanceM, mask, land, sceneBounds, minLen, out);
+    if (reservedSites !== undefined && pointInAnyReserved(mid, reservedSites)) continue;
+    fitInterval(a, b, t0, t1, clearanceM, mask, land, sceneBounds, minLen, out, reservedSites);
   }
 }
 
-function fitInterval(a: Vec2, b: Vec2, t0: number, t1: number, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[]): void {
+function fitInterval(a: Vec2, b: Vec2, t0: number, t1: number, clearanceM: number, mask: Ring, land: Ring, sceneBounds: Rect, minLen: number, out: Vec2[], reservedSites?: readonly Ring[]): void {
   const p0 = lerpPoint(a, b, t0);
   const p1 = lerpPoint(a, b, t1);
-  if (corridorFits(p0, p1, clearanceM, mask, land, sceneBounds)) {
+  if (corridorFits(p0, p1, clearanceM, mask, land, sceneBounds, reservedSites)) {
     out.push(p0, p1);
     return;
   }
   const length = Math.hypot(b.x - a.x, b.y - a.y);
   if ((t1 - t0) * length < minLen) return;
   const tm = (t0 + t1) / 2;
-  fitInterval(a, b, t0, tm, clearanceM, mask, land, sceneBounds, minLen, out);
-  fitInterval(a, b, tm, t1, clearanceM, mask, land, sceneBounds, minLen, out);
+  fitInterval(a, b, t0, tm, clearanceM, mask, land, sceneBounds, minLen, out, reservedSites);
+  fitInterval(a, b, tm, t1, clearanceM, mask, land, sceneBounds, minLen, out, reservedSites);
 }
 
 interface PlannedLine {
@@ -281,6 +297,7 @@ interface PlanState {
   streetCells: StreetCellPlan[];
   attachments: AttachmentReservation[];
   hubExclusions: HubExclusion[];
+  reservedSites: readonly Ring[];
   warnings: string[];
   rejected: number;
 }
@@ -1385,7 +1402,8 @@ function planPromenade(state: PlanState): void {
       const b = vertices[(i + 1) % vertices.length]!;
       const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       if (!pointInRing(mid, state.mask) || !pointInRing(mid, state.land)) continue;
-      if (!corridorFits(a, b, clearance, state.mask, state.land, state.sceneBounds)) continue;
+      if (state.reservedSites.length > 0 && pointInAnyReserved(mid, state.reservedSites)) continue;
+      if (!corridorFits(a, b, clearance, state.mask, state.land, state.sceneBounds, state.reservedSites)) continue;
       const role = `promenade/${runIndex}/${i}`;
       if (pushLine(state, [a, b], "waterfront-promenade", "tight", role)) accepted.push({ a, b, role });
     }
@@ -1414,7 +1432,7 @@ function planPromenade(state: PlanState): void {
       }
     }
     if (!best) continue;
-    if (!corridorFits(endpoint.point, best.point, clearance, state.mask, state.land, state.sceneBounds)) continue;
+    if (!corridorFits(endpoint.point, best.point, clearance, state.mask, state.land, state.sceneBounds, state.reservedSites)) continue;
     pushLine(state, [endpoint.point, best.point], "waterfront-promenade", "tight", `promenade/connector/${connectorIndex++}`);
   }
 }
@@ -1521,6 +1539,20 @@ function corridorsInsideMasks(source: RoadSource, mask: Ring, land: Ring, sceneB
     }
   }
   return true;
+}
+
+/**
+ * Every piece of the canonical compiled route occupancy (corridor quads, junction node
+ * discs at the widest radius, and smoothed curves — exactly what `compiledRouteOccupancy`
+ * unions) must stay out of every reserved landmark site. Sharing the plan validator's
+ * predicate keeps the road-side guarantee and the plan-side legality check identical.
+ */
+function corridorsAvoidSites(source: RoadSource, reservedSites: readonly Ring[]): boolean {
+  if (reservedSites.length === 0) return true;
+  const occupancy = compiledRouteOccupancy(compileRouteNetwork(source)).all;
+  return reservedSites.every(
+    (site) => polygonArea(intersection(ringAsMulti(site), occupancy)) <= 1e-6
+  );
 }
 
 function nearestNodeId(source: RoadSource, point: Vec2, maxD: number, eligible?: ReadonlySet<string>): string | undefined {
@@ -1766,6 +1798,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
         x: clamp(geometricCentre.x + signedHash(17, 1, seed) * Math.min(55, box.width * 0.045), box.x + minDim * 0.18, box.x + box.width - minDim * 0.18),
         y: clamp(geometricCentre.y + signedHash(17, 2, seed) * Math.min(45, box.height * 0.045), box.y + minDim * 0.18, box.y + box.height - minDim * 0.18)
       };
+  const reservedSites = input.reservedSites ?? [];
   const state: PlanState = {
     mask: input.mask,
     land,
@@ -1780,6 +1813,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
     streetCells: [],
     attachments: [],
     hubExclusions: [],
+    reservedSites,
     warnings: [],
     rejected: 0
   };
@@ -1808,7 +1842,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
     for (const [a, b] of linePairs(line)) {
       attempts++;
       const clipped: Vec2[] = [];
-      clipSegment(a, b, clearanceOf(line.classId), input.mask, land, sceneBounds, minLengthOfPlannedLine(line), clipped);
+      clipSegment(a, b, clearanceOf(line.classId), input.mask, land, sceneBounds, minLengthOfPlannedLine(line), clipped, reservedSites);
       if (clipped.length === 0) {
         discarded++;
         continue;
@@ -2007,6 +2041,7 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
   const topology = validateRouteTopology(finalRoads, compileRouteNetwork(finalRoads));
   if (!topology.ok) throw new Error(`Generated road topology is invalid: ${topology.problems.join(" ")}`);
   if (!corridorsInsideMasks(finalRoads, input.mask, land, sceneBounds)) throw new Error("Generated road corridors leave the active generation mask or land.");
+  if (!corridorsAvoidSites(finalRoads, reservedSites)) throw new Error("Generated road corridors cross a reserved landmark site; the reservation is not legal.");
   // Hubs must land on the vehicle network: a decorative loop (cycleway/promenade) can run closer to a hub point than the hub's own ring.
   const vehicleNodeIds = new Set<string>();
   for (const edge of finalRoads.edges) {

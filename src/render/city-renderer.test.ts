@@ -365,6 +365,24 @@ describe("CityRenderer chunk map", () => {
     r.destroy();
   });
 
+  it("carries per-chunk semantic and geometry counts into stats", () => {
+    const r = make();
+    r.setChunks([
+      { ...chunk("0,0", NEAR, 3), detail: buffers(5), buildingCount: 7, landmarkCount: 1, openSpaceCount: 2 },
+      { ...chunk("1,0", NEAR, 4), buildingCount: 3 }
+    ]);
+
+    expect(r.stats()).toMatchObject({
+      buildings: 10,
+      landmarks: 1,
+      openSpaces: 2,
+      verticesTotal: 0,
+      trianglesTotal: 12,
+      detailTrianglesTotal: 5
+    });
+    r.destroy();
+  });
+
   it("removeChunk and clearChunks destroy what they drop", () => {
     const r = make();
     r.setChunks([chunk("0,0", NEAR), chunk("1,0", NEAR), chunk("2,0", NEAR)]);
@@ -574,6 +592,23 @@ describe("CityRenderer neon pass", () => {
 
     expect(renderLog).toHaveLength(CITY_PASSES + post.passesOff);
     expect(r.stats()).toMatchObject({ neonTriangles: 0 });
+    r.destroy();
+  });
+
+  it("gates the neon pass on visible neon, not on installed neon meshes", () => {
+    const r = make();
+    r.clearChunks();
+    r.setChunk(neonChunk("far", FAR, 5, 4));
+    r.update(cam());
+
+    // Neon geometry is installed, but its chunk is culled: no additive pass may run.
+    expect(r.stats()).toMatchObject({ neonTriangles: 0 });
+    expect(renderLog).toHaveLength(CITY_PASSES + post.passesOff);
+
+    r.setChunk(neonChunk("near", NEAR, 3, 2));
+    r.update(cam());
+    expect(r.stats()).toMatchObject({ neonTriangles: 2 });
+    expect(renderLog).toHaveLength((CITY_PASSES + post.passesOff) + (CITY_PASSES + 1 + post.passesOff));
     r.destroy();
   });
 

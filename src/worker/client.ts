@@ -6,12 +6,19 @@ import type {
   BuildTerrainChunkResult,
   BuildDistrictPlanRequest,
   BuildDistrictPlanResult,
+  BuildCompleteCityPlanRequest,
+  BuildCompleteCityPlanResult,
+  BuildCompleteCityChunksRequest,
+  BuildCompleteCityChunksSummary,
+  CompleteCityChunkProgress,
   GenerateInitialDistrictsRequest,
   GenerateInitialDistrictsResult,
   GenerateInitialRoadNetworkRequest,
   GenerateInitialRoadNetworkResult,
-  WorkerRequest,
-  WorkerResponse
+  GenerateCompleteCityPlanRequest,
+  GenerateCompleteCityPlanResult,
+  WorkerMessage,
+  WorkerRequest
 } from "./protocol.js";
 
 /** A request with the id stripped — `WorkerClient` assigns it. Distributes over the union. */
@@ -28,6 +35,7 @@ export function workerUrl(): string {
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
+  onProgress?: (progress: CompleteCityChunkProgress) => void;
 }
 
 export class WorkerClient {
@@ -37,7 +45,7 @@ export class WorkerClient {
 
   constructor(url: string = workerUrl()) {
     const worker = new Worker(url, { type: "module" });
-    worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.#settle(event.data);
+    worker.onmessage = (event: MessageEvent<WorkerMessage>) => this.#settle(event.data);
     worker.onerror = (event) => this.#rejectAll(new Error(event.message || "worker error"));
     worker.onmessageerror = () => this.#rejectAll(new Error("worker message was not readable"));
     this.#worker = worker;
@@ -47,12 +55,12 @@ export class WorkerClient {
     return this.#pending.size;
   }
 
-  request(body: RequestBody): Promise<unknown> {
+  request(body: RequestBody, onProgress?: (progress: CompleteCityChunkProgress) => void): Promise<unknown> {
     const worker = this.#worker;
     if (!worker) return Promise.reject(new Error("worker terminated"));
     const id = this.#nextId++;
     return new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      this.#pending.set(id, { resolve, reject, onProgress });
       try {
         worker.postMessage({ ...body, id });
       } catch (err) {
@@ -92,18 +100,47 @@ export class WorkerClient {
     return this.request({ ...body, type: "generateInitialDistricts" }) as Promise<GenerateInitialDistrictsResult>;
   }
 
+  /** Full generation: Worker composes the revision-1 source candidate and its complete plan. */
+  generateCompleteCityPlan(
+    body: Omit<GenerateCompleteCityPlanRequest, "id" | "type">
+  ): Promise<GenerateCompleteCityPlanResult> {
+    return this.request({ ...body, type: "generateCompleteCityPlan" }) as Promise<GenerateCompleteCityPlanResult>;
+  }
+
+  /** Ordinary structural edit: candidate source in, validated complete plan out. */
+  buildCompleteCityPlan(
+    body: Omit<BuildCompleteCityPlanRequest, "id" | "type">
+  ): Promise<BuildCompleteCityPlanResult> {
+    return this.request({ ...body, type: "buildCompleteCityPlan" }) as Promise<BuildCompleteCityPlanResult>;
+  }
+
+  /** Progressive final chunks. Each chunk arrives as `onProgress`; the promise resolves with the final summary. */
+  buildCompleteCityChunks(
+    body: Omit<BuildCompleteCityChunksRequest, "id" | "type">,
+    onProgress?: (progress: CompleteCityChunkProgress) => void
+  ): Promise<BuildCompleteCityChunksSummary> {
+    return this.request({ ...body, type: "buildCompleteCityChunks" }, onProgress) as Promise<BuildCompleteCityChunksSummary>;
+  }
+
   terminate(): void {
     this.#worker?.terminate();
     this.#worker = null;
     this.#rejectAll(new Error("worker terminated"));
   }
 
-  #settle(response: WorkerResponse): void {
-    const pending = this.#pending.get(response.id);
+  #settle(message: WorkerMessage): void {
+    const pending = this.#pending.get(message.id);
     if (!pending) return;
-    this.#pending.delete(response.id);
-    if (response.ok) pending.resolve(response.result);
-    else pending.reject(new Error(response.error));
+    // Request-scoped progress: forward to the callback, but keep the request pending until
+    // the final summary. After settle or termination the entry is gone, so any straggler
+    // progress message for this id is ignored.
+    if (message.ok && "progress" in message && message.progress === true) {
+      pending.onProgress?.(message.result);
+      return;
+    }
+    this.#pending.delete(message.id);
+    if (message.ok) pending.resolve(message.result);
+    else pending.reject(new Error(message.error));
   }
 
   #rejectAll(reason: Error): void {

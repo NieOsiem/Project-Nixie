@@ -100,6 +100,21 @@ export type CurvePreset = "tight" | "standard" | "broad";
 export type RoadLayout = "european" | "grid" | "mixed";
 export type HubMode = "single-centre" | "multiple-hubs";
 export type CoastEdge = "north" | "east" | "south" | "west";
+export type TerrainMode = "rectangle" | "coastal" | "custom";
+
+export const TERRAIN_MODES: readonly TerrainMode[] = ["rectangle", "coastal", "custom"];
+
+/**
+ * Built-in full-city generation presets (spec §6.5). Applying one copies its effective
+ * settings into session staging; the preset identity itself is never persisted — the
+ * Generate workspace keeps its own selection state.
+ */
+export const GENERATE_PRESETS = [
+  { id: "full-city", label: "Full City" },
+  { id: "coastal", label: "Coastal" }
+] as const;
+
+export type GeneratePresetId = (typeof GENERATE_PRESETS)[number]["id"];
 
 export interface EditorPrefs {
   workspace: WorkspaceId;
@@ -198,6 +213,7 @@ let roadName = "";
 let roadScope: "segment" | "contiguous-name" = "segment";
 let roadLayout: RoadLayout = DEFAULT_PREFS.roadLayout;
 let hubMode: HubMode = DEFAULT_PREFS.hubMode;
+let terrainMode: TerrainMode = "rectangle";
 let districtSnap: DistrictSnapOptions = { ...DEFAULT_DISTRICT_SNAP };
 let districtType: DistrictTypeId = DISTRICT_TYPE_IDS[0];
 let districtPalette = DISTRICT_TYPE_REGISTRY.get(districtType)!.defaultPaletteId;
@@ -431,6 +447,15 @@ export function setHubMode(next: HubMode): void {
   writePrefs();
 }
 
+export function currentTerrainMode(): TerrainMode {
+  return terrainMode;
+}
+
+export function setTerrainMode(next: TerrainMode): void {
+  if ((TERRAIN_MODES as readonly string[]).includes(next)) terrainMode = next;
+  controller?.onStateChanged();
+}
+
 export function districtSnapOptions(): DistrictSnapOptions {
   return { ...districtSnap };
 }
@@ -498,4 +523,37 @@ export function currentSeed(): string {
 
 export function setSeed(next: string): void {
   seed = next;
+}
+
+/** Effective staged fields a built-in preset copies in (spec §6.2). Seed is never included. */
+interface GeneratePresetConfig {
+  terrainMode: TerrainMode;
+  roadLayout: RoadLayout;
+  hubMode: HubMode;
+  openSpaceProfile: DistrictOpenSpaceProfile;
+}
+
+const GENERATE_PRESET_CONFIG: Record<GeneratePresetId, GeneratePresetConfig> = {
+  "full-city": { terrainMode: "rectangle", roadLayout: "european", hubMode: "single-centre", openSpaceProfile: "medium" },
+  coastal: { terrainMode: "coastal", roadLayout: "european", hubMode: "single-centre", openSpaceProfile: "medium" }
+};
+
+/**
+ * Copy a built-in preset's effective settings into the session staging: terrain mode,
+ * road layout, hub mode, the full 16-type district pool, and the medium open-space
+ * default. The seed stays exactly as the user left it and the coast edge is preserved
+ * (Coastal keeps the staged edge, defaulting to west). No adapter call or Scene write
+ * happens here, and the preset identity is not persisted.
+ */
+export function applyGeneratePreset(id: GeneratePresetId): boolean {
+  const config = GENERATE_PRESET_CONFIG[id];
+  if (config === undefined) return false;
+  terrainMode = config.terrainMode;
+  roadLayout = config.roadLayout;
+  hubMode = config.hubMode;
+  districtPool = [...DISTRICT_TYPE_IDS];
+  openSpaceProfile = config.openSpaceProfile;
+  writePrefs(); // Road layout and hub mode are editor prefs; the staged fields are not.
+  controller?.onStateChanged();
+  return true;
 }

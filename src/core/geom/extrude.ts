@@ -7,6 +7,8 @@ export interface BuildingSpec {
   footprint: Ring;
   /** Height in metres. Stays in metres so geometry survives a grid-size change. */
   height: number;
+  /** Base of the extrusion in metres above ground. Podium/tower stacking (0 = ground). */
+  baseHeight?: number;
   roofMaterial: number;
   wallMaterial: number;
   /** 0..1 building hash. Picks the facade style and seeds its per-cell hashes. */
@@ -19,6 +21,16 @@ export interface BuildingSpec {
   facadeRate?: number;
   poolRate?: number;
   neonWeights?: readonly [number, number];
+  /** Grammar-selected facade family; salts the WALL seed so the shader pattern differs. */
+  facadeProfile?: string;
+  /** Grammar-selected roofline; salts the ROOF seed so the rooftop pattern differs. */
+  roofline?: string;
+  /** 0..1 decay; darkens walls (grime) and salts the WALL seed. */
+  wear?: number;
+  /** 0..1 chance the detail tier adds bounded rooftop utility prisms. */
+  rooftopUtilityRate?: number;
+  /** Explicit neon policy: false suppresses every sign and pool regardless of facadeRate. */
+  neonEnabled?: boolean;
 }
 
 export interface BuildingVolume {
@@ -63,6 +75,40 @@ function seedRoll(seed: number, salt: number): number {
   return (h >>> 0) / 4294967296;
 }
 
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return hash >>> 0;
+}
+
+/**
+ * WALL aSeed: the shader derives the whole facade family from it, so the grammar's
+ * facade profile and wear shift the pattern without any new geometry. Specs without a
+ * profile keep their exact seed so ad-hoc lots and old paths are untouched.
+ */
+function wallVariantSeed(spec: BuildingSpec, seed: number): number {
+  const profile = spec.facadeProfile !== undefined && spec.facadeProfile.length > 0;
+  const wear = spec.wear !== undefined && Number.isFinite(spec.wear) && spec.wear > 0;
+  if (!profile && !wear) return seed;
+  let salt = profile ? fnv1a(spec.facadeProfile!) : 0x9e3779b9;
+  if (wear) salt = Math.imul(salt ^ Math.min(0xffffff, Math.floor(spec.wear! * 0x1000000)), 0x85ebca6b) >>> 0;
+  return seedRoll(seed, salt);
+}
+
+/** ROOF aSeed: the roofline picks the rooftop style family in the shader. */
+function roofVariantSeed(spec: BuildingSpec, seed: number): number {
+  if (spec.roofline === undefined || spec.roofline.length === 0) return seed;
+  return seedRoll(seed, fnv1a(spec.roofline));
+}
+
+/** Grime: wear darkens walls toward the shade floor, bounded so lit walls never invert. */
+export const WEAR_SHADE_MAX = 0.18;
+const wearShade = (spec: BuildingSpec, shade: number): number => {
+  const wear = spec.wear ?? 0;
+  if (!(wear > 0) || !Number.isFinite(wear)) return shade;
+  return shade * (1 - Math.min(1, Math.max(0, wear)) * WEAR_SHADE_MAX);
+};
+
 function neonAccentWeight(weights: BuildingSpec["neonWeights"]): number {
   if (weights === undefined) return 0.5;
   const a = Number.isFinite(weights[0]) ? Math.max(0, weights[0]!) : 0;
@@ -90,7 +136,13 @@ export function describeBuildingMassing(
 ): BuildingMassing {
   const footprint = withPositiveArea(spec.footprint);
   const simple = (): BuildingMassing => ({
-    volumes: [{ footprint, baseHeight: 0, topHeight: spec.height }]
+    volumes: [
+      {
+        footprint,
+        baseHeight: spec.baseHeight ?? 0,
+        topHeight: (spec.baseHeight ?? 0) + spec.height
+      }
+    ]
   });
   if (
     spec.detailedMassing !== true ||
@@ -225,6 +277,7 @@ function appendVolume(
   const roofHalfHeight = supportsRoofStructures(poly) ? halfHeightM : -Math.max(halfHeightM, 1e-6);
 
   const roof = triangulate([poly]);
+  const roofSeed = roofVariantSeed(spec, seed);
   const roofBase = builder.vertexCount;
   for (const p of roof.positions) {
     builder.vertex(
@@ -236,7 +289,7 @@ function appendVolume(
       KIND.ROOF,
       halfWidthM,
       roofAngle,
-      seed,
+      roofSeed,
       centre.x,
       centre.y
     );
@@ -249,10 +302,11 @@ function appendVolume(
     );
   }
 
+  const wallSeed = wallVariantSeed(spec, seed);
   for (let i = 0; i < n; i++) {
     const a = poly[i]!;
     const b = poly[(i + 1) % n]!;
-    const shade = wallShade(a, b);
+    const shade = wearShade(spec, wallShade(a, b));
     const w = spec.wallMaterial;
     const end = Math.hypot(b.x - a.x, b.y - a.y) / pixelsPerMetre;
 
@@ -265,7 +319,7 @@ function appendVolume(
       KIND.WALL,
       0,
       height,
-      seed,
+      wallSeed,
       accentWeight
     );
     builder.vertex(
@@ -277,7 +331,7 @@ function appendVolume(
       KIND.WALL,
       end,
       height,
-      seed,
+      wallSeed,
       accentWeight
     );
     builder.vertex(
@@ -289,7 +343,7 @@ function appendVolume(
       KIND.WALL,
       end,
       height,
-      seed,
+      wallSeed,
       accentWeight
     );
     builder.vertex(
@@ -301,7 +355,7 @@ function appendVolume(
       KIND.WALL,
       0,
       height,
-      seed,
+      wallSeed,
       accentWeight
     );
 

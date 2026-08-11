@@ -12,12 +12,15 @@ import {
   FIRST_ZONE_BANK,
   LAST_ZONE_BANK,
   MATERIAL,
+  OPEN_SPACE_SURFACE_SHADES,
+  OPEN_SPACE_SURFACE_SLOTS,
   PALETTE_PRESETS,
   PALETTE_ROWS,
   PALETTE_SIZE,
   materialIndex,
   normalizePalette,
   packPalette,
+  paletteBanks,
   presetByName,
   zoneBank,
   type DistrictPalette,
@@ -132,10 +135,75 @@ describe("bank layout", () => {
     expect(zoneBank(LAST_ZONE_BANK - FIRST_ZONE_BANK + 1)).toBe(FIRST_ZONE_BANK);
   });
 
+  it("maps palette ids to zone banks independent of the order they appear in", () => {
+    const a = paletteBanks(["corporate", "industrial", "night-market"]);
+    const b = paletteBanks(["night-market", "industrial", "corporate"]);
+    expect([...a.entries()]).toEqual([...b.entries()]);
+    // The sort order is the only input: first palette alphabetically takes the first zone bank.
+    expect(a.get("corporate")).toBe(FIRST_ZONE_BANK);
+    expect(a.get("industrial")).toBe(FIRST_ZONE_BANK + 1);
+    expect(a.get("night-market")).toBe(FIRST_ZONE_BANK + 2);
+  });
+
+  it("derives banks from palette ids alone, never district order or district ids", () => {
+    // Two cities with the same palette set resolve the same id to the same bank, however
+    // their districts are arranged — that is what makes retinting stable across edits.
+    const first = paletteBanks(["corporate", "night-market"]);
+    const second = paletteBanks(["night-market", "corporate"]);
+    expect([...first.entries()]).toEqual([...second.entries()]);
+    expect(paletteBanks(["corporate", "night-market"]).get("night-market")).toBe(
+      paletteBanks(["night-market", "corporate"]).get("night-market")
+    );
+  });
+
+  it("dedupes, stays deterministic, and wraps inside the zone range", () => {
+    const ids = Array.from({ length: 40 }, (_, i) => `palette-${String(i).padStart(2, "0")}`);
+    const banks = paletteBanks(ids);
+    expect(banks.size).toBe(40);
+    expect(paletteBanks(ids)).toEqual(banks);
+    for (const bank of banks.values()) {
+      expect(bank).toBeGreaterThanOrEqual(FIRST_ZONE_BANK);
+      expect(bank).toBeLessThanOrEqual(LAST_ZONE_BANK);
+    }
+    expect(paletteBanks(["dup", "dup", "other"]).size).toBe(2);
+  });
+
   it("materialIndex round-trips to its bank and slot", () => {
     const i = materialIndex(7, DISTRICT_SLOT.ROOF_B);
     expect(Math.floor(i / BANK_SIZE)).toBe(7);
     expect(i % BANK_SIZE).toBe(DISTRICT_SLOT.ROOF_B);
+  });
+
+  it("resolves every shipping open-space surface style inside a district bank", () => {
+    const shippingStyles = [
+      "grass",
+      "paving",
+      "tarmac",
+      "scrub",
+      "concrete",
+      "planting",
+      "gravel"
+    ];
+    for (const style of shippingStyles) {
+      const slot = OPEN_SPACE_SURFACE_SLOTS[style];
+      expect(slot).toBeDefined();
+      expect(slot).toBeGreaterThanOrEqual(0);
+      expect(slot).toBeLessThan(BANK_SIZE);
+    }
+    // The two categories that share a plan slot must separate here: park vs service-yard.
+    expect(OPEN_SPACE_SURFACE_SLOTS["grass"]).not.toBe(OPEN_SPACE_SURFACE_SLOTS["gravel"]);
+  });
+
+  it("keeps every shipping surface shade distinct and bounded", () => {
+    const shades = Object.entries(OPEN_SPACE_SURFACE_SHADES)
+      .filter(([style]) => OPEN_SPACE_SURFACE_SLOTS[style] !== undefined)
+      .map(([, shade]) => shade);
+    expect(shades).toHaveLength(7);
+    expect(new Set(shades).size).toBe(7);
+    for (const shade of shades) {
+      expect(shade).toBeGreaterThan(0);
+      expect(shade).toBeLessThanOrEqual(1);
+    }
   });
 });
 

@@ -94,14 +94,6 @@ export interface CitySourceV2 {
   roads: RoadSource;
 }
 
-export interface CityStateV2 {
-  kind: "city-generator-2";
-  schemaVersion: 2;
-  generatorVersion: 9;
-  revision: number;
-  source: CitySourceV2;
-}
-
 export type DistrictPaletteId = string;
 export type DistrictOpenSpaceProfile = "none" | "very-low" | "low" | "medium" | "high";
 export type DistrictOpenSpaceOverride = {
@@ -159,32 +151,12 @@ export interface CitySourceV3 {
 export interface CityStateV3 {
   kind: "city-generator-2";
   schemaVersion: 3;
-  generatorVersion: 10;
+  generatorVersion: 11;
   revision: number;
   source: CitySourceV3;
 }
 
-export interface LegacyCitySourceV1 {
-  origin: Vec2;
-  citySeed: string;
-  generation: TerrainGeneration;
-  terrain: TerrainSource;
-}
-
-export interface LegacyCityStateV1 {
-  kind: "city-generator-2";
-  schemaVersion: 1;
-  generatorVersion: number;
-  revision: number;
-  source: LegacyCitySourceV1;
-}
-
-interface LegacyStateEnvelope {
-  source: LegacyCitySourceV1;
-  revision: number;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
@@ -253,29 +225,6 @@ export function validateRoadSource(roads: unknown, registry: ReadonlyMap<string,
     if (!enumValue(value.origin, ["generated", "authored"] as const)) problems.push(`Road edge "${value.id}" has invalid origin.`);
   }
   for (const id of routeIds) if (!edgeRouteUse.has(id)) problems.push(`Road route "${id}" is unreferenced.`);
-  return problems;
-}
-
-export function validateCitySourceV2(source: unknown): string[] {
-  const problems: string[] = [];
-  if (!isRecord(source)) return ["City source must be an object."];
-  if (!finiteVec(source.origin)) problems.push("City origin must have finite x/y.");
-  if (typeof source.citySeed !== "string" || source.citySeed.trim().length === 0) problems.push("City seed must be non-empty text.");
-  const generation = source.generation;
-  if (!isRecord(generation)) problems.push("City generation must be an object.");
-  else {
-    if (!enumValue(generation.terrainMode, ["rectangle", "coastal", "custom"] as const)) problems.push("Invalid terrain mode.");
-    if (!(generation.coastEdge === null || enumValue(generation.coastEdge, ["north", "east", "south", "west"] as const))) problems.push("Invalid coast edge.");
-    if (!enumValue(generation.roadLayout, ROAD_LAYOUTS)) problems.push("Invalid road layout.");
-    if (!enumValue(generation.hubMode, HUB_MODES)) problems.push("Invalid hub mode.");
-  }
-  const terrain = source.terrain;
-  if (!isRecord(terrain)) problems.push("City terrain must be an object.");
-  else {
-    const terrainProblems = validateTerrain(terrain as unknown as TerrainSource);
-    if (!terrainProblems.ok) problems.push(terrainProblems.reason);
-  }
-  problems.push(...validateRoadSource(source.roads));
   return problems;
 }
 
@@ -420,88 +369,10 @@ export function validateCityStateV3(state: unknown): string[] {
   if (!isRecord(state)) return ["City state must be an object."];
   if (state.kind !== "city-generator-2") problems.push("Invalid city kind.");
   if (state.schemaVersion !== 3) problems.push("Unsupported city schema version.");
-  if (state.generatorVersion !== 10) problems.push("Unsupported city generator version.");
+  if (state.generatorVersion !== 11) problems.push("Unsupported city generator version.");
   if (typeof state.revision !== "number" || !Number.isInteger(state.revision) || state.revision < 1) problems.push("City revision must be a positive integer.");
   problems.push(...validateCitySourceV3(state.source));
   return problems;
-}
-
-function defaultDistrictGeneration(generation: CitySourceV2["generation"]): CitySourceV3["generation"] {
-  return {
-    terrainMode: generation.terrainMode,
-    coastEdge: generation.coastEdge,
-    roadLayout: generation.roadLayout,
-    hubMode: generation.hubMode,
-    districtPool: [...DISTRICT_TYPE_IDS],
-    openSpaceProfile: "medium"
-  };
-}
-
-export function migrateSchema2ToSchema3(input: CityStateV2 | { source: CitySourceV2; revision: number } | CitySourceV2, revision?: number): CityStateV3 {
-  const isEnvelope = isRecord(input) && "source" in input;
-  const source = (isEnvelope ? input.source : input) as CitySourceV2;
-  const migratedRevision = isEnvelope ? (input as { revision: number }).revision : revision;
-  if (migratedRevision === undefined || !Number.isInteger(migratedRevision) || migratedRevision < 1) throw new Error("Schema-2 revision must be a positive integer.");
-  const migrated: CityStateV3 = {
-    kind: "city-generator-2",
-    schemaVersion: 3,
-    generatorVersion: 10,
-    revision: migratedRevision,
-    source: {
-      origin: { ...source.origin },
-      citySeed: source.citySeed,
-      generation: defaultDistrictGeneration(source.generation),
-      terrain: {
-        land: source.terrain.land.map((point) => ({ ...point })),
-        urbanFootprint: source.terrain.urbanFootprint?.map((point) => ({ ...point })) ?? null
-      },
-      roads: {
-        nodes: source.roads.nodes.map((node) => ({ ...node })),
-        routes: source.roads.routes.map((route) => ({ ...route })),
-        edges: source.roads.edges.map((edge) => ({ ...edge }))
-      },
-      districts: []
-    }
-  };
-  return migrated;
-}
-
-export function migrateSchema1ToSchema3(input: LegacyCityStateV1 | LegacyStateEnvelope | LegacyCitySourceV1, revision?: number): CityStateV3 {
-  return migrateSchema2ToSchema3(migrateSchema1ToSchema2(input, revision));
-}
-
-export function validateCityStateV2(state: unknown): string[] {
-  const problems: string[] = [];
-  if (!isRecord(state)) return ["City state must be an object."];
-  if (state.kind !== "city-generator-2") problems.push("Invalid city kind.");
-  if (state.schemaVersion !== 2) problems.push("Unsupported city schema version.");
-  if (state.generatorVersion !== 9) problems.push("Unsupported city generator version.");
-  if (typeof state.revision !== "number" || !Number.isInteger(state.revision) || state.revision < 1) problems.push("City revision must be a positive integer.");
-  problems.push(...validateCitySourceV2(state.source));
-  return problems;
-}
-
-export function migrateSchema1ToSchema2(input: LegacyCityStateV1 | LegacyStateEnvelope | LegacyCitySourceV1, revision?: number): CityStateV2 {
-  const isState = "source" in input;
-  const source: LegacyCitySourceV1 = isState ? input.source : input;
-  const migratedRevision = isState ? input.revision : revision;
-  if (migratedRevision === undefined || !Number.isInteger(migratedRevision) || migratedRevision < 1) throw new Error("Schema-1 revision must be a positive integer.");
-  const out: CitySourceV2 = {
-    origin: { ...source.origin },
-    citySeed: source.citySeed,
-    generation: {
-      terrainMode: source.generation.terrainMode,
-      coastEdge: source.generation.coastEdge,
-      roadLayout: "european",
-      hubMode: "single-centre"
-    },
-    terrain: {
-      land: source.terrain.land.map((p) => ({ ...p })),
-      urbanFootprint: source.terrain.urbanFootprint?.map((p) => ({ ...p })) ?? null
-    },
-    roads: { nodes: [], routes: [], edges: [] }
-  };
-  return { kind: "city-generator-2", schemaVersion: 2, generatorVersion: 9, revision: migratedRevision, source: out };
 }
 
 function fnv1a(text: string): number {

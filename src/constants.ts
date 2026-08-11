@@ -11,7 +11,7 @@ export const CITY_SCHEMA_VERSION = 3;
  * Identifies the generation algorithm. Never change the output of an existing version —
  * bump this instead, so an in-progress campaign's city survives a module update.
  */
-export const GENERATOR_VERSION = 10;
+export const GENERATOR_VERSION = 11;
 
 /**
  * Weather presets. Stored strings, so renaming one strands an existing scene's setting.

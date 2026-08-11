@@ -2,6 +2,7 @@ import {
   describeBuildingMassing,
   wallShade,
   withPositiveArea,
+  type BuildingMassing,
   type BuildingSpec
 } from "../geom/extrude.js";
 import { KIND, MeshBuilder, mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
@@ -12,7 +13,7 @@ import { hash2 } from "./hash.js";
 
 export const BUILDING_DETAIL_MIN_HEIGHT_M = 12;
 
-interface DetailPrism {
+export interface DetailPrism {
   footprint: Ring;
   baseHeight: number;
   topHeight: number;
@@ -140,6 +141,66 @@ function scaledRing(ring: Ring, scale: number): Ring {
     x: centre.x + (p.x - centre.x) * scale,
     y: centre.y + (p.y - centre.y) * scale
   }));
+}
+
+/**
+ * Bounded rooftop utility boxes (AC units, vents) for the detail tier, gated on the
+ * grammar's rooftop-utility rate. At most 3 prisms — 30 triangles — per building, and
+ * every corner stays inside the roof footprint.
+ */
+function utilityPrisms(
+  spec: BuildingSpec,
+  massing: BuildingMassing,
+  pixelsPerMetre: number,
+  accent: number
+): DetailPrism[] {
+  const rate = spec.rooftopUtilityRate;
+  if (!(rate !== undefined && Number.isFinite(rate) && rate > 0)) return [];
+  if (roll(spec.seed, 940) >= Math.min(1, Math.max(0, rate))) return [];
+
+  const roof = massing.volumes.at(-1)!;
+  const footprint = withPositiveArea(roof.footprint);
+  const frame = roofFrame(footprint, pixelsPerMetre);
+  if (frame === null) return [];
+
+  const count = Math.min(3, 1 + Math.floor(roll(spec.seed, 941) * 2.6));
+  const prisms: DetailPrism[] = [];
+  for (let boxIndex = 0; boxIndex < count; boxIndex++) {
+    const halfU = Math.min(0.5 + roll(spec.seed, 942 + boxIndex * 13) * 0.7, frame.extentU * 0.28);
+    const halfV = Math.min(0.4 + roll(spec.seed, 943 + boxIndex * 13) * 0.6, frame.extentV * 0.28);
+    if (halfU < 0.45 || halfV < 0.35) continue;
+    const rangeU = Math.max(0, frame.extentU - halfU - 0.7);
+    const rangeV = Math.max(0, frame.extentV - halfV - 0.7);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const salt = 944 + boxIndex * 13 + attempt * 31;
+      const centreU = (roll(spec.seed, salt) * 2 - 1) * rangeU;
+      const centreV = (roll(spec.seed, salt + 1) * 2 - 1) * rangeV;
+      const corner = (su: number, sv: number): Vec2 => {
+        const along = (centreU + su * halfU) * pixelsPerMetre;
+        const across = (centreV + sv * halfV) * pixelsPerMetre;
+        return {
+          x: frame.centre.x + frame.ux * along - frame.uy * across,
+          y: frame.centre.y + frame.uy * along + frame.ux * across
+        };
+      };
+      const box = withPositiveArea([
+        corner(-1, -1),
+        corner(1, -1),
+        corner(1, 1),
+        corner(-1, 1)
+      ]);
+      if (!box.every((p) => pointInRing(p, footprint))) continue;
+      prisms.push({
+        footprint: box,
+        baseHeight: roof.topHeight + 0.05,
+        topHeight: roof.topHeight + 1.5 + roll(spec.seed, salt + 2) * 2.2,
+        material: boxIndex % 2 === 0 ? accent : spec.wallMaterial,
+        seed: roll(spec.seed, salt + 3)
+      });
+      break;
+    }
+  }
+  return prisms;
 }
 
 function neonMaterial(spec: BuildingSpec, salt: number): number {
@@ -362,10 +423,11 @@ function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPr
     });
   }
 
+  prisms.push(...utilityPrisms(spec, massing, pixelsPerMetre, accent));
   return prisms;
 }
 
-function prismMesh(prism: DetailPrism): MeshBuffers {
+export function prismMesh(prism: DetailPrism): MeshBuffers {
   const footprint = withPositiveArea(prism.footprint);
   const cap = triangulate([footprint]);
   const bounds = ringBounds(footprint);

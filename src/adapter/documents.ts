@@ -7,11 +7,8 @@ import {
   MODULE_ID
 } from "../constants.js";
 import {
-  migrateSchema1ToSchema3,
-  migrateSchema2ToSchema3,
   OPEN_SPACE_CATEGORIES,
   OPEN_SPACE_SIZES,
-  type CitySourceV2,
   type CitySourceV3,
   type CityStateV3,
   type DistrictOpenSpaceOverride,
@@ -19,21 +16,21 @@ import {
   type OpenSpaceCategory,
   type OpenSpaceSize
 } from "../core/gen/city.js";
-import { validateCitySourceV3, validateCityStateV3 } from "../core/gen/city.js";
+import { validateCitySourceV3 } from "../core/gen/city.js";
 import type { TerrainSource } from "../core/gen/terrain.js";
-import { validateTerrain } from "../core/gen/terrain.js";
 import type { WallSegment } from "../core/gen/walls.js";
 import { validateRouteTopology } from "../core/graph/topology.js";
 
 export type CityLoadResult =
   | { kind: "absent" }
   | { kind: "legacy"; raw: unknown }
+  | { kind: "supported"; state: CityStateV3; raw?: unknown }
   | {
-      kind: "supported";
-      state: CityStateV3;
-      migratedFrom?:
-        | { schemaVersion: 1; generatorVersion: 8; revision: number }
-        | { schemaVersion: 2; generatorVersion: 9; revision: number };
+      kind: "obsolete-precomplete";
+      raw: unknown;
+      schemaVersion: 1 | 2 | 3;
+      generatorVersion: 8 | 9 | 10;
+      revision: number;
     }
   | {
       kind: "unsupported";
@@ -43,14 +40,46 @@ export type CityLoadResult =
     }
   | { kind: "malformed"; raw: unknown; reason: string };
 
-export type SaveExpectation =
+export type SaveExpectation = "absent" | "legacy" | number;
+
+/**
+ * Pins the Scene state that a destructive clear is allowed to remove. Only known
+ * replaceable kinds match, and each carries the exact canonical identity of the raw
+ * flag observed at confirmation time — kind + revision alone cannot tell a legacy
+ * payload edit or a different supported source written at the same revision apart.
+ * The identity is transient only (never persisted or Worker-transferred). "absent" is
+ * its own identity and is an idempotent no-op. Unsupported and malformed flags are
+ * never cleared.
+ */
+export type ClearConfirmation =
   | "absent"
-  | "legacy"
-  | number
-  | { kind: "migrated-schema-1"; revision: number }
-  | { kind: "migrated-schema-2"; revision: number };
+  | { kind: "legacy"; identity: string }
+  | { kind: "obsolete-precomplete"; revision: number; identity: string }
+  | { kind: "supported"; revision: number; identity: string };
 
 type RecordValue = Record<string, unknown>;
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const record = value as RecordValue;
+    const out: RecordValue = {};
+    for (const key of Object.keys(record).sort()) out[key] = canonicalize(record[key]);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Exact canonical JSON identity of the raw city flag. Transient only (never persisted or
+ * Worker-transferred): a different payload — even at the same kind and revision — always
+ * yields a different identity, so a same-revision source swap during confirmations is
+ * never cleared. An absent flag has no payload and is represented by the "absent" case.
+ */
+export function cityFlagIdentity(raw: unknown): string {
+  const canonical = canonicalize(raw);
+  return canonical === undefined ? "undefined" : JSON.stringify(canonical);
+}
 
 function requireScene(): any {
   const scene = canvas?.scene;
@@ -128,34 +157,10 @@ function decodeTerrain(value: unknown): TerrainSource | null {
   return { land, urbanFootprint } as TerrainSource;
 }
 
-function decodeGeneration(value: unknown): CitySourceV2["generation"] | null {
-  if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge") || !has(value, "roadLayout") || !has(value, "hubMode")) return null;
-  const mode = value.terrainMode;
-  const edge = value.coastEdge;
-  const roadLayout = value.roadLayout;
-  const hubMode = value.hubMode;
-  if (mode !== "rectangle" && mode !== "coastal" && mode !== "custom") return null;
-  if (edge !== null && edge !== "north" && edge !== "east" && edge !== "south" && edge !== "west") return null;
-  if ((mode === "coastal") !== (edge !== null)) return null;
-  if (roadLayout !== "european" && roadLayout !== "grid" && roadLayout !== "mixed") return null;
-  if (hubMode !== "single-centre" && hubMode !== "multiple-hubs") return null;
-  return { terrainMode: mode, coastEdge: edge, roadLayout, hubMode };
-}
-
-function decodeSchemaOneGeneration(value: unknown): CitySourceV2["generation"] | null {
-  if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge")) return null;
-  const mode = value.terrainMode;
-  const edge = value.coastEdge;
-  if (mode !== "rectangle" && mode !== "coastal" && mode !== "custom") return null;
-  if (edge !== null && edge !== "north" && edge !== "east" && edge !== "south" && edge !== "west") return null;
-  if ((mode === "coastal") !== (edge !== null)) return null;
-  return { terrainMode: mode, coastEdge: edge, roadLayout: "european", hubMode: "single-centre" };
-}
-
-function decodeRoads(value: unknown): CitySourceV2["roads"] | null {
+function decodeRoads(value: unknown): CitySourceV3["roads"] | null {
   if (!isRecord(value) || !Array.isArray(value.nodes) || !Array.isArray(value.routes) || !Array.isArray(value.edges)) return null;
 
-  const nodes: CitySourceV2["roads"]["nodes"] = [];
+  const nodes: CitySourceV3["roads"]["nodes"] = [];
   const nodeIds = new Set<string>();
   for (const item of value.nodes) {
     if (!isRecord(item) || !has(item, "id") || !has(item, "x") || !has(item, "y") || !nonEmptyText(item.id) || !finiteNumber(item.x) || !finiteNumber(item.y) || nodeIds.has(item.id)) return null;
@@ -163,7 +168,7 @@ function decodeRoads(value: unknown): CitySourceV2["roads"] | null {
     nodes.push({ id: item.id, x: item.x, y: item.y });
   }
 
-  const routes: CitySourceV2["roads"]["routes"] = [];
+  const routes: CitySourceV3["roads"]["routes"] = [];
   const routeIds = new Set<string>();
   for (const item of value.routes) {
     if (!isRecord(item) || !has(item, "id") || !has(item, "curvePreset") || !nonEmptyText(item.id) || !CURVE_PRESETS.includes(item.curvePreset as (typeof CURVE_PRESETS)[number]) || routeIds.has(item.id)) return null;
@@ -171,7 +176,7 @@ function decodeRoads(value: unknown): CitySourceV2["roads"] | null {
     routes.push({ id: item.id, curvePreset: item.curvePreset as (typeof CURVE_PRESETS)[number] });
   }
 
-  const edges: CitySourceV2["roads"]["edges"] = [];
+  const edges: CitySourceV3["roads"]["edges"] = [];
   const edgeIds = new Set<string>();
   const referencedRoutes = new Set<string>();
   for (const item of value.edges) {
@@ -214,19 +219,6 @@ function decodeRoads(value: unknown): CitySourceV2["roads"] | null {
   }
   if (routes.some((route) => !referencedRoutes.has(route.id))) return null;
   return { nodes, routes, edges };
-}
-
-function decodeSource(value: unknown): CitySourceV2 | null {
-  if (!isRecord(value) || !has(value, "origin") || !has(value, "citySeed") || !has(value, "generation") || !has(value, "terrain") || !has(value, "roads")) return null;
-  const origin = decodePoint(value.origin);
-  if (origin === null || !nonEmptyText(value.citySeed)) return null;
-  const generation = decodeGeneration(value.generation);
-  if (generation === null) return null;
-  const terrain = decodeTerrain(value.terrain);
-  if (terrain === null) return null;
-  const roads = decodeRoads(value.roads);
-  if (roads === null) return null;
-  return { origin, citySeed: value.citySeed, generation, terrain, roads };
 }
 
 function decodeWeightTable(value: unknown, keys: readonly string[]): Record<string, number> | null {
@@ -314,17 +306,6 @@ function decodeV3Source(value: unknown): CitySourceV3 | null {
   };
 }
 
-function decodeSchemaOneSource(value: unknown): CitySourceV2 | null {
-  if (!isRecord(value) || !has(value, "origin") || !has(value, "citySeed") || !has(value, "generation") || !has(value, "terrain")) return null;
-  const origin = decodePoint(value.origin);
-  if (origin === null || !nonEmptyText(value.citySeed)) return null;
-  const generation = decodeSchemaOneGeneration(value.generation);
-  if (generation === null) return null;
-  const terrain = decodeTerrain(value.terrain);
-  if (terrain === null) return null;
-  return { origin, citySeed: value.citySeed, generation, terrain, roads: { nodes: [], routes: [], edges: [] } };
-}
-
 function decodeSupported(raw: unknown): { state: CityStateV3 } | { reason: string } {
   if (!isRecord(raw)) return { reason: "state is not an object" };
   if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
@@ -354,37 +335,14 @@ function decodeSupported(raw: unknown): { state: CityStateV3 } | { reason: strin
   };
 }
 
-function decodeMigratedSchemaOne(raw: unknown): { state: CityStateV3 } | { reason: string } {
-  if (!isRecord(raw) || raw.kind !== "city-generator-2" || raw.schemaVersion !== 1 || raw.generatorVersion !== 8 || !positiveInteger(raw.revision) || !has(raw, "source")) {
-    return { reason: "invalid schema-1 state" };
-  }
-  const source = decodeSchemaOneSource(raw.source);
-  if (source === null) return { reason: "invalid city source" };
-  const terrainResult = validateTerrain(source.terrain as TerrainSource);
-  if (!terrainResult.ok) return { reason: terrainResult.reason };
-  const state = migrateSchema1ToSchema3(source, raw.revision);
-  const problems = validateCityStateV3(state);
-  return problems.length === 0 ? { state } : { reason: problems.join(" ") };
-}
-
-function decodeMigratedSchemaTwo(raw: unknown): { state: CityStateV3 } | { reason: string } {
-  if (!isRecord(raw) || raw.kind !== "city-generator-2" || raw.schemaVersion !== 2 || raw.generatorVersion !== 9 || !positiveInteger(raw.revision) || !has(raw, "source")) {
-    return { reason: "invalid schema-2 state" };
-  }
-  const source = decodeSource(raw.source);
-  if (source === null) return { reason: "invalid city source" };
-  const terrainResult = validateTerrain(source.terrain as TerrainSource);
-  if (!terrainResult.ok) return { reason: terrainResult.reason };
-  try {
-    const topology = validateRouteTopology(source.roads);
-    if (!topology.ok) return { reason: topology.problems.join(" ") };
-  } catch (error) {
-    return { reason: error instanceof Error ? error.message : String(error) };
-  }
-  const state = migrateSchema2ToSchema3(source, raw.revision);
-  const problems = validateCityStateV3(state);
-  return problems.length === 0 ? { state } : { reason: problems.join(" ") };
-}
+// WHY: Schema 1/gen 8, schema 2/gen 9, and schema 3/gen 10 are the known pre-complete
+// generations. They are read-only: raw data and version evidence are preserved so the
+// campaign can be recovered, but nothing is migrated or rewritten at open time.
+const OBSOLETE_PRECOMPLETE_GENERATOR = new Map<number, number>([
+  [1, 8],
+  [2, 9],
+  [3, 10]
+]);
 
 function classify(raw: unknown): CityLoadResult {
   if (raw === undefined) return { kind: "absent" };
@@ -394,39 +352,34 @@ function classify(raw: unknown): CityLoadResult {
   if (!Number.isInteger(raw.schemaVersion)) {
     return { kind: "malformed", raw, reason: "schemaVersion must be an integer" };
   }
-  if (raw.schemaVersion === 1) {
-    if (!positiveInteger(raw.generatorVersion)) return { kind: "malformed", raw, reason: "invalid generator version" };
-    if (raw.generatorVersion !== 8) {
-      return { kind: "unsupported", raw, schemaVersion: raw.schemaVersion, generatorVersion: raw.generatorVersion };
-    }
-    const migrated = decodeMigratedSchemaOne(raw);
-    return "state" in migrated
-      ? {
-          kind: "supported",
-          state: migrated.state,
-          migratedFrom: { schemaVersion: 1, generatorVersion: 8, revision: migrated.state.revision }
-        }
-      : { kind: "malformed", raw, reason: migrated.reason };
-  }
-  if (raw.schemaVersion === 2) {
-    if (!positiveInteger(raw.generatorVersion)) return { kind: "malformed", raw, reason: "invalid generator version" };
-    if (raw.generatorVersion !== 9) {
-      return { kind: "unsupported", raw, schemaVersion: raw.schemaVersion, generatorVersion: raw.generatorVersion };
-    }
-    const migrated = decodeMigratedSchemaTwo(raw);
-    return "state" in migrated
-      ? {
-          kind: "supported",
-          state: migrated.state,
-          migratedFrom: { schemaVersion: 2, generatorVersion: 9, revision: migrated.state.revision }
-        }
-      : { kind: "malformed", raw, reason: migrated.reason };
-  }
-  if (raw.schemaVersion !== CITY_SCHEMA_VERSION) {
-    return { kind: "unsupported", raw, schemaVersion: raw.schemaVersion as number };
-  }
   if (!positiveInteger(raw.generatorVersion)) {
     return { kind: "malformed", raw, reason: "invalid generator version" };
+  }
+  // WHY: schema 3 is the CURRENT schema and is shared by the obsolete generator 10 and the
+  // current generator 11, so the obsolete entry only applies when the generator version
+  // matches it; a current-schema/current-generator state must fall through to supported.
+  const obsoleteGenerator = OBSOLETE_PRECOMPLETE_GENERATOR.get(raw.schemaVersion as number);
+  if (obsoleteGenerator !== undefined && raw.generatorVersion === obsoleteGenerator) {
+    if (!positiveInteger(raw.revision)) return { kind: "malformed", raw, reason: "invalid city revision" };
+    return {
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: raw.schemaVersion as 1 | 2 | 3,
+      generatorVersion: raw.generatorVersion as 8 | 9 | 10,
+      revision: raw.revision as number
+    };
+  }
+  if (raw.schemaVersion !== CITY_SCHEMA_VERSION) {
+    // Known pre-complete schemas (1/2) carry their generator version as evidence of
+    // the unknown variant; future schemas only expose the schema version.
+    return obsoleteGenerator !== undefined
+      ? {
+          kind: "unsupported",
+          raw,
+          schemaVersion: raw.schemaVersion as number,
+          generatorVersion: raw.generatorVersion as number
+        }
+      : { kind: "unsupported", raw, schemaVersion: raw.schemaVersion as number };
   }
   if (raw.generatorVersion !== GENERATOR_VERSION) {
     return {
@@ -438,7 +391,7 @@ function classify(raw: unknown): CityLoadResult {
   }
   const decoded = decodeSupported(raw);
   return "state" in decoded
-    ? { kind: "supported", state: decoded.state }
+    ? { kind: "supported", state: decoded.state, raw }
     : { kind: "malformed", raw, reason: decoded.reason };
 }
 
@@ -463,15 +416,16 @@ export async function saveCityState(
   const state = validateCandidate(candidate);
   const scene = requireScene();
   const current = classify(scene.getFlag(MODULE_ID, FLAG_CITY));
-  const expectedBaseRevision =
-    typeof expectation === "number"
-      ? expectation
-      : typeof expectation === "object"
-        ? expectation.revision
-        : null;
+  const expectedBaseRevision = typeof expectation === "number" ? expectation : null;
   const expectedRevision = expectedBaseRevision === null ? 1 : expectedBaseRevision + 1;
   if (state.revision !== expectedRevision) {
     throw new Error(`Expected revision ${expectedRevision}, received ${state.revision}.`);
+  }
+  // A revision-1 save is creation: it may only land on a genuinely cleared Scene
+  // (absent) or on legacy 1.0 data awaiting replacement, never over an existing,
+  // obsolete, unsupported, or malformed city flag.
+  if (state.revision === 1 && current.kind !== "absent" && current.kind !== "legacy") {
+    throw new Error("City creation requires an absent or legacy Scene state.");
   }
   if (expectation === "absent" && current.kind !== "absent") {
     throw new Error("City flag appeared before creation; retry from the current Scene.");
@@ -480,24 +434,48 @@ export async function saveCityState(
     throw new Error("Legacy city replacement is stale; retry from the current Scene.");
   }
   if (typeof expectation === "number") {
-    if (
-      current.kind !== "supported" ||
-      current.migratedFrom !== undefined ||
-      current.state.revision !== expectation
-    ) {
+    if (current.kind !== "supported" || current.state.revision !== expectation) {
       throw new Error("City revision changed before save; retry from the current Scene.");
-    }
-  }
-  if (typeof expectation === "object") {
-    const migration = expectation.kind === "migrated-schema-1"
-      ? current.kind === "supported" && current.migratedFrom?.schemaVersion === 1 && current.migratedFrom.generatorVersion === 8 && current.migratedFrom.revision === expectation.revision
-      : current.kind === "supported" && current.migratedFrom?.schemaVersion === 2 && current.migratedFrom.generatorVersion === 9 && current.migratedFrom.revision === expectation.revision;
-    if (!migration) {
-      throw new Error("Migrated City Generator state changed before save; retry from the current Scene.");
     }
   }
   await scene.setFlag(MODULE_ID, FLAG_CITY, state);
   return state;
+}
+
+/**
+ * Destructive clear of the city flag, guarded by the caller's confirmation of the
+ * current Scene state. Only known replaceable kinds are removed — legacy 1.0 data,
+ * obsolete-precomplete generations at an exact revision, and a supported city at an
+ * exact revision — and each must still carry the exact raw identity that was confirmed;
+ * a payload swap at the same kind and revision is never cleared. Unsupported and
+ * malformed flags are never cleared. "absent" is an idempotent no-op. The clear and the
+ * follow-up revision-1 save stay separate so the destructive step happens immediately
+ * after confirmation and a later planning failure never leaves an authoritative flag
+ * behind.
+ */
+export async function clearCityState(confirmation: ClearConfirmation): Promise<void> {
+  requireGM();
+  const scene = requireScene();
+  const raw = scene.getFlag(MODULE_ID, FLAG_CITY);
+  const current = classify(raw);
+  if (confirmation === "absent") {
+    if (current.kind !== "absent") {
+      throw new Error("City flag appeared before clearing; retry from the current Scene.");
+    }
+    return;
+  }
+  if (confirmation.kind === "legacy") {
+    if (current.kind !== "legacy" || cityFlagIdentity(raw) !== confirmation.identity) {
+      throw new Error("City flag changed before clearing; retry from the current Scene.");
+    }
+  } else if (confirmation.kind === "obsolete-precomplete") {
+    if (current.kind !== "obsolete-precomplete" || current.revision !== confirmation.revision || cityFlagIdentity(raw) !== confirmation.identity) {
+      throw new Error("Obsolete city flag changed before clearing; retry from the current Scene.");
+    }
+  } else if (current.kind !== "supported" || current.state.revision !== confirmation.revision || cityFlagIdentity(raw) !== confirmation.identity) {
+    throw new Error("City revision changed before clearing; retry from the current Scene.");
+  }
+  await scene.unsetFlag(MODULE_ID, FLAG_CITY);
 }
 
 export function generatedWallIds(): string[] {

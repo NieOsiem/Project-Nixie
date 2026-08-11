@@ -276,10 +276,16 @@ function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number):
   };
 }
 
-/** Emits KIND.NEON quads for the buildings a chunk owns. Footprints are world pixels. */
+/**
+ * Emits KIND.NEON quads for the buildings a chunk owns. Footprints are world pixels.
+ * A mass whose grammar disabled neon contributes nothing here even when its signage
+ * rate is high — the renderer gates its pass on these triangles, so an empty result
+ * is a guaranteed zero-glow chunk.
+ */
 export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): MeshBuffers {
   const quads: NeonQuad[] = [];
   for (const spec of buildings) {
+    if (spec.neonEnabled === false) continue;
     const massing = describeBuildingMassing(spec, pixelsPerMetre);
     const facade = facadeSign(spec, massing, pixelsPerMetre);
     if (facade !== null) {

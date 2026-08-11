@@ -108,6 +108,40 @@ describe("neonMesh", () => {
     expect(m.indices.length).toBe(0);
   });
 
+  it("emits zero neon for a neon-disabled mass even at full signage rate", () => {
+    const spec = {
+      ...cityOf(1)[0]!,
+      facadeRate: 1,
+      poolRate: 1,
+      neonEnabled: false
+    };
+    const m = neonMesh([spec], PPM);
+    expect(m.vertexCount).toBe(0);
+    expect(m.triangleCount).toBe(0);
+  });
+
+  it("keeps signs and pools for an explicitly neon-enabled mass", () => {
+    const spec = {
+      ...cityOf(1)[0]!,
+      facadeRate: 1,
+      poolRate: 1,
+      neonEnabled: true
+    };
+    const m = neonMesh([spec], PPM);
+    expect(m.vertexCount).toBeGreaterThan(0);
+    for (let i = 0; i < m.vertexCount; i++) expect(vertexAt(m, i).kind).toBe(KIND.NEON);
+  });
+
+  it("filters neon-disabled buildings out of a mixed batch", () => {
+    const disabled = { ...cityOf(2)[0]!, facadeRate: 1, poolRate: 1, neonEnabled: false };
+    const enabled = { ...cityOf(2)[1]!, facadeRate: 1, poolRate: 1, neonEnabled: true };
+    expect(neonMesh([disabled], PPM).vertexCount).toBe(0);
+    const both = neonMesh([disabled, enabled], PPM);
+    const alone = neonMesh([enabled], PPM);
+    expect([...both.vertices]).toEqual([...alone.vertices]);
+    expect([...both.indices]).toEqual([...alone.indices]);
+  });
+
   it("returns exclusively-owned exact-sized buffers, so the worker can transfer them", () => {
     for (const m of [neonMesh(cityOf(300), PPM), neonMesh([], PPM)]) {
       for (const view of [m.vertices, m.indices]) {

@@ -70,6 +70,46 @@ describe("TerrainSession", () => {
     expect(session.historyDepth).toBe(0);
   });
 
+  it("treats an obsolete-precomplete load as read-only until the flag is cleared", () => {
+    const session = new TerrainSession();
+    session.reset({
+      kind: "obsolete-precomplete",
+      raw: { kind: "city-generator-2", schemaVersion: 3, generatorVersion: 10, revision: 6 },
+      schemaVersion: 3,
+      generatorVersion: 10,
+      revision: 6
+    });
+    expect(session.status).toMatchObject({ kind: "obsolete-precomplete", revision: 6 });
+    expect(session.current).toBeNull();
+    expect(session.canUndo).toBe(false);
+    expect(session.historyDepth).toBe(0);
+    expect(() => session.publishCreation(state(1))).toThrow(/cleared/i);
+    expect(session.current).toBeNull();
+    expect(session.historyDepth).toBe(0);
+  });
+
+  it("supports the post-clear history baseline: reset to absent then creation with an empty history", () => {
+    const session = new TerrainSession();
+    session.reset({ kind: "obsolete-precomplete", raw: {}, schemaVersion: 2, generatorVersion: 9, revision: 3 });
+    const before = { epoch: session.buildEpoch, draft: session.draftVersion };
+    session.reset({ kind: "absent" });
+    session.publishCreation(state(1));
+    expect(session.current?.revision).toBe(1);
+    expect(session.status.kind).toBe("supported");
+    expect(session.historyDepth).toBe(0);
+    expect(session.canUndo).toBe(false);
+    expect(session.buildEpoch).toBeGreaterThan(before.epoch);
+    expect(session.draftVersion).toBeGreaterThan(before.draft);
+  });
+
+  it("refuses direct creation over legacy data without a clear", () => {
+    const session = new TerrainSession();
+    session.reset({ kind: "legacy", raw: { formatVersion: 4 } });
+    expect(() => session.publishCreation(state(1))).toThrow(/cleared/i);
+    expect(session.current).toBeNull();
+    expect(session.historyDepth).toBe(0);
+  });
+
   it("publishes creation only after a successful save and starts at revision 1", () => {
     const session = new TerrainSession();
     session.reset({ kind: "absent" });

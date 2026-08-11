@@ -100,6 +100,46 @@ describe("buildingDetailMesh", () => {
     ).toBe(0);
   });
 
+  it("adds bounded rooftop utility prisms only when the rate is set", () => {
+    const plain = buildingDetailMesh([spec()], PPM);
+    const withUtilities = buildingDetailMesh([spec({ rooftopUtilityRate: 1 })], PPM);
+    const delta = withUtilities.triangleCount - plain.triangleCount;
+    // Each 10-triangle utility box adds 20 vertices: at least one box, capped at three.
+    expect(delta).toBeGreaterThanOrEqual(10);
+    expect(delta).toBeLessThanOrEqual(30);
+    expect(withUtilities.vertexCount - plain.vertexCount).toBe(delta * 2);
+  });
+
+  it("keeps the added utility boxes on the roof, inside the building's horizontal bounds", () => {
+    const building = spec({ rooftopUtilityRate: 1 });
+    const plain = buildingDetailMesh([spec()], PPM);
+    const withUtilities = buildingDetailMesh([building], PPM);
+    const bounds = {
+      minX: Math.min(...building.footprint.map((p) => p.x)),
+      maxX: Math.max(...building.footprint.map((p) => p.x)),
+      minY: Math.min(...building.footprint.map((p) => p.y)),
+      maxY: Math.max(...building.footprint.map((p) => p.y))
+    };
+    // Utility prisms append last, so the tail of the buffer is exactly the new boxes.
+    const utilityStart = plain.vertexCount * VERTEX_FLOATS;
+    for (let i = utilityStart; i < withUtilities.vertices.length; i += VERTEX_FLOATS) {
+      const v = vertexAt(withUtilities, i / VERTEX_FLOATS);
+      expect(v.height).toBeGreaterThan(building.height);
+      expect(v.height).toBeLessThanOrEqual(building.height + 5);
+      expect(v.x).toBeGreaterThanOrEqual(bounds.minX - 1e-3);
+      expect(v.x).toBeLessThanOrEqual(bounds.maxX + 1e-3);
+      expect(v.y).toBeGreaterThanOrEqual(bounds.minY - 1e-3);
+      expect(v.y).toBeLessThanOrEqual(bounds.maxY + 1e-3);
+    }
+  });
+
+  it("leaves the detail tier unchanged when the rate is zero or absent", () => {
+    const absent = buildingDetailMesh([spec()], PPM);
+    const zero = buildingDetailMesh([spec({ rooftopUtilityRate: 0 })], PPM);
+    expect([...zero.vertices]).toEqual([...absent.vertices]);
+    expect(zero.triangleCount).toBe(absent.triangleCount);
+  });
+
   it("keeps metre dimensions fixed across a scene regrid", () => {
     const coarse = buildingDetailMesh([spec()], PPM);
     const finePpm = PPM * 2;

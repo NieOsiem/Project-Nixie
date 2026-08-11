@@ -55,6 +55,36 @@ export const DISTRICT_SLOT_LABELS: [number, string][] = [
 
 export const materialIndex = (bank: number, slot: number): number => bank * BANK_SIZE + slot;
 
+/**
+ * Open-space surface styles resolve to a district slot inside the open space's own bank,
+ * so the ground stays district-retintable. The plan already resolved a category slot;
+ * this table re-derives the material from the surface style so the two categories that
+ * share a plan slot (park and service-yard both ROOF_A) still get distinct payloads.
+ */
+export const OPEN_SPACE_SURFACE_SLOTS: Readonly<Record<string, number>> = Object.freeze({
+  grass: DISTRICT_SLOT.ROOF_A,
+  paving: DISTRICT_SLOT.WALL_A,
+  tarmac: DISTRICT_SLOT.WALL_B,
+  scrub: DISTRICT_SLOT.WALL_C,
+  concrete: DISTRICT_SLOT.ROOF_B,
+  planting: DISTRICT_SLOT.ROOF_C,
+  gravel: DISTRICT_SLOT.ROOF_B
+});
+
+/**
+ * Per-style flat-ground shade: the flat path multiplies the base colour by this, so each
+ * style keeps its own tone (park brightest, service grounds darkest) without new geometry.
+ */
+export const OPEN_SPACE_SURFACE_SHADES: Readonly<Record<string, number>> = Object.freeze({
+  grass: 1,
+  paving: 0.97,
+  tarmac: 0.9,
+  scrub: 0.94,
+  concrete: 0.88,
+  planting: 0.96,
+  gravel: 0.86
+});
+
 /** Absolute indices into the shared bank. Generation code refers to surfaces by these. */
 export const MATERIAL = {
   GROUND: materialIndex(CITY_BANK, CITY_SLOT.GROUND),
@@ -71,6 +101,17 @@ export const MATERIAL = {
 export function zoneBank(index: number): number {
   const span = LAST_ZONE_BANK - FIRST_ZONE_BANK + 1;
   return FIRST_ZONE_BANK + (((index % span) + span) % span);
+}
+
+/**
+ * Maps a city's distinct palette ids to district banks.
+ *
+ * WHY sorted, not insertion-ordered: retinting must depend only on which palettes the city
+ * uses, never on district order or district ids. Two cities with the same palette set
+ * resolve the same id to the same bank, so a palette swap cannot reshuffle every bank.
+ */
+export function paletteBanks(paletteIds: Iterable<string>): ReadonlyMap<string, number> {
+  return new Map([...new Set(paletteIds)].sort().map((id, index) => [id, zoneBank(index)]));
 }
 
 export interface RGB {

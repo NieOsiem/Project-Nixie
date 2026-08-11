@@ -5,6 +5,7 @@ import {
   ROOF_SHADE,
   SHADE_MAX,
   SHADE_MIN,
+  WEAR_SHADE_MAX,
   describeBuildingMassing,
   extrudeBuilding,
   wallShade,
@@ -232,6 +233,81 @@ describe("extrudeBuilding", () => {
     expect(shadesOf(b)).toEqual(shadesOf(a));
   });
 
+  it("salts only the wall seed from the facade profile and wear", () => {
+    const plain = extrudeBuilding(spec(), PPM);
+    const profiled = extrudeBuilding(spec({ facadeProfile: "shopfront" }), PPM);
+    const worn = extrudeBuilding(spec({ facadeProfile: "shopfront", wear: 0.7 }), PPM);
+
+    // Roof caps keep the raw building seed; walls carry the profile/wear variant.
+    for (let i = 0; i < 4; i++) {
+      expect(vertexAt(profiled, i).seed).toBe(vertexAt(plain, i).seed);
+      expect(vertexAt(worn, i).seed).toBe(vertexAt(plain, i).seed);
+    }
+    const plainWallSeeds = Array.from({ length: plain.vertexCount - 4 }, (_, i) =>
+      vertexAt(plain, i + 4).seed
+    );
+    const profiledWallSeeds = Array.from({ length: profiled.vertexCount - 4 }, (_, i) =>
+      vertexAt(profiled, i + 4).seed
+    );
+    const wornWallSeeds = Array.from({ length: worn.vertexCount - 4 }, (_, i) =>
+      vertexAt(worn, i + 4).seed
+    );
+    expect(profiledWallSeeds).not.toEqual(plainWallSeeds);
+    expect(wornWallSeeds).not.toEqual(profiledWallSeeds);
+    // Geometry is untouched: same extents, heights and triangle counts.
+    expect(profiled.vertexCount).toBe(plain.vertexCount);
+    expect(profiled.triangleCount).toBe(plain.triangleCount);
+  });
+
+  it("salts only the roof seed from the roofline", () => {
+    const plain = extrudeBuilding(spec(), PPM);
+    const roofed = extrudeBuilding(spec({ roofline: "sawtooth" }), PPM);
+    for (let i = 0; i < 4; i++) {
+      expect(vertexAt(roofed, i).seed).not.toBe(vertexAt(plain, i).seed);
+    }
+    const plainWallSeeds = Array.from({ length: plain.vertexCount - 4 }, (_, i) =>
+      vertexAt(plain, i + 4).seed
+    );
+    const roofedWallSeeds = Array.from({ length: roofed.vertexCount - 4 }, (_, i) =>
+      vertexAt(roofed, i + 4).seed
+    );
+    expect(roofedWallSeeds).toEqual(plainWallSeeds);
+  });
+
+  it("darkens worn walls toward the shade floor without inverting lighting", () => {
+    const clean = extrudeBuilding(spec(), PPM);
+    const worn = extrudeBuilding(spec({ wear: 1 }), PPM);
+    const cleanShades = Array.from({ length: clean.vertexCount - 4 }, (_, i) =>
+      vertexAt(clean, i + 4).shade
+    );
+    const wornShades = Array.from({ length: worn.vertexCount - 4 }, (_, i) =>
+      vertexAt(worn, i + 4).shade
+    );
+    for (let i = 0; i < cleanShades.length; i++) {
+      expect(wornShades[i]!).toBeLessThan(cleanShades[i]!);
+      expect(wornShades[i]!).toBeGreaterThanOrEqual(SHADE_MIN * (1 - WEAR_SHADE_MAX) - 1e-6);
+    }
+    // Multiplicative grime preserves relative lighting: opposing-wall ordering and the
+    // light-to-dark ratio survive the darkening.
+    for (let i = 0; i < 2; i++) {
+      const opposite = (i + 2) % 4;
+      expect(Math.sign(wornShades[i]! - wornShades[opposite]!)).toBe(
+        Math.sign(cleanShades[i]! - cleanShades[opposite]!)
+      );
+      expect(wornShades[i]! / wornShades[opposite]!).toBeCloseTo(
+        cleanShades[i]! / cleanShades[opposite]!,
+        6
+      );
+    }
+  });
+
+  it("keeps profile variants deterministic across repeated builds", () => {
+    const a = extrudeBuilding(spec({ facadeProfile: "civic-columns", roofline: "crown", wear: 0.4 }), PPM);
+    const b = extrudeBuilding(spec({ facadeProfile: "civic-columns", roofline: "crown", wear: 0.4 }), PPM);
+    expect([...b.vertices]).toEqual([...a.vertices]);
+    expect([...b.indices]).toEqual([...a.indices]);
+  });
+
   it("keeps unmarked high-rise specs as one simple volume", () => {
     const building = spec({
       height: DETAILED_MASSING_MIN_HEIGHT_M * 2,
@@ -239,6 +315,21 @@ describe("extrudeBuilding", () => {
     });
     expect(describeBuildingMassing(building, PPM).volumes).toHaveLength(1);
     expect(extrudeBuilding(building, PPM)).toMatchObject({ vertexCount: 20, triangleCount: 10 });
+  });
+
+  it("lifts a mass onto its elevation base, walls from baseHeight to baseHeight + height", () => {
+    const lifted = extrudeBuilding(spec({ baseHeight: 30 }), PPM);
+    const heights = Array.from({ length: lifted.vertexCount }, (_, i) => vertexAt(lifted, i).height);
+    expect(Math.min(...heights)).toBe(30);
+    expect(Math.max(...heights)).toBe(70);
+    // The roof cap sits on top of the lifted mass, not on the ground.
+    for (let i = 0; i < 4; i++) expect(vertexAt(lifted, i).height).toBe(70);
+    expect(describeBuildingMassing(spec({ baseHeight: 30 }), PPM).volumes[0]).toMatchObject({
+      baseHeight: 30,
+      topHeight: 70
+    });
+    // A spec without an elevation keeps extruding from the ground.
+    expect(describeBuildingMassing(spec(), PPM).volumes[0]!.baseHeight).toBe(0);
   });
 
   it("describes deterministic contained two-tier massing for marked orthogonal towers", () => {

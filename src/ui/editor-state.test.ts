@@ -1,34 +1,50 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { GeneratePresetId, TerrainMode } from "./editor-state.js";
 import {
+  applyGeneratePreset,
   canvasTool,
   clearEditorActionError,
   closeEditor,
+  currentCoastEdge,
   currentCurvePreset,
   currentDistrictPalette,
+  currentDistrictPool,
   currentEditorActionError,
   currentHubMode,
   currentObjectCategory,
+  currentOpenSpaceProfile,
   currentRoadClass,
   currentRoadLayout,
+  currentSeed,
+  currentTerrainMode,
   currentWorkspace,
   districtSnapOptions,
   DISTRICT_TYPE_IDS,
   DISTRICT_TOOL,
   editorLayerActivated,
   editorLayerDeactivated,
+  GENERATE_PRESETS,
   isEditorOpen,
   notifyEditorInteraction,
   openEditor,
   ownedLayerName,
   ROAD_TOOL,
   setCanvasTool,
-  setEditorActionError,
+  setCoastEdge,
+  setDistrictPool,
   setDistrictSnapOptions,
   setDistrictPalette,
   setDistrictType,
+  setEditorActionError,
   setEditorController,
+  setHubMode,
   setObjectCategory,
+  setOpenSpaceProfile,
+  setRoadLayout,
+  setSeed,
+  setTerrainMode,
   setWorkspace,
+  TERRAIN_MODES,
   TOOL
 } from "./editor-state.js";
 
@@ -74,6 +90,13 @@ afterEach(() => {
   if (isEditorOpen()) closeEditor({ restoreDefaultLayer: false });
   setDistrictSnapOptions({ districtVertices: true, roadJunctions: true, blockBoundaries: true, foundryGrid: false });
   setDistrictType(DISTRICT_TYPE_IDS[0]);
+  setTerrainMode("rectangle");
+  setCoastEdge("west");
+  setDistrictPool(DISTRICT_TYPE_IDS);
+  setOpenSpaceProfile("medium");
+  setSeed("nixie-2");
+  setRoadLayout("european");
+  setHubMode("single-centre");
   setEditorController(null);
   vi.unstubAllGlobals();
 });
@@ -244,5 +267,126 @@ describe("session preferences", () => {
     expect(currentEditorActionError()).toEqual({ label: "district edit", message: "Locked district", affectedIds: ["d-1"] });
     clearEditorActionError();
     expect(currentEditorActionError()).toBeNull();
+  });
+});
+
+describe("Generate staging (Phase 4)", () => {
+  it("exposes the built-in Full City and Coastal presets with stable ids and labels", () => {
+    expect(GENERATE_PRESETS).toEqual([
+      { id: "full-city", label: "Full City" },
+      { id: "coastal", label: "Coastal" }
+    ]);
+  });
+
+  it("stages the terrain mode, rejects unknown values, and keeps it out of prefs", () => {
+    openEditor();
+    setWorkspace("generate");
+    expect(currentTerrainMode()).toBe("rectangle");
+    setTerrainMode("coastal");
+    expect(currentTerrainMode()).toBe("coastal");
+    setTerrainMode("custom");
+    expect(currentTerrainMode()).toBe("custom");
+    // Runtime-boundary probe: the setter must ignore out-of-union values.
+    setTerrainMode("bogus" as unknown as TerrainMode);
+    expect(currentTerrainMode()).toBe("custom");
+    expect(TERRAIN_MODES).toEqual(["rectangle", "coastal", "custom"]);
+    expect(JSON.parse(sessionStorage.getItem(PREFS_KEY)!)).not.toHaveProperty("terrainMode");
+  });
+
+  it("applies the Full City preset as complete valid staging without altering the seed", () => {
+    setSeed("hand-picked-seed");
+    setTerrainMode("custom");
+    setCoastEdge("east");
+    setRoadLayout("grid");
+    setHubMode("multiple-hubs");
+    setDistrictPool(["old-city"]);
+    setOpenSpaceProfile("none");
+    expect(applyGeneratePreset("full-city")).toBe(true);
+    expect(currentTerrainMode()).toBe("rectangle");
+    expect(currentCoastEdge()).toBe("east");
+    expect(currentRoadLayout()).toBe("european");
+    expect(currentHubMode()).toBe("single-centre");
+    expect(currentDistrictPool()).toEqual([...DISTRICT_TYPE_IDS]);
+    expect(currentOpenSpaceProfile()).toBe("medium");
+    expect(currentSeed()).toBe("hand-picked-seed");
+  });
+
+  it("applies the Coastal preset with coastal terrain, preserving the staged coast edge", () => {
+    setCoastEdge("north");
+    setRoadLayout("mixed");
+    setHubMode("multiple-hubs");
+    setDistrictPool(["old-city"]);
+    setOpenSpaceProfile("none");
+    expect(applyGeneratePreset("coastal")).toBe(true);
+    expect(currentTerrainMode()).toBe("coastal");
+    expect(currentCoastEdge()).toBe("north");
+    expect(currentRoadLayout()).toBe("european");
+    expect(currentHubMode()).toBe("single-centre");
+    expect(currentDistrictPool()).toEqual([...DISTRICT_TYPE_IDS]);
+    expect(currentOpenSpaceProfile()).toBe("medium");
+    expect(currentSeed()).toBe("nixie-2");
+  });
+
+  it("rejects an unknown preset id without changing staged settings", () => {
+    setTerrainMode("coastal");
+    setDistrictPool(["old-city"]);
+    // Runtime-boundary probe: unknown preset ids must be rejected without staging changes.
+    expect(applyGeneratePreset("bogus" as unknown as GeneratePresetId)).toBe(false);
+    expect(currentTerrainMode()).toBe("coastal");
+    expect(currentDistrictPool()).toEqual(["old-city"]);
+  });
+
+  it("keeps staged Generate fields out of persisted editor prefs", () => {
+    openEditor();
+    setWorkspace("generate");
+    applyGeneratePreset("coastal");
+    setTerrainMode("custom");
+    setCoastEdge("east");
+    setDistrictPool(["old-city", "waterfront"]);
+    setOpenSpaceProfile("low");
+    setSeed("hand-picked-seed");
+    const persisted = JSON.parse(sessionStorage.getItem(PREFS_KEY)!) as Record<string, unknown>;
+    expect(persisted).not.toHaveProperty("terrainMode");
+    expect(persisted).not.toHaveProperty("coastEdge");
+    expect(persisted).not.toHaveProperty("districtPool");
+    expect(persisted).not.toHaveProperty("openSpaceProfile");
+    expect(persisted).not.toHaveProperty("seed");
+  });
+
+  it("retains staged Generate settings across workspace switches and editor close", () => {
+    openEditor();
+    setWorkspace("generate");
+    setTerrainMode("coastal");
+    applyGeneratePreset("coastal");
+    setWorkspace("terrain");
+    expect(currentTerrainMode()).toBe("coastal");
+    expect(currentSeed()).toBe("nixie-2");
+    setWorkspace("generate");
+    expect(currentTerrainMode()).toBe("coastal");
+    expect(currentCoastEdge()).toBe("west");
+    closeEditor();
+    expect(currentTerrainMode()).toBe("coastal");
+    openEditor();
+    expect(currentTerrainMode()).toBe("coastal");
+  });
+
+  it("starts each browser session with default Generate staging", async () => {
+    openEditor();
+    setTerrainMode("coastal");
+    setCoastEdge("east");
+    setDistrictPool(["old-city"]);
+    setOpenSpaceProfile("high");
+    setSeed("session-seed");
+    // Test-only: a fresh module instance simulates a new browser session; a static import
+    // would keep reusing the mutated instance, so the module boundary must be exercised.
+    vi.resetModules();
+    const fresh = await import("./editor-state.js");
+    expect(fresh.currentTerrainMode()).toBe("rectangle");
+    expect(fresh.currentCoastEdge()).toBe("west");
+    expect(fresh.currentDistrictPool()).toEqual([...fresh.DISTRICT_TYPE_IDS]);
+    expect(fresh.currentOpenSpaceProfile()).toBe("medium");
+    expect(fresh.currentSeed()).toBe("nixie-2");
+    expect(fresh.currentRoadLayout()).toBe("european");
+    expect(fresh.currentHubMode()).toBe("single-centre");
   });
 });

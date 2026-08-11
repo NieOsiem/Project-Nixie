@@ -6,6 +6,7 @@ import {
   cancelTerrainDraft,
   clearDistrictSelection,
   clearRoadSelection,
+  generationActive,
   getDistrictSelection,
   getRoadSelection,
   redo,
@@ -26,6 +27,7 @@ import {
   WORKSPACE_META,
   type WorkspaceId
 } from "./editor-state.js";
+import { diagnosticsWarningActive } from "./workspaces/diagnostics.js";
 import { workspaceModule } from "./workspaces/index.js";
 import { escapeHTML } from "./workspaces/shared.js";
 import type { WorkspaceContext } from "./workspaces/types.js";
@@ -61,30 +63,37 @@ function workspaceContext(): WorkspaceContext {
 function shellHTML(): string {
   const activeWorkspace = currentWorkspace();
   const module = workspaceModule(activeWorkspace);
+  const busy = generationActive();
+  const warning = diagnosticsWarningActive();
   const tabs = WORKSPACE_IDS.map((id) => {
     const meta = WORKSPACE_META[id];
     const active = id === activeWorkspace ? " active" : "";
     const unavailable = meta.phase === null ? "" : " unavailable";
     const title = meta.phase === null ? meta.label : `${meta.label} (${meta.phase})`;
-    return `<button type="button" class="nixie-workspace${active}${unavailable}" data-action="workspace" data-workspace="${id}" title="${title}"><i class="${meta.icon}"></i><span>${meta.label}</span></button>`;
+    const badge = id === "diagnostics" && warning ? `<i class="nixie-warn-badge" title="Diagnostics need attention"></i>` : "";
+    return `<button type="button" class="nixie-workspace${active}${unavailable}" data-action="workspace" data-workspace="${id}" title="${title}"><i class="${meta.icon}"></i><span>${meta.label}</span>${badge}</button>`;
   }).join("");
-  const shelf = module.renderShelf();
-  const tray = module.renderTray();
+  // While full-city generation runs, every workspace's controls are locked, so the tray
+  // always shows the durable uninterruptible progress regardless of the active workspace.
+  const trayModule = busy ? workspaceModule("generate") : module;
+  const shelf = busy ? "" : module.renderShelf();
+  const tray = trayModule.renderTray();
   const actionError = currentEditorActionError();
   const error = actionError === null ? "" : `<section class="nixie-action-error" data-panel="action-error"><h3>${escapeHTML(actionError.label)} failed</h3><p>${escapeHTML(actionError.message)}</p>${actionError.affectedIds.length === 0 ? "" : `<p class="nixie-note">Affected IDs: ${actionError.affectedIds.map((id) => escapeHTML(id)).join(", ")}</p>`}</section>`;
-  const trayContent = actionError === null ? tray : error;
+  const trayContent = busy ? tray : actionError === null ? tray : error;
+  const trayIsGenerate = busy || activeWorkspace === "generate";
   return `<header class="nixie-workspace-bar">
     <div class="nixie-brand"><i class="fa-solid fa-city"></i><span>NIXIE</span></div>
     <nav class="nixie-workspaces">${tabs}</nav>
     <div class="nixie-shell-actions">
-      <button type="button" data-action="undo"${canUndo() ? "" : " disabled"} title="Undo city edit"><i class="fa-solid fa-rotate-left"></i></button>
-      <button type="button" data-action="redo"${canRedo() ? "" : " disabled"} title="Redo city edit"><i class="fa-solid fa-rotate-right"></i></button>
+      <button type="button" data-action="undo"${canUndo() && !busy ? "" : " disabled"} title="Undo city edit"><i class="fa-solid fa-rotate-left"></i></button>
+      <button type="button" data-action="redo"${canRedo() && !busy ? "" : " disabled"} title="Redo city edit"><i class="fa-solid fa-rotate-right"></i></button>
       <span class="nixie-shell-sep"></span>
       <button type="button" data-action="close-editor" title="Close the Nixie editor"><i class="fa-solid fa-xmark"></i></button>
     </div>
   </header>
   ${shelf === "" ? "" : `<div class="nixie-tool-shelf">${shelf}</div>`}
-  ${trayContent === "" ? "" : `<div class="nixie-context-tray${activeWorkspace === "generate" && actionError === null ? " nixie-tray-generate" : ""}">${trayContent}</div>`}`;
+  ${trayContent === "" ? "" : `<div class="nixie-context-tray${trayIsGenerate ? " nixie-tray-generate" : ""}">${trayContent}</div>`}`;
 }
 
 let cachedClass: any = null;
@@ -122,6 +131,9 @@ function editorShellClass(): any {
 
     _onRender(): void {
       workspaceModule(currentWorkspace()).onRender(this.element as HTMLElement, workspaceContext());
+      // Full-city generation lockout: the workspace bar, shelf, and tray are inert; only
+      // Close stays available (see .nixie-editor.busy). Generation itself survives closing.
+      this.element.classList.toggle("busy", generationActive());
     }
 
     async _onClose(options: any): Promise<void> {

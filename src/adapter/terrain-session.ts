@@ -90,8 +90,11 @@ export class TerrainSession {
   }
 
   publishCreation(saved: CityStateV3): void {
-    if (this.#status.kind !== "absent" && this.#status.kind !== "legacy") {
-      throw new Error("City creation requires an absent or legacy Scene state.");
+    // WHY: Creation only ever follows an explicit clear of the city flag; direct
+    // replacement of legacy data is no longer a supported path. The cleared Scene is
+    // the post-clear baseline: empty history, no prior revision to reconcile.
+    if (this.#status.kind !== "absent") {
+      throw new Error("City creation requires a cleared Scene state.");
     }
     this.#assertSaved(saved, 1);
     this.#publish(saved);

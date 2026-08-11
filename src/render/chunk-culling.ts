@@ -10,6 +10,10 @@ export interface ChunkGeometry {
   neon?: MeshBuffers;
   /** Culling bounds in WORLD PIXELS, already including any building overhang. */
   boundsPx: Rect;
+  /** Semantic counts carried for renderer statistics. Optional so whole-city geometry stays minimal. */
+  buildingCount?: number;
+  landmarkCount?: number;
+  openSpaceCount?: number;
 }
 
 /** All culling needs. Both `ChunkGeometry` and the renderer's live chunks satisfy it. */

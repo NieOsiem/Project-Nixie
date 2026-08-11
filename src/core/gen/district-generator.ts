@@ -4,6 +4,7 @@ import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictSource } from "./
 import { validateDistrictCandidates } from "./district-edit.js";
 import { buildDistrictPlan, type DerivedBlock } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "./district-registry.js";
+import { LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarId } from "./landmark-registry.js";
 import { validateRing } from "./terrain.js";
 
 export interface DistrictGenerationAvailability {
@@ -294,4 +295,84 @@ export function generateInitialDistricts(source: CitySourceV3): DistrictSource[]
   validateDistrictCandidates({ ...source, districts }, districts);
   buildDistrictPlan({ ...source, districts });
   return districts;
+}
+
+/** A major landmark site reserved before roads, with the grammar that will occupy it. */
+export interface ReservedLandmarkRequirement {
+  grammarId: LandmarkGrammarId;
+  sitePolygon: Ring;
+}
+
+function pointInRing(point: Vec2, ring: Ring): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i]!;
+    const b = ring[j]!;
+    const crosses = a.y > point.y !== b.y > point.y &&
+      point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Post-generation assignment used by full generation: every district containing a reserved
+ * major landmark site centroid is given a district type (from the enabled pool) whose
+ * compatibility tags satisfy every contained reservation — non-empty tag intersection per
+ * grammar, matching `landmarkFitsDistrict`. District id/seed/geometry are preserved; the
+ * palette is updated to the new type's default. The choice among several fitting types is a
+ * deterministic labelled-seed pick. If no single enabled type satisfies a multi-site
+ * conflict, the original type is kept as deterministic contrast and a warning is returned.
+ */
+export function assignLandmarkCompatibleDistrictTypes(
+  districts: readonly DistrictSource[],
+  requirements: readonly ReservedLandmarkRequirement[],
+  pool: readonly DistrictTypeId[],
+  seed: string
+): { districts: DistrictSource[]; warnings: string[] } {
+  if (requirements.length === 0) return { districts: [...districts], warnings: [] };
+  const poolSet = new Set(pool);
+  const requiredByDistrict = new Map<string, LandmarkGrammarId[]>();
+  for (const requirement of requirements) {
+    const definition = LANDMARK_GRAMMAR_REGISTRY.get(requirement.grammarId);
+    if (!definition) continue;
+    const centroid = ringCentroid(requirement.sitePolygon);
+    const district = districts.find((candidate) => pointInRing(centroid, candidate.polygon));
+    if (!district) continue;
+    const current = requiredByDistrict.get(district.id) ?? [];
+    current.push(requirement.grammarId);
+    requiredByDistrict.set(district.id, current);
+  }
+  const warnings: string[] = [];
+  const assigned = districts.map((district) => {
+    const required = requiredByDistrict.get(district.id);
+    if (!required || required.length === 0) return district;
+    const fits = (typeId: DistrictTypeId): boolean => {
+      const definition = DISTRICT_TYPE_REGISTRY.get(typeId);
+      if (!definition) return false;
+      return required.every((grammarId) => {
+        const grammar = LANDMARK_GRAMMAR_REGISTRY.get(grammarId)!;
+        return grammar.compatibilityTags.some((tag) => definition.compatibilityTags.includes(tag));
+      });
+    };
+    if (fits(district.typeId)) return district;
+    const candidates = [...poolSet].filter((typeId) => typeId !== district.typeId && fits(typeId)).sort();
+    if (candidates.length === 0) {
+      warnings.push(
+        `District "${district.id}" cannot host landmark reservation(s) ${[...new Set(required)].sort().join(", ")} with any enabled district type; kept as deterministic contrast.`
+      );
+      return district;
+    }
+    let best = candidates[0]!;
+    let bestValue = -1;
+    for (const typeId of candidates) {
+      const value = hashUnit(`${seed}/landmarks/v3/district-type/${district.id}/${typeId}`);
+      if (value > bestValue) {
+        bestValue = value;
+        best = typeId;
+      }
+    }
+    return { ...district, typeId: best, paletteId: DISTRICT_TYPE_REGISTRY.get(best)!.defaultPaletteId };
+  });
+  return { districts: assigned, warnings };
 }

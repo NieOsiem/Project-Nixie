@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
 import type { CityStateV3 } from "../core/gen/city.js";
-import { loadCityState, saveCityState } from "./documents.js";
+import { cityFlagIdentity, clearCityState, loadCityState, saveCityState } from "./documents.js";
 
 let stored: unknown;
 let setFlag: ReturnType<typeof vi.fn>;
+let unsetFlag: ReturnType<typeof vi.fn>;
 
 function installScene(flag: unknown, write: (value: unknown) => Promise<void> = async (value) => {
   stored = value;
@@ -14,13 +15,17 @@ function installScene(flag: unknown, write: (value: unknown) => Promise<void> = 
   setFlag = vi.fn(async (_module: string, key: string, value: unknown) => {
     if (key === FLAG_CITY) await write(value);
   });
-  (globalThis as any).canvas = {
+  unsetFlag = vi.fn(async (_module: string, key: string) => {
+    if (key === FLAG_CITY) stored = undefined;
+  });
+  vi.stubGlobal("canvas", {
     scene: {
       getFlag: (module: string, key: string) => (module === MODULE_ID && key === FLAG_CITY ? stored : undefined),
-      setFlag
+      setFlag,
+      unsetFlag
     }
-  };
-  (globalThis as any).game = { user: { isGM: true } };
+  });
+  vi.stubGlobal("game", { user: { isGM: true } });
 }
 
 function schemaOne(revision = 1): Record<string, unknown> {
@@ -42,6 +47,30 @@ function schemaOne(revision = 1): Record<string, unknown> {
         ],
         urbanFootprint: null
       }
+    }
+  };
+}
+
+function schemaTwo(revision = 4): Record<string, unknown> {
+  return {
+    kind: "city-generator-2",
+    schemaVersion: 2,
+    generatorVersion: 9,
+    revision,
+    source: {
+      origin: { x: 5000, y: 4000 },
+      citySeed: "phase2-seed",
+      generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "european", hubMode: "single-centre" },
+      terrain: {
+        land: [
+          { x: -100, y: -80 },
+          { x: 100, y: -80 },
+          { x: 100, y: 80 },
+          { x: -100, y: 80 }
+        ],
+        urbanFootprint: null
+      },
+      roads: { nodes: [], routes: [], edges: [] }
     }
   };
 }
@@ -99,8 +128,7 @@ const roads = {
 };
 
 afterEach(() => {
-  delete (globalThis as any).canvas;
-  delete (globalThis as any).game;
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -116,44 +144,89 @@ describe("loadCityState", () => {
     expect(loadCityState()).toEqual({ kind: "legacy", raw });
   });
 
-  it("migrates schema 1 in memory without writing and adds empty roads", () => {
+  it("classifies schema 1 / generator 8 as obsolete-precomplete without decoding or writing", () => {
     const raw = schemaOne(7);
     installScene(raw);
     const result = loadCityState();
     expect(setFlag).not.toHaveBeenCalled();
-    expect(result.kind).toBe("supported");
-    if (result.kind === "supported") {
-      const source = raw.source as any;
-      expect(result.state.schemaVersion).toBe(3);
-      expect(result.state.generatorVersion).toBe(10);
-      expect(result.state.revision).toBe(7);
-      expect(result.state.source.origin).toEqual(source.origin);
-      expect(result.state.source.citySeed).toBe(source.citySeed);
-      expect(result.state.source.terrain).toEqual(source.terrain);
-      expect(result.state.source.roads).toEqual({ nodes: [], routes: [], edges: [] });
-      expect(result.migratedFrom).toEqual({ schemaVersion: 1, generatorVersion: 8, revision: 7 });
-    }
+    expect(result).toEqual({
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: 1,
+      generatorVersion: 8,
+      revision: 7
+    });
+  });
+
+  it("classifies schema 2 / generator 9 as obsolete-precomplete without decoding or writing", () => {
+    const raw = schemaTwo(9);
+    installScene(raw);
+    const result = loadCityState();
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: 2,
+      generatorVersion: 9,
+      revision: 9
+    });
+  });
+
+  it("classifies schema 3 / generator 10 as obsolete-precomplete and preserves raw data", () => {
+    const raw = { ...state(3, roads), generatorVersion: 10 };
+    installScene(raw);
+    const result = loadCityState();
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: 3,
+      generatorVersion: 10,
+      revision: 3
+    });
+  });
+
+  it("keeps obsolete raw data untouched even when its payload is not current-schema decodable", () => {
+    const raw = { ...schemaOne(2), source: { land: "garbage" } };
+    installScene(raw);
+    const result = loadCityState();
+    expect(result).toEqual({
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: 1,
+      generatorVersion: 8,
+      revision: 2
+    });
   });
 
   it("round-trips schema 3 road fields and IDs", () => {
     const raw = state(3, roads);
     installScene(raw);
     const result = loadCityState();
-    expect(result).toEqual({ kind: "supported", state: raw });
+    expect(result).toEqual({ kind: "supported", state: raw, raw });
   });
 
-  it("rejects future schemas and unsupported generators without writing", () => {
+  it("rejects future schemas and unknown generator versions without writing", () => {
     const future = { ...state(), schemaVersion: 4 };
     installScene(future);
     expect(loadCityState()).toEqual({ kind: "unsupported", raw: future, schemaVersion: 4 });
 
-    const unsupported = { ...state(), generatorVersion: 11 };
-    installScene(unsupported);
+    const futureGenerator = { ...state(), generatorVersion: 12 };
+    installScene(futureGenerator);
     expect(loadCityState()).toEqual({
       kind: "unsupported",
-      raw: unsupported,
+      raw: futureGenerator,
       schemaVersion: CITY_SCHEMA_VERSION,
-      generatorVersion: 11
+      generatorVersion: 12
+    });
+
+    const unknownSchemaOneGenerator = { ...schemaOne(), generatorVersion: 7 };
+    installScene(unknownSchemaOneGenerator);
+    expect(loadCityState()).toEqual({
+      kind: "unsupported",
+      raw: unknownSchemaOneGenerator,
+      schemaVersion: 1,
+      generatorVersion: 7
     });
   });
 
@@ -162,8 +235,13 @@ describe("loadCityState", () => {
     installScene(metadata);
     expect(loadCityState()).toMatchObject({ kind: "malformed", raw: metadata });
 
-    const malformed = state(1, roads);
-    (malformed.source.roads.edges[0] as any).classId = "unknown";
+    const malformed = {
+      ...state(1, roads),
+      source: {
+        ...state(1, roads).source,
+        roads: { ...roads, edges: [{ ...roads.edges[0], classId: "unknown" }] }
+      }
+    };
     installScene(malformed);
     expect(loadCityState()).toMatchObject({ kind: "malformed", raw: malformed });
   });
@@ -214,38 +292,44 @@ describe("saveCityState", () => {
     expect(stored).toEqual(candidate);
   });
 
-  it("writes schema 3 revision plus one on the first edit to migrated schema 1", async () => {
-    const raw = schemaOne(4);
-    installScene(raw);
+  it("writes the guarded revision plus one over a supported city", async () => {
+    const current = state(4, roads);
+    installScene(current);
     const candidate = state(5, roads);
-    await expect(
-      saveCityState(candidate, { kind: "migrated-schema-1", revision: 4 })
-    ).resolves.toEqual(candidate);
+    await expect(saveCityState(candidate, 4)).resolves.toEqual(candidate);
+    expect(setFlag).toHaveBeenCalledOnce();
     expect(stored).toEqual(candidate);
   });
 
-  it("does not let schema-1 and schema-2 expectations satisfy each other", async () => {
-    const migrated = schemaOne(4);
-    installScene(migrated);
-    await expect(saveCityState(state(5), 4)).rejects.toThrow(/revision/i);
-    expect(setFlag).not.toHaveBeenCalled();
-    expect(stored).toBe(migrated);
-
-    const current = state(4);
+  it("guards a revision-1 save against an existing supported Scene", async () => {
+    const current = state(4, roads);
     installScene(current);
-    await expect(
-      saveCityState(state(5), { kind: "migrated-schema-1", revision: 4 })
-    ).rejects.toThrow(/migrated/i);
+    await expect(saveCityState(state(1), "absent")).rejects.toThrow(/creation|appeared/i);
     expect(setFlag).not.toHaveBeenCalled();
     expect(stored).toBe(current);
   });
 
-  it("rejects stale migration writes and leaves raw schema 1 untouched", async () => {
-    const raw = schemaOne(4);
-    installScene(raw);
-    await expect(saveCityState(state(5), 3)).rejects.toThrow(/revision/i);
+  it("refuses every save against an obsolete-precomplete flag and leaves raw data untouched", async () => {
+    const rawSchemaOne = schemaOne(4);
+    installScene(rawSchemaOne);
+    await expect(saveCityState(state(1), "absent")).rejects.toThrow(/creation/i);
     expect(setFlag).not.toHaveBeenCalled();
-    expect(stored).toBe(raw);
+    expect(stored).toBe(rawSchemaOne);
+
+    const rawSchemaTwo = schemaTwo(4);
+    installScene(rawSchemaTwo);
+    await expect(saveCityState(state(5), 4)).rejects.toThrow(/revision/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(rawSchemaTwo);
+    expect(rawSchemaTwo.schemaVersion).toBe(2);
+    expect(rawSchemaTwo.generatorVersion).toBe(9);
+
+    const rawSchemaThree = { ...state(4), generatorVersion: 10 };
+    installScene(rawSchemaThree);
+    await expect(saveCityState(state(5), 4)).rejects.toThrow(/revision/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(rawSchemaThree);
+    expect(stored).toEqual(expect.objectContaining({ generatorVersion: 10 }));
   });
 
   it("rejects malformed or unsupported flags without writing", async () => {
@@ -264,5 +348,89 @@ describe("saveCityState", () => {
     await expect(saveCityState(state(), "absent")).rejects.toThrow("write failed");
     expect(setFlag).toHaveBeenCalledOnce();
     expect(stored).toBeUndefined();
+  });
+});
+
+describe("clearCityState", () => {
+  it("is an idempotent no-op when the Scene is already absent", async () => {
+    installScene(undefined);
+    await clearCityState("absent");
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(loadCityState()).toEqual({ kind: "absent" });
+  });
+
+  it("clears legacy data only with a matching confirmation", async () => {
+    const legacy = { formatVersion: 4 };
+    installScene(legacy);
+    await expect(clearCityState("absent")).rejects.toThrow(/appeared/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(legacy);
+
+    await clearCityState({ kind: "legacy", identity: cityFlagIdentity(legacy) });
+    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(loadCityState()).toEqual({ kind: "absent" });
+  });
+
+  it("clears obsolete-precomplete flags only at the confirmed revision", async () => {
+    const raw = schemaOne(6);
+    installScene(raw);
+    await expect(clearCityState({ kind: "obsolete-precomplete", revision: 5, identity: cityFlagIdentity(raw) })).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(raw);
+
+    await clearCityState({ kind: "obsolete-precomplete", revision: 6, identity: cityFlagIdentity(raw) });
+    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(loadCityState()).toEqual({ kind: "absent" });
+  });
+
+  it("clears supported cities only at the exact revision", async () => {
+    const current = state(7, roads);
+    installScene(current);
+    await expect(clearCityState({ kind: "supported", revision: 6, identity: cityFlagIdentity(current) })).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(current);
+
+    await clearCityState({ kind: "supported", revision: 7, identity: cityFlagIdentity(current) });
+    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(loadCityState()).toEqual({ kind: "absent" });
+  });
+
+  it("rejects a different legacy payload with the same confirmation kind", async () => {
+    const legacyA = { formatVersion: 4, label: "A" };
+    installScene(legacyA);
+    const pin = { kind: "legacy" as const, identity: cityFlagIdentity(legacyA) };
+    // The legacy payload is replaced while the confirmation is pending.
+    const legacyB = { formatVersion: 4, label: "B", graph: { nodes: [] } };
+    installScene(legacyB);
+    await expect(clearCityState(pin)).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(legacyB);
+  });
+
+  it("rejects a different supported source at the same confirmed revision", async () => {
+    const cityA = state(7, roads);
+    installScene(cityA);
+    const pin = { kind: "supported" as const, revision: 7, identity: cityFlagIdentity(cityA) };
+    // A different city is written at the same revision while the confirmation is pending.
+    const cityB = { ...state(7, roads), source: { ...state(7, roads).source, citySeed: "different-source" } };
+    installScene(cityB);
+    await expect(clearCityState(pin)).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(cityB);
+  });
+
+  it("never clears unsupported or malformed flags", async () => {
+    const unsupported = { ...state(), generatorVersion: 12 };
+    installScene(unsupported);
+    await expect(clearCityState({ kind: "legacy", identity: "x" })).rejects.toThrow(/changed/i);
+    await expect(clearCityState({ kind: "supported", revision: 1, identity: "x" })).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(unsupported);
+
+    const malformed = { ...state(), source: { ...state().source, roads: { nodes: [], routes: [{ id: "orphan", curvePreset: "tight" }], edges: [] } } };
+    installScene(malformed);
+    await expect(clearCityState({ kind: "legacy", identity: "x" })).rejects.toThrow(/changed/i);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(malformed);
   });
 });

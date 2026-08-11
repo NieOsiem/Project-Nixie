@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import { migrateSchema2ToSchema3, type CitySourceV2, type CityStateV3 } from "../core/gen/city.js";
+import type { CityStateV3 } from "../core/gen/city.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { loadCityState, replaceGeneratedWalls, saveCityState } from "./documents.js";
 
@@ -39,7 +39,27 @@ function schema2(revision = 3): Record<string, unknown> {
 }
 
 function schema3(revision = 1): CityStateV3 {
-  return migrateSchema2ToSchema3(schema2(revision).source as CitySourceV2, revision);
+  return {
+    kind: "city-generator-2",
+    schemaVersion: CITY_SCHEMA_VERSION,
+    generatorVersion: GENERATOR_VERSION,
+    revision,
+    source: {
+      origin: { x: 5000, y: 4000 },
+      citySeed: "documents-phase3",
+      generation: {
+        terrainMode: "rectangle",
+        coastEdge: null,
+        roadLayout: "european",
+        hubMode: "single-centre",
+        districtPool: [...DISTRICT_TYPE_IDS],
+        openSpaceProfile: "medium"
+      },
+      terrain: { land: rectangleLand({ x: -100, y: -80, width: 200, height: 160 }), urbanFootprint: null },
+      roads: { nodes: [], routes: [], edges: [] },
+      districts: []
+    }
+  };
 }
 
 function validDistrict(): CityStateV3["source"]["districts"][number] {
@@ -65,20 +85,28 @@ afterEach(() => {
 });
 
 describe("Phase 3 Scene persistence", () => {
-  it("migrates schema 2 in memory without an open-time write", () => {
+  it("classifies schema 2 / generator 9 as obsolete-precomplete without an open-time write", () => {
     const raw = schema2(7);
     installScene(raw);
     const result = loadCityState();
     expect(setFlag).not.toHaveBeenCalled();
-    expect(result.kind).toBe("supported");
-    if (result.kind === "supported") {
-      expect(result.state.schemaVersion).toBe(CITY_SCHEMA_VERSION);
-      expect(result.state.generatorVersion).toBe(GENERATOR_VERSION);
-      expect(result.state.revision).toBe(7);
-      expect(result.state.source.generation.districtPool).toEqual(DISTRICT_TYPE_IDS);
-      expect(result.state.source.districts).toEqual([]);
-      expect(result.migratedFrom).toEqual({ schemaVersion: 2, generatorVersion: 9, revision: 7 });
-    }
+    expect(result).toEqual({
+      kind: "obsolete-precomplete",
+      raw,
+      schemaVersion: 2,
+      generatorVersion: 9,
+      revision: 7
+    });
+  });
+
+  it("refuses a schema-3 save over an obsolete schema-2 flag and leaves it untouched", async () => {
+    const raw = schema2(4);
+    installScene(raw);
+    await expect(saveCityState(schema3(5), 4)).rejects.toThrow(/revision/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(raw);
+    expect(raw.schemaVersion).toBe(2);
+    expect(raw.generatorVersion).toBe(9);
   });
 
   it("round-trips district source fields without persisting derived objects", () => {
@@ -100,7 +128,7 @@ describe("Phase 3 Scene persistence", () => {
     }];
     installScene(state);
     const result = loadCityState();
-    expect(result).toEqual({ kind: "supported", state });
+    expect(result).toEqual({ kind: "supported", state, raw: state });
     expect(Object.keys(state.source)).not.toEqual(expect.arrayContaining(["blocks", "developmentCells", "openSpaceIntents", "wallCells"]));
   });
 
@@ -122,28 +150,6 @@ describe("Phase 3 Scene persistence", () => {
     }];
     installScene(state);
     expect(loadCityState()).toMatchObject({ kind: "malformed", raw: state });
-  });
-
-  it("writes the first schema-3 edit with a guarded schema-2 migration expectation", async () => {
-    const raw = schema2(4);
-    installScene(raw);
-    const candidate = schema3(5);
-    await expect(saveCityState(candidate, { kind: "migrated-schema-2", revision: 4 })).resolves.toEqual(candidate);
-    expect(setFlag).toHaveBeenCalledOnce();
-    expect(stored).toEqual(candidate);
-  });
-
-  it("leaves a migrated schema-2 flag unchanged when the first save is rejected", async () => {
-    const raw = schema2(4);
-    installScene(raw);
-    setFlag.mockImplementationOnce(async () => {
-      throw new Error("setFlag rejected");
-    });
-    await expect(saveCityState(schema3(5), { kind: "migrated-schema-2", revision: 4 })).rejects.toThrow("setFlag rejected");
-    expect(setFlag).toHaveBeenCalledOnce();
-    expect(stored).toBe(raw);
-    expect(raw.schemaVersion).toBe(2);
-    expect(raw.generatorVersion).toBe(9);
   });
 
   it.each([

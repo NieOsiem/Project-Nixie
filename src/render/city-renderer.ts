@@ -61,6 +61,12 @@ interface LiveChunk {
   mesh: CityMesh;
   detail: CityMesh | null;
   neon: NeonMesh | null;
+  buildingCount: number;
+  landmarkCount: number;
+  openSpaceCount: number;
+  /** Copied off the buffers at install time; CityMesh only keeps triangleCount. */
+  meshVertexCount: number;
+  detailVertexCount: number;
 }
 
 /**
@@ -342,7 +348,18 @@ export class CityRenderer {
       this.#neonContent.addChild(neon.display);
     }
 
-    this.#chunks.set(chunk.id, { id: chunk.id, boundsPx: chunk.boundsPx, mesh, detail, neon });
+    this.#chunks.set(chunk.id, {
+      id: chunk.id,
+      boundsPx: chunk.boundsPx,
+      mesh,
+      detail,
+      neon,
+      buildingCount: chunk.buildingCount ?? 0,
+      landmarkCount: chunk.landmarkCount ?? 0,
+      openSpaceCount: chunk.openSpaceCount ?? 0,
+      meshVertexCount: chunk.mesh.vertexCount,
+      detailVertexCount: chunk.detail?.vertexCount ?? 0
+    });
     this.#contentDirty = true;
   }
 
@@ -469,7 +486,7 @@ export class CityRenderer {
     // WHY: neon depth-tests against the opaque pass, so every chunk's buildings must have
     // written depth first — drawing a chunk's glow before a later chunk's walls shows it
     // through them. `clear:false` skips the clear entirely, so that depth survives.
-    if (this.#neonContent.children.length > 0) {
+    if (this.#visibleNeonTriangles > 0) {
       this.#renderer.render(this.#neonContent, { renderTexture: this.#target, clear: false });
     }
 
@@ -587,9 +604,17 @@ export class CityRenderer {
   stats(): Record<string, unknown> {
     let trianglesTotal = 0;
     let detailTrianglesTotal = 0;
+    let verticesTotal = 0;
+    let buildings = 0;
+    let landmarks = 0;
+    let openSpaces = 0;
     for (const chunk of this.#chunks.values()) {
       trianglesTotal += chunk.mesh.triangleCount;
       detailTrianglesTotal += chunk.detail?.triangleCount ?? 0;
+      verticesTotal += chunk.meshVertexCount + chunk.detailVertexCount;
+      buildings += chunk.buildingCount;
+      landmarks += chunk.landmarkCount;
+      openSpaces += chunk.openSpaceCount;
     }
     return {
       renderCount: this.#renderCount,
@@ -612,6 +637,10 @@ export class CityRenderer {
       neonTriangles: this.#visibleNeonTriangles,
       trianglesTotal: trianglesTotal + detailTrianglesTotal,
       detailTrianglesTotal,
+      verticesTotal,
+      buildings,
+      landmarks,
+      openSpaces,
       bloom: this.#bloom.bloomEnabled,
       bloomStrength: this.#bloomStrength,
       rainStrength: this.#rainStrength,

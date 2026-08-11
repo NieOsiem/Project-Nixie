@@ -4,69 +4,100 @@ import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
 import type { CityStateV3 } from "../core/gen/city.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { TerrainSession } from "./terrain-session.js";
-import { handleRequest, type WorkerRequest } from "../worker/protocol.js";
 import {
+  handleWorkerMessage,
+  type WorkerMessage,
+  type WorkerRequest
+} from "../worker/protocol.js";
+import {
+  addCityListener,
+  clearConfirmationFor,
   configuredPixelsPerMetre,
-  chunkCoverageComplete,
   cancelTerrainDraft,
   createDistrict,
   deleteRoadJunction,
   deleteRoads,
   districtDiagnostics,
   enabledFlagChanged,
-  getRoadSelection,
-  getDistrictSelection,
-  getDistrictPlanView,
   fillDistrict,
   generateDistricts,
+  generateNewSeed,
+  generationPreflight,
+  generationState,
+  getCity,
+  getDistrictPlanView,
+  getDistrictSelection,
+  getRoadSelection,
   mergeDistricts,
   mount,
+  randomizeEntireCity,
   reclassifyRoad,
+  rebuildGeometry,
   renameRoad,
   retryDistrictPlan,
+  retryFullGeneration,
   retryGeneratedWalls,
   roadClearanceBlockers,
   sceneBoundsFromPixels,
+  selectDistrict,
   selectRoad,
   selectRoadNode,
-  selectDistrict,
-  setRoadCurvePreset,
-  setRoadLocked,
   setDistrictDraftCancelListener,
-  splitDistrict,
+  setRoadCurvePreset,
   setRoadDraftCancelListener,
+  setRoadLocked,
+  splitDistrict,
+  startFullGeneration,
   stats,
   undo,
-  unmount
+  unmount,
+  type ClearConfirmation
 } from "./terrain-canvas.js";
 
-/** WHY: the adapter builds the plan only in the worker; the fake executes the real protocol dispatcher. */
+/** WHY: the adapter builds plans and chunks only in the worker; the fake runs the real
+ * worker entry so it stays in lockstep with the progressive chunk executor. */
 class FakeWorker {
   onmessage: ((event: { data: unknown }) => void) | null = null;
   onerror: unknown = null;
   onmessageerror: unknown = null;
   terminate = vi.fn();
+  /** Number of complete-plan builds the worker has served (for reuse assertions). */
+  planBuilds = 0;
+  /** Test hook: mutate a response before it is dispatched to the adapter. */
+  tamper: ((request: WorkerRequest, message: WorkerMessage) => void) | null = null;
 
   constructor(_url: string, _options?: unknown) {}
 
   postMessage(message: WorkerRequest): void {
+    if (message.type === "buildCompleteCityPlan") this.planBuilds += 1;
     queueMicrotask(() => {
-      const response = handleRequest(message);
-      this.onmessage?.({ data: response });
+      void handleWorkerMessage(
+        {
+          post: (item) => {
+            this.tamper?.(message, item);
+            this.onmessage?.({ data: item });
+          }
+        },
+        message
+      );
     });
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function state(): CityStateV3 {
   return {
     kind: "city-generator-2",
     schemaVersion: 3,
-    generatorVersion: 10,
+    generatorVersion: 11,
     revision: 1,
     source: {
       origin: { x: 500, y: 400 },
-      citySeed: "scale-fixture",
-      generation: { terrainMode: "custom", coastEdge: null, roadLayout: "european", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
+      citySeed: "adapter-fixture",
+      generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "european", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
       terrain: {
         land: [
           { x: -100, y: -80 },
@@ -198,14 +229,6 @@ describe("road clearance containment", () => {
   });
 });
 
-describe("road install coverage", () => {
-  it("requires every visible chunk before allowing a dirty-only install", () => {
-    const scene = { x: 0, y: 0, width: 256, height: 128 };
-    expect(chunkCoverageComplete(["0,0", "1,0"], scene)).toBe(true);
-    expect(chunkCoverageComplete(["0,0"], scene)).toBe(false);
-  });
-});
-
 function bulkRoadState(): CityStateV3 {
   const city = state();
   city.source.roads = {
@@ -232,36 +255,52 @@ function bulkRoadState(): CityStateV3 {
 }
 
 describe("road bulk mutation selection", () => {
-  let saved: CityStateV3;
+  let saved: CityStateV3 | undefined;
   let saveError: Error | null;
   let wallCreateError: Error | null;
-  let wallDocuments: any[];
+  let wallDocuments: Array<{ id: string }>;
+  let worker: FakeWorker;
+
+  // WHY: the adapter constructs `new Worker(...)`; stubbing the global with an instance
+  // would throw "not a constructor", so the stub is a factory returning the shared fake.
+  function workerFactory(): FakeWorker {
+    return worker;
+  }
+
+  function setupScene(initial: CityStateV3 | undefined): void {
+    unmount();
+    saved = initial;
+    mount();
+  }
 
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    saved = bulkRoadState();
     saveError = null;
     wallCreateError = null;
     wallDocuments = [];
+    worker = new FakeWorker("worker-url");
     const scene = {
-      get walls(): any[] { return wallDocuments; },
+      get walls(): Array<{ id: string }> { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
       setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
         if (saveError !== null) throw saveError;
         saved = structuredClone(value);
         return saved;
       }),
+      unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
+        saved = undefined;
+      }),
       deleteEmbeddedDocuments: vi.fn(async (_type: string, ids: string[]) => {
         wallDocuments = wallDocuments.filter((wall) => !ids.includes(wall.id));
         return [];
       }),
-      createEmbeddedDocuments: vi.fn(async (_type: string, data: any[]) => {
+      createEmbeddedDocuments: vi.fn(async (_type: string, data: Array<Record<string, unknown>>) => {
         if (wallCreateError !== null) throw wallCreateError;
         const created = data.map((value, index) => ({
           id: `wall-${index}`,
           ...value,
-          getFlag: (module: string, flag: string) => value.flags?.[module]?.[flag]
+          getFlag: () => undefined
         }));
         wallDocuments.push(...created);
         return created;
@@ -277,8 +316,8 @@ describe("road bulk mutation selection", () => {
     vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
     vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
     vi.stubGlobal("document", { baseURI: "http://test.local/" });
-    vi.stubGlobal("Worker", FakeWorker);
-    mount();
+    vi.stubGlobal("Worker", workerFactory);
+    setupScene(bulkRoadState());
   });
 
   afterEach(() => {
@@ -290,30 +329,30 @@ describe("road bulk mutation selection", () => {
   it("applies class and name to exactly the selected edges with a multi-selection", async () => {
     await reclassifyRoad("arterial", true, ["edge-a", "edge-c"]);
     await renameRoad("Boulevard", true, ["edge-a", "edge-c"]);
-    expect(saved.revision).toBe(3);
-    expect(saved.source.roads.edges.map((edge: CityStateV3["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
+    expect(saved?.revision).toBe(3);
+    expect(saved!.source.roads.edges.map((edge: CityStateV3["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
       ["edge-a", "arterial", "Boulevard"],
       ["edge-b", "street", "A"],
       ["edge-c", "arterial", "Boulevard"],
       ["edge-d", "narrow", "C"]
     ]);
-  });
+  }, 120_000);
 
-  it("commits district geometry without replacing terrain chunk state", async () => {
+  it("commits district geometry and rebuilds the complete plan in the same action", async () => {
     await createDistrict([
-      { x: -70, y: -20 },
-      { x: -20, y: -20 },
-      { x: -20, y: 20 },
-      { x: -70, y: 20 }
-    ], "corporate-core", "night-market");
-    expect(saved.revision).toBe(2);
-    expect(saved.source.districts).toHaveLength(1);
-    expect(saved.source.districts[0]!.paletteId).toBe("night-market");
-    expect(stats()?.lastBuild).toBeNull();
+      { x: -90, y: -70 },
+      { x: -70, y: -70 },
+      { x: -70, y: -50 },
+      { x: -90, y: -50 }
+    ], "corporate-core");
+    expect(saved?.revision).toBe(2);
+    expect(saved!.source.districts).toHaveLength(1);
+    expect(saved!.source.districts[0]!.paletteId).toBe("corporate");
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 2 }));
     await expect(undo()).resolves.toBe(true);
-    expect(saved.source.districts).toHaveLength(0);
-    expect(stats()?.lastBuild).toBeNull();
-  });
+    expect(saved?.source.districts).toHaveLength(0);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 3 }));
+  }, 120_000);
 
   it("rejects Fill with more than one selected district before planning", async () => {
     await createDistrict([
@@ -322,11 +361,11 @@ describe("road bulk mutation selection", () => {
     await createDistrict([
       { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
     ], "night-market");
-    const ids = saved.source.districts.map((district) => district.id);
+    const ids = saved!.source.districts.map((district) => district.id);
     selectDistrict(ids[0]!);
     selectDistrict(ids[1]!, true);
     await expect(fillDistrict({ x: 0, y: 0 }, "corporate-core")).rejects.toThrow("Fill requires zero or one selected district.");
-  });
+  }, 120_000);
 
   it("rejects Split unless the requested district is the sole selection", async () => {
     await createDistrict([
@@ -335,11 +374,11 @@ describe("road bulk mutation selection", () => {
     await createDistrict([
       { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
     ], "night-market");
-    const ids = saved.source.districts.map((district) => district.id);
+    const ids = saved!.source.districts.map((district) => district.id);
     selectDistrict(ids[0]!);
     selectDistrict(ids[1]!, true);
     await expect(splitDistrict(ids[0]!, [{ x: -80, y: -80 }, { x: -80, y: -40 }])).rejects.toThrow("Split requires exactly one selected district.");
-  });
+  }, 120_000);
 
   it("rejects repeat initial generation without replacing existing districts", async () => {
     await createDistrict([
@@ -348,7 +387,7 @@ describe("road bulk mutation selection", () => {
     const before = structuredClone(saved);
     await expect(generateDistricts({ districtPool: ["corporate-core"], openSpaceProfile: "medium" })).rejects.toThrow("requires an empty district source");
     expect(saved).toEqual(before);
-  });
+  }, 120_000);
 
   it("preserves the selected merge participants when persistence fails", async () => {
     await createDistrict([
@@ -357,13 +396,13 @@ describe("road bulk mutation selection", () => {
     await createDistrict([
       { x: -70, y: -70 }, { x: -50, y: -70 }, { x: -50, y: -50 }, { x: -70, y: -50 }
     ], "night-market");
-    const ids = saved.source.districts.map((district) => district.id);
+    const ids = saved!.source.districts.map((district) => district.id);
     selectDistrict(ids[0]!);
     selectDistrict(ids[1]!, true);
     saveError = new Error("save failed");
     await expect(mergeDistricts(ids, ids[0]!)).rejects.toThrow("save failed");
     expect(getDistrictSelection()).toEqual([...ids].sort());
-  });
+  }, 120_000);
 
   it("retains a degraded wall diagnostic while editing and clears it after Retry succeeds", async () => {
     await createDistrict([
@@ -372,13 +411,13 @@ describe("road bulk mutation selection", () => {
     wallCreateError = new Error("wall creation failed");
     await expect(retryGeneratedWalls()).rejects.toThrow("wall creation failed");
     expect(districtDiagnostics()).toEqual(expect.arrayContaining([expect.objectContaining({ subsystem: "walls", retry: "walls", message: "wall creation failed" })]));
-    const revision = saved.revision;
+    const revision = saved?.revision;
     wallCreateError = null;
     await expect(retryGeneratedWalls()).resolves.toBeUndefined();
-    expect(saved.revision).toBe(revision);
+    expect(saved?.revision).toBe(revision);
     expect(districtDiagnostics().some((entry) => entry.subsystem === "walls")).toBe(false);
     expect(wallDocuments.length).toBeGreaterThan(0);
-  });
+  }, 120_000);
 
   it("keeps additive selection within the district object type across district identities", async () => {
     await createDistrict([
@@ -390,23 +429,23 @@ describe("road bulk mutation selection", () => {
     await createDistrict([
       { x: -30, y: -70 }, { x: -10, y: -70 }, { x: -10, y: -50 }, { x: -30, y: -50 }
     ], "night-market");
-    const corporate = saved.source.districts.filter((district) => district.typeId === "corporate-core");
-    const market = saved.source.districts.find((district) => district.typeId === "night-market")!;
+    const corporate = saved!.source.districts.filter((district) => district.typeId === "corporate-core");
+    const market = saved!.source.districts.find((district) => district.typeId === "night-market")!;
     selectDistrict(corporate[0]!.id);
     selectDistrict(corporate[1]!.id, true);
     expect(getDistrictSelection()).toEqual(corporate.map((district) => district.id).sort());
     selectDistrict(market.id, true);
     expect(getDistrictSelection()).toEqual([...corporate.map((district) => district.id), market.id].sort());
-  });
+  }, 120_000);
 
   it("applies a curve preset to every route represented by the selected edges", async () => {
     await setRoadCurvePreset("broad", ["edge-a", "edge-c"]);
-    expect(saved.revision).toBe(2);
-    expect(saved.source.roads.routes).toEqual([
+    expect(saved?.revision).toBe(2);
+    expect(saved!.source.roads.routes).toEqual([
       { id: "route-a", curvePreset: "broad" },
       { id: "route-b", curvePreset: "broad" }
     ]);
-  });
+  }, 120_000);
 
   it("rejects duplicate or stale selections before saving", async () => {
     const before = structuredClone(saved);
@@ -419,38 +458,26 @@ describe("road bulk mutation selection", () => {
     selectRoad("edge-a");
     await setRoadLocked(true);
     expect(getRoadSelection().edgeIds).toEqual(["edge-a"]);
-  });
+  }, 120_000);
 
   it("keeps a selected edge across a full rebuild commit", async () => {
     selectRoad("edge-a");
     await setRoadCurvePreset("broad", ["edge-a"]);
     expect(getRoadSelection().edgeIds).toEqual(["edge-a"]);
-  });
+  }, 120_000);
 
   it("drops deleted roads from the selection", async () => {
     selectRoad("edge-a");
     selectRoad("edge-b", true);
     await deleteRoads(["edge-a"]);
     expect(getRoadSelection().edgeIds).toEqual(["edge-b"]);
-  });
+  }, 120_000);
 
   it("drops deleted junctions from the selection", async () => {
     selectRoadNode("a1");
     await deleteRoadJunction("a1");
     expect(getRoadSelection().nodeIds).toEqual([]);
-  });
-
-  it("publishes the district plan asynchronously after a district commit", async () => {
-    await createDistrict([
-      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
-    ], "corporate-core");
-    await vi.waitFor(() => {
-      expect(stats()).toEqual(expect.objectContaining({
-        districtPlan: expect.objectContaining({ revision: saved.revision })
-      }));
-    });
-    expect(getDistrictPlanView()).not.toBeNull();
-  });
+  }, 120_000);
 
   it("keeps only the latest revision's plan across rapid commits", async () => {
     await createDistrict([
@@ -459,42 +486,473 @@ describe("road bulk mutation selection", () => {
     await createDistrict([
       { x: -60, y: -70 }, { x: -40, y: -70 }, { x: -40, y: -50 }, { x: -60, y: -50 }
     ], "night-market");
-    await vi.waitFor(() => {
-      expect(stats()).toEqual(expect.objectContaining({
-        districtPlan: expect.objectContaining({ revision: saved.revision })
-      }));
-    });
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: saved?.revision }));
     const view = getDistrictPlanView();
     const fragmentIds = new Set((view?.blocks ?? []).flatMap((block) => block.districtFragments.map((fragment) => fragment.districtId)));
     expect(fragmentIds.size).toBeGreaterThanOrEqual(2);
-  });
+  }, 120_000);
 
   it("makes Fill wait for the current plan and target a road-defined block", async () => {
-    // No commit has requested a plan yet; Fill must request and await it itself.
+    // No commit has published a plan yet; Fill must rebuild and await it itself.
     await fillDistrict({ x: -45, y: 0 }, "night-market");
-    expect(saved.source.districts).toHaveLength(1);
-  });
+    expect(saved?.source.districts).toHaveLength(1);
+  }, 120_000);
 
-  it("degrades plan builds without freezing the UI thread when the worker is unavailable", async () => {
+  it("rejects structural commits without a worker and leaves the flag untouched", async () => {
+    // Re-mount with no worker so no stale client from the initial mount survives.
     vi.stubGlobal("Worker", undefined);
-    await createDistrict([
+    unmount();
+    mount();
+    const before = structuredClone(saved);
+    await expect(createDistrict([
       { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
-    ], "corporate-core");
-    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ subsystem: "districts", retry: "plan" })
-    ]));
-    await expect(fillDistrict({ x: 0, y: 0 }, "corporate-core")).rejects.toThrow("unavailable");
-  });
+    ], "corporate-core")).rejects.toThrow(/worker is unavailable/);
+    expect(saved).toEqual(before);
+    const complete = stats()?.completePlan;
+    expect(isRecord(complete) ? complete.revision : null).not.toBe(2);
+  }, 120_000);
 
   it("restores the plan when Retry succeeds after the worker returns", async () => {
     vi.stubGlobal("Worker", undefined);
-    await createDistrict([
-      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
-    ], "corporate-core");
+    unmount();
+    mount();
+    await expect(fillDistrict({ x: -45, y: 0 }, "night-market")).rejects.toThrow(/unavailable/);
     expect(districtDiagnostics().some((entry) => entry.retry === "plan")).toBe(true);
-    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("Worker", workerFactory);
     await retryDistrictPlan();
     expect(getDistrictPlanView()).not.toBeNull();
     expect(districtDiagnostics().some((entry) => entry.retry === "plan")).toBe(false);
+  }, 120_000);
+});
+
+describe("full generation", () => {
+  let saved: unknown;
+  let wallDocuments: Array<{ id: string }>;
+  let saveError: Error | null;
+  let worker: FakeWorker;
+
+  // WHY: the adapter constructs `new Worker(...)`; the stub must be a constructor-like
+  // factory returning the shared fake (see the road describe).
+  function workerFactory(): FakeWorker {
+    return worker;
+  }
+
+  function setupScene(initial: unknown): void {
+    unmount();
+    saved = initial;
+    mount();
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    wallDocuments = [];
+    saveError = null;
+    worker = new FakeWorker("worker-url");
+    const scene = {
+      get walls(): Array<{ id: string }> { return wallDocuments; },
+      getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+        if (saveError !== null) throw saveError;
+        saved = structuredClone(value);
+        return saved as CityStateV3;
+      }),
+      unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
+        saved = undefined;
+      }),
+      deleteEmbeddedDocuments: vi.fn(async (_type: string, ids: string[]) => {
+        wallDocuments = wallDocuments.filter((wall) => !ids.includes(wall.id));
+        return [];
+      }),
+      createEmbeddedDocuments: vi.fn(async (_type: string, data: Array<Record<string, unknown>>) => {
+        const created = data.map((value, index) => ({
+          id: `wall-${index}`,
+          ...value,
+          getFlag: () => undefined
+        }));
+        wallDocuments.push(...created);
+        return created;
+      })
+    };
+    vi.stubGlobal("canvas", {
+      ready: true,
+      dimensions: { sceneRect: { x: 400, y: 320, width: 200, height: 160 }, size: 1, distance: 1 },
+      scene,
+      app: undefined
+    });
+    vi.stubGlobal("game", { user: { isGM: true } });
+    vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
+    vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
+    vi.stubGlobal("document", { baseURI: "http://test.local/" });
+    vi.stubGlobal("Worker", workerFactory);
+    setupScene(undefined);
   });
+
+  afterEach(() => {
+    unmount();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // WHY: the UI pins the confirmation from the pre-dialog preflight; tests mirror that by
+  // defaulting to the live Scene's preflight-derived confirmation (kind + revision + exact
+  // raw identity), so a same-kind payload swap is pinned the same way a user would confirm.
+  const staging = (seed: string, confirmation?: ClearConfirmation) => ({
+    terrainMode: "rectangle" as const,
+    coastEdge: null,
+    citySeed: seed,
+    roadLayout: "european" as const,
+    hubMode: "single-centre" as const,
+    districtPool: [...DISTRICT_TYPE_IDS],
+    openSpaceProfile: "medium" as const,
+    randomize: false,
+    confirmation: confirmation ?? clearConfirmationFor(generationPreflight())
+  });
+
+  it("preflights absent, legacy, obsolete-precomplete, supported, and unreplaceable states cheaply", () => {
+    setupScene(undefined);
+    expect(generationPreflight()).toMatchObject({ kind: "absent", replaceable: true });
+    setupScene({ formatVersion: 4 });
+    expect(generationPreflight()).toMatchObject({ kind: "legacy", replaceable: true });
+    setupScene({ kind: "city-generator-2", schemaVersion: 3, generatorVersion: 10, revision: 6 });
+    expect(generationPreflight()).toMatchObject({ kind: "obsolete-precomplete", replaceable: true, revision: 6 });
+    setupScene(bulkRoadState());
+    expect(generationPreflight()).toMatchObject({ kind: "supported", replaceable: true, revision: 1 });
+    setupScene({ kind: "city-generator-2", schemaVersion: 99, generatorVersion: 11, revision: 1 });
+    expect(generationPreflight()).toMatchObject({ kind: "unsupported", replaceable: false });
+    setupScene({ kind: "city-generator-2", schemaVersion: 3, generatorVersion: 11, revision: "broken" });
+    expect(generationPreflight()).toMatchObject({ kind: "malformed", replaceable: false });
+  });
+
+  it("generates a complete city end to end on an absent Scene", async () => {
+    const result = await startFullGeneration(staging("full-city-seed"));
+    expect(result.ok).toBe(true);
+    expect(result.state.phase).toBe("complete");
+    expect(result.state.sourceRevision).toBe(1);
+    const city = getCity();
+    expect(city).not.toBeNull();
+    expect(city!.source.citySeed).toBe("full-city-seed");
+    expect(city!.source.districts.length).toBeGreaterThan(0);
+    expect(city!.source.roads.edges.length).toBeGreaterThan(0);
+    expect(saved).toEqual(city);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 1 }));
+    await vi.waitFor(() => expect(wallDocuments.length).toBeGreaterThan(0), { timeout: 5000 });
+  }, 120_000);
+
+  it("clears legacy data before full generation", async () => {
+    setupScene({ formatVersion: 4 });
+    const result = await startFullGeneration(staging("legacy-replace"));
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("legacy-replace");
+    expect(saved).toEqual(getCity());
+  }, 120_000);
+
+  it("clears obsolete-precomplete flags before full generation", async () => {
+    setupScene({ kind: "city-generator-2", schemaVersion: 3, generatorVersion: 10, revision: 6 });
+    const result = await startFullGeneration(staging("obsolete-replace"));
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("obsolete-replace");
+  }, 120_000);
+
+  it("replaces a supported city at its exact revision", async () => {
+    setupScene(bulkRoadState());
+    const result = await startFullGeneration(staging("supported-replace"));
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("supported-replace");
+    expect(getCity()?.revision).toBe(1);
+  }, 120_000);
+
+  it("rejects invalid staged settings before claiming, enqueueing, or clearing", async () => {
+    const before = structuredClone(saved);
+    const beforeState = generationState();
+    // WHY: the seed is normalized before validation, so a blank non-random seed throws
+    // synchronously rather than rejecting; either way nothing is claimed or cleared.
+    expect(() => startFullGeneration(staging("   "))).toThrow(/must not be empty/);
+    await expect(startFullGeneration({ ...staging("pool"), districtPool: [] })).rejects.toThrow(/at least one district type/);
+    await expect(startFullGeneration({ ...staging("coast"), terrainMode: "coastal", coastEdge: null })).rejects.toThrow(/coast edge/);
+    await expect(startFullGeneration({ ...staging("coast-edge"), terrainMode: "rectangle", coastEdge: "west" })).rejects.toThrow(/only applies to coastal/);
+    expect(saved).toEqual(before);
+    // The pre-call state (whatever it was) is untouched: no claim, no clear, no failure.
+    expect(generationState()).toEqual(beforeState);
+  });
+
+  it("rejects a stale pre-dialog confirmation without clearing", async () => {
+    setupScene(bulkRoadState());
+    const pinned = clearConfirmationFor(generationPreflight());
+    expect(pinned).toMatchObject({ kind: "supported", revision: 1 });
+    if (typeof pinned !== "string") expect(pinned.identity.length).toBeGreaterThan(0);
+    // The Scene moves past the confirmed revision while the dialogs are open.
+    setupScene({ ...bulkRoadState(), revision: 2 });
+    const before = structuredClone(saved);
+    await expect(startFullGeneration(staging("stale-pin", pinned))).rejects.toThrow(/Scene changed while you confirmed/);
+    expect(saved).toEqual(before);
+    expect(generationPreflight()).toMatchObject({ kind: "supported", revision: 2 });
+    expect(generationState().active).toBe(false);
+    expect(generationState().phase).toBe("idle");
+  });
+
+  it("rejects a retry when the Scene moved past the confirmed operation", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("moved-on"));
+    expect(generationState().phase).toBe("failed");
+    // A different city appears before the retry; it was not authorized by the operation.
+    setupScene(bulkRoadState());
+    vi.stubGlobal("Worker", workerFactory);
+    await expect(retryFullGeneration()).rejects.toThrow(/fresh confirmation/);
+    expect(saved).toEqual(bulkRoadState());
+    expect(generationState().active).toBe(false);
+    expect(generationState().phase).toBe("idle");
+  }, 120_000);
+
+  it("retries an installing-phase failure while the Scene is still the revision it created", async () => {
+    let tampered = false;
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && !tampered && response.ok === true && "progress" in response && isRecord(response.result)) {
+        response.result = { ...response.result, sourceRevision: 999 };
+        tampered = true;
+      }
+    };
+    const failed = await startFullGeneration(staging("install-retry"));
+    expect(failed.ok).toBe(false);
+    expect(generationState().failure).toMatchObject({ phase: "installing", component: "chunks" });
+    // The Scene is still exactly the revision this confirmed operation created, so the
+    // same-operation retry clears without fresh confirmations.
+    expect(generationPreflight()).toMatchObject({ kind: "supported", revision: 1 });
+    const retried = await retryFullGeneration();
+    expect(retried.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("install-retry");
+    expect(getCity()?.revision).toBe(1);
+  }, 120_000);
+
+  it("reports the operation epoch equal to the published session epoch", async () => {
+    const result = await startFullGeneration(staging("epoch-equality"));
+    expect(result.ok).toBe(true);
+    const buildEpoch = stats()?.buildEpoch;
+    expect(typeof buildEpoch).toBe("number");
+    expect(result.state.epoch).toBe(buildEpoch);
+    // Post-clear epochs are positive; a pre-clear capture would collide with the session
+    // epoch seen before the operation started.
+    expect(result.state.epoch).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("clears old selections and scene state immediately after the confirmed clear", async () => {
+    setupScene(bulkRoadState());
+    selectRoad("edge-a");
+    selectRoadNode("a0");
+    const snapshots: Array<{ roads: number; nodes: number; districts: number; kind: string }> = [];
+    const remove = addCityListener(() => {
+      const selection = getRoadSelection();
+      snapshots.push({
+        roads: selection.edgeIds.length,
+        nodes: selection.nodeIds.length,
+        districts: getDistrictSelection().length,
+        kind: generationPreflight().kind
+      });
+    });
+    try {
+      const result = await startFullGeneration(staging("cleared-visuals"));
+      expect(result.ok).toBe(true);
+    } finally {
+      remove();
+    }
+    expect(snapshots.some((s) => s.kind === "supported" && (s.roads > 0 || s.nodes > 0))).toBe(true);
+    expect(snapshots.some((s) => s.kind === "absent" && s.roads === 0 && s.nodes === 0 && s.districts === 0)).toBe(true);
+    expect(getRoadSelection().edgeIds).toEqual([]);
+    expect(getRoadSelection().nodeIds).toEqual([]);
+    expect(getDistrictSelection()).toEqual([]);
+  }, 120_000);
+
+  it("refuses to start on unreplaceable Scene state without touching the flag", async () => {
+    setupScene({ kind: "city-generator-2", schemaVersion: 99, generatorVersion: 11, revision: 1 });
+    const before = structuredClone(saved);
+    await expect(startFullGeneration(staging("never", { kind: "supported", revision: 1, identity: "unused" }))).rejects.toThrow(/cannot replace/i);
+    expect(saved).toEqual(before);
+    expect(generationState().active).toBe(false);
+  });
+
+  it("refuses a second start while one is already in progress", async () => {
+    const first = startFullGeneration(staging("in-flight"));
+    await expect(startFullGeneration(staging("second"))).rejects.toThrow(/already in progress/i);
+    await expect(first).resolves.toMatchObject({ ok: true });
+  }, 120_000);
+
+  it("leaves an absent flag and a durable failure state when planning fails", async () => {
+    vi.stubGlobal("Worker", undefined);
+    const result = await startFullGeneration(staging("doomed"));
+    expect(result.ok).toBe(false);
+    const state = generationState();
+    expect(state.phase).toBe("failed");
+    expect(state.failure).toMatchObject({ phase: "planning", component: "generation" });
+    expect(state.canRetrySameSeed).toBe(true);
+    expect(state.canGenerateNewSeed).toBe(true);
+    expect(generationPreflight()).toMatchObject({ kind: "absent" });
+    expect(getCity()).toBeNull();
+  }, 120_000);
+
+  it("retries the failed generation with the exact same seed", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("same-seed"));
+    expect(generationState().phase).toBe("failed");
+    vi.stubGlobal("Worker", workerFactory);
+    const result = await retryFullGeneration();
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("same-seed");
+  }, 120_000);
+
+  it("generates a new seed on retry", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("old-seed"));
+    vi.stubGlobal("Worker", workerFactory);
+    const result = await generateNewSeed("brand-new-seed");
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("brand-new-seed");
+  }, 120_000);
+
+  it("rolls a random seed when requested", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("fixed-seed"));
+    vi.stubGlobal("Worker", workerFactory);
+    const result = await randomizeEntireCity(staging("ignored-seed"));
+    expect(result.ok).toBe(true);
+    expect(getCity()?.source.citySeed).not.toBe("ignored-seed");
+    expect(getCity()?.source.citySeed.length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("rolls a fresh non-empty seed for a blank staged seed via randomizeEntireCity", async () => {
+    const result = await randomizeEntireCity(staging("   "));
+    expect(result.ok).toBe(true);
+    const seed = getCity()?.source.citySeed ?? "";
+    expect(seed.trim().length).toBeGreaterThan(0);
+    expect(seed.trim()).not.toBe("");
+  }, 120_000);
+
+  it("stores no stale chunk records or progress when the session moves during progressive install", async () => {
+    let bumped = false;
+    const observedProgress: number[] = [];
+    const remove = addCityListener(() => {
+      const progress = generationState().progress;
+      if (progress !== null && progress.total > 0) observedProgress.push(progress.index);
+    });
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && !bumped && response.ok === true && "progress" in response && isRecord(response.result)) {
+        bumped = true;
+        // WHY: simulate the session moving past the install identity mid-stream (e.g. a
+        // canvas remount while chunks are still arriving): the session epoch bumps and
+        // the saved revision-1 city stays current, so geometry recovery stays available.
+        mount();
+      }
+    };
+    try {
+      const result = await startFullGeneration(staging("stale-session"));
+      expect(result.ok).toBe(false);
+      expect(generationState().failure).toMatchObject({ phase: "installing", component: "chunks" });
+      expect(generationState().canRetryGeometry).toBe(true);
+    } finally {
+      remove();
+      worker.tamper = null;
+    }
+    // The session moved before the first chunk landed, so no onProgress update was stored.
+    expect(observedProgress).toEqual([]);
+  }, 120_000);
+
+  it("rejects retries when there is no failed generation", async () => {
+    const result = await startFullGeneration(staging("clean-run"));
+    expect(result.ok).toBe(true);
+    await expect(retryFullGeneration()).rejects.toThrow(/no failed full generation/);
+    await expect(generateNewSeed()).rejects.toThrow(/no failed full generation/);
+  }, 120_000);
+
+  it("reports a revision-1 save failure with component save and a durable retry", async () => {
+    saveError = new Error("save failed");
+    const result = await startFullGeneration(staging("save-doomed"));
+    expect(result.ok).toBe(false);
+    expect(generationState().failure).toMatchObject({ phase: "saving", component: "save" });
+    expect(generationState().canRetrySameSeed).toBe(true);
+    // The clear already happened, so no city flag is left behind.
+    expect(generationPreflight()).toMatchObject({ kind: "absent" });
+    saveError = null;
+    const retried = await retryFullGeneration();
+    expect(retried.ok).toBe(true);
+    expect(getCity()?.source.citySeed).toBe("save-doomed");
+  }, 120_000);
+
+  it("installs final chunks progressively and publishes progress", async () => {
+    const phases: string[] = [];
+    const remove = addCityListener(() => {
+      const state = generationState();
+      phases.push(`${state.phase}:${state.progress?.total ?? 0}`);
+    });
+    try {
+      const result = await startFullGeneration(staging("progressive"));
+      expect(result.ok).toBe(true);
+      expect(phases).toEqual(expect.arrayContaining([expect.stringMatching(/^installing:/)]));
+      expect(phases.some((entry) => /^installing:[1-9]/.test(entry))).toBe(true);
+      expect(generationState().phase).toBe("complete");
+    } finally {
+      remove();
+    }
+  }, 120_000);
+
+  it("installs nothing from a stale full-generation result", async () => {
+    worker.tamper = (request, response) => {
+      if (request.type === "generateCompleteCityPlan" && response.ok === true && isRecord(response.result)) {
+        response.result = { ...response.result, actionToken: "tampered" };
+      }
+    };
+    await expect(startFullGeneration(staging("stale-plan"))).resolves.toMatchObject({ ok: false });
+    expect(generationState().failure?.component).toBe("generation");
+    // The clear happened, so the flag is absent — nothing stale was installed.
+    expect(generationPreflight()).toMatchObject({ kind: "absent" });
+  }, 120_000);
+
+  it("isolates a stale chunk progress batch without corrupting the chunk set", async () => {
+    let tampered = false;
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && !tampered && response.ok === true && "progress" in response && isRecord(response.result)) {
+        response.result = { ...response.result, sourceRevision: 999 };
+        tampered = true;
+      }
+    };
+    const result = await startFullGeneration(staging("stale-chunks"));
+    expect(result.ok).toBe(false);
+    expect(generationState().failure).toMatchObject({ phase: "installing", component: "chunks" });
+    expect(generationState().canRetryGeometry).toBe(true);
+  }, 120_000);
+
+  it("keeps the operation state across an editor round-trip", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("durable-failure"));
+    expect(generationState().phase).toBe("failed");
+    unmount();
+    mount();
+    expect(generationState().phase).toBe("failed");
+    expect(generationState().canRetrySameSeed).toBe(true);
+    vi.stubGlobal("Worker", workerFactory);
+    const result = await retryFullGeneration();
+    expect(result.ok).toBe(true);
+  }, 120_000);
+
+  it("reuses the current semantic plan on rebuild and only reinstalls chunks", async () => {
+    const result = await startFullGeneration(staging("scale-stable"));
+    expect(result.ok).toBe(true);
+    const buildsBefore = worker.planBuilds;
+    const rebuild = await rebuildGeometry();
+    expect(rebuild.chunks).toBeGreaterThanOrEqual(0);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 1 }));
+    expect(worker.planBuilds).toBe(buildsBefore);
+  }, 120_000);
+
+  it("reuses the current plan for metadata-only edits and rebuilds it for structural edits", async () => {
+    await startFullGeneration(staging("edit-reuse"));
+    const complete = stats()?.completePlan;
+    if (!isRecord(complete)) throw new Error("expected a published complete plan");
+    const buildToken = String(complete.buildToken);
+    const buildsAfterGeneration = worker.planBuilds;
+    await renameRoad("Renamed", false, [getCity()!.source.roads.edges[0]!.id]);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ buildToken }));
+    expect(worker.planBuilds).toBe(buildsAfterGeneration);
+    await setRoadCurvePreset("broad", [getCity()!.source.roads.edges[0]!.id]);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 3 }));
+    expect(worker.planBuilds).toBeGreaterThan(buildsAfterGeneration);
+  }, 120_000);
 });

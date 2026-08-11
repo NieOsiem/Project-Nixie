@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { rectRing } from "../geom/types.js";
-import type { CitySourceV3, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { districtGenerationAvailability, districtRegionContext, generateInitialDistricts, resolveGeneratedRegions } from "./district-generator.js";
+import { rectRing, type Ring } from "../geom/types.js";
+import type { CitySourceV3, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
+import { assignLandmarkCompatibleDistrictTypes, districtGenerationAvailability, districtRegionContext, generateInitialDistricts, resolveGeneratedRegions } from "./district-generator.js";
 import { buildDistrictPlan, type DerivedBlock } from "./district-plan.js";
-import { DISTRICT_TYPE_IDS } from "./district-registry.js";
+import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "./district-registry.js";
+import type { LandmarkGrammarId } from "./landmark-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 import { validateRing } from "./terrain.js";
 
@@ -157,4 +158,68 @@ describe("initial district generation", () => {
     expect(new Set(districts.map((district) => district.typeId)).size).toBeGreaterThan(4);
     expect(plan.developmentCells.length).toBeGreaterThan(plan.blocks.length);
   }, 45_000);
+});
+
+describe("assignLandmarkCompatibleDistrictTypes", () => {
+  const district = (id: string, polygon: Ring, typeId: DistrictTypeId): DistrictSource => ({
+    id,
+    polygon,
+    seed: `${id}-seed`,
+    typeId,
+    paletteId: DISTRICT_TYPE_REGISTRY.get(typeId)!.defaultPaletteId,
+    origin: "generated",
+    locked: false,
+    openSpaceOverride: null
+  });
+  // Corporate core is "formal"; a hero tower (formal+waterfront) fits it, a utility site
+  // (industrial) does not.
+  const hero = { grammarId: "hero-tower-plaza" as LandmarkGrammarId, sitePolygon: rectRing({ x: 10, y: 10, width: 20, height: 20 }) };
+  const utility = { grammarId: "infrastructure-utility-site" as LandmarkGrammarId, sitePolygon: rectRing({ x: 60, y: 60, width: 20, height: 20 }) };
+  const tags = (typeId: DistrictTypeId): readonly string[] => DISTRICT_TYPE_REGISTRY.get(typeId)!.compatibilityTags;
+
+  it("reassigns a containing district to a compatible type with the type's default palette", () => {
+    const districts = [district("a", rectRing({ x: 0, y: 0, width: 100, height: 100 }), "corporate-core")];
+    const { districts: assigned, warnings } = assignLandmarkCompatibleDistrictTypes(districts, [utility], [...DISTRICT_TYPE_IDS], "seed");
+    expect(warnings).toEqual([]);
+    const updated = assigned[0]!;
+    expect(updated.id).toBe("a");
+    expect(updated.polygon).toEqual(districts[0]!.polygon);
+    expect(updated.seed).toBe("a-seed");
+    expect(updated.typeId).not.toBe("corporate-core");
+    expect(tags(updated.typeId)).toContain("industrial");
+    expect(updated.paletteId).toBe(DISTRICT_TYPE_REGISTRY.get(updated.typeId)!.defaultPaletteId);
+  });
+
+  it("keeps the original type when it already satisfies every contained reservation", () => {
+    const districts = [district("a", rectRing({ x: 0, y: 0, width: 100, height: 100 }), "corporate-core")];
+    const { districts: assigned, warnings } = assignLandmarkCompatibleDistrictTypes(districts, [hero], [...DISTRICT_TYPE_IDS], "seed");
+    expect(warnings).toEqual([]);
+    expect(assigned[0]).toEqual(districts[0]);
+  });
+
+  it("is deterministic across identical inputs", () => {
+    const districts = [
+      district("a", rectRing({ x: 0, y: 0, width: 100, height: 100 }), "corporate-core"),
+      district("b", rectRing({ x: 100, y: 0, width: 100, height: 100 }), "corporate-core")
+    ];
+    const first = assignLandmarkCompatibleDistrictTypes(districts, [utility], [...DISTRICT_TYPE_IDS], "seed");
+    const second = assignLandmarkCompatibleDistrictTypes(districts, [utility], [...DISTRICT_TYPE_IDS], "seed");
+    expect(second).toEqual(first);
+  });
+
+  it("leaves the original type as deterministic contrast with a warning when no pool type fits", () => {
+    const districts = [district("a", rectRing({ x: 0, y: 0, width: 100, height: 100 }), "corporate-core")];
+    // Pool is only "formal" types: nothing fits an industrial utility site.
+    const { districts: assigned, warnings } = assignLandmarkCompatibleDistrictTypes(districts, [utility], ["corporate-core", "civic-institutional"], "seed");
+    expect(assigned[0]).toEqual(districts[0]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/District "a" cannot host landmark reservation/);
+  });
+
+  it("touches nothing when no reservation or no containing district exists", () => {
+    const districts = [district("a", rectRing({ x: 0, y: 0, width: 100, height: 100 }), "corporate-core")];
+    expect(assignLandmarkCompatibleDistrictTypes(districts, [], [...DISTRICT_TYPE_IDS], "seed").districts).toEqual(districts);
+    const outside = { grammarId: "hero-tower-plaza" as LandmarkGrammarId, sitePolygon: rectRing({ x: 500, y: 500, width: 20, height: 20 }) };
+    expect(assignLandmarkCompatibleDistrictTypes(districts, [outside], [...DISTRICT_TYPE_IDS], "seed").districts).toEqual(districts);
+  });
 });
