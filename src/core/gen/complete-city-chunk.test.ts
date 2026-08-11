@@ -9,7 +9,7 @@ import {
   type Rect,
   type Ring
 } from "../geom/types.js";
-import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
+import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, OPEN_SPACE_SURFACE_SHADES, materialIndex } from "../palette.js";
 import { compileRouteNetwork } from "../graph/compiler.js";
 import { compiledRouteOccupancy } from "./district-plan.js";
 import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type OpenSpaceCategory } from "./city.js";
@@ -683,6 +683,97 @@ describe("buildCompleteCityChunk", () => {
     expect(park.pair).not.toBe(yard.pair);
     expect(yard.hasDetail).toBe(true);
     expect(treatments.find((t) => t.category === "vacant")!.hasDetail).toBe(false);
+  });
+
+  it("keeps no-fitting residual vacancy on the shared city ground while intentional scrub keeps its district vacant slot", () => {
+    const polygon = rectRing({ x: 20, y: 80, width: 40, height: 30 });
+    const scrub = (over: Partial<OpenSpacePlan>): OpenSpacePlan => ({
+      id: "os-scrub",
+      parcelId: null,
+      blockId: "block-0",
+      fragmentId: "frag-0",
+      districtId: "corporate-core",
+      landmarkId: null,
+      category: "vacant",
+      size: "small",
+      polygon,
+      surfaceStyle: "scrub",
+      detailStyle: "none",
+      lineage: "intent",
+      seed: "os-scrub-seed",
+      material: materialIndex(BANK, DISTRICT_SLOT.WALL_C),
+      areaM2: 1200,
+      ...over
+    });
+    const only = (openSpaces: OpenSpacePlan[]): CompleteCityPlan => ({
+      ...PLAN,
+      parcels: [],
+      buildings: [],
+      landmarks: [],
+      openSpaces,
+      diagnostics: {
+        ...PLAN.diagnostics,
+        parcelCount: 0,
+        buildingCount: 0,
+        landmarkCount: 0,
+        openSpaceCount: openSpaces.length,
+        massCount: 0
+      }
+    });
+    const bare = buildCompleteCityChunk(SOURCE, only([]), { cx: 0, cy: 0 }, SCENE, PPM);
+    const openSpaceVertices = (build: CompleteChunkBuild): { material: number; shade: number; kind: number }[] => {
+      const entries: { material: number; shade: number; kind: number }[] = [];
+      for (let i = bare.mesh.vertexCount; i < build.mesh.vertexCount; i++) {
+        const at = i * VERTEX_FLOATS;
+        entries.push({
+          material: build.mesh.vertices[at + 3]!,
+          shade: build.mesh.vertices[at + 4]!,
+          kind: build.mesh.vertices[at + 5]!
+        });
+      }
+      return entries;
+    };
+
+    const fallback = buildCompleteCityChunk(
+      SOURCE,
+      only([
+        scrub({
+          id: "os-fallback",
+          parcelId: "parcel-residual",
+          lineage: "residual",
+          seed: "os-fallback-seed",
+          material: MATERIAL.GROUND
+        })
+      ]),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    const fallbackVertices = openSpaceVertices(fallback);
+    expect(fallbackVertices.length).toBeGreaterThan(0);
+    for (const vertex of fallbackVertices) {
+      expect(vertex.kind).toBe(KIND.FLAT);
+      expect(vertex.material).toBe(MATERIAL.GROUND);
+      expect(vertex.shade).toBeCloseTo(1, 4);
+    }
+    expect(fallback.detail.vertexCount).toBe(0);
+
+    const intentional = buildCompleteCityChunk(
+      SOURCE,
+      only([scrub({})]),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    const vacantSlot = materialIndex(BANK, DISTRICT_SLOT.WALL_C);
+    const intentionalVertices = openSpaceVertices(intentional);
+    expect(intentionalVertices.length).toBeGreaterThan(0);
+    for (const vertex of intentionalVertices) {
+      expect(vertex.kind).toBe(KIND.FLAT);
+      expect(vertex.material).toBe(vacantSlot);
+      expect(vertex.shade).toBeCloseTo(OPEN_SPACE_SURFACE_SHADES.scrub!, 4);
+    }
+    expect(intentional.detail.vertexCount).toBe(0);
   });
 
   it("keeps the geometry budget: one 4-vertex 14 m mass is exactly 10 opaque triangles", () => {

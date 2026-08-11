@@ -268,6 +268,10 @@ function toPixelsSurfaces(surfaces: CitySurfacePartitions, origin: Vec2, pixelsP
  * The per-style shade keeps every category's flat tone distinct.
  */
 function openSpaceMaterialAndShade(plan: OpenSpacePlan): { material: number; shade: number } {
+  // WHY: Ground-backed residuals must not be remapped through an open-space style slot.
+  if (plan.material === MATERIAL.GROUND) {
+    return { material: MATERIAL.GROUND, shade: 1 };
+  }
   // WHY: materialIndex expects a bank number; plan.material is already bank * BANK_SIZE + slot.
   const bank = Math.floor(plan.material / BANK_SIZE);
   const slot =

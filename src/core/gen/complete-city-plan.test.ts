@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, type MultiPolygon, type Ring } from "../geom/types.js";
+import { MATERIAL } from "../palette.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
@@ -420,6 +421,11 @@ describe("buildCompleteCityPlan", () => {
     expect(vacant.length).toBe(unbuiltCount);
     expect(vacant.some((openSpace) => openSpace.areaM2 < 25)).toBe(true);
     expect(unbuiltAreaM2 / plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0)).toBeLessThanOrEqual(0.1);
+    expect(vacant.every((openSpace) => openSpace.material === MATERIAL.GROUND)).toBe(true);
+    expect(vacant.every((openSpace) => openSpace.surfaceStyle === "scrub" && openSpace.detailStyle === "none")).toBe(true);
+    const intentional = plan.openSpaces.filter((openSpace) => openSpace.parcelId === null);
+    expect(intentional.length).toBeGreaterThan(0);
+    expect(intentional.some((openSpace) => openSpace.material !== MATERIAL.GROUND)).toBe(true);
     // The classification is deterministic.
     expect(buildCompleteCityPlan(ringSource(4))).toEqual(plan);
   }, 120_000);

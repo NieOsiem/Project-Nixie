@@ -1,7 +1,7 @@
 import { difference, intersection, isSnapNoise, ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
-import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
+import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, districtStructuralInputSignature, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY } from "./district-registry.js";
@@ -1401,9 +1401,7 @@ function refineParcel(
 
 function residualParcelPlans(
   parcel: ParcelPlan,
-  refined: RefinedParcelResult,
-  district: DistrictSource | undefined,
-  banks: Map<string, number>
+  refined: RefinedParcelResult
 ): { parcels: ParcelPlan[]; openSpaces: OpenSpacePlan[] } {
   const parcels: ParcelPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
@@ -1441,7 +1439,7 @@ function residualParcelPlans(
       lineage: seed,
       seed,
       areaM2,
-      material: materialIndex(parcelBank(district, banks), OPEN_SPACE_SLOTS.vacant)
+      material: MATERIAL.GROUND
     });
     index++;
   }
@@ -1472,7 +1470,7 @@ function planBuildings(
     }
     const refined = refineParcel(parcel, weights, useWeights, district, banks);
     if (refined !== null) {
-      const residual = residualParcelPlans(parcel, refined, district, banks);
+      const residual = residualParcelPlans(parcel, refined);
       parcels.push(...refined.parcels, ...residual.parcels);
       buildings.push(...refined.buildings);
       openSpaces.push(...residual.openSpaces);
@@ -1497,7 +1495,7 @@ function planBuildings(
       lineage: parcel.seed,
       seed: `${parcel.seed}/unbuilt`,
       areaM2: parcel.areaM2,
-      material: materialIndex(parcelBank(district, banks), OPEN_SPACE_SLOTS.vacant)
+      material: MATERIAL.GROUND
     });
   }
   if (refinedCount > 0) warnings.push(`${refinedCount} planning parcels were partitioned into building-compatible final parcels.`);
