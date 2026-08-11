@@ -11,10 +11,11 @@ import { normalizeRing, validateRing } from "./terrain.js";
 
 const GEOMETRY_EPSILON = 1e-6;
 const KEY_SCALE = 1_000;
-// Raised from 20 to match the smallest building grammar's minAreaM2 (narrow-shopfront = 70m²).
-// Parcels below 100m² cannot fit playable building grammars and were creating tiny sliver plots.
-// Dropping them lets ground show through and maintains tabletop encounter scale.
-export const MIN_PARCEL_AREA_M2 = 100;
+// Lowered from 100 to 16 to match the smallest micro grammar (street-kiosk). The old
+// 100 m² floor discarded the fine-grain fabric (night-market and old-city cells run
+// 5-16 m wide), leaving those districts as empty ground; micro grammars now fill
+// parcels down to 16 m² and everything smaller stays explicitly unbuilt.
+export const MIN_PARCEL_AREA_M2 = 16;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
 
 /** Deterministic open-space material slot per category (shared with the renderer contract). */
@@ -236,6 +237,109 @@ function fitRectInside(rect: Ring, container: MultiPolygon): Ring | null {
     if (isSnapNoise(difference(ringAsMulti(current), [container]))) return current;
     const factor = attempt === 0 ? 0.92 : 0.88;
     current = current.map((point) => ({ x: centre.x + (point.x - centre.x) * factor, y: centre.y + (point.y - centre.y) * factor }));
+  }
+  return null;
+}
+
+/**
+ * Which side of a parcel's local frame faces its frontage road. "u" is the parcel's
+ * width axis (parallel to frontageAngleRad), "v" its depth axis; sign picks the
+ * low/high side. Parcels without road contact (interior remainders) get null.
+ */
+export interface FrontageSide {
+  axis: "u" | "v";
+  sign: 1 | -1;
+}
+
+/** Re-express a frontage side from one local frame's angle into another's. */
+function frontageInFrame(frontage: FrontageSide, fromAngleRad: number, toAngleRad: number): FrontageSide {
+  const localDir = frontage.axis === "u" ? { x: frontage.sign, y: 0 } : { x: 0, y: frontage.sign };
+  const world = rotatePoint(localDir, { x: 0, y: 0 }, fromAngleRad);
+  const back = rotatePoint(world, { x: 0, y: 0 }, -toAngleRad);
+  if (Math.abs(back.x) >= Math.abs(back.y)) return { axis: "u", sign: back.x >= 0 ? 1 : -1 };
+  return { axis: "v", sign: back.y >= 0 ? 1 : -1 };
+}
+
+interface OccBox {
+  box: Rect;
+  polygon: MultiPolygon[number];
+}
+
+function occupancyBoxes(occupancy: MultiPolygon): OccBox[] {
+  return occupancy
+    .filter((polygon) => polygon.length > 0 && polygon[0]!.length >= 3)
+    .map((polygon) => ({ box: ringBounds(polygon[0]!), polygon }));
+}
+
+/**
+ * Deterministic frontage detection: probe each side of the parcel's local AABB outward
+ * by 4 m and test overlap with the road clearance occupancy. The side whose probe
+ * overlaps most is the frontage. Parcels were carved against the same occupancy, so a
+ * road-adjacent side always overlaps; interior parcels overlap nothing and stay null.
+ */
+function detectFrontage(parcel: { polygon: Ring; frontageAngleRad: number }, boxes: OccBox[]): FrontageSide | null {
+  const centre = ringCentroid(parcel.polygon);
+  const angle = parcel.frontageAngleRad;
+  const local = parcel.polygon.map((point) => rotatePoint(point, centre, -angle));
+  const bounds = ringBounds(local);
+  const PROBE_DEPTH_M = 4;
+  let bestSide: FrontageSide | null = null;
+  let bestAreaM2 = 0;
+  const probe = (axis: "u" | "v", sign: 1 | -1): void => {
+    const rect: Ring =
+      axis === "u"
+        ? (sign < 0
+          ? rectRing({ x: bounds.x - PROBE_DEPTH_M, y: bounds.y, width: PROBE_DEPTH_M, height: bounds.height })
+          : rectRing({ x: bounds.x + bounds.width, y: bounds.y, width: PROBE_DEPTH_M, height: bounds.height }))
+        : (sign < 0
+          ? rectRing({ x: bounds.x, y: bounds.y - PROBE_DEPTH_M, width: bounds.width, height: PROBE_DEPTH_M })
+          : rectRing({ x: bounds.x, y: bounds.y + bounds.height, width: bounds.width, height: PROBE_DEPTH_M }));
+    const world = rect.map((point) => rotatePoint(point, centre, angle));
+    const probeBox = ringBounds(world);
+    let areaM2 = 0;
+    for (const entry of boxes) {
+      if (!rectsIntersect(probeBox, entry.box)) continue;
+      areaM2 += multiArea(intersection(ringAsMulti(world), [entry.polygon]));
+    }
+    if (areaM2 > 0.5 && areaM2 > bestAreaM2) {
+      bestAreaM2 = areaM2;
+      bestSide = { axis, sign };
+    }
+  };
+  probe("u", -1);
+  probe("u", 1);
+  probe("v", -1);
+  probe("v", 1);
+  return bestSide;
+}
+
+/**
+ * Shrink a rect toward its frontage edge (not its centroid) until it sits inside the
+ * container, so street-wall masses stay flush to the road side while conforming to
+ * irregular parcels. The lateral axis scales toward the rect's own midline.
+ */
+function fitRectPinned(rect: Ring, container: MultiPolygon, frontage: FrontageSide, angle: number, centre: Vec2): Ring | null {
+  const initialArea = Math.abs(ringArea(rect));
+  if (initialArea <= GEOMETRY_EPSILON) return null;
+  let current = rect;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    if (Math.abs(ringArea(current)) < initialArea * 0.3) return null;
+    if (isSnapNoise(difference(ringAsMulti(current), [container]))) return current;
+    const local = current.map((point) => rotatePoint(point, centre, -angle));
+    const lb = ringBounds(local);
+    const factor = attempt === 0 ? 0.94 : 0.9;
+    const next: Ring = local.map((point) => {
+      const front = frontage.axis === "v" ? (frontage.sign < 0 ? lb.y : lb.y + lb.height) : (frontage.sign < 0 ? lb.x : lb.x + lb.width);
+      const lateralC = frontage.axis === "v" ? lb.x + lb.width / 2 : lb.y + lb.height / 2;
+      const pinned = frontage.axis === "v" ? point.y : point.x;
+      const lateral = frontage.axis === "v" ? point.x : point.y;
+      const p = front + (pinned - front) * factor;
+      const l = lateralC + (lateral - lateralC) * factor;
+      const x = frontage.axis === "v" ? l : p;
+      const y = frontage.axis === "v" ? p : l;
+      return rotatePoint({ x, y }, centre, angle);
+    });
+    current = next;
   }
   return null;
 }
@@ -965,7 +1069,8 @@ function archetypeMasses(
   definition: BuildingGrammarDefinition,
   seed: string,
   heightM: number,
-  setbackM: number
+  setbackM: number,
+  frontage: FrontageSide | null
 ): RawMass[] {
   const angle = parcel.frontageAngleRad;
   const centre = ringCentroid(parcel.polygon);
@@ -978,18 +1083,33 @@ function archetypeMasses(
   // back from the parcel's local bounds.
   const usableW = Math.max(0, bounds.width - 2 * setbackM);
   const usableH = Math.max(0, bounds.height - 2 * setbackM);
-  const mainW = usableW * definition.massing.mainWidthFactor * occupancyFactor;
-  const mainH = usableH * definition.massing.mainDepthFactor * occupancyFactor;
+  // Size always comes from the frontage policy so every building spans its parcel
+  // width (no side moats anywhere, interior or fronted): street-wall fills both axes,
+  // setback keeps the depth on the declared occupancy so the back yard varies. Only
+  // the OFFSET depends on frontage detection: fronted parcels are pushed to the road
+  // (flush for street-wall, a front plaza for setback); interior parcels center.
+  const streetWall = definition.frontage.mode === "street-wall";
+  const mainW = usableW * definition.frontage.widthFill;
+  const mainH = usableH * (streetWall ? definition.frontage.depthFill : definition.massing.mainDepthFactor * occupancyFactor);
   if (!(mainW > 0.5 && mainH > 0.5)) return [];
   const container = ringAsMulti(parcel.polygon);
-  const baseX = (bounds.width - mainW) / 2;
-  const baseY = (bounds.height - mainH) / 2;
+  let baseX = (bounds.width - mainW) / 2;
+  let baseY = (bounds.height - mainH) / 2;
+  if (frontage !== null) {
+    const front = streetWall
+      ? range(`${seed}/front`, definition.frontage.frontSetback[0], definition.frontage.frontSetback[1])
+      : Math.max(setbackM, range(`${seed}/front`, definition.frontage.frontSetback[0], definition.frontage.frontSetback[1]));
+    if (frontage.axis === "v") baseY = frontage.sign < 0 ? front : bounds.height - mainH - front;
+    else baseX = frontage.sign < 0 ? front : bounds.width - mainW - front;
+  }
   const gap = 0.04;
   // WHY: the first peer pins the declared total height; later peers must not raise the peak.
   const peerHeight = (salt: string, index: number): number =>
     index === 0 ? heightM : heightM * (0.8 + hashUnit(`${seed}/mass/${salt}`) * 0.2);
   const put = (rect: Ring, kind: string, elevationM: number, height: number): RawMass | null => {
-    const fitted = fitRectInside(rect, container);
+    // Fronted masses shrink toward the road edge (keeping the flush front); unfronted
+    // masses keep the centroid shrink.
+    const fitted = frontage === null ? fitRectInside(rect, container) : fitRectPinned(rect, container, frontage, angle, centre);
     if (!fitted) return null;
     return { footprint: fitted, elevationM, heightM: height, kind };
   };
@@ -1126,8 +1246,10 @@ function archetypeMasses(
   const masses: RawMass[] = [];
   const unit = (1 - gap * (count - 1)) / count;
   for (let index = 0; index < count; index++) {
-    const w = mainW * unit * (0.62 + hashUnit(`${seed}/compound/${index}`) * 0.38);
-    const h = mainH * (0.4 + hashUnit(`${seed}/compound/d/${index}`) * 0.34);
+    // Tighter internal fill: compounds now cover 0.78-1.0 x 0.55-0.9 of their cell so
+    // utility/derelict clusters read as built yards instead of scattered sheds.
+    const w = mainW * unit * (0.78 + hashUnit(`${seed}/compound/${index}`) * 0.22);
+    const h = mainH * (0.55 + hashUnit(`${seed}/compound/d/${index}`) * 0.35);
     const x = baseX + index * mainW * (unit + gap) + (mainW * unit - w) / 2;
     const mass = put(localRect(bounds, angle, centre, x, baseY + (mainH - h) / 2, w, h), index % 3 === 0 ? "shed" : "pavilion", 0, peerHeight(`compound-${index}`, index));
     if (!mass) return [];
@@ -1164,7 +1286,8 @@ export function planParcelBuilding(
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
   banks: Map<string, number>,
-  appearanceSeedOverride?: string
+  appearanceSeedOverride?: string,
+  frontage: FrontageSide | null = null
 ): BuildingPlan | null {
   const active = BUILDING_GRAMMAR_IDS.filter((id) => (weights[id] ?? 0) > 0);
   const fitting = active.filter((id) => grammarFitsParcel(BUILDING_GRAMMAR_REGISTRY.get(id)!, parcel));
@@ -1182,7 +1305,7 @@ export function planParcelBuilding(
   const heightM = range(`${geometrySeed}/height`, grammar.height.minM, grammar.height.maxM) * (1 - grammar.height.skylineBias) +
     range(`${geometrySeed}/height-sky`, grammar.height.minM, grammar.height.maxM) * grammar.height.skylineBias;
   const setbackM = range(`${parcel.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
-  const rawMasses = archetypeMasses(parcel, grammar, geometrySeed, heightM, setbackM);
+  const rawMasses = archetypeMasses(parcel, grammar, geometrySeed, heightM, setbackM, frontage);
   if (rawMasses.length === 0) return null;
   const bank = parcelBank(district, banks);
   const buildingId = stableId("building", `${parcel.id}|${grammarId}|${rawMasses.map((mass) => pointKey(mass.footprint[0]!)).join("+")}`);
@@ -1318,11 +1441,15 @@ function refineParcelVariant(
   weights: Readonly<Record<BuildingGrammarId, number>>,
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
-  banks: Map<string, number>
+  banks: Map<string, number>,
+  frontage: FrontageSide | null
 ): RefinedParcelResult | null {
   const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
   const unbuilt: Ring[] = [];
+  // Every cell of a partition inherits the parent's frontage direction re-expressed in
+  // the partition's frame, so the whole partition reads as one continuous street front.
+  const cellFrontage = frontage === null ? null : frontageInFrame(frontage, parcel.frontageAngleRad, partition.angleRad);
   const startX = partition.bounds.x - partition.widthM * offsetX / 3;
   const startY = partition.bounds.y - partition.depthM * offsetY / 3;
   const columns = Math.ceil((partition.bounds.x + partition.bounds.width - startX) / partition.widthM);
@@ -1369,7 +1496,7 @@ function refineParcelVariant(
             seed: `${parcel.seed}/refined/${lineage}`,
             areaM2: pieceAreaM2
           };
-          const building = planParcelBuilding(candidate, weights, useWeights, district, banks);
+          const building = planParcelBuilding(candidate, weights, useWeights, district, banks, undefined, cellFrontage);
           if (building !== null) {
             parcels.push(candidate);
             buildings.push(building);
@@ -1390,13 +1517,14 @@ function refineParcel(
   weights: Readonly<Record<BuildingGrammarId, number>>,
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
-  banks: Map<string, number>
+  banks: Map<string, number>,
+  frontage: FrontageSide | null
 ): RefinedParcelResult | null {
   let best: RefinedParcelResult | null = null;
   for (const partition of parcelPartitionCandidates(parcel, weights)) {
     for (let offsetX = 0; offsetX < 3; offsetX++) {
       for (let offsetY = 0; offsetY < 3; offsetY++) {
-        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks);
+        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks, frontage);
         if (result !== null && (best === null || result.areaM2 > best.areaM2)) best = result;
         if (best !== null && best.areaM2 >= parcel.areaM2 * 0.97) return best;
       }
@@ -1455,7 +1583,8 @@ function residualParcelPlans(
 function planBuildings(
   sourceParcels: ParcelPlan[],
   districtById: Map<string, DistrictSource>,
-  banks: Map<string, number>
+  banks: Map<string, number>,
+  occupancy: MultiPolygon
 ): { parcels: ParcelPlan[]; buildings: BuildingPlan[]; openSpaces: OpenSpacePlan[]; warnings: string[] } {
   const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
@@ -1463,18 +1592,20 @@ function planBuildings(
   const warnings: string[] = [];
   let refinedCount = 0;
   let unbuiltCount = 0;
+  const occBoxes = occupancyBoxes(occupancy);
   for (const parcel of sourceParcels) {
     const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
     const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
     const weights = definition ? definition.buildingGrammarWeights : UNZONED_BUILDING_GRAMMAR_WEIGHTS;
     const useWeights = definition ? definition.visualUseWeights : UNZONED_VISUAL_USE_WEIGHTS;
-    const building = planParcelBuilding(parcel, weights, useWeights, district, banks);
+    const frontage = detectFrontage(parcel, occBoxes);
+    const building = planParcelBuilding(parcel, weights, useWeights, district, banks, undefined, frontage);
     if (building !== null) {
       parcels.push(parcel);
       buildings.push(building);
       continue;
     }
-    const refined = refineParcel(parcel, weights, useWeights, district, banks);
+    const refined = refineParcel(parcel, weights, useWeights, district, banks, frontage);
     if (refined !== null) {
       const residual = residualParcelPlans(parcel, refined);
       parcels.push(...refined.parcels, ...residual.parcels);
@@ -1614,7 +1745,7 @@ export function buildCompleteCityPlan(
   // leaving an unexplained void in the city.
   const landmarkSites = new Map(landmarks.map((landmark) => [landmark.id, landmark.sitePolygon]));
   const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, landmarkSites, districtById, banks);
-  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(planningParcels, districtById, banks);
+  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(planningParcels, districtById, banks, occupancy.all);
   const placedLandmarkIds = new Set(landmarks.map((landmark) => landmark.id));
   const keptLandmarkOpenSpaces = landmarkOpenSpaces.filter((openSpace) => openSpace.landmarkId === null || placedLandmarkIds.has(openSpace.landmarkId));
   const allOpenSpaces = [...keptLandmarkOpenSpaces, ...openSpaces, ...unbuiltOpenSpaces].sort((a, b) => a.id.localeCompare(b.id));

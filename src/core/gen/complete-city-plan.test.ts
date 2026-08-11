@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti, union } from "../geom/boolean.js";
-import { rectRing, rectsIntersect, ringArea, ringBounds, type MultiPolygon, type Ring } from "../geom/types.js";
+import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring } from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
-import { buildCompleteCityPlan, derivePaletteBanks, planParcelBuilding, reserveMajorLandmarkSites, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
+import { buildCompleteCityPlan, derivePaletteBanks, planParcelBuilding, reserveMajorLandmarkSites, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -736,5 +736,133 @@ describe("buildCompleteCityPlan", () => {
     const tallProblems = validateCompleteCityPlan(tallMass);
     expect(tallProblems.some((message) => message.includes("declared maximum height"))).toBe(true);
     expect(tallProblems.some((message) => message.includes("masses' peak"))).toBe(true);
+  }, 120_000);
+});
+
+describe("frontage placement", () => {
+  const frontage = (axis: "u" | "v", sign: 1 | -1): FrontageSide => ({ axis, sign });
+  const only = (grammarId: BuildingGrammarId): Record<BuildingGrammarId, number> =>
+    Object.fromEntries(BUILDING_GRAMMAR_IDS.map((id) => [id, id === grammarId ? 1 : 0])) as Record<BuildingGrammarId, number>;
+  const allUses = (): Record<BuildingUseId, number> =>
+    Object.fromEntries(BUILDING_USE_IDS.map((use) => [use, 1])) as Record<BuildingUseId, number>;
+  const parcel = (x: number, y: number, width: number, height: number, angle = 0) => ({
+    id: `parcel-${x}-${y}`,
+    blockId: "block-0",
+    fragmentId: "fragment-0",
+    districtId: null,
+    polygon: rectRing({ x, y, width, height }),
+    frontageAngleRad: angle,
+    seed: `parcel-${x}-${y}`,
+    areaM2: width * height
+  });
+
+  it("pushes a street-wall mass flush to its frontage with no side moats", () => {
+    // narrow-shopfront: maxWidthM 16, maxDepthM 30, maxAreaM2 480
+    const input = parcel(0, 0, 14, 26);
+    const building = planParcelBuilding(input, only("narrow-shopfront"), allUses(), undefined, new Map(), undefined, frontage("v", 1));
+    expect(building, "street-wall grammar must build on a fitting parcel").not.toBeNull();
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get(building!.grammarId)!;
+    expect(grammar.frontage.mode).toBe("street-wall");
+    // Front edge: in the parcel's local frame the front is the max-Y side (sign +1).
+    const localMasses = building!.masses.map((mass, index) => ({
+      id: `${building!.id}|m${index}`,
+      maxY: Math.max(...mass.footprint.map((point) => point.y)),
+      minX: Math.min(...mass.footprint.map((point) => point.x)),
+      maxX: Math.max(...mass.footprint.map((point) => point.x))
+    }));
+    const front = 26;
+    for (const mass of localMasses) {
+      // flush to the road: front gap at most the declared front-setback maximum
+      expect(front - mass.maxY, mass.id).toBeGreaterThanOrEqual(-0.01);
+      expect(front - mass.maxY, mass.id).toBeLessThanOrEqual(grammar.frontage.frontSetback[1] + 0.01);
+    }
+    // width span: the mass fills the parcel width (no buffer moats on the sides)
+    const span = Math.max(...localMasses.map((mass) => mass.maxX)) - Math.min(...localMasses.map((mass) => mass.minX));
+    expect(span).toBeGreaterThan(14 * 0.85);
+  });
+
+  it("centers the same street-wall grammar when no frontage is detected but still fills the parcel width", () => {
+    const input = parcel(0, 0, 14, 26);
+    const building = planParcelBuilding(input, only("narrow-shopfront"), allUses(), undefined, new Map());
+    expect(building).not.toBeNull();
+    const ys = building!.masses.flatMap((mass) => mass.footprint.map((point) => point.y));
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const midY = (minY + maxY) / 2;
+    expect(midY).toBeGreaterThan(9);
+    expect(midY).toBeLessThan(17);
+    const xs = building!.masses.flatMap((mass) => mass.footprint.map((point) => point.x));
+    expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThan(14 * 0.85);
+  });
+
+  it("keeps a setback-mode grammar off the street with a front plaza", () => {
+    // civic-pavilion: maxDepthM 34
+    const input = parcel(0, 0, 30, 30);
+    const building = planParcelBuilding(input, only("civic-pavilion"), allUses(), undefined, new Map(), undefined, frontage("v", 1));
+    expect(building).not.toBeNull();
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get(building!.grammarId)!;
+    expect(grammar.frontage.mode).toBe("setback");
+    const maxY = Math.max(...building!.masses.flatMap((mass) => mass.footprint.map((point) => point.y)));
+    expect(30 - maxY).toBeGreaterThanOrEqual(grammar.frontage.frontSetback[0] - 0.01);
+  });
+
+  it("builds sub-100 m² fine-grain parcels through the micro grammars", () => {
+    const input = parcel(0, 0, 6, 6); // 36 m² — below the old 100 m² main-grammar floor
+    const building = planParcelBuilding(input, only("street-kiosk"), allUses(), undefined, new Map(), undefined, frontage("v", 1));
+    expect(building, "a 36 m² parcel must produce a street-kiosk").not.toBeNull();
+    expect(building!.grammarId).toBe("street-kiosk");
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get("street-kiosk")!;
+    expect(building!.heightM).toBeGreaterThanOrEqual(grammar.height.minM);
+    expect(building!.heightM).toBeLessThanOrEqual(grammar.height.maxM);
+    for (const mass of building!.masses) {
+      expect(overlap(mass.footprint, input.polygon)).toBeGreaterThan(Math.abs(ringArea(mass.footprint)) - 0.5);
+    }
+  });
+
+  it("keeps whole-city density above the pre-pass moat baseline", () => {
+    // Regression floor for the Phase 4.5 density pass: before it, the median parcel
+    // occupancy on the ring fixture was ~0.25 (buildings centered with all-side moats).
+    const plan = buildCompleteCityPlan(ringSource(16));
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const parcelById = new Map(plan.parcels.map((p) => [p.id, p]));
+    const ratios = plan.buildings
+      .map((building) => {
+        const p = parcelById.get(building.parcelId);
+        return p ? building.areaM2 / p.areaM2 : 0;
+      })
+      .sort((a, b) => a - b);
+    expect(ratios.length).toBeGreaterThan(0);
+    const median = ratios[Math.floor(ratios.length / 2)]!;
+    expect(median).toBeGreaterThan(0.45);
+    // And the width-span contract: no building may sit with big side moats. The
+    // mass union spans the parcel's local width on the median (irregular clipped
+    // pieces can legitimately have wider AABBs than their building).
+    const spans: number[] = [];
+    for (const building of plan.buildings) {
+      const p = parcelById.get(building.parcelId);
+      if (!p) continue;
+      const centre = ringCentroid(p.polygon);
+      const local = p.polygon.map((point) => {
+        const dx = point.x - centre.x;
+        const dy = point.y - centre.y;
+        const c = Math.cos(-p.frontageAngleRad);
+        const s = Math.sin(-p.frontageAngleRad);
+        return { x: centre.x + dx * c - dy * s, y: centre.y + dx * s + dy * c };
+      });
+      const bounds = ringBounds(local);
+      const massXs = building.masses.flatMap((mass) => mass.footprint.map((point) => {
+        const dx = point.x - centre.x;
+        const dy = point.y - centre.y;
+        const c = Math.cos(-p.frontageAngleRad);
+        const s = Math.sin(-p.frontageAngleRad);
+        return { x: centre.x + dx * c - dy * s, y: centre.y + dx * s + dy * c };
+      }));
+      const massMinX = Math.min(...massXs.map((point) => point.x));
+      const massMaxX = Math.max(...massXs.map((point) => point.x));
+      spans.push((massMaxX - massMinX) / bounds.width);
+    }
+    spans.sort((a, b) => a - b);
+    expect(spans[Math.floor(spans.length / 2)]!).toBeGreaterThan(0.7);
+    expect(spans[0]!).toBeGreaterThan(0.25);
   }, 120_000);
 });
