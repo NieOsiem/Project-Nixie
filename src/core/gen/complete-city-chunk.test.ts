@@ -633,8 +633,9 @@ describe("buildCompleteCityChunk", () => {
       { category: "vacant", surfaceStyle: "scrub", detailStyle: "none", slot: DISTRICT_SLOT.WALL_C },
       { category: "utility", surfaceStyle: "concrete", detailStyle: "utility-structures", slot: DISTRICT_SLOT.ROOF_B },
       { category: "landscaping", surfaceStyle: "planting", detailStyle: "planters", slot: DISTRICT_SLOT.ROOF_C },
-      { category: "service-yard", surfaceStyle: "gravel", detailStyle: "bins", slot: DISTRICT_SLOT.ROOF_A }
+      { category: "service-yard", surfaceStyle: "gravel", detailStyle: "bins", slot: DISTRICT_SLOT.ROOF_B }
     ];
+    const bankStart = materialIndex(BANK, 0);
     const treatments = styles.map(({ category, surfaceStyle, detailStyle, slot }) => {
       const openSpace: OpenSpacePlan = {
         id: `os-${category}`,
@@ -667,10 +668,11 @@ describe("buildCompleteCityChunk", () => {
         const at = i * VERTEX_FLOATS;
         const kind = build.mesh.vertices[at + 5]!;
         const material = build.mesh.vertices[at + 3]!;
-        if (kind !== KIND.FLAT || material < BANK * BANK_SIZE) continue;
+        if (kind !== KIND.FLAT || material < bankStart || material >= bankStart + BANK_SIZE) continue;
         flatPairs.add(`${material}:${build.mesh.vertices[at + 4]!}`);
       }
       expect(flatPairs.size).toBe(1);
+      expect([...flatPairs][0]!.split(":")[0]).toBe(String(materialIndex(BANK, slot)));
       return { category, pair: [...flatPairs][0]!, hasDetail: build.detail.vertexCount > 0 };
     });
 
