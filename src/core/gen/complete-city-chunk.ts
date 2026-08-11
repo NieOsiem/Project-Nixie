@@ -283,6 +283,9 @@ function openSpaceMaterialAndShade(plan: OpenSpacePlan): { material: number; sha
   };
 }
 
+/** Height offset in metres for open space polygons to prevent z-fighting with exposed ground at height 0. */
+export const OPEN_SPACE_HEIGHT_M = 0.02;
+
 function openSpaceMeshes(
   openSpaces: { plan: OpenSpacePlan; polygon: MultiPolygon }[],
   origin: Vec2,
@@ -297,7 +300,11 @@ function openSpaceMeshes(
     );
     if (polygon.length === 0) continue;
     const { material, shade } = openSpaceMaterialAndShade(openSpace.plan);
-    const mesh = flatMesh(polygon, 0, material, shade);
+    // WHY: Open spaces sit on top of base exposed land (height 0). Drawing them at height 0
+    // causes z-fighting (coplanar polygon artifacts) at high zoom levels. Elevating by
+    // OPEN_SPACE_HEIGHT_M (0.02 m) gives them depth clearance over ground while keeping them below
+    // road markings (0.05 m).
+    const mesh = flatMesh(polygon, OPEN_SPACE_HEIGHT_M, material, shade);
     if (mesh.triangleCount === 0) continue;
     meshes.push(mesh);
     triangles += mesh.triangleCount;
