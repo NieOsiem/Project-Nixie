@@ -19,8 +19,12 @@ import { hash2 } from "./hash.js";
  * half-extents to keep a bar shaped like a bar.
  */
 export const GLOW_MARGIN_M = 2;
-export const POOL_RADIUS_M = 30;
-export const POOL_RATE = 1;
+
+// WHY: fixed 30 m pools overlapped across adjacent lots; panel-scaled pools with a 10 m cap keep additive glow local.
+export const MAX_POOL_RADIUS_M = 10;
+export const MIN_POOL_RADIUS_M = 2;
+const POOL_RADIUS_FACTOR = 0.8;
+export const POOL_RATE = 0.5;
 
 const FACADE_RATE = 0.75;
 const FACADE_MIN_BUILDING_M = 6;
@@ -57,9 +61,9 @@ const BANNER_TOP_HIGH = 0.9;
 export const SIGN_BAND_TOP_M = 12;
 const SIZE_RAMP_FULL_M = 60;
 
-const POOL_MAX_SIGN_HEIGHT_M = 15;
+export const POOL_MAX_SIGN_HEIGHT_M = 15;
 const POOL_HEIGHT_M = 0.03;
-const POOL_STRENGTH = 0.22;
+const POOL_STRENGTH = 0.14;
 
 const STRENGTH_SPREAD = 0.6;
 const FACADE_STRENGTH = 0.7;
@@ -260,7 +264,8 @@ function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number):
 
   const cx = sign.corners.reduce((sum, c) => sum + c.x, 0) / sign.corners.length;
   const cy = sign.corners.reduce((sum, c) => sum + c.y, 0) / sign.corners.length;
-  const r = POOL_RADIUS_M * pixelsPerMetre;
+  const radiusM = poolRadiusM(sign);
+  const r = radiusM * pixelsPerMetre;
   return {
     corners: [
       { x: cx - r, y: cy - r, h: POOL_HEIGHT_M },
@@ -268,20 +273,20 @@ function groundPool(sign: NeonQuad, spec: BuildingSpec, pixelsPerMetre: number):
       { x: cx + r, y: cy + r, h: POOL_HEIGHT_M },
       { x: cx - r, y: cy + r, h: POOL_HEIGHT_M }
     ],
-    halfWidthM: POOL_RADIUS_M,
-    halfHeightM: POOL_RADIUS_M,
+    halfWidthM: radiusM,
+    halfHeightM: radiusM,
     material: sign.material,
     strength: sign.strength * POOL_STRENGTH,
     radial: 1
   };
 }
 
-/**
- * Emits KIND.NEON quads for the buildings a chunk owns. Footprints are world pixels.
- * A mass whose grammar disabled neon contributes nothing here even when its signage
- * rate is high — the renderer gates its pass on these triangles, so an empty result
- * is a guaranteed zero-glow chunk.
- */
+function poolRadiusM(sign: NeonQuad): number {
+  const halfDiagM = Math.hypot(sign.halfWidthM, sign.halfHeightM);
+  return Math.min(MAX_POOL_RADIUS_M, Math.max(MIN_POOL_RADIUS_M, POOL_RADIUS_FACTOR * halfDiagM));
+}
+
+/** A mass with neon disabled emits no geometry, so its renderer pass remains empty. */
 export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): MeshBuffers {
   const quads: NeonQuad[] = [];
   for (const spec of buildings) {

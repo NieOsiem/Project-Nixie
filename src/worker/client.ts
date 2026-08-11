@@ -131,11 +131,15 @@ export class WorkerClient {
   #settle(message: WorkerMessage): void {
     const pending = this.#pending.get(message.id);
     if (!pending) return;
-    // Request-scoped progress: forward to the callback, but keep the request pending until
-    // the final summary. After settle or termination the entry is gone, so any straggler
-    // progress message for this id is ignored.
+    // WHY: progress remains pending until its final summary; stragglers after settlement are ignored.
     if (message.ok && "progress" in message && message.progress === true) {
-      pending.onProgress?.(message.result);
+      try {
+        pending.onProgress?.(message.result);
+      } catch (err) {
+        // WHY: leaving a failed install callback pending lets the final summary falsely report success.
+        this.#pending.delete(message.id);
+        pending.reject(err instanceof Error ? err : new Error(String(err)));
+      }
       return;
     }
     this.#pending.delete(message.id);

@@ -477,7 +477,7 @@ export function compiledRouteOccupancy(network: CompiledRouteNetwork): RouteOccu
   return { vehicle: vehicleUnion, nonVehicle: nonVehicleUnion, all: union([vehicleUnion, nonVehicleUnion]) };
 }
 
-function inputSignature(source: CitySourceV3): StructuralInputSignature {
+export function districtStructuralInputSignature(source: CitySourceV3): StructuralInputSignature {
   const nodes = [...source.roads.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const routes = [...source.roads.routes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...source.roads.edges].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, a, b, routeId, classId }) => ({ id, a, b, routeId, classId }));
@@ -850,7 +850,7 @@ export function buildDistrictPlan(source: CitySourceV3): DistrictPlan {
   const planned = planFragments(source, base.blocks);
   const fragments = base.blocks.reduce((sum, block) => sum + block.districtFragments.length, 0);
   return {
-    revisionInputs: inputSignature(source),
+    revisionInputs: districtStructuralInputSignature(source),
     blocks: base.blocks,
     developmentCells: planned.cells,
     openSpaceIntents: planned.intents,

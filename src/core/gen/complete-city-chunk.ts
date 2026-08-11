@@ -44,6 +44,8 @@ import type {
   LandmarkPlan,
   OpenSpacePlan
 } from "./complete-city-plan.js";
+import { BUILDING_GRAMMAR_REGISTRY } from "./building-registry.js";
+import { LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
 import { validateCompleteCityPlan } from "./complete-city-plan.js";
 
 /**
@@ -72,10 +74,10 @@ import { validateCompleteCityPlan } from "./complete-city-plan.js";
  *
  * The three mesh outputs match the renderer's `ChunkGeometry` split: everything opaque
  * in `mesh`, higher-quality architecture in `detail`, and additive neon quads in `neon`.
- * Every mass extrudes into the opaque silhouette (it must exist at every quality);
- * masses whose `detailPolicy` is "detail" or "both" additionally feed the detail tier.
- * Neon is depth-tested against the opaque pass by the renderer, so no NEON vertex may
- * ever leak into `mesh`.
+ * The grammar's `geometryPolicy.coarse` picks the motion representation: "volumes"
+ * emits every mass in `mesh`; "silhouette" emits only the primary mass there and defers
+ * remaining masses to settled `detail`. Per-mass architectural detail follows
+ * `detailPolicy`. Neon is depth-tested against opaque geometry and stays in `neon`.
  */
 
 export interface CompleteChunkBuild {
@@ -411,6 +413,7 @@ function massSpec(mass: PlanMass, origin: Vec2, pixelsPerMetre: number): Buildin
   };
 }
 
+
 /**
  * Extent a kept mass's geometry can reach: footprint, shadow of its full height, and the
  * clutter boxes that sit on top of tall building masses (never landmark masses).
@@ -500,6 +503,34 @@ export function buildCompleteCityChunk(
     landmark.masses.map((mass) => massSpec(mass, origin, pixelsPerMetre))
   );
 
+  // WHY: silhouette policy keeps motion cheap without leaving false opaque geometry in the settled view.
+  const silhouetteBuildings = new Set(
+    ownedBuildings
+      .filter((building) => (BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)?.geometryPolicy.coarse ?? "volumes") === "silhouette")
+      .map((building) => building.id)
+  );
+  const silhouetteLandmarks = new Set(
+    ownedLandmarks
+      .filter((landmark) => (LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)?.geometryPolicy.coarse ?? "volumes") === "silhouette")
+      .map((landmark) => landmark.id)
+  );
+  const coarseBuildingSpecs = ownedBuildings.flatMap((building) =>
+    (silhouetteBuildings.has(building.id) ? building.masses.slice(0, 1) : building.masses)
+      .map((mass) => massSpec(mass, origin, pixelsPerMetre))
+  );
+  const coarseLandmarkSpecs = ownedLandmarks.flatMap((landmark) =>
+    (silhouetteLandmarks.has(landmark.id) ? landmark.masses.slice(0, 1) : landmark.masses)
+      .map((mass) => massSpec(mass, origin, pixelsPerMetre))
+  );
+  const silhouetteVolumeSpecs = [
+    ...ownedBuildings
+      .filter((building) => silhouetteBuildings.has(building.id))
+      .flatMap((building) => building.masses.slice(1).map((mass) => massSpec(mass, origin, pixelsPerMetre))),
+    ...ownedLandmarks
+      .filter((landmark) => silhouetteLandmarks.has(landmark.id))
+      .flatMap((landmark) => landmark.masses.slice(1).map((mass) => massSpec(mass, origin, pixelsPerMetre)))
+  ];
+
   const surfaceParts = [
     flatMesh(clipped.water, 0, MATERIAL.WATER, 1),
     flatMesh(clipped.exposedLand, 0, MATERIAL.GROUND, 1),
@@ -513,11 +544,10 @@ export function buildCompleteCityChunk(
   const mesh = mergeMeshes([
     ...surfaceParts,
     ...openSpaceMeshes_,
-    ...buildingSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
-    ...landmarkSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
+    ...coarseBuildingSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
+    ...coarseLandmarkSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
     clutterMesh(buildingSpecs, pixelsPerMetre)
   ]);
-  // "coarse" masses are silhouette-only; the rest also earn their detail tier.
   const detailBuildingSpecs = ownedBuildings.flatMap((building) =>
     building.masses
       .filter((mass) => mass.detailPolicy === "detail" || mass.detailPolicy === "both")
@@ -531,7 +561,8 @@ export function buildCompleteCityChunk(
   const detail = mergeMeshes([
     buildingDetailMesh(detailBuildingSpecs, pixelsPerMetre),
     buildingDetailMesh(detailLandmarkSpecs, pixelsPerMetre),
-    openSpaceDetailMesh(openSpaces, origin, pixelsPerMetre)
+    openSpaceDetailMesh(openSpaces, origin, pixelsPerMetre),
+    ...silhouetteVolumeSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre))
   ]);
   const neon = neonMesh([...buildingSpecs, ...landmarkSpecs], pixelsPerMetre);
 

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { DISTRICT_PALETTE_IDS } from "./gen/district-registry.js";
 import {
   BANK_COUNT,
   BANK_SIZE,
   BASE_BANK,
+  BUILTIN_PALETTES,
   CITY_BANK,
   CITY_SLOT,
   CITY_SURFACES,
@@ -17,6 +19,7 @@ import {
   PALETTE_PRESETS,
   PALETTE_ROWS,
   PALETTE_SIZE,
+  builtinPalette,
   materialIndex,
   normalizePalette,
   packPalette,
@@ -272,6 +275,86 @@ describe("shipped palettes", () => {
   it("finds presets by name and nothing else", () => {
     expect(presetByName(DEFAULT_DISTRICT_PALETTE.name)).toEqual(DEFAULT_DISTRICT_PALETTE);
     expect(presetByName("no such preset")).toBeNull();
+  });
+});
+
+describe("built-in district palettes", () => {
+  const GROUND_SLOTS = [
+    DISTRICT_SLOT.WALL_A,
+    DISTRICT_SLOT.WALL_B,
+    DISTRICT_SLOT.WALL_C,
+    DISTRICT_SLOT.ROOF_A,
+    DISTRICT_SLOT.ROOF_B,
+    DISTRICT_SLOT.ROOF_C
+  ];
+
+  const bankRegion = (packed: Uint8Array, bank: number): string =>
+    [...packed.slice(bank * BANK_SIZE * 4, (bank + 1) * BANK_SIZE * 4)].join(",");
+
+  it("resolves every shipping district palette id to a distinct full bank", () => {
+    expect(new Set(DISTRICT_PALETTE_IDS).size).toBe(16);
+    expect(Object.keys(BUILTIN_PALETTES).length).toBe(16);
+    for (const id of DISTRICT_PALETTE_IDS) {
+      const palette = builtinPalette(id);
+      expect(palette).not.toBe(DEFAULT_DISTRICT_PALETTE);
+      expect(palette.materials).toHaveLength(BANK_SIZE);
+      for (const m of palette.materials) {
+        for (const c of [m.base.r, m.base.g, m.base.b, m.emissive.r, m.emissive.g, m.emissive.b]) {
+          expect(c).toBeGreaterThanOrEqual(0);
+          expect(c).toBeLessThanOrEqual(1);
+        }
+        expect(m.emissiveStrength).toBeGreaterThanOrEqual(0);
+        expect(m.emissiveStrength).toBeLessThanOrEqual(EMISSIVE_MAX);
+      }
+    }
+    const signatures = DISTRICT_PALETTE_IDS.map((id) => JSON.stringify(builtinPalette(id).materials));
+    expect(new Set(signatures).size).toBe(signatures.length);
+  });
+
+  it("keeps ground-sampled wall and roof slots under the whole-ground bloom threshold", () => {
+    // WHY: open-space ground surfaces sample these slots (paving -> WALL_A, tarmac ->
+    // WALL_B, grass -> ROOF_A, ...). The shader multiplies by EMISSIVE_MAX, so the peak
+    // must stay under the 0.55 luma threshold a broad ground would otherwise clear.
+    for (const id of DISTRICT_PALETTE_IDS) {
+      for (const slot of GROUND_SLOTS) {
+        const m = builtinPalette(id).materials[slot]!;
+        const peak =
+          Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength * EMISSIVE_MAX;
+        expect(peak).toBeLessThan(0.55);
+      }
+    }
+  });
+
+  it("maps ids to banks by sorted order, never district order", () => {
+    const ids = ["waterfront", "corporate", "night-market"];
+    expect(paletteBanks(ids)).toEqual(paletteBanks([...ids].reverse()));
+    const sorted = [...ids].sort().map((id, index) => [id, FIRST_ZONE_BANK + index]);
+    expect([...paletteBanks(ids).entries()]).toEqual(sorted);
+  });
+
+  it("packs several distinct ids into distinct bank bytes under the plan's sorted rule", () => {
+    const ids = [
+      "commercial",
+      "entertainment",
+      "industrial-heavy",
+      "industrial-light",
+      "night-market",
+      "residential-mega"
+    ];
+    const banks: Material[][] = Array.from({ length: BANK_COUNT }, () =>
+      DEFAULT_DISTRICT_PALETTE.materials
+    );
+    banks[CITY_BANK] = CITY_SURFACES;
+    for (const [id, bank] of paletteBanks(ids)) banks[bank] = builtinPalette(id).materials;
+    const packed = packPalette(banks);
+    const regions = [...paletteBanks(ids).values()].map((bank) => bankRegion(packed, bank));
+    expect(new Set(regions).size).toBe(regions.length);
+    expect([...paletteBanks(ids).values()].sort((a, b) => a - b)).toEqual([2, 3, 4, 5, 6, 7]);
+  });
+
+  it("falls back to the default palette for unknown or unzoned ids", () => {
+    expect(builtinPalette("no-such-id")).toBe(DEFAULT_DISTRICT_PALETTE);
+    expect(builtinPalette("")).toBe(DEFAULT_DISTRICT_PALETTE);
   });
 });
 

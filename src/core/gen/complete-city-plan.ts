@@ -3,7 +3,7 @@ import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type Mult
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
-import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
+import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, districtStructuralInputSignature, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY } from "./district-registry.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
@@ -252,6 +252,17 @@ export interface PaletteBankEntry {
 export function derivePaletteBanks(source: CitySourceV3): PaletteBankEntry[] {
   const ids = [...new Set(source.districts.map((district) => district.paletteId))].sort();
   return ids.map((paletteId, index) => ({ paletteId, bank: FIRST_ZONE_BANK + index }));
+}
+
+export function completeCityStructuralInput(source: CitySourceV3): StructuralInputSignature {
+  const base = districtStructuralInputSignature(source);
+  const palettes = [...source.districts]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(({ id, paletteId }) => ({ id, paletteId }));
+  return {
+    ...base,
+    districts: stableId("complete-districts", `${base.districts}|${JSON.stringify(palettes)}`)
+  };
 }
 
 export interface MajorLandmarkSiteReservation {
@@ -968,7 +979,9 @@ function archetypeMasses(
   const baseX = (bounds.width - mainW) / 2;
   const baseY = (bounds.height - mainH) / 2;
   const gap = 0.04;
-  const massHeight = (salt: string): number => heightM * (0.8 + hashUnit(`${seed}/mass/${salt}`) * 0.4);
+  // WHY: the first peer pins the declared total height; later peers must not raise the peak.
+  const peerHeight = (salt: string, index: number): number =>
+    index === 0 ? heightM : heightM * (0.8 + hashUnit(`${seed}/mass/${salt}`) * 0.2);
   const put = (rect: Ring, kind: string, elevationM: number, height: number): RawMass | null => {
     const fitted = fitRectInside(rect, container);
     if (!fitted) return null;
@@ -976,16 +989,13 @@ function archetypeMasses(
   };
   const mergePieces = (rings: readonly Ring[]): Ring | null => largestHoleFreePiece(union(rings.map((ring) => ringAsMulti(ring))));
   const archetype = definition.archetype;
-  // The declared mass count is the deterministic number of peer BuildingMassPlan entries;
-  // every archetype lays out exactly that many contained, same-elevation masses, so the
-  // declared count materially controls the generated output.
   const count = definition.massing.minMasses + Math.floor(hashUnit(`${seed}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
 
   if (archetype === "rectangle") {
     const masses: RawMass[] = [];
     const barH = (mainH - gap * (count - 1)) / count;
     for (let index = 0; index < count; index++) {
-      const mass = put(localRect(bounds, angle, centre, baseX, baseY + index * (barH + gap), mainW, barH), "slab", 0, index === 0 ? heightM : massHeight(`slab-${index}`));
+      const mass = put(localRect(bounds, angle, centre, baseX, baseY + index * (barH + gap), mainW, barH), "slab", 0, peerHeight(`slab-${index}`, index));
       if (!mass) return [];
       masses.push(mass);
     }
@@ -1007,7 +1017,7 @@ function archetypeMasses(
       masses.push({
         footprint: [a, b, { x: c.x + unitC.x * inset, y: c.y + unitC.y * inset }, { x: d.x - unitC.x * inset, y: d.y - unitC.y * inset }],
         elevationM: 0,
-        heightM: index === 0 ? heightM : massHeight(`wedge-${index}`),
+        heightM: peerHeight(`wedge-${index}`, index),
         kind: "wedge"
       });
     }
@@ -1017,21 +1027,24 @@ function archetypeMasses(
     const wingW = mainW * 0.42;
     const wingH = mainH * 0.55;
     const side = hashUnit(`${seed}/wing`) < 0.5 ? -1 : 1;
-    // Two disjoint bars forming an L: a full-width bottom slab plus a wing block in the
-    // opposite top corner. The wing occupies only the corner, so the bars never overlap.
+    // WHY: one concave base prevents an L grammar from rendering as unrelated rectangles.
     const bottomBar = localRect(bounds, angle, centre, baseX, baseY + wingH, mainW, mainH - wingH);
     const sideBarX = side < 0 ? baseX : baseX + mainW - wingW;
     const sideBar = localRect(bounds, angle, centre, sideBarX, baseY, wingW, wingH);
-    if (count >= 2) {
-      const bottom = put(bottomBar, "slab", 0, heightM);
-      const wing = put(sideBar, "wing", 0, massHeight("wing"));
-      if (!bottom || !wing) return [];
-      return [bottom, wing];
-    }
     const merged = mergePieces([bottomBar, sideBar]);
     if (!merged) return [];
-    const fitted = fitRectInside(merged, container);
-    return fitted ? [{ footprint: fitted, elevationM: 0, heightM, kind: "l-shape" }] : [];
+    const base = fitRectInside(merged, container);
+    if (!base || base.length <= 4) return [];
+    if (count < 2) return [{ footprint: base, elevationM: 0, heightM, kind: "l-shape" }];
+    // WHY: the upper slab must complete, not exceed, the grammar's declared total height.
+    const baseShare = 0.6 + hashUnit(`${seed}/stack-share`) * 0.2;
+    const slabRect = localRect(bounds, angle, centre, baseX + mainW * 0.12, baseY + wingH, mainW * 0.76, (mainH - wingH) * 0.55);
+    const slab = fitRectInside(slabRect, ringAsMulti(base)) ?? fitRectInside(slabRect, container);
+    if (!slab) return [];
+    return [
+      { footprint: base, elevationM: 0, heightM: heightM * baseShare, kind: "l-shape" },
+      { footprint: slab, elevationM: heightM * baseShare, heightM: heightM * (1 - baseShare), kind: "slab" }
+    ];
   }
   if (archetype === "u-shape") {
     const barH = mainH * 0.24;
@@ -1039,17 +1052,23 @@ function archetypeMasses(
     const left = localRect(bounds, angle, centre, baseX, baseY, barW, mainH);
     const right = localRect(bounds, angle, centre, baseX + mainW - barW, baseY, barW, mainH);
     const cross = localRect(bounds, angle, centre, baseX + barW, baseY, mainW - 2 * barW, barH);
-    if (count >= 2) {
-      const leftMass = put(left, "wing", 0, massHeight("wing"));
-      const rightPiece = mergePieces([right, cross]);
-      const rightMass = rightPiece ? put(rightPiece, "wing", 0, massHeight("wing")) : null;
-      if (!leftMass || !rightMass) return [];
-      return [leftMass, rightMass];
-    }
+    // The base is ALWAYS the single concave U ring of all three bars; declared extra
+    // masses (industrial-loading-court 1-2) stack above the cross bar.
     const merged = mergePieces([left, right, cross]);
     if (!merged) return [];
-    const fitted = fitRectInside(merged, container);
-    return fitted ? [{ footprint: fitted, elevationM: 0, heightM, kind: "u-shape" }] : [];
+    const base = fitRectInside(merged, container);
+    if (!base || base.length <= 4) return [];
+    if (count < 2) return [{ footprint: base, elevationM: 0, heightM, kind: "u-shape" }];
+    // The base takes most of the declared height and the stacked slab completes it exactly,
+    // so base + slab can never leave the grammar's declared total range.
+    const baseShare = 0.6 + hashUnit(`${seed}/stack-share`) * 0.2;
+    const slabRect = localRect(bounds, angle, centre, baseX + barW, baseY, mainW - 2 * barW, barH);
+    const slab = fitRectInside(slabRect, ringAsMulti(base)) ?? fitRectInside(slabRect, container);
+    if (!slab) return [];
+    return [
+      { footprint: base, elevationM: 0, heightM: heightM * baseShare, kind: "u-shape" },
+      { footprint: slab, elevationM: heightM * baseShare, heightM: heightM * (1 - baseShare), kind: "slab" }
+    ];
   }
   if (archetype === "courtyard") {
     const barW = mainW * 0.22;
@@ -1061,8 +1080,8 @@ function archetypeMasses(
     const bars = [top, bottom, left, right] as const;
     const kept = count < 4 ? bars.filter((_, index) => index !== Math.floor(hashUnit(`${seed}/court-drop`) * 4)) : bars;
     const masses: RawMass[] = [];
-    for (const rect of kept) {
-      const mass = put(rect, "ring-bar", 0, massHeight("ring-bar"));
+    for (let index = 0; index < kept.length; index++) {
+      const mass = put(kept[index]!, "ring-bar", 0, peerHeight("ring-bar", index));
       if (!mass) return [];
       masses.push(mass);
     }
@@ -1104,7 +1123,7 @@ function archetypeMasses(
     const w = mainW * unit * (0.62 + hashUnit(`${seed}/compound/${index}`) * 0.38);
     const h = mainH * (0.4 + hashUnit(`${seed}/compound/d/${index}`) * 0.34);
     const x = baseX + index * mainW * (unit + gap) + (mainW * unit - w) / 2;
-    const mass = put(localRect(bounds, angle, centre, x, baseY + (mainH - h) / 2, w, h), index % 3 === 0 ? "shed" : "pavilion", 0, massHeight(`compound-${index}`));
+    const mass = put(localRect(bounds, angle, centre, x, baseY + (mainH - h) / 2, w, h), index % 3 === 0 ? "shed" : "pavilion", 0, peerHeight(`compound-${index}`, index));
     if (!mass) return [];
     masses.push(mass);
   }
@@ -1127,7 +1146,9 @@ export interface ParcelBuildingInput {
  * shipping grammar's declared limits genuinely fit the parcel, and the parcel must be
  * left as an explicitly classified unbuilt open parcel. The chosen grammar always fits
  * (strict area/width/depth/aspect/setback checks), the visual use is always one of the
- * grammar's compatibleUses, and the mass count always lies in the declared range.
+ * grammar's compatibleUses, and its mass count and total height stay within declared
+ * ranges. Geometry and IDs derive from the parcel geometry stream; rendered appearance
+ * derives only from the appearance stream.
  * This is the production per-parcel materializer: planBuildings and the fixed breadth
  * gallery both run through it.
  */
@@ -1136,7 +1157,8 @@ export function planParcelBuilding(
   weights: Readonly<Record<BuildingGrammarId, number>>,
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
-  banks: Map<string, number>
+  banks: Map<string, number>,
+  appearanceSeedOverride?: string
 ): BuildingPlan | null {
   const active = BUILDING_GRAMMAR_IDS.filter((id) => (weights[id] ?? 0) > 0);
   const fitting = active.filter((id) => grammarFitsParcel(BUILDING_GRAMMAR_REGISTRY.get(id)!, parcel));
@@ -1150,7 +1172,7 @@ export function planParcelBuilding(
   ) as Record<BuildingUseId, number>;
   const visualUse = supportedUses.length > 0 ? weightedChoice(compatibleWeights, supportedUses, `${parcel.seed}/use`) : grammar.compatibleUses[0]!;
   const geometrySeed = `${parcel.seed}/geometry`;
-  const appearanceSeed = `${parcel.seed}/appearance`;
+  const appearanceSeed = appearanceSeedOverride ?? `${parcel.seed}/appearance`;
   const heightM = range(`${geometrySeed}/height`, grammar.height.minM, grammar.height.maxM) * (1 - grammar.height.skylineBias) +
     range(`${geometrySeed}/height-sky`, grammar.height.minM, grammar.height.maxM) * grammar.height.skylineBias;
   const setbackM = range(`${parcel.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
@@ -1160,10 +1182,12 @@ export function planParcelBuilding(
   const buildingId = stableId("building", `${parcel.id}|${grammarId}|${rawMasses.map((mass) => pointKey(mass.footprint[0]!)).join("+")}`);
   const masses: BuildingMassPlan[] = rawMasses.map((raw, index) => {
     const massSeed = `${geometrySeed}/mass/${index}`;
-    const wallSlot = weightedIndex([...grammar.materialSlots.wall], `${massSeed}/wall`);
-    const roofSlot = weightedIndex([...grammar.materialSlots.roof], `${massSeed}/roof`);
-    const facadeProfile = grammar.facadeProfiles[fnv1a(`${massSeed}/facade`) % grammar.facadeProfiles.length]!;
-    const roofline = grammar.rooflines[fnv1a(`${massSeed}/roofline`) % grammar.rooflines.length]!;
+    // WHY: appearance rerolls must not move geometry, IDs, or associations.
+    const appearanceMassSeed = `${appearanceSeed}/mass/${index}`;
+    const wallSlot = weightedIndex([...grammar.materialSlots.wall], `${appearanceMassSeed}/wall`);
+    const roofSlot = weightedIndex([...grammar.materialSlots.roof], `${appearanceMassSeed}/roof`);
+    const facadeProfile = grammar.facadeProfiles[fnv1a(`${appearanceMassSeed}/facade`) % grammar.facadeProfiles.length]!;
+    const roofline = grammar.rooflines[fnv1a(`${appearanceMassSeed}/roofline`) % grammar.rooflines.length]!;
     return {
       id: stableId("mass", `${buildingId}|m${index}`),
       buildingId,
@@ -1180,10 +1204,10 @@ export function planParcelBuilding(
       neonSlots: grammar.materialSlots.neon,
       wallMaterial: materialIndex(bank, wallSlot),
       roofMaterial: materialIndex(bank, 3 + roofSlot),
-      facadeSeed: hashUnit(`${massSeed}/facade-seed`),
-      signageRate: range(`${massSeed}/signage`, grammar.signage.rateMin, grammar.signage.rateMax),
-      rooftopUtilityRate: range(`${massSeed}/rooftop`, grammar.rooftopUtility.rateMin, grammar.rooftopUtility.rateMax),
-      wear: range(`${massSeed}/wear`, grammar.wear.min, grammar.wear.max),
+      facadeSeed: hashUnit(`${appearanceMassSeed}/facade-seed`),
+      signageRate: range(`${appearanceMassSeed}/signage`, grammar.signage.rateMin, grammar.signage.rateMax),
+      rooftopUtilityRate: range(`${appearanceMassSeed}/rooftop`, grammar.rooftopUtility.rateMin, grammar.rooftopUtility.rateMax),
+      wear: range(`${appearanceMassSeed}/wear`, grammar.wear.min, grammar.wear.max),
       detailPolicy: grammar.geometryPolicy.detail === "none" ? "coarse" : grammar.geometryPolicy.neon ? "both" : "detail",
       neonEnabled: grammar.geometryPolicy.neon,
       seed: massSeed
@@ -1207,47 +1231,281 @@ export function planParcelBuilding(
   };
 }
 
+interface ParcelPartition {
+  angleRad: number;
+  orientation: number;
+  grammarId: BuildingGrammarId;
+  bounds: Rect;
+  centre: Vec2;
+  columns: number;
+  rows: number;
+  widthM: number;
+  depthM: number;
+  score: number;
+}
+
+interface RefinedParcelResult {
+  parcels: ParcelPlan[];
+  buildings: BuildingPlan[];
+  unbuilt: Ring[];
+  areaM2: number;
+}
+
+function parcelPartitionCandidates(
+  parcel: ParcelPlan,
+  weights: Readonly<Record<BuildingGrammarId, number>>
+): ParcelPartition[] {
+  const centre = ringCentroid(parcel.polygon);
+  const candidates: ParcelPartition[] = [];
+  for (let orientation = 0; orientation < 2; orientation++) {
+    const angleRad = parcel.frontageAngleRad + orientation * Math.PI / 2;
+    const local = parcel.polygon.map((point) => rotatePoint(point, centre, -angleRad));
+    const bounds = ringBounds(local);
+    const grammarCandidates: ParcelPartition[] = [];
+    for (const grammarId of BUILDING_GRAMMAR_IDS) {
+      const weight = weights[grammarId] ?? 0;
+      if (weight <= 0) continue;
+      const limits = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!.siteLimits;
+      let best: ParcelPartition | null = null;
+      const maxColumns = Math.min(64, Math.ceil(bounds.width / limits.minWidthM));
+      const maxRows = Math.min(64, Math.ceil(bounds.height / limits.minDepthM));
+      for (let columns = 1; columns <= maxColumns; columns++) {
+        const widthM = bounds.width / columns;
+        if (widthM < limits.minWidthM || widthM > limits.maxWidthM) continue;
+        for (let rows = 1; rows <= maxRows; rows++) {
+          const depthM = bounds.height / rows;
+          const areaM2 = widthM * depthM;
+          const aspect = widthM / depthM;
+          if (areaM2 < limits.minAreaM2 || areaM2 > limits.maxAreaM2) continue;
+          if (aspect < limits.minAspect || aspect > limits.maxAspect) continue;
+          const targetAreaM2 = Math.sqrt(limits.minAreaM2 * limits.maxAreaM2);
+          const score = Math.abs(Math.log(areaM2 / targetAreaM2)) - Math.log(weight + 0.01) * 0.08;
+          if (best === null || score < best.score) {
+            best = {
+              angleRad,
+              orientation,
+              grammarId,
+              bounds,
+              centre,
+              columns,
+              rows,
+              widthM,
+              depthM,
+              score
+            };
+          }
+        }
+      }
+      if (best !== null) grammarCandidates.push(best);
+    }
+    grammarCandidates.sort((a, b) => a.score - b.score || a.grammarId.localeCompare(b.grammarId));
+    candidates.push(...grammarCandidates.slice(0, 3));
+  }
+  return candidates;
+}
+
+function refineParcelVariant(
+  parcel: ParcelPlan,
+  partition: ParcelPartition,
+  offsetX: number,
+  offsetY: number,
+  weights: Readonly<Record<BuildingGrammarId, number>>,
+  useWeights: Readonly<Record<BuildingUseId, number>>,
+  district: DistrictSource | undefined,
+  banks: Map<string, number>
+): RefinedParcelResult | null {
+  const parcels: ParcelPlan[] = [];
+  const buildings: BuildingPlan[] = [];
+  const unbuilt: Ring[] = [];
+  const startX = partition.bounds.x - partition.widthM * offsetX / 3;
+  const startY = partition.bounds.y - partition.depthM * offsetY / 3;
+  const columns = Math.ceil((partition.bounds.x + partition.bounds.width - startX) / partition.widthM);
+  const rows = Math.ceil((partition.bounds.y + partition.bounds.height - startY) / partition.depthM);
+  let candidateIndex = 0;
+  let areaM2 = 0;
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const rect = localRect(
+        partition.bounds,
+        partition.angleRad,
+        partition.centre,
+        startX - partition.bounds.x + column * partition.widthM,
+        startY - partition.bounds.y + row * partition.depthM,
+        partition.widthM,
+        partition.depthM
+      );
+      let clipped: MultiPolygon;
+      try {
+        clipped = intersection(ringAsMulti(rect), ringAsMulti(parcel.polygon));
+      } catch {
+        return null;
+      }
+      for (const polygon of clipped) {
+        let pieceIndex = 0;
+        for (const piece of canonicalHoleFreePieces(polygon)) {
+          const pieceAreaM2 = Math.abs(ringArea(piece));
+          if (pieceAreaM2 < MIN_PARCEL_AREA_M2) {
+            if (pieceAreaM2 > GEOMETRY_EPSILON) unbuilt.push(piece);
+            pieceIndex++;
+            continue;
+          }
+          const lineage = `${partition.orientation}/${partition.grammarId}/${offsetX}/${offsetY}/${row}/${column}/${pieceIndex}`;
+          const candidate: ParcelPlan = {
+            id: stableId("parcel", `${parcel.id}|refined|${lineage}|${ringKey(piece)}`),
+            blockId: parcel.blockId,
+            fragmentId: parcel.fragmentId,
+            districtId: parcel.districtId,
+            index: parcel.index * 10_000 + candidateIndex,
+            polygon: piece,
+            frontageRoadId: parcel.frontageRoadId,
+            frontageAngleRad: partition.angleRad,
+            role: `${parcel.role}-refined`,
+            seed: `${parcel.seed}/refined/${lineage}`,
+            areaM2: pieceAreaM2
+          };
+          const building = planParcelBuilding(candidate, weights, useWeights, district, banks);
+          if (building !== null) {
+            parcels.push(candidate);
+            buildings.push(building);
+            areaM2 += pieceAreaM2;
+          } else {
+            unbuilt.push(piece);
+          }
+          candidateIndex++;
+          pieceIndex++;
+        }
+      }
+    }
+  }
+  return { parcels, buildings, unbuilt, areaM2 };
+}
+function refineParcel(
+  parcel: ParcelPlan,
+  weights: Readonly<Record<BuildingGrammarId, number>>,
+  useWeights: Readonly<Record<BuildingUseId, number>>,
+  district: DistrictSource | undefined,
+  banks: Map<string, number>
+): RefinedParcelResult | null {
+  let best: RefinedParcelResult | null = null;
+  for (const partition of parcelPartitionCandidates(parcel, weights)) {
+    for (let offsetX = 0; offsetX < 3; offsetX++) {
+      for (let offsetY = 0; offsetY < 3; offsetY++) {
+        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks);
+        if (result !== null && (best === null || result.areaM2 > best.areaM2)) best = result;
+        if (best !== null && best.areaM2 >= parcel.areaM2 * 0.97) return best;
+      }
+    }
+  }
+  return best?.areaM2 ? best : null;
+}
+
+function residualParcelPlans(
+  parcel: ParcelPlan,
+  refined: RefinedParcelResult,
+  district: DistrictSource | undefined,
+  banks: Map<string, number>
+): { parcels: ParcelPlan[]; openSpaces: OpenSpacePlan[] } {
+  const parcels: ParcelPlan[] = [];
+  const openSpaces: OpenSpacePlan[] = [];
+  let index = 0;
+  for (const piece of refined.unbuilt) {
+    const areaM2 = Math.abs(ringArea(piece));
+    if (areaM2 <= GEOMETRY_EPSILON) continue;
+    const seed = `${parcel.seed}/residual/${index}`;
+    const residualParcel: ParcelPlan = {
+      id: stableId("parcel", `${parcel.id}|residual|${index}|${ringKey(piece)}`),
+      blockId: parcel.blockId,
+      fragmentId: parcel.fragmentId,
+      districtId: parcel.districtId,
+      index: parcel.index * 10_000 + 9_000 + index,
+      polygon: piece,
+      frontageRoadId: parcel.frontageRoadId,
+      frontageAngleRad: parcel.frontageAngleRad,
+      role: `${parcel.role}-residual`,
+      seed,
+      areaM2
+    };
+    parcels.push(residualParcel);
+    openSpaces.push({
+      id: stableId("open", `${residualParcel.id}|${ringKey(piece)}`),
+      parcelId: residualParcel.id,
+      blockId: parcel.blockId,
+      fragmentId: parcel.fragmentId,
+      districtId: parcel.districtId,
+      landmarkId: null,
+      category: "vacant",
+      size: areaM2 < 800 ? "small" : "large",
+      polygon: piece,
+      surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
+      detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
+      lineage: seed,
+      seed,
+      areaM2,
+      material: materialIndex(parcelBank(district, banks), OPEN_SPACE_SLOTS.vacant)
+    });
+    index++;
+  }
+  return { parcels, openSpaces };
+}
+
 function planBuildings(
-  parcels: ParcelPlan[],
+  sourceParcels: ParcelPlan[],
   districtById: Map<string, DistrictSource>,
   banks: Map<string, number>
-): { buildings: BuildingPlan[]; openSpaces: OpenSpacePlan[]; warnings: string[] } {
+): { parcels: ParcelPlan[]; buildings: BuildingPlan[]; openSpaces: OpenSpacePlan[]; warnings: string[] } {
+  const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
   const warnings: string[] = [];
-  for (const parcel of parcels) {
+  let refinedCount = 0;
+  let unbuiltCount = 0;
+  for (const parcel of sourceParcels) {
     const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
     const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
     const weights = definition ? definition.buildingGrammarWeights : UNZONED_BUILDING_GRAMMAR_WEIGHTS;
     const useWeights = definition ? definition.visualUseWeights : UNZONED_VISUAL_USE_WEIGHTS;
     const building = planParcelBuilding(parcel, weights, useWeights, district, banks);
-    if (!building) {
-      // Explicit classification: the parcel stays open (vacant), identified by parcelId,
-      // so no region of the city silently disappears from the accounting.
-      warnings.push(`Parcel "${parcel.id}" has no fitting building grammar and stays an explicitly unbuilt open parcel.`);
-      openSpaces.push({
-        id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
-        parcelId: parcel.id,
-        blockId: parcel.blockId,
-        fragmentId: parcel.fragmentId,
-        districtId: parcel.districtId,
-        landmarkId: null,
-        category: "vacant",
-        size: "large",
-        polygon: parcel.polygon,
-        surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
-        detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
-        lineage: parcel.seed,
-        seed: `${parcel.seed}/unbuilt`,
-        areaM2: parcel.areaM2,
-        material: materialIndex(parcelBank(district, banks), OPEN_SPACE_SLOTS.vacant)
-      });
+    if (building !== null) {
+      parcels.push(parcel);
+      buildings.push(building);
       continue;
     }
-    buildings.push(building);
+    const refined = refineParcel(parcel, weights, useWeights, district, banks);
+    if (refined !== null) {
+      const residual = residualParcelPlans(parcel, refined, district, banks);
+      parcels.push(...refined.parcels, ...residual.parcels);
+      buildings.push(...refined.buildings);
+      openSpaces.push(...residual.openSpaces);
+      refinedCount++;
+      unbuiltCount += residual.parcels.length;
+      continue;
+    }
+    parcels.push(parcel);
+    unbuiltCount++;
+    openSpaces.push({
+      id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
+      parcelId: parcel.id,
+      blockId: parcel.blockId,
+      fragmentId: parcel.fragmentId,
+      districtId: parcel.districtId,
+      landmarkId: null,
+      category: "vacant",
+      size: "large",
+      polygon: parcel.polygon,
+      surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
+      detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
+      lineage: parcel.seed,
+      seed: `${parcel.seed}/unbuilt`,
+      areaM2: parcel.areaM2,
+      material: materialIndex(parcelBank(district, banks), OPEN_SPACE_SLOTS.vacant)
+    });
   }
+  if (refinedCount > 0) warnings.push(`${refinedCount} planning parcels were partitioned into building-compatible final parcels.`);
+  if (unbuiltCount > 0) warnings.push(`${unbuiltCount} parcels have no fitting building grammar and remain explicitly unbuilt.`);
+  parcels.sort((a, b) => a.id.localeCompare(b.id));
   buildings.sort((a, b) => a.id.localeCompare(b.id));
-  return { buildings, openSpaces, warnings };
+  openSpaces.sort((a, b) => a.id.localeCompare(b.id));
+  return { parcels, buildings, openSpaces, warnings };
 }
 
 function materializeLandmarkMasses(
@@ -1263,10 +1521,12 @@ function materializeLandmarkMasses(
     landmark.rawMasses = landmarkMassRects(landmark.sitePolygon, definition, landmark.seed, regions.get(landmark.id) ?? ringAsMulti(landmark.sitePolygon));
     landmark.masses = landmark.rawMasses.map((raw, index) => {
       const massSeed = `${landmark.seed}/mass/${index}`;
-      const wallSlot = weightedIndex([...definition.materialSlots.wall], `${massSeed}/wall`);
-      const roofSlot = weightedIndex([...definition.materialSlots.roof], `${massSeed}/roof`);
-      const facadeProfile = definition.facadeProfiles[fnv1a(`${massSeed}/facade`) % definition.facadeProfiles.length]!;
-      const roofline = definition.rooflines[fnv1a(`${massSeed}/roofline`) % definition.rooflines.length]!;
+      // WHY: landmark appearance changes must not move geometry or IDs.
+      const appearanceMassSeed = `${landmark.appearanceSeed}/mass/${index}`;
+      const wallSlot = weightedIndex([...definition.materialSlots.wall], `${appearanceMassSeed}/wall`);
+      const roofSlot = weightedIndex([...definition.materialSlots.roof], `${appearanceMassSeed}/roof`);
+      const facadeProfile = definition.facadeProfiles[fnv1a(`${appearanceMassSeed}/facade`) % definition.facadeProfiles.length]!;
+      const roofline = definition.rooflines[fnv1a(`${appearanceMassSeed}/roofline`) % definition.rooflines.length]!;
       return {
         id: stableId("lmass", `${landmark.id}|m${index}`),
         landmarkId: landmark.id,
@@ -1280,12 +1540,12 @@ function materializeLandmarkMasses(
         neonSlots: definition.materialSlots.neon,
         wallMaterial: materialIndex(bank, wallSlot),
         roofMaterial: materialIndex(bank, 3 + roofSlot),
-        facadeSeed: hashUnit(`${massSeed}/facade-seed`),
+        facadeSeed: hashUnit(`${appearanceMassSeed}/facade-seed`),
         facadeProfile,
         roofline,
-        signageRate: range(`${massSeed}/signage`, definition.signage.rateMin, definition.signage.rateMax),
-        rooftopUtilityRate: range(`${massSeed}/rooftop`, definition.rooftopUtility.rateMin, definition.rooftopUtility.rateMax),
-        wear: range(`${massSeed}/wear`, definition.wear.min, definition.wear.max),
+        signageRate: range(`${appearanceMassSeed}/signage`, definition.signage.rateMin, definition.signage.rateMax),
+        rooftopUtilityRate: range(`${appearanceMassSeed}/rooftop`, definition.rooftopUtility.rateMin, definition.rooftopUtility.rateMax),
+        wear: range(`${appearanceMassSeed}/wear`, definition.wear.min, definition.wear.max),
         detailPolicy: definition.geometryPolicy.detail === "none" ? "coarse" : definition.geometryPolicy.neon ? "both" : "detail",
         neonEnabled: definition.geometryPolicy.neon,
         seed: massSeed
@@ -1347,8 +1607,8 @@ export function buildCompleteCityPlan(
   // region returns to explicit parcel/open-space/remainder accounting instead of
   // leaving an unexplained void in the city.
   const landmarkSites = new Map(landmarks.map((landmark) => [landmark.id, landmark.sitePolygon]));
-  const { parcels, openSpaces, warnings } = planFragments(districtPlan, landmarkSites, districtById, banks);
-  const { buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(parcels, districtById, banks);
+  const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, landmarkSites, districtById, banks);
+  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(planningParcels, districtById, banks);
   const placedLandmarkIds = new Set(landmarks.map((landmark) => landmark.id));
   const keptLandmarkOpenSpaces = landmarkOpenSpaces.filter((openSpace) => openSpace.landmarkId === null || placedLandmarkIds.has(openSpace.landmarkId));
   const allOpenSpaces = [...keptLandmarkOpenSpaces, ...openSpaces, ...unbuiltOpenSpaces].sort((a, b) => a.id.localeCompare(b.id));
@@ -1357,7 +1617,7 @@ export function buildCompleteCityPlan(
     ...carveFailures,
     ...emptyLandmarks.map((landmark) => `Landmark "${landmark.landmarkGrammarId}" at "${landmark.placementLineage}" produced no masses and was dropped.`)
   ];
-  const structuralInput = districtPlan.revisionInputs;
+  const structuralInput = completeCityStructuralInput(source);
   const fragmentCount = districtPlan.blocks.reduce((sum, block) => sum + block.districtFragments.length, 0);
   const contentSignature = JSON.stringify({
     structuralInput,
@@ -1541,9 +1801,22 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
     if (grammar && Array.isArray(building.masses) && !(building.masses.length >= grammar.massing.minMasses && building.masses.length <= grammar.massing.maxMasses)) {
       problems.push(`Building "${building.id}" has ${building.masses.length} masses outside grammar "${building.grammarId}" declared range ${grammar.massing.minMasses}-${grammar.massing.maxMasses}.`);
     }
+    // WHY: grammar height describes the whole building, not each stacked mass independently.
+    if (grammar && Number.isFinite(building.heightM) && Array.isArray(building.masses) && building.masses.length > 0) {
+      const peak = Math.max(...building.masses.map((mass) => mass.elevationM + mass.heightM));
+      if (Math.abs(peak - building.heightM) > GEOMETRY_EPSILON) {
+        problems.push(`Building "${building.id}" total height ${building.heightM} does not match its masses' peak ${peak}.`);
+      }
+    }
+    if (grammar && Number.isFinite(building.heightM) && !(building.heightM >= grammar.height.minM - GEOMETRY_EPSILON && building.heightM <= grammar.height.maxM + GEOMETRY_EPSILON)) {
+      problems.push(`Building "${building.id}" total height ${building.heightM} is outside grammar "${building.grammarId}" declared range ${grammar.height.minM}-${grammar.height.maxM}.`);
+    }
     for (const mass of building.masses) {
       if (!validRing(mass.footprint)) problems.push(`Building "${building.id}" mass ${mass.index} has an invalid footprint.`);
       if (!Number.isFinite(mass.elevationM) || mass.elevationM < 0 || !(mass.heightM > 0)) problems.push(`Building "${building.id}" mass ${mass.index} has invalid elevation or height.`);
+      if (grammar && mass.elevationM + mass.heightM > grammar.height.maxM + GEOMETRY_EPSILON) {
+        problems.push(`Building "${building.id}" mass ${mass.index} top exceeds grammar "${building.grammarId}" declared maximum height.`);
+      }
       if (parcel && validRing(mass.footprint) && !ringContained(mass.footprint, parcel.polygon)) problems.push(`Building "${building.id}" mass ${mass.index} is not contained in its parcel.`);
       if (typeof mass.neonEnabled !== "boolean") problems.push(`Building "${building.id}" mass ${mass.index} has an invalid neon flag.`);
     }
@@ -1551,8 +1824,7 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
       for (let right = left + 1; right < building.masses.length; right++) {
         const a = building.masses[left]!;
         const b = building.masses[right]!;
-        // Stacked volumes (podium bases and their contained upper masses) legally share
-        // footprint at different elevations; only same-level peer masses must be disjoint.
+        // WHY: stacked volumes may share footprint only when their elevation spans do not overlap.
         const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
         if (spansOverlap && ringOverlaps(a.footprint, b.footprint)) {
           problems.push(`Building "${building.id}" masses ${left} and ${right} overlap.`);

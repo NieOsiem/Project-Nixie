@@ -207,6 +207,16 @@ describe("handleRequest buildTerrainChunk", () => {
     expect(new Set(response.transfer!).size).toBe(2);
     for (const buffer of response.transfer!) expect(buffer).toBeInstanceOf(ArrayBuffer);
   });
+
+  it("carries the source revision identity on a failure response", () => {
+    const response = handleRequest({ ...request, id: 22, pixelsPerMetre: 0 });
+    expect(response).toEqual({
+      id: 22,
+      ok: false,
+      error: "Pixels per metre must be positive and finite.",
+      sourceRevision: 14
+    });
+  });
 });
 
 describe("handleRequest buildCityChunks", () => {
@@ -243,6 +253,18 @@ describe("handleRequest buildCityChunks", () => {
     expect(response.transfer).toEqual(expected);
     expect(response.transfer).toHaveLength(result.chunks.length * 2);
     expect(new Set(response.transfer!).size).toBe(response.transfer!.length);
+  });
+
+  it("carries revision and token identity on a failure response", () => {
+    const response = handleRequest({ ...request, id: 72, pixelsPerMetre: 0 });
+    expect(response).toEqual({
+      id: 72,
+      ok: false,
+      error: "Pixels per metre must be positive and finite.",
+      sourceRevision: 9,
+      actionToken: "action-3",
+      buildToken: 42
+    });
   });
 });
 
@@ -290,7 +312,10 @@ describe("handleRequest generateInitialRoadNetwork", () => {
     expect(response).toEqual({
       id: 82,
       ok: false,
-      error: "Road generation requires a non-empty mask."
+      error: "Road generation requires a non-empty mask.",
+      sourceRevision: 17,
+      actionToken: "roads-action-4",
+      buildToken: 99
     });
   });
 });
@@ -435,7 +460,11 @@ describe("handleRequest generateCompleteCityPlan", () => {
     expect(response).toEqual({
       id: request.id + 2,
       ok: false,
-      error: "Coastal full generation requires a coast edge."
+      error: "Coastal full generation requires a coast edge.",
+      absentGenerationToken: "absent-9",
+      actionToken: "full-generation-action",
+      buildToken: "full-generation-build",
+      epoch: 4
     });
   });
 });
@@ -464,6 +493,19 @@ describe("handleRequest buildCompleteCityPlan", () => {
     expect(result.validation).toEqual([]);
     expect(response.transfer).toBeUndefined();
   }, 120_000);
+
+  it("carries revision, token and epoch identity on a failure response", () => {
+    const response = handleRequest({ ...request, id: 105, sourceRevision: 0 });
+    expect(response).toEqual({
+      id: 105,
+      ok: false,
+      error: "Complete plan source revision must be a positive integer.",
+      sourceRevision: 0,
+      actionToken: "complete-edit-action",
+      buildToken: "complete-edit-build",
+      epoch: 5
+    });
+  });
 });
 
 describe("handleRequest buildCompleteCityChunks", () => {
@@ -522,8 +564,15 @@ describe("handleRequest buildCompleteCityChunks", () => {
       id: request.id + 1,
       plan: broken
     });
-    expect(response.ok).toBe(false);
-    if (response.ok === false) expect(response.error.length).toBeGreaterThan(0);
+    expect(response).toEqual({
+      id: request.id + 1,
+      ok: false,
+      error: expect.stringMatching(/invalid/i),
+      sourceRevision: 12,
+      actionToken: "complete-chunks-action",
+      buildToken: "complete-chunks-build",
+      epoch: 5
+    });
   });
 });
 
@@ -669,7 +718,15 @@ describe("handleWorkerMessage buildCompleteCityChunks", () => {
     expect(sink.records).toHaveLength(2);
     expect("progress" in sink.records[0]!.message).toBe(true);
     const failure = sink.records[1]!.message;
-    expect(failure).toEqual({ id: request.id, ok: false, error: "chunk build exploded" });
+    expect(failure).toEqual({
+      id: request.id,
+      ok: false,
+      error: "chunk build exploded",
+      sourceRevision: 12,
+      actionToken: "progress-action",
+      buildToken: "progress-build",
+      epoch: 6
+    });
     expect(sink.records[1]!.transfer).toBeUndefined();
   });
 
@@ -677,10 +734,16 @@ describe("handleWorkerMessage buildCompleteCityChunks", () => {
     const sink = recordingSink();
     await handleWorkerMessage(sink, { ...request, plan: { ...plan, parcels: [] } });
     expect(sink.records).toHaveLength(1);
-    const failure = sink.records[0]!.message;
-    expect(failure.id).toBe(request.id);
-    expect(failure.ok).toBe(false);
-    if (failure.ok === false) expect(failure.error).toMatch(/invalid/i);
+    expect(sink.records[0]!.message).toEqual({
+      id: request.id,
+      ok: false,
+      error: expect.stringMatching(/invalid/i),
+      sourceRevision: 12,
+      actionToken: "progress-action",
+      buildToken: "progress-build",
+      epoch: 6
+    });
+    expect(sink.records[0]!.transfer).toBeUndefined();
   });
 
   it("posts a final summary equal to the core full-batch aggregate with no chunk geometry", async () => {

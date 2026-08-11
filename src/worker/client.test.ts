@@ -276,4 +276,40 @@ describe("WorkerClient", () => {
     expect(seen).toEqual(["0,0"]);
     expect(client.inFlight).toBe(0);
   });
+
+  it("rejects once when the progress callback throws and ignores later messages", async () => {
+    const { client, fake } = clientWithFake();
+    const seen: string[] = [];
+    const pending = client.buildCompleteCityChunks(
+      chunkBody(),
+      (progress) => {
+        seen.push(progress.chunk.id);
+        if (progress.chunk.id === "0,0") throw new Error("callback exploded");
+      }
+    );
+    const request = fake.posted[0]!.message as { id: number };
+    fake.deliver(progressFor(request.id, 0, 1, chunk("0,0")));
+    await expect(pending).rejects.toThrow("callback exploded");
+    expect(seen).toEqual(["0,0"]);
+    expect(client.inFlight).toBe(0);
+    // The dropped entry ignores later progress and the final summary for the same id.
+    fake.deliver(progressFor(request.id, 0, 1, chunk("late")));
+    fake.deliver(summaryFor(request.id, { requested: 1, built: 1, vertexCount: 3, triangleCount: 1, bytes: 132, markingTriangleCount: 0, buildingCount: 0, landmarkCount: 0, openSpaceCount: 0 }));
+    expect(seen).toEqual(["0,0"]);
+    expect(client.inFlight).toBe(0);
+  });
+
+  it("turns a non-Error callback throw into an Error rejection", async () => {
+    const { client, fake } = clientWithFake();
+    const pending = client.buildCompleteCityChunks(
+      chunkBody(),
+      () => {
+        throw "plain-string-boom";
+      }
+    );
+    const request = fake.posted[0]!.message as { id: number };
+    fake.deliver(progressFor(request.id, 0, 1, chunk("0,0")));
+    await expect(pending).rejects.toThrow("plain-string-boom");
+    expect(client.inFlight).toBe(0);
+  });
 });

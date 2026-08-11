@@ -5,7 +5,7 @@ import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeS
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
-import { buildCompleteCityPlan, derivePaletteBanks, planParcelBuilding, reserveMajorLandmarkSites, validateCompleteCityPlan, type CompleteCityPlan, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
+import { buildCompleteCityPlan, derivePaletteBanks, planParcelBuilding, reserveMajorLandmarkSites, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -404,18 +404,22 @@ describe("buildCompleteCityPlan", () => {
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const builtIds = new Set(plan.buildings.map((building) => building.parcelId));
     const vacant = plan.openSpaces.filter((openSpace) => openSpace.parcelId !== null);
-    expect(vacant.every((openSpace) => openSpace.category === "vacant" && openSpace.size === "large")).toBe(true);
+    expect(vacant.every((openSpace) => openSpace.category === "vacant")).toBe(true);
     const vacantByParcel = new Map(vacant.map((openSpace) => [openSpace.parcelId, openSpace]));
     let unbuiltCount = 0;
+    let unbuiltAreaM2 = 0;
     for (const parcel of plan.parcels) {
       if (builtIds.has(parcel.id)) continue;
       unbuiltCount++;
+      unbuiltAreaM2 += parcel.areaM2;
       const openSpace = vacantByParcel.get(parcel.id);
       expect(openSpace, parcel.id).toBeDefined();
       expect(openSpace!.areaM2).toBeCloseTo(parcel.areaM2, 4);
     }
     expect(unbuiltCount).toBeGreaterThan(0);
     expect(vacant.length).toBe(unbuiltCount);
+    expect(vacant.some((openSpace) => openSpace.areaM2 < 25)).toBe(true);
+    expect(unbuiltAreaM2 / plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0)).toBeLessThanOrEqual(0.1);
     // The classification is deterministic.
     expect(buildCompleteCityPlan(ringSource(4))).toEqual(plan);
   }, 120_000);
@@ -457,7 +461,21 @@ describe("buildCompleteCityPlan", () => {
       expect(building!.masses.length, grammarId).toBeLessThanOrEqual(grammar.massing.maxMasses);
       expect(building!.setbackM!, grammarId).toBeGreaterThanOrEqual(grammar.footprint.setbackMin);
       expect(building!.setbackM!, grammarId).toBeLessThanOrEqual(grammar.footprint.setbackMax);
+      // The declared height range is enforced on the TOTAL: heightM is the peak of the
+      // masses' tops and both stay inside the grammar's declared range.
+      expect(building!.heightM, grammarId).toBeGreaterThanOrEqual(grammar.height.minM);
+      expect(building!.heightM, grammarId).toBeLessThanOrEqual(grammar.height.maxM);
+      const totalHeight = Math.max(...building!.masses.map((mass) => mass.elevationM + mass.heightM));
+      expect(totalHeight, grammarId).toBeCloseTo(building!.heightM, 9);
+      for (const mass of building!.masses) {
+        expect(mass.elevationM + mass.heightM, mass.id).toBeLessThanOrEqual(grammar.height.maxM + 1e-9);
+      }
       expect(grammar.compatibleUses, grammarId).toContain(building!.visualUse);
+      if (grammar.archetype === "l-shape" || grammar.archetype === "u-shape") {
+        const base = building!.masses.find((mass) => mass.elevationM === 0);
+        expect(base, grammarId).toBeDefined();
+        expect(base!.footprint.length, grammarId).toBeGreaterThan(4);
+      }
       for (const mass of building!.masses) {
         expect(mass.neonEnabled, mass.id).toBe(grammar.geometryPolicy.neon);
         expect(overlap(mass.footprint, parcel.polygon), mass.id).toBeGreaterThan(Math.abs(ringArea(mass.footprint)) - 0.5);
@@ -485,6 +503,116 @@ describe("buildCompleteCityPlan", () => {
     expect([...archetypes].sort()).toEqual([...FOOTPRINT_ARCHETYPE_IDS].sort());
   }, 60_000);
 
+  it("keeps stacked and multi-mass totals inside every grammar's declared height range", () => {
+    // Probe a deterministic seed spread per grammar: every produced total must equal the
+    // declared heightM inside the grammar range, regardless of the mass-count roll, and
+    // stacked L/U outputs must sit exactly on the base's top.
+    for (const grammarId of BUILDING_GRAMMAR_IDS) {
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
+      const limits = grammar.siteLimits;
+      const width = (limits.minWidthM + limits.maxWidthM) / 2;
+      const depth = (limits.minDepthM + limits.maxDepthM) / 2;
+      const weights = Object.fromEntries(BUILDING_GRAMMAR_IDS.map((id) => [id, id === grammarId ? 1 : 0])) as Record<BuildingGrammarId, number>;
+      const useWeights = Object.fromEntries(BUILDING_USE_IDS.map((use) => [use, 1])) as Record<BuildingUseId, number>;
+      let stackedSeen = 0;
+      for (let seedIndex = 0; seedIndex < 40; seedIndex++) {
+        const probe = {
+          id: `probe-${grammarId}-${seedIndex}`,
+          blockId: "block-0",
+          fragmentId: "frag-0",
+          districtId: null,
+          polygon: rectRing({ x: 0, y: 0, width, height: depth }),
+          frontageAngleRad: 0,
+          seed: `probe/${grammarId}/${seedIndex}`,
+          areaM2: width * depth
+        };
+        const building = planParcelBuilding(probe, weights, useWeights, undefined, new Map());
+        if (building === null) continue;
+        expect(building.heightM, building.id).toBeGreaterThanOrEqual(grammar.height.minM - 1e-9);
+        expect(building.heightM, building.id).toBeLessThanOrEqual(grammar.height.maxM + 1e-9);
+        const totalHeight = Math.max(...building.masses.map((mass) => mass.elevationM + mass.heightM));
+        expect(totalHeight, building.id).toBeCloseTo(building.heightM, 9);
+        for (const mass of building.masses) {
+          expect(mass.elevationM + mass.heightM, mass.id).toBeLessThanOrEqual(grammar.height.maxM + 1e-9);
+        }
+        if (building.masses.length >= 2 && (grammar.archetype === "l-shape" || grammar.archetype === "u-shape")) {
+          stackedSeen++;
+          expect(building.masses[1]!.elevationM, building.id).toBeCloseTo(building.masses[0]!.heightM, 9);
+        }
+      }
+      if ((grammar.archetype === "l-shape" || grammar.archetype === "u-shape") && grammar.massing.maxMasses >= 2) {
+        expect(stackedSeen, grammarId).toBeGreaterThan(0);
+      }
+    }
+  }, 60_000);
+
+  it("changes only appearance fields when the appearance seed changes", () => {
+    const parcel = {
+      id: "iso-parcel",
+      blockId: "block-0",
+      fragmentId: "frag-0",
+      districtId: null,
+      polygon: rectRing({ x: 0, y: 0, width: 40, height: 34 }),
+      frontageAngleRad: 0,
+      seed: "iso/parcel",
+      areaM2: 40 * 34
+    };
+    const weights = Object.fromEntries(BUILDING_GRAMMAR_IDS.map((id) => [id, id === "corporate-tower-podium" ? 1 : 0])) as Record<BuildingGrammarId, number>;
+    const useWeights = Object.fromEntries(BUILDING_USE_IDS.map((use) => [use, 1])) as Record<BuildingUseId, number>;
+    const first = planParcelBuilding(parcel, weights, useWeights, undefined, new Map(), "iso/appearance/one")!;
+    const second = planParcelBuilding(parcel, weights, useWeights, undefined, new Map(), "iso/appearance/two")!;
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    const geometry = (plan: BuildingPlan): string =>
+      JSON.stringify([
+        plan.id,
+        plan.parcelId,
+        plan.blockId,
+        plan.fragmentId,
+        plan.districtId,
+        plan.grammarId,
+        plan.visualUse,
+        plan.archetype,
+        plan.seed,
+        plan.heightM,
+        plan.setbackM,
+        plan.areaM2,
+        plan.masses.map((mass) => [
+          mass.id,
+          mass.buildingId,
+          mass.index,
+          mass.footprint,
+          mass.archetype,
+          mass.elevationM,
+          mass.heightM,
+          mass.massing,
+          mass.wallSlots,
+          mass.roofSlots,
+          mass.neonSlots,
+          mass.detailPolicy,
+          mass.neonEnabled,
+          mass.seed
+        ])
+      ]);
+    const appearance = (plan: BuildingPlan): string =>
+      JSON.stringify(
+        plan.masses.map((mass) => [
+          mass.roofline,
+          mass.facadeProfile,
+          mass.wallMaterial,
+          mass.roofMaterial,
+          mass.facadeSeed,
+          mass.signageRate,
+          mass.rooftopUtilityRate,
+          mass.wear
+        ])
+      );
+    expect(geometry(second)).toBe(geometry(first));
+    expect(appearance(second)).not.toBe(appearance(first));
+    // The production default appearance lineage is the parcel-derived appearance stream.
+    expect(planParcelBuilding(parcel, weights, useWeights, undefined, new Map())!.appearanceSeed).toBe("iso/parcel/appearance");
+  }, 30_000);
+
   it("reaches every archetype and a broad grammar set in a single whole-city plan", () => {
     // Ordinary whole-city reachability sanity: one deterministic plan must produce all
     // seven archetypes and most shipping grammars as generated outputs.
@@ -495,6 +623,12 @@ describe("buildCompleteCityPlan", () => {
     const archetypes = new Set(plan.buildings.map((building) => building.archetype));
     expect(grammars.size).toBeGreaterThanOrEqual(16);
     expect([...archetypes].sort()).toEqual([...FOOTPRINT_ARCHETYPE_IDS].sort());
+    for (const building of plan.buildings) {
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)!;
+      expect(building.heightM, building.id).toBeGreaterThanOrEqual(grammar.height.minM);
+      expect(building.heightM, building.id).toBeLessThanOrEqual(grammar.height.maxM);
+      expect(Math.max(...building.masses.map((mass) => mass.elevationM + mass.heightM)), building.id).toBeCloseTo(building.heightM, 9);
+    }
   }, 120_000);
 
   it("rejects injected illegal cross-occupancy, missing landmark open space, and non-fitting grammars", () => {
@@ -549,5 +683,39 @@ describe("buildCompleteCityPlan", () => {
       )
     };
     expect(validateCompleteCityPlan(badNeon).some((message) => message.includes("invalid neon flag"))).toBe(true);
+  }, 120_000);
+
+  it("rejects injected building totals outside the grammar's declared height range", () => {
+    const plan = buildCompleteCityPlan(ringSource(4));
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const first = plan.buildings[0]!;
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get(first.grammarId)!;
+    const withHeight = (heightM: number): CompleteCityPlan => ({
+      ...plan,
+      buildings: plan.buildings.map((building) => (building.id === first.id ? { ...building, heightM } : building))
+    });
+    expect(
+      validateCompleteCityPlan(withHeight(grammar.height.maxM + 100)).some(
+        (message) => message.includes("total height") && message.includes("outside")
+      )
+    ).toBe(true);
+    expect(
+      validateCompleteCityPlan(withHeight(grammar.height.minM - 100)).some(
+        (message) => message.includes("total height") && message.includes("outside")
+      )
+    ).toBe(true);
+    // A single mass towering past the declared maximum is rejected even when heightM is
+    // left untouched, because the total must equal the peak of the masses' tops.
+    const tallMass: CompleteCityPlan = {
+      ...plan,
+      buildings: plan.buildings.map((building) =>
+        building.id === first.id && building.masses.length > 0
+          ? { ...building, masses: building.masses.map((mass, index) => (index === 0 ? { ...mass, heightM: grammar.height.maxM + 50 } : mass)) }
+          : building
+      )
+    };
+    const tallProblems = validateCompleteCityPlan(tallMass);
+    expect(tallProblems.some((message) => message.includes("declared maximum height"))).toBe(true);
+    expect(tallProblems.some((message) => message.includes("masses' peak"))).toBe(true);
   }, 120_000);
 });

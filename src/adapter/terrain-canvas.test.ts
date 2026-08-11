@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
-import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3 } from "../core/gen/city.js";
+import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
+import type { CityStateV3, DistrictSource } from "../core/gen/city.js";
+import { BANK_SIZE, BASE_BANK, builtinPalette, packPalette, paletteBanks } from "../core/palette.js";
 import { rectangleLand } from "../core/gen/terrain.js";
+import type { Ring } from "../core/geom/types.js";
 import { TerrainSession } from "./terrain-session.js";
 import {
   handleWorkerMessage,
@@ -37,6 +39,7 @@ import {
   retryDistrictPlan,
   retryFullGeneration,
   retryGeneratedWalls,
+  retryGeometry,
   roadClearanceBlockers,
   sceneBoundsFromPixels,
   selectDistrict,
@@ -51,8 +54,63 @@ import {
   stats,
   undo,
   unmount,
+  updateDistricts,
   type ClearConfirmation
 } from "./terrain-canvas.js";
+
+/** Every CityRenderer the adapter constructs, with the palettes it was handed. */
+const rendererState = vi.hoisted(() => ({
+  instances: [] as Array<{ paletteUpdates: Uint8Array[] }>
+}));
+
+// WHY: the adapter constructs CityRenderer at mount once canvas.app.renderer exists; the
+// fake records every palette upload so tests can prove one shared texture is refreshed.
+vi.mock("../render/city-renderer.js", () => {
+  interface FakeStageObject {
+    parent: { removeChild(child: unknown): void } | null;
+    alpha: number;
+    elevation: number;
+    sortLayer: number;
+    sort: number;
+  }
+
+  class FakeCityRenderer {
+    display: FakeStageObject = { parent: null, alpha: 1, elevation: 0, sortLayer: 0, sort: 0 };
+    overlay: FakeStageObject = { parent: null, alpha: 1, elevation: 0, sortLayer: 0, sort: 0 };
+    weather: FakeStageObject = { parent: null, alpha: 1, elevation: 0, sortLayer: 0, sort: 0 };
+    lookDials: Record<string, number> = {};
+    rainStrength = 0;
+    cameraHeightMetres = 500;
+    cameraZoomMode = "dolly";
+    pixelsPerMetre = 1;
+    leanOverride: number | null = null;
+    renderScale = 1;
+    supersample = 1.5;
+    bloomEnabled = true;
+    bloomStrength = 1;
+    paletteUpdates: Uint8Array[] = [];
+
+    constructor(_renderer: unknown, _buffers: unknown, palette: Uint8Array, _options: unknown) {
+      this.paletteUpdates.push(palette);
+      rendererState.instances.push(this);
+    }
+
+    clearChunks(): void {}
+    setChunk(_chunk: unknown): void {}
+    updatePalette(palette: Uint8Array): void {
+      this.paletteUpdates.push(palette);
+    }
+    markContentDirty(): void {}
+    stats(): Record<string, unknown> { return {}; }
+    leanCalibrationPoint(): { leanStrength: number } {
+      return { leanStrength: this.leanOverride ?? 0 };
+    }
+    update(): void {}
+    animate(): void {}
+    destroy(): void {}
+  }
+  return { CityRenderer: FakeCityRenderer };
+});
 
 /** WHY: the adapter builds plans and chunks only in the worker; the fake runs the real
  * worker entry so it stays in lockstep with the progressive chunk executor. */
@@ -419,6 +477,83 @@ describe("road bulk mutation selection", () => {
     expect(wallDocuments.length).toBeGreaterThan(0);
   }, 120_000);
 
+  it("persists a revision-bound render diagnostic when install fails after a committed edit", async () => {
+    let tampered = false;
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && request.sourceRevision === 2 && !tampered && response.ok === true && "progress" in response && isRecord(response.result)) {
+        response.result = { ...response.result, sourceRevision: 999 };
+        tampered = true;
+      }
+    };
+    const result = await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    expect(tampered).toBe(true);
+    // The committed source is authoritative even though presentation failed.
+    expect(saved?.revision).toBe(2);
+    expect(saved!.source.districts).toHaveLength(1);
+    // The returned result is degraded, and the failed install is not stored as a build.
+    expect(result).toMatchObject({ full: true, degraded: true, chunks: 0 });
+    expect(stats()?.lastBuild).not.toEqual(expect.objectContaining({ degraded: true }));
+    // Post-save render copy, distinct from a structural-before-save rejection.
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subsystem: "geometry",
+        retry: "geometry",
+        revision: 2,
+        message: expect.stringContaining("The city was saved, but final presentation failed")
+      })
+    ]));
+  }, 120_000);
+
+  it("clears the render diagnostic only after a matching geometry retry installs the chunks", async () => {
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && request.sourceRevision === 2 && response.ok === true && "progress" in response && isRecord(response.result)) {
+        response.result = { ...response.result, sourceRevision: 999 };
+      }
+    };
+    const failed = await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    expect(failed.degraded).toBe(true);
+    expect(districtDiagnostics().some((entry) => entry.retry === "geometry")).toBe(true);
+    const buildsBefore = worker.planBuilds;
+    // A still-failing retry reinstalls nothing and keeps the diagnostic.
+    await expect(retryGeometry()).rejects.toThrow();
+    expect(districtDiagnostics().some((entry) => entry.retry === "geometry")).toBe(true);
+    worker.tamper = null;
+    const retried = await retryGeometry();
+    expect(retried.degraded).not.toBe(true);
+    expect(retried.stale).toBe(false);
+    expect(stats()?.lastBuild).toEqual(retried);
+    expect(saved?.revision).toBe(2);
+    expect(districtDiagnostics().some((entry) => entry.retry === "geometry")).toBe(false);
+    // The retry reinstalled the plan's chunks without rebuilding the plan.
+    expect(worker.planBuilds).toBe(buildsBefore);
+  }, 120_000);
+
+  it("rejects an install whose accepted progress does not match the worker summary", async () => {
+    worker.tamper = (request, response) => {
+      if (request.type === "buildCompleteCityChunks" && request.sourceRevision === 2 && response.ok === true && !("progress" in response) && isRecord(response.result) && isRecord(response.result.counters)) {
+        const built = response.result.counters.built;
+        response.result = { ...response.result, counters: { ...response.result.counters, built: typeof built === "number" ? built + 1 : built } };
+      }
+    };
+    const result = await createDistrict([
+      { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
+    ], "corporate-core");
+    // Incomplete progress cannot report success: the batch fails degraded instead.
+    expect(result).toMatchObject({ full: true, degraded: true, chunks: 0 });
+    expect(saved?.revision).toBe(2);
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subsystem: "geometry", retry: "geometry", revision: 2 })
+    ]));
+    worker.tamper = null;
+    const retried = await retryGeometry();
+    expect(retried.degraded).not.toBe(true);
+    expect(districtDiagnostics().some((entry) => entry.retry === "geometry")).toBe(false);
+  }, 120_000);
+
   it("keeps additive selection within the district object type across district identities", async () => {
     await createDistrict([
       { x: -90, y: -70 }, { x: -70, y: -70 }, { x: -70, y: -50 }, { x: -90, y: -50 }
@@ -622,6 +757,36 @@ describe("full generation", () => {
     expect(generationPreflight()).toMatchObject({ kind: "unsupported", replaceable: false });
     setupScene({ kind: "city-generator-2", schemaVersion: 3, generatorVersion: 11, revision: "broken" });
     expect(generationPreflight()).toMatchObject({ kind: "malformed", replaceable: false });
+  });
+
+  it("reports GM authority in the preflight", () => {
+    setupScene(undefined);
+    expect(generationPreflight().gm).toBe(true);
+    vi.stubGlobal("game", { user: { isGM: false } });
+    expect(generationPreflight().gm).toBe(false);
+  });
+
+  it("rejects a non-GM start before claiming, enqueueing, or clearing", async () => {
+    setupScene(bulkRoadState());
+    vi.stubGlobal("game", { user: { isGM: false } });
+    const before = structuredClone(saved);
+    await expect(startFullGeneration(staging("non-gm"))).rejects.toThrow(/Only a GM/);
+    expect(saved).toEqual(before);
+    expect(generationState().active).toBe(false);
+    expect(generationState().phase).toBe("idle");
+  });
+
+  it("rejects non-GM retries and new-seed generation without claiming", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await startFullGeneration(staging("gm-retry"));
+    expect(generationState().phase).toBe("failed");
+    const before = structuredClone(saved);
+    vi.stubGlobal("game", { user: { isGM: false } });
+    vi.stubGlobal("Worker", workerFactory);
+    await expect(retryFullGeneration()).rejects.toThrow(/Only a GM/);
+    await expect(generateNewSeed()).rejects.toThrow(/Only a GM/);
+    expect(saved).toEqual(before);
+    expect(generationState().active).toBe(false);
   });
 
   it("generates a complete city end to end on an absent Scene", async () => {
@@ -954,5 +1119,186 @@ describe("full generation", () => {
     await setRoadCurvePreset("broad", [getCity()!.source.roads.edges[0]!.id]);
     expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 3 }));
     expect(worker.planBuilds).toBeGreaterThan(buildsAfterGeneration);
+  }, 120_000);
+});
+
+describe("district palette texture", () => {
+  let saved: CityStateV3 | undefined;
+  let saveError: Error | null;
+  let wallDocuments: Array<{ id: string }>;
+  let worker: FakeWorker;
+
+  function workerFactory(): FakeWorker {
+    return worker;
+  }
+
+  const rect = (x: number, y: number, width: number, height: number): Ring => [
+    { x, y },
+    { x: x + width, y },
+    { x: x + width, y: y + height },
+    { x, y: y + height }
+  ];
+
+  const zone = (id: string, x: number, y: number, typeId: DistrictTypeId): DistrictSource => ({
+    id,
+    polygon: rect(x, y, 60, 40),
+    seed: `${id}-seed`,
+    typeId,
+    paletteId: DISTRICT_TYPE_REGISTRY.get(typeId)!.defaultPaletteId,
+    origin: "generated",
+    locked: false,
+    openSpaceOverride: null
+  });
+
+  // Commercial, entertainment, industrial-heavy/light, night-market, residential-mega:
+  // six 60 x 40 m districts in two rows, all inside the 200 x 160 m land mask.
+  function paletteState(): CityStateV3 {
+    const city = state();
+    city.source.districts = [
+      zone("commercial", -90, -70, "commercial-highrise"),
+      zone("entertainment", -30, -70, "entertainment-strip"),
+      zone("heavy", 30, -70, "heavy-industrial"),
+      zone("light", -90, -10, "light-industrial"),
+      zone("market", -30, -10, "night-market"),
+      zone("mega", 30, -10, "residential-megablocks")
+    ];
+    return city;
+  }
+
+  function setupMountedScene(initial: CityStateV3): void {
+    rendererState.instances.length = 0;
+    saved = initial;
+    vi.stubGlobal("PIXI", { UPDATE_PRIORITY: { HIGH: 2 } });
+    vi.stubGlobal("canvas", {
+      ready: true,
+      dimensions: { sceneRect: { x: 400, y: 320, width: 200, height: 160 }, size: 1, distance: 1 },
+      scene: {
+        get walls(): Array<{ id: string }> { return wallDocuments; },
+        getFlag: (_module: string, flag: string): unknown =>
+          flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
+        setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+          if (saveError !== null) throw saveError;
+          saved = structuredClone(value);
+          return saved as CityStateV3;
+        }),
+        unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
+          saved = undefined;
+        }),
+        deleteEmbeddedDocuments: vi.fn(async () => []),
+        createEmbeddedDocuments: vi.fn(async () => [])
+      },
+      app: {
+        renderer: { screen: { width: 200, height: 160 } },
+        ticker: { add: vi.fn(), remove: vi.fn() }
+      },
+      primary: {
+        addChild: vi.fn(),
+        sortDirty: false,
+        constructor: { BACKGROUND_ELEVATION: 0 }
+      },
+      stage: { scale: { x: 1, y: 1 } }
+    });
+    vi.stubGlobal("game", { user: { isGM: true } });
+    vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
+    vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
+    vi.stubGlobal("document", { baseURI: "http://test.local/" });
+    vi.stubGlobal("Worker", workerFactory);
+    mount();
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    wallDocuments = [];
+    saveError = null;
+    worker = new FakeWorker("worker-url");
+  });
+
+  afterEach(() => {
+    unmount();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const bankRegion = (packed: Uint8Array, bank: number): string =>
+    [...packed.slice(bank * BANK_SIZE * 4, (bank + 1) * BANK_SIZE * 4)].join(",");
+
+  it("packs six distinct built-ins into distinct banks and refreshes the one shared texture on city change", async () => {
+    setupMountedScene(paletteState());
+    // mount() constructs the renderer with the source-derived palette: one instance, one texture.
+    expect(rendererState.instances).toHaveLength(1);
+    const renderer = rendererState.instances[0]!;
+    const initial = renderer.paletteUpdates[0]!;
+
+    const ids = () => getCity()!.source.districts.map((district) => district.paletteId);
+    expect(new Set(ids())).toEqual(
+      new Set(["commercial", "entertainment", "industrial-heavy", "industrial-light", "night-market", "residential-mega"])
+    );
+    const zoneBanks = [...paletteBanks(ids()).values()].sort((a, b) => a - b);
+    expect(zoneBanks).toEqual([2, 3, 4, 5, 6, 7]);
+    const initialRegions = zoneBanks.map((bank) => bankRegion(initial, bank));
+    expect(new Set(initialRegions).size).toBe(6);
+    // The sorted rule puts residential-mega at bank 7.
+    expect(bankRegion(initial, 7)).toBe(bankRegion(packPalette([builtinPalette("residential-mega").materials]), 0));
+
+    // A structural edit swapping residential-mega for corporate must refresh the SAME texture.
+    await updateDistricts(["mega"], { paletteId: "corporate" });
+    expect(rendererState.instances).toHaveLength(1);
+    expect(renderer.paletteUpdates.length).toBeGreaterThanOrEqual(2);
+    const latest = renderer.paletteUpdates[renderer.paletteUpdates.length - 1]!;
+    expect(latest).not.toEqual(initial);
+
+    // Sorted ids are now commercial, corporate, entertainment, industrial-heavy, industrial-light,
+    // night-market, so corporate owns bank 3 and night-market moves to bank 7.
+    expect(bankRegion(latest, 3)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
+    expect(bankRegion(latest, 7)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
+    const latestRegions = [...paletteBanks(getCity()!.source.districts.map((district) => district.paletteId)).values()].map(
+      (bank) => bankRegion(latest, bank)
+    );
+    expect(new Set(latestRegions).size).toBe(6);
+    // The shared city bank and the unzoned bank 1 survive the refresh untouched.
+    expect(latest.slice(0, BANK_SIZE * 4)).toEqual(initial.slice(0, BANK_SIZE * 4));
+    expect(bankRegion(latest, BASE_BANK)).toBe(bankRegion(initial, BASE_BANK));
+  }, 120_000);
+
+  it("rebuilds the complete plan exactly once for a palette-only district update so source, plan, and texture agree", async () => {
+    setupMountedScene(paletteState());
+    const renderer = rendererState.instances[0]!;
+    // WHY: mount() starts the baseline plan build asynchronously; wait for it so the
+    // build count below proves the palette edit itself rebuilt exactly once.
+    await vi.waitFor(() => {
+      if (!isRecord(stats()?.completePlan)) throw new Error("expected a published complete plan after mount");
+    }, { timeout: 15_000 });
+    const buildsBefore = worker.planBuilds;
+    const baseline = stats()?.completePlan;
+    const baselineSignature = isRecord(baseline) ? baseline.structuralInput : null;
+    expect(isRecord(baselineSignature)).toBe(true);
+    const baselineDistricts = (baselineSignature as Record<string, unknown>).districts;
+    expect(typeof baselineDistricts).toBe("string");
+
+    await updateDistricts(["mega"], { paletteId: "corporate" });
+
+    // Source: the palette-only patch landed on the district.
+    expect(getCity()!.source.districts.find((district) => district.id === "mega")?.paletteId).toBe("corporate");
+
+    // Plan: rebuilt once through the worker (never reused) and published with a
+    // palette-inclusive structural signature that no longer matches the stale banks.
+    expect(worker.planBuilds).toBe(buildsBefore + 1);
+    const published = stats()?.completePlan;
+    expect(isRecord(published) ? published.revision : null).toBe(2);
+    const publishedSignature = isRecord(published) ? published.structuralInput : null;
+    expect(isRecord(publishedSignature)).toBe(true);
+    expect((publishedSignature as Record<string, unknown>).districts).not.toBe(baselineDistricts);
+
+    // Palette texture: one shared texture refreshed so its bank mapping matches the
+    // sorted source palettes (corporate owns bank 3, night-market moves to bank 7).
+    expect(renderer.paletteUpdates.length).toBeGreaterThanOrEqual(2);
+    const latest = renderer.paletteUpdates[renderer.paletteUpdates.length - 1]!;
+    expect(bankRegion(latest, 3)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
+    expect(bankRegion(latest, 7)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
+    const latestRegions = [...paletteBanks(getCity()!.source.districts.map((district) => district.paletteId)).values()].map(
+      (bank) => bankRegion(latest, bank)
+    );
+    expect(new Set(latestRegions).size).toBe(6);
   }, 120_000);
 });

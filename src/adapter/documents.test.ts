@@ -309,6 +309,29 @@ describe("saveCityState", () => {
     expect(stored).toBe(current);
   });
 
+  it("rejects a direct save over legacy data; legacy replacement needs the clear first", async () => {
+    const legacy = { formatVersion: 4, label: "old" };
+    installScene(legacy);
+    await expect(saveCityState(state(), "absent")).rejects.toThrow(/creation/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(legacy);
+    // WHY: exercise the removed "legacy" expectation at runtime; the type no longer permits it.
+    await expect(saveCityState(state(), "legacy" as unknown as "absent")).rejects.toThrow(/creation/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(legacy);
+  });
+
+  it("replaces legacy data only through identity-pinned clear then a revision-1 absent save", async () => {
+    const legacy = { formatVersion: 4, label: "old" };
+    installScene(legacy);
+    await clearCityState({ kind: "legacy", identity: cityFlagIdentity(legacy) });
+    expect(loadCityState()).toEqual({ kind: "absent" });
+    const candidate = state();
+    await expect(saveCityState(candidate, "absent")).resolves.toEqual(candidate);
+    expect(setFlag).toHaveBeenCalledOnce();
+    expect(stored).toEqual(candidate);
+  });
+
   it("refuses every save against an obsolete-precomplete flag and leaves raw data untouched", async () => {
     const rawSchemaOne = schemaOne(4);
     installScene(rawSchemaOne);

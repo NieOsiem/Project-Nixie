@@ -9,7 +9,9 @@ import {
   BILLBOARD_MAX_W_M,
   BILLBOARD_MIN_W_M,
   GLOW_MARGIN_M,
-  POOL_RADIUS_M,
+  MAX_POOL_RADIUS_M,
+  MIN_POOL_RADIUS_M,
+  POOL_MAX_SIGN_HEIGHT_M,
   POOL_RATE,
   SIGN_BAND_TOP_M,
   neonMesh
@@ -174,8 +176,8 @@ describe("neonMesh", () => {
     }
   });
 
-  it("pairs low facade signs with reduced radial pools", () => {
-    expect(POOL_RATE).toBe(1);
+  it("pairs low facade signs with bounded radial pools", () => {
+    expect(POOL_RATE).toBeLessThan(1);
     const m = neonMesh(cityOf(300), PPM);
     let pools = 0;
     for (let q = 0; q < m.vertexCount; q += 4) {
@@ -187,8 +189,11 @@ describe("neonMesh", () => {
       expect(pool.material).toBe(sign.material);
       expect(pool.strength).toBeLessThan(sign.strength);
       for (let i = 0; i < 4; i++) expect(vertexAt(m, q + i).height).toBeCloseTo(0.03, 6);
-      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 2);
-      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(POOL_RADIUS_M * PPM * 2, 2);
+      // The radius is the panel-derived value — floored, hard-capped, never a fixed 30 m.
+      expect(pool.halfWidthM).toBeGreaterThanOrEqual(MIN_POOL_RADIUS_M);
+      expect(pool.halfWidthM).toBeLessThanOrEqual(MAX_POOL_RADIUS_M);
+      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(pool.halfWidthM * PPM * 2, 2);
+      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(pool.halfWidthM * PPM * 2, 2);
     }
     expect(pools).toBeGreaterThan(0);
   });
@@ -204,7 +209,7 @@ describe("neonMesh", () => {
   });
 
   it("keeps every quad inside its own building's footprint plus the glow margin", () => {
-    const slack = POOL_RADIUS_M * PPM;
+    const slack = MAX_POOL_RADIUS_M * PPM;
     const epsilon = 1e-3;
     for (const spec of cityOf(250)) {
       const m = neonMesh([spec], PPM);
@@ -261,8 +266,10 @@ describe("neonMesh", () => {
   });
 
   it("keeps total additive fill inside its overdraw budget", () => {
-    // Panel *count* is the wrong proxy: measured on this fixture, panels are under 3% of
-    // neon fill and the pools are the whole cost. Glow area is what the GPU pays.
+    // Glow area is what the GPU pays: panels are a few m² each, and a pool's quad is its
+    // full radius because the shader's quadratic falloff reaches the quad edge. Pools
+    // used to dominate this budget at 3,600 m² each; the capped footprint and reduced
+    // rate bring the whole frame's additive fill back to panel scale.
     const specs = cityOf(1400);
     const ground = specs.reduce(
       (r, s) => {
@@ -280,13 +287,35 @@ describe("neonMesh", () => {
 
     let glowM2 = 0;
     for (const q of quadsOf(neonMesh(specs, PPM))) {
-      // A pool's quad is its radius, not its half-extent plus a margin.
       glowM2 +=
         q.radial === 1
-          ? (2 * POOL_RADIUS_M) ** 2
+          ? (2 * q.halfWidthM) ** 2
           : 2 * (q.halfWidthM + GLOW_MARGIN_M) * 2 * (q.halfHeightM + GLOW_MARGIN_M);
     }
-    expect(glowM2 / groundM2).toBeLessThan(4.5);
+    expect(glowM2 / groundM2).toBeLessThan(0.6);
+  });
+
+  it("caps every pool span at 20 m and stays an order of magnitude under the old 3,600 m² pool budget", () => {
+    const quads = quadsOf(neonMesh(cityOf(1400), PPM));
+    let poolM2 = 0;
+    let streetReaching = 0;
+    for (let i = 0; i < quads.length; i++) {
+      const q = quads[i]!;
+      if (q.radial === 1) {
+        // The pool quad spans its full radius on every side: 2r across.
+        const spanM = 2 * q.halfWidthM;
+        expect(spanM).toBeLessThanOrEqual(2 * MAX_POOL_RADIUS_M);
+        expect(spanM).toBeLessThanOrEqual(20);
+        poolM2 += spanM * spanM;
+        continue;
+      }
+      // The old pool emitted for every sign whose bottom reached the street, at rate 1.
+      if (q.bottomM <= POOL_MAX_SIGN_HEIGHT_M) streetReaching++;
+    }
+    expect(poolM2).toBeGreaterThan(0);
+    // Old budget: 3,600 m² per street-reaching sign. New: at most 400 m² per pool at a
+    // reduced rate — the aggregate must stay under a tenth of the old per-sign allowance.
+    expect(poolM2).toBeLessThan(streetReaching * 360);
   });
 
   it("carries each panel's own half-extents, which is what keeps a bar from going round", () => {
@@ -304,17 +333,28 @@ describe("neonMesh", () => {
     expect(panels).toBeGreaterThan(0);
   });
 
-  it("keeps horizontal panels in the bottom band and pools every one of them", () => {
+  it("keeps horizontal panels in the bottom band with their pools adjacent", () => {
     const quads = quadsOf(neonMesh(cityOf(600), PPM));
     let horizontals = 0;
+    let pooled = 0;
+    let bare = 0;
     for (let i = 0; i < quads.length; i++) {
       const q = quads[i]!;
       if (q.radial !== 0 || q.halfHeightM > q.halfWidthM) continue;
       horizontals++;
       expect((q.topM + q.bottomM) / 2).toBeLessThanOrEqual(SIGN_BAND_TOP_M + 1e-5);
-      expect(quads[i + 1]?.radial).toBe(1);
+      if (quads[i + 1]?.radial === 1) {
+        pooled++;
+        expect(quads[i + 1]!.material).toBe(q.material);
+      } else {
+        bare++;
+      }
     }
     expect(horizontals).toBeGreaterThan(50);
+    // Pools still follow their signs (adjacent, same material), but the reduced rate
+    // leaves some street-reaching signs pool-less instead of pooling every one.
+    expect(pooled).toBeGreaterThan(0);
+    expect(bare).toBeGreaterThan(0);
   });
 
   it("hangs vertical banners on tall buildings, the one thing exempt from the band", () => {

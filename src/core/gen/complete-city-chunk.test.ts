@@ -13,6 +13,7 @@ import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../pal
 import { compileRouteNetwork } from "../graph/compiler.js";
 import { compiledRouteOccupancy } from "./district-plan.js";
 import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type OpenSpaceCategory } from "./city.js";
+import type { BuildingGrammarId } from "./building-registry.js";
 import { citySurfaces, type CitySurfacePartitions } from "./city-chunk.js";
 import { chunkId, chunkKeyAt, chunkRect, chunksCovering } from "./chunks.js";
 import {
@@ -193,9 +194,9 @@ const buildingC: BuildingPlan = {
   archetype: "rectangle",
   seed: "building-c-seed",
   appearanceSeed: "building-c-appearance",
-  heightM: 6,
+  heightM: 14,
   masses: [
-    mass("building-c-mass", "building-c", 0, rectRing({ x: 10, y: 10, width: 20, height: 20 }), 0, 6, "coarse")
+    mass("building-c-mass", "building-c", 0, rectRing({ x: 10, y: 10, width: 20, height: 20 }), 0, 14, "coarse")
   ],
   areaM2: 400
 };
@@ -475,7 +476,7 @@ describe("buildCompleteCityChunk", () => {
     expect(kindsOf(build.mesh).has(KIND.NEON)).toBe(false);
     expect(kindsOf(build.mesh).has(KIND.DETAIL)).toBe(false);
     expect(build.mesh.vertexCount).toBeGreaterThan(0);
-    expect([...kindsOf(build.detail)].every((kind) => kind === KIND.DETAIL)).toBe(true);
+    expect(kindsOf(build.detail).has(KIND.NEON)).toBe(false);
     expect([...kindsOf(build.neon)].every((kind) => kind === KIND.NEON)).toBe(true);
     // The neon-signature tower earns glow; the coarse podium never leaks into the neon pass.
     expect(build.neon.vertexCount).toBeGreaterThan(0);
@@ -682,7 +683,7 @@ describe("buildCompleteCityChunk", () => {
     expect(treatments.find((t) => t.category === "vacant")!.hasDetail).toBe(false);
   });
 
-  it("keeps the geometry budget: one 4-vertex 6 m mass is exactly 10 opaque triangles", () => {
+  it("keeps the geometry budget: one 4-vertex 14 m mass is exactly 10 opaque triangles", () => {
     const onlyC = (): CompleteCityPlan => ({
       ...PLAN,
       buildings: PLAN.buildings.filter((b) => b.id === "building-c"),
@@ -697,12 +698,70 @@ describe("buildCompleteCityChunk", () => {
       SCENE,
       PPM
     );
-    // 3n - 2 roof triangles for a 4-vertex footprint; no clutter (6 m < 20 m), no detail
-    // (6 m < 12 m) and no neon (signageRate 0).
+    // 2 roof triangles + 8 wall triangles for a 4-vertex footprint; no clutter (14 m <
+    // 20 m), no detail (coarse policy) and no neon (signageRate 0).
     expect(withC.mesh.triangleCount - bare.mesh.triangleCount).toBe(10);
     expect(withC.detail.triangleCount).toBe(0);
     expect(withC.neon.triangleCount).toBe(0);
     expect(withC.buildingCount).toBe(1);
+  });
+
+  it("splits coarse and settled geometry by the grammar's geometryPolicy.coarse", () => {
+    const podium = mass("s-podium", "s", 0, rectRing({ x: 60, y: 10, width: 20, height: 11 }), 0, 12, "detail");
+    const tower = mass("s-tower", "s", 1, rectRing({ x: 63, y: 13, width: 12, height: 6 }), 12, 12, "detail", {
+      facadeProfile: "glass-curtain",
+      roofline: "flat"
+    });
+    const withGrammar = (grammarId: BuildingGrammarId, heightM: number): CompleteCityPlan => ({
+      ...PLAN,
+      landmarks: [],
+      openSpaces: [],
+      buildings: [
+        {
+          id: "s",
+          parcelId: "parcel-a",
+          blockId: "block-0",
+          fragmentId: "frag-0",
+          districtId: "corporate-core",
+          grammarId,
+          visualUse: "industrial",
+          archetype: "rectangle",
+          seed: "s-seed",
+          appearanceSeed: "s-appearance",
+          heightM,
+          masses: [podium, tower],
+          areaM2: 220 + 72
+        }
+      ],
+      diagnostics: { ...PLAN.diagnostics, buildingCount: 1, landmarkCount: 0, openSpaceCount: 0, massCount: 2 }
+    });
+    const wallVertices = (mesh: MeshBuffers): number => {
+      let count = 0;
+      for (let i = 0; i < mesh.vertexCount; i++) {
+        if (mesh.vertices[i * VERTEX_FLOATS + 5] === KIND.WALL) count++;
+      }
+      return count;
+    };
+    const volumes = buildCompleteCityChunk(
+      SOURCE,
+      withGrammar("residential-slab", 24),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    const silhouette = buildCompleteCityChunk(
+      SOURCE,
+      withGrammar("stacked-workshop", 24),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    expect(wallVertices(volumes.mesh)).toBe(32);
+    expect(wallVertices(silhouette.mesh)).toBe(16);
+    expect(kindsOf(silhouette.detail).has(KIND.WALL)).toBe(true);
+    expect(kindsOf(volumes.detail).has(KIND.WALL)).toBe(false);
+    expect(silhouette.detail.triangleCount).toBeGreaterThan(0);
+    expect(silhouette.buildingIds).toEqual(volumes.buildingIds);
   });
 });
 

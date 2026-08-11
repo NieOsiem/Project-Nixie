@@ -39,6 +39,7 @@ function preflight(overrides: Partial<GenerationPreflight> = {}): GenerationPref
   return {
     kind: "absent",
     replaceable: true,
+    gm: true,
     revision: null,
     schemaVersion: null,
     generatorVersion: null,
@@ -233,6 +234,13 @@ describe("Generate tray form state", () => {
     expect(obsolete).toMatch(/data-action="randomize" class="nixie-destructive">/);
   });
 
+  it("gates the randomize action on GM authority with a GM-only message", () => {
+    const html = generateFormHTML(formModel({ preflight: preflight({ gm: false }) }));
+    expect(html).toMatch(/data-action="randomize"[^>]*disabled/);
+    expect(html).toContain("Only a GM may replace or create a city");
+    expect(generateFormHTML(formModel({ preflight: preflight({ gm: true }) }))).toMatch(/data-action="randomize" class="nixie-destructive">/);
+  });
+
   it("blocks generation until the Scene is enabled", () => {
     const html = generateFormHTML(formModel({ preflight: preflight({ kind: "supported", sceneEnabled: false }) }));
     expect(html).toContain("Nixie is disabled on this Scene");
@@ -279,6 +287,27 @@ describe("Randomize Entire City confirmations", () => {
     expect(dialogs[1]!.title).toBe("Nixie: Start uninterruptible generation?");
     expect(dialogs[1]!.content).toContain("cannot be cancelled");
     expect(dialogs[1]!.content).toContain("closing the editor");
+  });
+
+  it("warns that Nixie-owned content, locks, generated walls, and City Generator history are discarded", () => {
+    const dialogs = randomizeConfirmations(preflight({ kind: "supported" }));
+    const first = dialogs[0]!;
+    expect(first.content).toContain("Nixie-owned city content");
+    expect(first.content).toContain("locks");
+    expect(first.content).toContain("generated walls");
+    expect(first.content).toContain("City Generator undo and redo history");
+    expect(first.content).toContain("cannot be restored with Undo");
+    expect(dialogs[1]!.content).toContain("cannot be cancelled or undone");
+  });
+
+  it("carries the discard warning into the legacy and obsolete first dialogs", () => {
+    for (const kind of ["legacy", "obsolete-precomplete"] as const) {
+      const first = randomizeConfirmations(preflight({ kind }))[0]!;
+      expect(first.content).toContain("Nixie-owned city content");
+      expect(first.content).toContain("locks");
+      expect(first.content).toContain("generated walls");
+      expect(first.content).toContain("City Generator undo and redo history");
+    }
   });
 
   it("uses kind-specific first dialogs for legacy and obsolete data", () => {
@@ -375,6 +404,17 @@ describe("Generation progress", () => {
     // step match must be followed by the closing quote or a state class, not an "s".
     expect((html.match(/nixie-progress-step(?=[" ])/g) ?? []).length).toBe(7);
   });
+
+  it("claims only implemented Phase 4 work: walls, no Phase-5 props, vehicles, or POIs", () => {
+    const html = generateProgressHTML(state({ active: true, phase: "installing", progress: { index: 6, total: 7 } }));
+    expect(html).toContain("Rendering city chunks");
+    expect(html).toContain("Walls and final chunk presentation");
+    expect(html).not.toMatch(/props/i);
+    expect(html).not.toMatch(/vehicles/i);
+    expect(html).not.toMatch(/POIs?/i);
+    expect(generateProgressHTML(state({ phase: "planning" }))).toContain("Planning city structure");
+    expect(generateProgressHTML(state({ phase: "saving" }))).toContain("Saving the city");
+  });
 });
 
 describe("Structural failure recovery", () => {
@@ -450,6 +490,16 @@ describe("Generate workspace behavior", () => {
     expect(request.confirmation).toMatchObject({ kind: "supported", revision: 5 });
     // The confirmation also carries the raw-payload identity observed with the preflight.
     if (typeof request.confirmation !== "string") expect(request.confirmation.identity.length).toBeGreaterThan(0);
+  });
+
+  it("never shows confirmations or starts for a non-GM", async () => {
+    stubUi();
+    const { deps, confirm, start } = depSet({ generationPreflight: () => preflight({ gm: false }) });
+    const module = generateWorkspace(deps);
+    module.onAction("randomize", {} as HTMLElement, fakeCtx());
+    await flushMicrotasks();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("changes nothing when the first confirmation is cancelled", async () => {

@@ -291,7 +291,16 @@ export interface WorkerProgress {
   transfer?: ArrayBuffer[];
 }
 
-export interface WorkerFailure {
+/** Identity echoed back on failure responses so the caller can attribute the failure. */
+export interface WorkerFailureIdentity {
+  sourceRevision?: number;
+  absentGenerationToken?: number | string;
+  actionToken?: number | string;
+  buildToken?: number | string;
+  epoch?: number;
+}
+
+export interface WorkerFailure extends WorkerFailureIdentity {
   id: number;
   ok: false;
   error: string;
@@ -301,6 +310,43 @@ export type WorkerResponse = WorkerSuccess | WorkerFailure;
 
 /** Everything the worker may post for one request id, in order: progress..., settle. */
 export type WorkerMessage = WorkerResponse | WorkerProgress;
+
+/** The identity fields applicable to a request's failure response, mirroring its success result. */
+function failureIdentity(request: WorkerRequest): WorkerFailureIdentity {
+  switch (request.type) {
+    case "ping":
+      return {};
+    case "buildTerrainChunk":
+      return { sourceRevision: request.sourceRevision };
+    case "buildCityChunks":
+    case "generateInitialRoadNetwork":
+    case "buildDistrictPlan":
+    case "generateInitialDistricts":
+      return {
+        sourceRevision: request.sourceRevision,
+        actionToken: request.actionToken,
+        buildToken: request.buildToken
+      };
+    case "generateCompleteCityPlan":
+      return {
+        absentGenerationToken: request.absentGenerationToken,
+        actionToken: request.actionToken,
+        buildToken: request.buildToken,
+        epoch: request.epoch
+      };
+    case "buildCompleteCityPlan":
+    case "buildCompleteCityChunks":
+      return {
+        sourceRevision: request.sourceRevision,
+        actionToken: request.actionToken,
+        buildToken: request.buildToken,
+        epoch: request.epoch
+      };
+    default:
+      // Unknown request type: no identity fields apply.
+      return {};
+  }
+}
 
 /** Never throws: a failing handler becomes a failure response the client can reject on. */
 export function handleRequest(request: WorkerRequest): WorkerResponse {
@@ -532,7 +578,8 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
     return {
       id: request.id,
       ok: false,
-      error: err instanceof Error ? err.message : String(err)
+      error: err instanceof Error ? err.message : String(err),
+      ...failureIdentity(request)
     };
   }
 }
@@ -594,7 +641,7 @@ export async function handleWorkerMessage(
       request.pixelsPerMetre
     );
   } catch (err) {
-    sink.post({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+    sink.post({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err), ...identity });
     return;
   }
   let index = 0;
@@ -635,7 +682,7 @@ export async function handleWorkerMessage(
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
   } catch (err) {
-    sink.post({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err) });
+    sink.post({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err), ...identity });
     return;
   }
   sink.post({

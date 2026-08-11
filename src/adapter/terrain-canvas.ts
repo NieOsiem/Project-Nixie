@@ -31,8 +31,8 @@ import {
   type RouteClassId
 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
-import type { DistrictPlan, StructuralInputSignature } from "../core/gen/district-plan.js";
-import type { CompleteCityPlan } from "../core/gen/complete-city-plan.js";
+import type { DistrictPlan } from "../core/gen/district-plan.js";
+import { completeCityStructuralInput, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import type { CompleteChunkBuild } from "../core/gen/complete-city-chunk.js";
 import { districtGenerationAvailability, generateInitialDistricts } from "../core/gen/district-generator.js";
 import {
@@ -69,7 +69,10 @@ import {
   CITY_BANK,
   CITY_SURFACES,
   DEFAULT_DISTRICT_PALETTE,
+  FIRST_ZONE_BANK,
+  builtinPalette,
   packPalette,
+  paletteBanks,
   type Material
 } from "../core/palette.js";
 import { WEATHER_PRESETS, type LookDials } from "../render/look-dials.js";
@@ -150,6 +153,8 @@ export interface GenerationPreflight {
   kind: "absent" | "legacy" | "obsolete-precomplete" | "supported" | "unsupported" | "malformed";
   /** Whether the current Scene state may be replaced by full generation. */
   replaceable: boolean;
+  /** Whether the current user has GM authority to run full generation. */
+  gm: boolean;
   revision: number | null;
   schemaVersion: number | null;
   generatorVersion: number | null;
@@ -279,6 +284,7 @@ let districtSnapOptionsState = {
 };
 let wallDiagnostic: { kind: "degraded"; reason: string; revision: number } | null = null;
 let wallNotifyRevision: number | null = null;
+let geometryDiagnostic: { kind: "degraded"; reason: string; revision: number } | null = null;
 let lastWallBuild: { scheduled: number; created: number; deleted: number; ms: number; stale: boolean; degraded?: boolean } | null = null;
 const wallScheduler = new WallReplacementScheduler();
 
@@ -478,12 +484,24 @@ function sceneBoundsM(origin = cityOrigin()): Rect {
   return sceneBoundsFromPixels(scene, origin, pixelsPerMetre());
 }
 
+// WHY: geometry encodes sorted palette banks; rebuilding with the same mapping keeps shared texture addresses valid.
 function terrainPalette(): Uint8Array {
   const banks: Material[][] = Array.from({ length: BANK_COUNT }, () =>
     DEFAULT_DISTRICT_PALETTE.materials
   );
   banks[CITY_BANK] = CITY_SURFACES;
+  const source = session.current?.source;
+  if (source !== null && source !== undefined) {
+    for (const [paletteId, bank] of paletteBanks(source.districts.map((district) => district.paletteId))) {
+      if (bank < FIRST_ZONE_BANK) continue;
+      banks[bank] = builtinPalette(paletteId).materials;
+    }
+  }
   return packPalette(banks);
+}
+
+function refreshPalette(): void {
+  cityRenderer?.updatePalette(terrainPalette());
 }
 
 function notifyCityChanged(): void {
@@ -500,6 +518,7 @@ function resetCompletePlanState(): void {
   completePlanEpoch = null;
   completePlanRoundTripMs = 0;
   completePlanDiagnostic = null;
+  geometryDiagnostic = null;
   planBuildInFlight = null;
   planBuildQueued = null;
   resolvePlanWaiters();
@@ -553,6 +572,7 @@ function publishCompletePlan(plan: CompleteCityPlan, revision: number, epoch: nu
     }
   }
   resolvePlanWaiters();
+  refreshPalette();
   notifyCityChanged();
 }
 
@@ -908,72 +928,6 @@ function roadEdgesForSelection(
   return connected;
 }
 
-// WHY: generator 11 must decide whether a candidate edit changes the plan's structural
-// input BEFORE touching the worker (metadata-only commits reuse the current plan and
-// stay offline). This mirrors `inputSignature` in core/gen/district-plan.ts exactly and
-// MUST stay in lockstep with it; the comparison target is the worker-built plan's own
-// signature, so any drift surfaces as an unnecessary rebuild, never a stale publish.
-const SIGNATURE_KEY_SCALE = 1_000;
-const SIGNATURE_EPSILON = 1e-6;
-
-function signatureHash(text: string): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
-  return hash >>> 0;
-}
-
-function signatureStableId(prefix: string, material: string): string {
-  return `${prefix}_${signatureHash(material).toString(16).padStart(8, "0")}`;
-}
-
-function signaturePointKey(point: Vec2): string {
-  return `${Math.round(point.x * SIGNATURE_KEY_SCALE)},${Math.round(point.y * SIGNATURE_KEY_SCALE)}`;
-}
-
-function signatureKeyPoint(key: string): Vec2 {
-  const [x, y] = key.split(",").map(Number);
-  return { x: x! / SIGNATURE_KEY_SCALE, y: y! / SIGNATURE_KEY_SCALE };
-}
-
-function signatureSamePoint(a: Vec2, b: Vec2): boolean {
-  return Math.hypot(a.x - b.x, a.y - b.y) <= SIGNATURE_EPSILON;
-}
-
-function signatureCanonicalRing(ring: Ring): Ring {
-  const snapped: Ring = [];
-  for (const point of ring) {
-    const next = signatureKeyPoint(signaturePointKey(point));
-    const previous = snapped[snapped.length - 1];
-    if (!previous || !signatureSamePoint(previous, next)) snapped.push(next);
-  }
-  if (snapped.length > 1 && signatureSamePoint(snapped[0]!, snapped[snapped.length - 1]!)) snapped.pop();
-  const normalized = normalizeRing(snapped);
-  if (normalized.length === 0) return [];
-  let start = 0;
-  for (let i = 1; i < normalized.length; i++) {
-    const a = normalized[i]!;
-    const b = normalized[start]!;
-    if (a.x < b.x || (a.x === b.x && a.y < b.y)) start = i;
-  }
-  return [...normalized.slice(start), ...normalized.slice(0, start)];
-}
-
-function signatureRing(ring: Ring): string {
-  return signatureCanonicalRing(ring).map((point) => signaturePointKey(point)).join(";");
-}
-
-function structuralSignature(source: CitySourceV3): StructuralInputSignature {
-  const nodes = [...source.roads.nodes].sort((a, b) => a.id.localeCompare(b.id));
-  const routes = [...source.roads.routes].sort((a, b) => a.id.localeCompare(b.id));
-  const edges = [...source.roads.edges].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, a, b, routeId, classId }) => ({ id, a, b, routeId, classId }));
-  const districts = [...source.districts].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, polygon, seed, typeId, openSpaceOverride }) => ({ id, polygon, seed, typeId, openSpaceOverride }));
-  return {
-    terrain: signatureStableId("terrain", `${signatureRing(source.terrain.land)}|${source.terrain.urbanFootprint ? signatureRing(source.terrain.urbanFootprint) : ""}`),
-    roads: signatureStableId("roads", JSON.stringify({ nodes, routes, edges })),
-    districts: signatureStableId("districts", JSON.stringify(districts)),
-    generation: signatureStableId("generation", JSON.stringify({ districtPool: [...source.generation.districtPool].sort(), openSpaceProfile: source.generation.openSpaceProfile }))
-  };
-}
 
 /** The current plan when the candidate's structural input is unchanged (metadata reuse). */
 function planForCandidate(candidate: CityStateV3): CompleteCityPlan | null {
@@ -984,7 +938,7 @@ function planForCandidate(candidate: CityStateV3): CompleteCityPlan | null {
   // the build epoch only reflects render-input changes like Scene scale, which must not
   // invalidate the semantic plan.
   if (completePlanRevision !== current.revision) return null;
-  const signature = structuralSignature(candidate.source);
+  const signature = completeCityStructuralInput(candidate.source);
   const stored = plan.structuralInput;
   if (signature.terrain !== stored.terrain || signature.roads !== stored.roads || signature.districts !== stored.districts || signature.generation !== stored.generation) return null;
   return plan;
@@ -1071,11 +1025,19 @@ function completeChunkGeometry(build: CompleteChunkBuild): ChunkGeometry {
   };
 }
 
+// WHY: post-save render failures keep their own copy, distinct from structural-before-save
+// rejections that committed nothing; the persisted geometry diagnostic reuses it.
+function renderFailureReason(error: unknown): string {
+  return `The city was saved, but final presentation failed: ${error instanceof Error ? error.message : String(error)}`;
+}
+
 /**
  * Build the final complete chunks for a saved revision through the worker and install
  * them as they arrive. Every progress message is identity-checked; stale ones install
- * nothing. Throws when the worker fails so callers decide between a degraded result
- * (ordinary commits, rebuilds) and a durable failure (full generation).
+ * nothing, and the number of sequentially accepted progress chunks must match the worker
+ * summary before the batch can report success. Throws when the worker fails so callers
+ * decide between a degraded result (ordinary commits, rebuilds) and a durable failure
+ * (full generation).
  */
 async function installCompleteChunks(
   city: CityStateV3,
@@ -1103,6 +1065,7 @@ async function installCompleteChunks(
   if (client === null) throw new Error("The city worker is unavailable; final city geometry cannot be built.");
   const identity: CompleteIdentity = { sourceRevision: city.revision, actionToken, buildToken: epoch, epoch };
   let installed = 0;
+  let accepted = 0;
   let staleProgress = false;
   const summary = await client.buildCompleteCityChunks(
     {
@@ -1126,6 +1089,7 @@ async function installCompleteChunks(
       }
       const record = completeRecordFrom(progress.chunk);
       chunks.set(record.id, record);
+      accepted += 1;
       if (renderer !== null) {
         renderer.setChunk(completeChunkGeometry(progress.chunk));
         frameQuality.reset();
@@ -1136,6 +1100,15 @@ async function installCompleteChunks(
   );
   if (staleProgress || !completeIdentityMatches(summary, identity)) {
     throw new Error("Worker returned a stale complete city chunk batch.");
+  }
+  if (
+    accepted !== keys.length ||
+    summary.counters.requested !== keys.length ||
+    summary.counters.built !== accepted
+  ) throw new Error("Worker posted incomplete city chunk progress; its summary does not match the requested chunk count.");
+  // WHY: the render diagnostic clears only once the matching revision's chunks all installed.
+  if (geometryDiagnostic !== null && geometryDiagnostic.revision <= city.revision) {
+    geometryDiagnostic = null;
   }
   const result: RebuildResult = {
     full: true,
@@ -1217,6 +1190,7 @@ async function commitCandidate(candidate: CityStateV3, options: { wallRelevant?:
   } catch (error) {
     console.error(`${MODULE_ID} | committed city presentation failed`, error);
     ui.notifications?.error(`Nixie: the city was saved, but presentation failed — ${error instanceof Error ? error.message : String(error)}`);
+    geometryDiagnostic = { kind: "degraded", reason: renderFailureReason(error), revision: saved.revision };
     return {
       full: true,
       chunks: 0,
@@ -1605,6 +1579,9 @@ export function districtDiagnostics(): Array<Record<string, unknown>> {
     entries.push(...completePlan.districtPlan.diagnostics.warnings.map((message) => ({ subsystem: "districts", message })));
   }
   if (wallDiagnostic !== null) entries.push({ subsystem: "walls", retry: "walls", message: wallDiagnostic.reason, revision: wallDiagnostic.revision });
+  if (geometryDiagnostic !== null) {
+    entries.push({ subsystem: "geometry", retry: "geometry", message: geometryDiagnostic.reason, revision: geometryDiagnostic.revision });
+  }
   return entries;
 }
 
@@ -1847,6 +1824,7 @@ async function applyHistory(direction: "undo" | "redo"): Promise<boolean> {
   } catch (error) {
     console.error(`${MODULE_ID} | restored city presentation failed`, error);
     ui.notifications?.error(`Nixie: the city was restored, but presentation failed — ${error instanceof Error ? error.message : String(error)}`);
+    geometryDiagnostic = { kind: "degraded", reason: renderFailureReason(error), revision: saved.revision };
   }
   return true;
 }
@@ -1892,7 +1870,7 @@ function randomSeed(): string {
 export function generationPreflight(): GenerationPreflight {
   const result = loadCityState();
   const sceneEnabled = isSceneEnabled();
-  const base = { sceneEnabled, raw: result.kind === "absent" ? undefined : result.raw };
+  const base = { sceneEnabled, gm: game.user?.isGM === true, raw: result.kind === "absent" ? undefined : result.raw };
   switch (result.kind) {
     case "absent":
       return { ...base, kind: "absent", replaceable: true, revision: null, schemaVersion: null, generatorVersion: null, reason: "This Scene has no city flag." };
@@ -1916,7 +1894,11 @@ export function generationActive(): boolean {
 
 export function generationState(): GenerationState {
   const operation = generationOperation;
-  const degradedCurrent = session.current !== null && completePlan !== null && completePlanRevision === session.current.revision && lastBuild?.degraded === true;
+  const degradedCurrent =
+    session.current !== null &&
+    completePlan !== null &&
+    completePlanRevision === session.current.revision &&
+    (lastBuild?.degraded === true || geometryDiagnostic?.revision === session.current.revision);
   if (operation === null) {
     return {
       active: false,
@@ -2220,6 +2202,8 @@ function fullGenerationStaging(request: FullGenerationRequest): FullGenerationSt
 
 /** Start a full generation. Call only after the UI's two confirmations. */
 export function startFullGeneration(request: FullGenerationRequest): Promise<FullGenerationResult> {
+  // WHY: gate before the claim so a non-GM never claims the durable operation slot.
+  if (game.user?.isGM !== true) return Promise.reject(new Error("Only a GM may start a full generation."));
   const requested = fullGenerationStaging(request);
   const seed = request.randomize ? randomSeed() : normalizeCitySeed(request.citySeed.trim());
   const staging = { ...requested, citySeed: seed };
@@ -2237,6 +2221,7 @@ export function startFullGeneration(request: FullGenerationRequest): Promise<Ful
 
 /** Retry the last failed full generation with the exact same seed and settings. */
 export function retryFullGeneration(): Promise<FullGenerationResult> {
+  if (game.user?.isGM !== true) return Promise.reject(new Error("Only a GM may start a full generation."));
   const operation = generationOperation;
   if (operation === null || operation.failure === null) {
     return Promise.reject(new Error("There is no failed full generation to retry."));
@@ -2252,6 +2237,7 @@ export function retryFullGeneration(): Promise<FullGenerationResult> {
 
 /** Retry the last failed full generation with a new seed (random when omitted). */
 export function generateNewSeed(seed?: string): Promise<FullGenerationResult> {
+  if (game.user?.isGM !== true) return Promise.reject(new Error("Only a GM may start a full generation."));
   const operation = generationOperation;
   if (operation === null || operation.failure === null) {
     return Promise.reject(new Error("There is no failed full generation to retry."));
@@ -2276,11 +2262,12 @@ export function retryGeometry(): Promise<RebuildResult> {
   return terrainActions.run(async () => {
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    // WHY: the diagnostic clears inside installCompleteChunks, and only a real install for
+    // the current revision may claim success; a failed rebuild must not return stale chunks.
     if (completePlan === null || completePlanRevision !== city.revision) {
-      await rebuildGeometry();
-      const built = lastBuild;
-      if (built === null) throw new Error("City geometry is unavailable.");
-      return built;
+      const rebuilt = await rebuildGeometry();
+      if (rebuilt.degraded === true) throw new Error("City geometry is still unavailable.");
+      return rebuilt;
     }
     return installCompleteChunks(city, completePlan, nextCompleteSequence(), session.buildEpoch);
   });
@@ -2412,6 +2399,7 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
     }
     console.error(`${MODULE_ID} | terrain rebuild failed`, error);
     ui.notifications?.error(`Nixie: city presentation failed — ${error instanceof Error ? error.message : String(error)}`);
+    geometryDiagnostic = { kind: "degraded", reason: renderFailureReason(error), revision };
     return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: performance.now() - started, stale: false, degraded: true };
   }
 }
@@ -2568,6 +2556,7 @@ export function stats(): Record<string, unknown> | null {
       revision: completePlanRevision,
       roundTripMs: completePlanRoundTripMs,
       buildToken: completePlan.buildToken,
+      structuralInput: completePlan.structuralInput,
       blocks: completePlan.districtPlan.blocks.length,
       fragments: completePlan.districtPlan.blocks.reduce((sum, block) => sum + block.districtFragments.length, 0),
       developmentCells: completePlan.districtPlan.developmentCells.length,

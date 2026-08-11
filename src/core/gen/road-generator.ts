@@ -1526,10 +1526,6 @@ function corridorsInsideMasks(source: RoadSource, mask: Ring, land: Ring, sceneB
   for (const span of network.segments) {
     const corridor = edgeQuad(span.a, span.b, span.clearanceM);
     if (corridor.length >= 3 && !shapeInsideMasks(corridor, mask, land, sceneBounds)) {
-      if (process.env.NIXIE_DEBUG_ROADS) {
-        const { writeFileSync } = require("node:fs");
-        writeFileSync(process.env.NIXIE_DEBUG_ROADS, JSON.stringify({ span, mask, land, sceneBounds }));
-      }
       return false;
     }
     for (const point of [span.a, span.b]) {

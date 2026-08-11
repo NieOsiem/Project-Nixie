@@ -115,6 +115,25 @@ describe("Diagnostics workspace", () => {
     expect(hasWallRetry([views[0]!])).toBe(false);
   });
 
+  it("renders a revision-bound post-save geometry diagnostic with a render retry", () => {
+    const message = "The city was saved, but final presentation failed: chunk batch incomplete.";
+    const html = diagnosticsTrayHTML([
+      { subsystem: "geometry", retry: "geometry", message, kind: "degraded", revision: 4 }
+    ]);
+    expect(html).toContain(message);
+    expect(html).toContain('data-action="diagnostics-retry-geometry"');
+    expect(html).toContain("Retry rendering");
+    expect(sanitizeDiagnosticEntry({ retry: "geometry", message: "Presentation failed." })).toEqual({
+      severity: "warning",
+      message: "Presentation failed.",
+      subsystem: "geometry",
+      retry: "geometry"
+    });
+    expect(hasActionableDiagnosticViews(diagnosticViews([
+      { subsystem: "geometry", retry: "geometry", message }
+    ]))).toBe(true);
+  });
+
   it("shows the structural failure with same-seed, new-seed, and render retries", () => {
     const f = failure();
     const html = diagnosticsTrayHTML([], state({ phase: "failed", failure: f }));

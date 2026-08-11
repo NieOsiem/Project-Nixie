@@ -32,7 +32,7 @@ export function sanitizeDiagnosticEntry(raw: Record<string, unknown>): Diagnosti
   if (message === null) return null;
   const retry = retryOf(raw.retry);
   const subsystem = typeof raw.subsystem === "string" && raw.subsystem.length > 0 ? raw.subsystem : retry ?? "city";
-  const severity = raw.severity === "warning" || raw.kind === "degraded" || retry === "walls" || retry === "plan" ? "warning" : "error";
+  const severity = raw.severity === "warning" || raw.kind === "degraded" || retry === "walls" || retry === "plan" || retry === "geometry" ? "warning" : "error";
   return { severity, message, subsystem, retry };
 }
 

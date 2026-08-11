@@ -40,7 +40,7 @@ export type CityLoadResult =
     }
   | { kind: "malformed"; raw: unknown; reason: string };
 
-export type SaveExpectation = "absent" | "legacy" | number;
+export type SaveExpectation = "absent" | number;
 
 /**
  * Pins the Scene state that a destructive clear is allowed to remove. Only known
@@ -421,17 +421,12 @@ export async function saveCityState(
   if (state.revision !== expectedRevision) {
     throw new Error(`Expected revision ${expectedRevision}, received ${state.revision}.`);
   }
-  // A revision-1 save is creation: it may only land on a genuinely cleared Scene
-  // (absent) or on legacy 1.0 data awaiting replacement, never over an existing,
-  // obsolete, unsupported, or malformed city flag.
-  if (state.revision === 1 && current.kind !== "absent" && current.kind !== "legacy") {
-    throw new Error("City creation requires an absent or legacy Scene state.");
+  // WHY: creation must follow the confirmed clear; otherwise existing or future data could be overwritten.
+  if (state.revision === 1 && current.kind !== "absent") {
+    throw new Error("City creation requires an absent Scene state.");
   }
   if (expectation === "absent" && current.kind !== "absent") {
     throw new Error("City flag appeared before creation; retry from the current Scene.");
-  }
-  if (expectation === "legacy" && current.kind !== "legacy") {
-    throw new Error("Legacy city replacement is stale; retry from the current Scene.");
   }
   if (typeof expectation === "number") {
     if (current.kind !== "supported" || current.state.revision !== expectation) {

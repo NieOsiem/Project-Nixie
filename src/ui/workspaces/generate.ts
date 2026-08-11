@@ -60,7 +60,7 @@ export const GENERATION_PHASE_STEPS = [
   "Secondary roads and pedestrian routes",
   "Districts and blocks",
   "Parcels, buildings, and open spaces",
-  "Props, vehicles, POIs, and walls"
+  "Walls and final chunk presentation"
 ] as const;
 
 export interface ConfirmDialog {
@@ -136,6 +136,7 @@ export function fullGenerationRequest(staged: StagedGenerateSettings, randomize:
 }
 
 export function generateStatusMessage(preflight: GenerationPreflight): string {
+  if (!preflight.gm) return "Only a GM may replace or create a city with Randomize Entire City.";
   switch (preflight.kind) {
     case "unsupported":
       return "This Scene contains an unsupported City Generator 2.0 schema. Full-city generation is unavailable until the data is migrated or repaired.";
@@ -161,17 +162,17 @@ export function randomizeConfirmations(preflight: GenerationPreflight): readonly
       case "legacy":
         return {
           title: "Nixie: Replace the legacy city?",
-          content: "This Scene contains City Generator 1.0 data. Randomize Entire City permanently discards it and generates a new City Generator 2.0 city that cannot be restored with Undo. Continue?"
+          content: "This Scene contains City Generator 1.0 data. Randomize Entire City permanently discards it and generates a new City Generator 2.0 city. All Nixie-owned city content, locks, generated walls, and City Generator undo and redo history are discarded. The previous city cannot be restored with Undo. Continue?"
         };
       case "obsolete-precomplete":
         return {
           title: "Nixie: Replace the outdated city?",
-          content: "This Scene contains an outdated, incomplete City Generator 2.0 city. Randomize Entire City permanently discards it and generates a complete new city that cannot be restored with Undo. Continue?"
+          content: "This Scene contains an outdated, incomplete City Generator 2.0 city. Randomize Entire City permanently discards it and generates a complete new city. All Nixie-owned city content, locks, generated walls, and City Generator undo and redo history are discarded. The previous city cannot be restored with Undo. Continue?"
         };
       case "supported":
         return {
           title: "Nixie: Replace the current city?",
-          content: "Randomize Entire City permanently discards all Nixie-owned City Generator 2.0 content in this Scene, including locked or manually edited Nixie objects. City Generator undo and redo history is cleared and the previous city cannot be restored with Undo. Continue?"
+          content: "Randomize Entire City permanently discards all Nixie-owned city content, locks, generated walls, and City Generator undo and redo history. The previous city cannot be restored with Undo. Continue?"
         };
       default:
         return {
@@ -184,7 +185,7 @@ export function randomizeConfirmations(preflight: GenerationPreflight): readonly
     first,
     {
       title: "Nixie: Start uninterruptible generation?",
-      content: "Once generation begins it cannot be cancelled, and closing the editor or changing the Scene view will not stop it. Continue?"
+      content: "Once generation begins it cannot be cancelled or undone, and closing the editor or changing the Scene view will not stop it. Continue?"
     }
   ];
 }
@@ -270,7 +271,7 @@ export function generateFormHTML(model: GenerateFormModel): string {
   const blockedDisabled = blocked ? " disabled" : "";
   const terrainMode = model.terrainMode === "coastal" ? "coastal" : "rectangle";
   const coastDisabled = terrainMode !== "coastal" || model.busy ? " disabled" : "";
-  const canRandomize = preflight.replaceable && preflight.sceneEnabled && !model.busy && model.stagedProblem === null;
+  const canRandomize = preflight.gm && preflight.replaceable && preflight.sceneEnabled && !model.busy && model.stagedProblem === null;
   const stagedProblem = model.stagedProblem === null ? "" : `<p class="nixie-note" data-status="staged-invalid">${escapeHTML(model.stagedProblem)}</p>`;
   const presetOptions = GENERATE_PRESETS.map(
     (preset) => `<option value="${preset.id}"${selected(preset.id, model.preset)}>${escapeHTML(preset.label)}</option>`
@@ -456,7 +457,7 @@ export function generateWorkspace(deps: Partial<GenerateWorkspaceDeps> = {}): Wo
     // re-checks the same rule defensively before claim and clear.
     if (validateGenerationStaging(stagingFrom(staged)) !== null) return;
     const preflight = d.generationPreflight();
-    if (!preflight.replaceable || !preflight.sceneEnabled) return;
+    if (!preflight.gm || !preflight.replaceable || !preflight.sceneEnabled) return;
     // WHY: pin the exact pre-dialog preflight (kind + revision) so a Scene that changes
     // while the dialogs are open is rejected at clear time instead of silently replaced.
     const confirmation = clearConfirmationFor(preflight);

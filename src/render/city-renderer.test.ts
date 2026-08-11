@@ -199,6 +199,14 @@ const buffers = (triangleCount: number): MeshBuffers => ({
   triangleCount
 });
 
+/** Buffers with deterministic uploaded byte sizes: floats*4 + uints*4 per array. */
+const sized = (triangleCount: number, vertexCount: number, vertexFloats: number, indexUints: number): MeshBuffers => ({
+  vertices: new Float32Array(vertexFloats),
+  indices: new Uint32Array(indexUints),
+  vertexCount,
+  triangleCount
+});
+
 const chunk = (id: string, boundsPx: Rect, triangleCount = 1): ChunkGeometry => ({
   id,
   mesh: buffers(triangleCount),
@@ -380,6 +388,52 @@ describe("CityRenderer chunk map", () => {
       trianglesTotal: 12,
       detailTrianglesTotal: 5
     });
+    r.destroy();
+  });
+
+  it("totals include neon while glow triangles stay a subset", () => {
+    const r = make();
+    r.setChunks([
+      { ...chunk("0,0", NEAR, 3), detail: buffers(5), neon: buffers(2) },
+      { ...chunk("1,0", NEAR, 4), neon: buffers(7) }
+    ]);
+
+    expect(r.stats()).toMatchObject({
+      trianglesTotal: 21,
+      detailTrianglesTotal: 5,
+      neonTrianglesTotal: 9
+    });
+    r.destroy();
+  });
+
+  it("vertex totals include detail and neon vertex counts", () => {
+    const r = make();
+    r.setChunks([
+      { ...chunk("0,0", NEAR, 3), mesh: sized(3, 12, 12, 9), detail: sized(5, 8, 8, 15), neon: sized(2, 6, 6, 6) },
+      chunk("1,0", NEAR, 4)
+    ]);
+
+    expect(r.stats()).toMatchObject({ verticesTotal: 26 });
+    r.destroy();
+  });
+
+  it("tracks total and largest chunk upload bytes through replace and clear", () => {
+    const r = make();
+    r.setChunks([
+      { ...chunk("0,0", NEAR, 3), mesh: sized(3, 0, 4, 2), detail: sized(5, 0, 4, 2), neon: sized(2, 0, 8, 4) },
+      { ...chunk("1,0", NEAR, 4), neon: sized(7, 0, 16, 8) }
+    ]);
+    expect(r.stats()).toMatchObject({ uploadedBytes: 192, largestChunkUploadBytes: 96 });
+
+    // Replacing the largest chunk must recompute the max from what remains.
+    r.setChunk({ ...chunk("1,0", NEAR, 9), mesh: sized(9, 0, 10, 6) });
+    expect(r.stats()).toMatchObject({ uploadedBytes: 160, largestChunkUploadBytes: 96 });
+
+    r.removeChunk("0,0");
+    expect(r.stats()).toMatchObject({ uploadedBytes: 64, largestChunkUploadBytes: 64 });
+
+    r.clearChunks();
+    expect(r.stats()).toMatchObject({ uploadedBytes: 0, largestChunkUploadBytes: 0 });
     r.destroy();
   });
 

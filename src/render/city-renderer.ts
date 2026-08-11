@@ -64,9 +64,11 @@ interface LiveChunk {
   buildingCount: number;
   landmarkCount: number;
   openSpaceCount: number;
-  /** Copied off the buffers at install time; CityMesh only keeps triangleCount. */
+  // WHY: CityMesh keeps triangle counts only; renderer stats need install-time vertex counts.
   meshVertexCount: number;
   detailVertexCount: number;
+  neonVertexCount: number;
+  uploadedBytes: number;
 }
 
 /**
@@ -124,6 +126,8 @@ export class CityRenderer {
   #visibleTriangles = 0;
   #visibleDetailTriangles = 0;
   #visibleNeonTriangles = 0;
+  #uploadedBytes = 0;
+  #largestChunkUploadBytes = 0;
   #renderScale = 1;
   #supersample = 1;
   #pivotUv = new Float32Array([0.5, 0.5]);
@@ -348,6 +352,10 @@ export class CityRenderer {
       this.#neonContent.addChild(neon.display);
     }
 
+    const uploadedBytes =
+      chunk.mesh.vertices.byteLength + chunk.mesh.indices.byteLength +
+      (chunk.detail === undefined ? 0 : chunk.detail.vertices.byteLength + chunk.detail.indices.byteLength) +
+      (chunk.neon === undefined ? 0 : chunk.neon.vertices.byteLength + chunk.neon.indices.byteLength);
     this.#chunks.set(chunk.id, {
       id: chunk.id,
       boundsPx: chunk.boundsPx,
@@ -358,8 +366,12 @@ export class CityRenderer {
       landmarkCount: chunk.landmarkCount ?? 0,
       openSpaceCount: chunk.openSpaceCount ?? 0,
       meshVertexCount: chunk.mesh.vertexCount,
-      detailVertexCount: chunk.detail?.vertexCount ?? 0
+      detailVertexCount: chunk.detail?.vertexCount ?? 0,
+      neonVertexCount: chunk.neon?.vertexCount ?? 0,
+      uploadedBytes
     });
+    this.#uploadedBytes += uploadedBytes;
+    if (uploadedBytes > this.#largestChunkUploadBytes) this.#largestChunkUploadBytes = uploadedBytes;
     this.#contentDirty = true;
   }
 
@@ -376,6 +388,15 @@ export class CityRenderer {
     if (chunk.neon !== null) {
       this.#neonContent.removeChild(chunk.neon.display);
       chunk.neon.destroy();
+    }
+    this.#uploadedBytes -= chunk.uploadedBytes;
+    if (chunk.uploadedBytes === this.#largestChunkUploadBytes) {
+      this.#largestChunkUploadBytes = 0;
+      for (const other of this.#chunks.values()) {
+        if (other.uploadedBytes > this.#largestChunkUploadBytes) {
+          this.#largestChunkUploadBytes = other.uploadedBytes;
+        }
+      }
     }
     this.#contentDirty = true;
   }
@@ -604,6 +625,7 @@ export class CityRenderer {
   stats(): Record<string, unknown> {
     let trianglesTotal = 0;
     let detailTrianglesTotal = 0;
+    let neonTrianglesTotal = 0;
     let verticesTotal = 0;
     let buildings = 0;
     let landmarks = 0;
@@ -611,7 +633,8 @@ export class CityRenderer {
     for (const chunk of this.#chunks.values()) {
       trianglesTotal += chunk.mesh.triangleCount;
       detailTrianglesTotal += chunk.detail?.triangleCount ?? 0;
-      verticesTotal += chunk.meshVertexCount + chunk.detailVertexCount;
+      neonTrianglesTotal += chunk.neon?.triangleCount ?? 0;
+      verticesTotal += chunk.meshVertexCount + chunk.detailVertexCount + chunk.neonVertexCount;
       buildings += chunk.buildingCount;
       landmarks += chunk.landmarkCount;
       openSpaces += chunk.openSpaceCount;
@@ -635,9 +658,12 @@ export class CityRenderer {
       triangles: this.#visibleTriangles,
       detailTriangles: this.#visibleDetailTriangles,
       neonTriangles: this.#visibleNeonTriangles,
-      trianglesTotal: trianglesTotal + detailTrianglesTotal,
+      trianglesTotal: trianglesTotal + detailTrianglesTotal + neonTrianglesTotal,
       detailTrianglesTotal,
+      neonTrianglesTotal,
       verticesTotal,
+      uploadedBytes: this.#uploadedBytes,
+      largestChunkUploadBytes: this.#largestChunkUploadBytes,
       buildings,
       landmarks,
       openSpaces,
