@@ -12,10 +12,9 @@ import { normalizeRing, validateRing } from "./terrain.js";
 const GEOMETRY_EPSILON = 1e-6;
 const KEY_SCALE = 1_000;
 // Raised from 20 to match the smallest building grammar's minAreaM2 (narrow-shopfront = 70m²).
-// Parcels below 70m² cannot fit any building grammar and were silently converting to vacant
-// open space voids. Dropping them instead lets exposed ground show through, which is
-// visually less jarring than a cluster of tiny derelict lots.
-export const MIN_PARCEL_AREA_M2 = 70;
+// Parcels below 100m² cannot fit playable building grammars and were creating tiny sliver plots.
+// Dropping them lets ground show through and maintains tabletop encounter scale.
+export const MIN_PARCEL_AREA_M2 = 100;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
 
 /** Deterministic open-space material slot per category (shared with the renderer contract). */
@@ -228,14 +227,14 @@ function grammarFitsParcel(
 
 /** Shrink a rect toward its own centroid until it sits inside the container, or null. */
 function fitRectInside(rect: Ring, container: MultiPolygon): Ring | null {
+  const initialArea = Math.abs(ringArea(rect));
+  if (initialArea <= GEOMETRY_EPSILON) return null;
   const centre = ringCentroid(rect);
   let current = rect;
-  for (let attempt = 0; attempt < 16; attempt++) {
-    if (Math.abs(ringArea(current)) <= GEOMETRY_EPSILON) return null;
-    // Gate on the same snap-noise predicate the validator uses, so a fitted mass can
-    // never read as escaping its parcel after the boolean pipeline re-snaps.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (Math.abs(ringArea(current)) < initialArea * 0.5) return null;
     if (isSnapNoise(difference(ringAsMulti(current), [container]))) return current;
-    const factor = attempt === 0 ? 0.88 : 0.86;
+    const factor = attempt === 0 ? 0.92 : 0.88;
     current = current.map((point) => ({ x: centre.x + (point.x - centre.x) * factor, y: centre.y + (point.y - centre.y) * factor }));
   }
   return null;
@@ -1031,8 +1030,8 @@ function archetypeMasses(
     return masses;
   }
   if (archetype === "l-shape") {
-    const wingW = mainW * 0.42;
-    const wingH = mainH * 0.55;
+    const wingW = mainW * 0.58;
+    const wingH = mainH * 0.65;
     const side = hashUnit(`${seed}/wing`) < 0.5 ? -1 : 1;
     // WHY: one concave base prevents an L grammar from rendering as unrelated rectangles.
     const bottomBar = localRect(bounds, angle, centre, baseX, baseY + wingH, mainW, mainH - wingH);
@@ -1054,8 +1053,8 @@ function archetypeMasses(
     ];
   }
   if (archetype === "u-shape") {
-    const barH = mainH * 0.24;
-    const barW = mainW * 0.26;
+    const barH = mainH * 0.38;
+    const barW = mainW * 0.36;
     const left = localRect(bounds, angle, centre, baseX, baseY, barW, mainH);
     const right = localRect(bounds, angle, centre, baseX + mainW - barW, baseY, barW, mainH);
     const cross = localRect(bounds, angle, centre, baseX + barW, baseY, mainW - 2 * barW, barH);
@@ -1078,8 +1077,8 @@ function archetypeMasses(
     ];
   }
   if (archetype === "courtyard") {
-    const barW = mainW * 0.22;
-    const barH = mainH * 0.22;
+    const barW = mainW * 0.28;
+    const barH = mainH * 0.28;
     const top = localRect(bounds, angle, centre, baseX, baseY, mainW, barH);
     const bottom = localRect(bounds, angle, centre, baseX, baseY + mainH - barH, mainW, barH);
     const left = localRect(bounds, angle, centre, baseX, baseY + barH, barW, mainH - 2 * barH);

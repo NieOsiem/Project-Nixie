@@ -113,16 +113,16 @@ interface GrammarShape {
 const GRAMMAR_SHAPES: Readonly<Record<BlockGrammarId, GrammarShape>> = {
   "perimeter-courtyard": { widthFactor: 0.85, depthFactor: 0.72, angleOffset: 0, stagger: 0, sparse: 0.04 }, // Tuned: reduced skip rate for tighter residential grain
   "fine-grain-frontage": { widthFactor: 0.48, depthFactor: 0.72, angleOffset: 0, stagger: 0.5, sparse: 0 },
-  "rotated-bands": { widthFactor: 0.72, depthFactor: 1.2, angleOffset: Math.PI / 7, stagger: 0.5, sparse: 0 }, // Tuned: was inflating residential plot depth
-  "irregular-mosaic": { widthFactor: 0.78, depthFactor: 0.82, angleOffset: Math.PI / 11, stagger: 0.35, sparse: 0.08 },
-  "superblock-compound": { widthFactor: 1.7, depthFactor: 1.55, angleOffset: Math.PI / 24, stagger: 0, sparse: 0.05 },
-  "tower-podium-field": { widthFactor: 1.25, depthFactor: 1.25, angleOffset: Math.PI / 18, stagger: 0.25, sparse: 0.03 }, // Tuned: reduced skip rate so tower blocks are denser
-  "industrial-yard": { widthFactor: 1.1, depthFactor: 1.1, angleOffset: Math.PI / 20, stagger: 0.5, sparse: 0.05 }, // Tuned: was inflating cells to 170x185m effective size
-  "logistics-sheds": { widthFactor: 0.92, depthFactor: 1.35, angleOffset: 0, stagger: 0.5, sparse: 0.08 }, // Tuned: was creating 270m deep parcels
-  "campus-pavilions": { widthFactor: 1.25, depthFactor: 1.1, angleOffset: Math.PI / 9, stagger: 0.5, sparse: 0.18 }, // Tuned: 34% sparsity + large walk reservations left buildings floating in vast lawns
-  "market-alley": { widthFactor: 0.38, depthFactor: 0.62, angleOffset: Math.PI / 30, stagger: 0.5, sparse: 0.05 },
+  "rotated-bands": { widthFactor: 0.72, depthFactor: 1.2, angleOffset: 0, stagger: 0.5, sparse: 0 }, // Tuned: aligned with street frontage
+  "irregular-mosaic": { widthFactor: 0.78, depthFactor: 0.82, angleOffset: 0, stagger: 0.35, sparse: 0.08 },
+  "superblock-compound": { widthFactor: 1.7, depthFactor: 1.55, angleOffset: 0, stagger: 0, sparse: 0.05 },
+  "tower-podium-field": { widthFactor: 1.25, depthFactor: 1.25, angleOffset: 0, stagger: 0.25, sparse: 0.03 }, // Tuned: aligned with street frontage
+  "industrial-yard": { widthFactor: 1.1, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.05 }, // Tuned: aligned with street frontage
+  "logistics-sheds": { widthFactor: 0.92, depthFactor: 1.35, angleOffset: 0, stagger: 0.5, sparse: 0.08 },
+  "campus-pavilions": { widthFactor: 1.25, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.18 }, // Tuned: aligned with street frontage
+  "market-alley": { widthFactor: 0.38, depthFactor: 0.62, angleOffset: 0, stagger: 0.5, sparse: 0.05 },
   "radial-fan": { widthFactor: 1, depthFactor: 1, angleOffset: 0, stagger: 0, sparse: 0 },
-  "waterfront-terraces": { widthFactor: 0.78, depthFactor: 1.45, angleOffset: Math.PI / 36, stagger: 0.5, sparse: 0.12 }
+  "waterfront-terraces": { widthFactor: 0.78, depthFactor: 1.45, angleOffset: 0, stagger: 0.5, sparse: 0.12 }
 };
 
 const PROFILE_RATES = { none: 0, "very-low": 0.025, low: 0.075, medium: 0.14, high: 0.23 } as const;
@@ -767,7 +767,7 @@ export function planDistrictFragmentWithGrammar(
       const pieceSeed = `${seed}/piece/${pieceIndex}`;
       const pieceFragment = { ...fragment, buildable: ringAsMulti(ring) };
       const baseAngle = longestEdgeAngle(ring);
-      const rotation = baseAngle + GRAMMAR_SHAPES[grammarId].angleOffset + (hashUnit(`${pieceSeed}/rotation`) - 0.5) * Math.PI / 12;
+      const rotation = baseAngle + GRAMMAR_SHAPES[grammarId].angleOffset;
       const frontageRoadId = boundaryRoadIds.length > 0 ? boundaryRoadIds[fnv1a(pieceSeed) % boundaryRoadIds.length]! : null;
       if (decomposed) {
         const cellRing = canonicalRing(ring);
