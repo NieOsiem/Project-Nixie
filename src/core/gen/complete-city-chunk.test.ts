@@ -194,9 +194,9 @@ const buildingC: BuildingPlan = {
   archetype: "rectangle",
   seed: "building-c-seed",
   appearanceSeed: "building-c-appearance",
-  heightM: 14,
+  heightM: 60,
   masses: [
-    mass("building-c-mass", "building-c", 0, rectRing({ x: 10, y: 10, width: 20, height: 20 }), 0, 14, "coarse")
+    mass("building-c-mass", "building-c", 0, rectRing({ x: 10, y: 10, width: 20, height: 20 }), 0, 60, "coarse")
   ],
   areaM2: 400
 };
@@ -776,7 +776,7 @@ describe("buildCompleteCityChunk", () => {
     expect(intentional.detail.vertexCount).toBe(0);
   });
 
-  it("keeps the geometry budget: one 4-vertex 14 m mass is exactly 10 opaque triangles", () => {
+  it("keeps the geometry budget: one 4-vertex 60 m mass is exactly 10 opaque plus bounded clutter triangles", () => {
     const onlyC = (): CompleteCityPlan => ({
       ...PLAN,
       buildings: PLAN.buildings.filter((b) => b.id === "building-c"),
@@ -791,9 +791,10 @@ describe("buildCompleteCityChunk", () => {
       SCENE,
       PPM
     );
-    // 2 roof triangles + 8 wall triangles for a 4-vertex footprint; no clutter (14 m <
-    // 20 m), no detail (coarse policy) and no neon (signageRate 0).
-    expect(withC.mesh.triangleCount - bare.mesh.triangleCount).toBe(10);
+    // 2 roof triangles + 8 wall triangles for a 4-vertex footprint; the 60 m height
+    // crosses the 20 m clutter gate, adding exactly two 10-triangle rooftop boxes for
+    // this deterministic seed; no detail (coarse policy) and no neon (signageRate 0).
+    expect(withC.mesh.triangleCount - bare.mesh.triangleCount).toBe(30);
     expect(withC.detail.triangleCount).toBe(0);
     expect(withC.neon.triangleCount).toBe(0);
     expect(withC.buildingCount).toBe(1);
@@ -837,7 +838,7 @@ describe("buildCompleteCityChunk", () => {
     };
     const volumes = buildCompleteCityChunk(
       SOURCE,
-      withGrammar("residential-slab", 24),
+      withGrammar("residential-slab", 60),
       { cx: 0, cy: 0 },
       SCENE,
       PPM

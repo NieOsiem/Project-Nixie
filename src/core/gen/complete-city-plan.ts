@@ -5,7 +5,7 @@ import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materi
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, districtStructuralInputSignature, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY } from "./district-registry.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
 import { normalizeRing, validateRing } from "./terrain.js";
 
@@ -245,10 +245,14 @@ function fitRectInside(rect: Ring, container: MultiPolygon): Ring | null {
  * Which side of a parcel's local frame faces its frontage road. "u" is the parcel's
  * width axis (parallel to frontageAngleRad), "v" its depth axis; sign picks the
  * low/high side. Parcels without road contact (interior remainders) get null.
+ * angleRad, when present, is the frontage edge's own direction (from the parcel edge
+ * segment that borders the corridor) — fronted masses rotate to it so buildings sit
+ * parallel to their street even when the cell frame is diagonal to it.
  */
 export interface FrontageSide {
   axis: "u" | "v";
   sign: 1 | -1;
+  angleRad?: number;
 }
 
 /** Re-express a frontage side from one local frame's angle into another's. */
@@ -285,7 +289,7 @@ function detectFrontage(parcel: { polygon: Ring; frontageAngleRad: number }, box
   const PROBE_DEPTH_M = 4;
   let bestSide: FrontageSide | null = null;
   let bestAreaM2 = 0;
-  const probe = (axis: "u" | "v", sign: 1 | -1): void => {
+  const probeArea = (axis: "u" | "v", sign: 1 | -1): number => {
     const rect: Ring =
       axis === "u"
         ? (sign < 0
@@ -301,16 +305,39 @@ function detectFrontage(parcel: { polygon: Ring; frontageAngleRad: number }, box
       if (!rectsIntersect(probeBox, entry.box)) continue;
       areaM2 += multiArea(intersection(ringAsMulti(world), [entry.polygon]));
     }
+    return areaM2;
+  };
+  for (const [axis, sign] of [["u", -1], ["u", 1], ["v", -1], ["v", 1]] as const) {
+    const areaM2 = probeArea(axis, sign);
     if (areaM2 > 0.5 && areaM2 > bestAreaM2) {
       bestAreaM2 = areaM2;
       bestSide = { axis, sign };
     }
-  };
-  probe("u", -1);
-  probe("u", 1);
-  probe("v", -1);
-  probe("v", 1);
-  return bestSide;
+  }
+  if (bestSide === null) return null;
+  const winner: FrontageSide = bestSide;
+  // The winning side's own edge direction: average the parcel edges that lie on that
+  // side of the local AABB. Fronted masses rotate to this so buildings sit parallel
+  // to their street even in diagonal cells.
+  const sideLine = winner.axis === "u" ? (winner.sign < 0 ? bounds.x : bounds.x + bounds.width) : (winner.sign < 0 ? bounds.y : bounds.y + bounds.height);
+  let dxSum = 0;
+  let dySum = 0;
+  for (let index = 0; index < parcel.polygon.length; index++) {
+    const a = parcel.polygon[index]!;
+    const b = parcel.polygon[(index + 1) % parcel.polygon.length]!;
+    const la = rotatePoint(a, centre, -angle);
+    const lb = rotatePoint(b, centre, -angle);
+    const mid = winner.axis === "u" ? (la.y + lb.y) / 2 : (la.x + lb.x) / 2;
+    if (Math.abs(mid - sideLine) > 1.5) continue;
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len < 0.5) continue;
+    dxSum += (b.x - a.x) / len;
+    dySum += (b.y - a.y) / len;
+  }
+  if (dxSum * dxSum + dySum * dySum > 1e-6) {
+    winner.angleRad = Math.atan2(dySum, dxSum);
+  }
+  return winner;
 }
 
 /**
@@ -1072,10 +1099,14 @@ function archetypeMasses(
   setbackM: number,
   frontage: FrontageSide | null
 ): RawMass[] {
-  const angle = parcel.frontageAngleRad;
+  // Fronted masses rotate to their street: when the frontage detection found the road
+  // edge's direction, that direction becomes the massing frame's width axis, so
+  // buildings sit parallel to the road even when the cell frame is diagonal to it.
+  const angle = frontage?.angleRad ?? parcel.frontageAngleRad;
   const centre = ringCentroid(parcel.polygon);
   const local = parcel.polygon.map((point) => rotatePoint(point, centre, -angle));
   const bounds = ringBounds(local);
+  const localFrontage = frontage === null ? null : frontage.angleRad === undefined ? frontage : frontageInFrame(frontage, parcel.frontageAngleRad, angle);
   const occupancy = range(`${seed}/occupancy`, definition.footprint.occupancyMin, definition.footprint.occupancyMax);
   const occupancyFactor = Math.sqrt(occupancy);
   // The declared setback is applied as an inset band on all sides before the main mass
@@ -1095,12 +1126,12 @@ function archetypeMasses(
   const container = ringAsMulti(parcel.polygon);
   let baseX = (bounds.width - mainW) / 2;
   let baseY = (bounds.height - mainH) / 2;
-  if (frontage !== null) {
+  if (localFrontage !== null) {
     const front = streetWall
       ? range(`${seed}/front`, definition.frontage.frontSetback[0], definition.frontage.frontSetback[1])
       : Math.max(setbackM, range(`${seed}/front`, definition.frontage.frontSetback[0], definition.frontage.frontSetback[1]));
-    if (frontage.axis === "v") baseY = frontage.sign < 0 ? front : bounds.height - mainH - front;
-    else baseX = frontage.sign < 0 ? front : bounds.width - mainW - front;
+    if (localFrontage.axis === "v") baseY = localFrontage.sign < 0 ? front : bounds.height - mainH - front;
+    else baseX = localFrontage.sign < 0 ? front : bounds.width - mainW - front;
   }
   const gap = 0.04;
   // WHY: the first peer pins the declared total height; later peers must not raise the peak.
@@ -1109,7 +1140,7 @@ function archetypeMasses(
   const put = (rect: Ring, kind: string, elevationM: number, height: number): RawMass | null => {
     // Fronted masses shrink toward the road edge (keeping the flush front); unfronted
     // masses keep the centroid shrink.
-    const fitted = frontage === null ? fitRectInside(rect, container) : fitRectPinned(rect, container, frontage, angle, centre);
+    const fitted = localFrontage === null ? fitRectInside(rect, container) : fitRectPinned(rect, container, localFrontage, angle, centre);
     if (!fitted) return null;
     return { footprint: fitted, elevationM, heightM: height, kind };
   };
@@ -1293,7 +1324,16 @@ export function planParcelBuilding(
   const fitting = active.filter((id) => grammarFitsParcel(BUILDING_GRAMMAR_REGISTRY.get(id)!, parcel));
   if (fitting.length === 0) return null;
   const primary = selectBuildingGrammar(weights, `${parcel.seed}/grammar`);
-  const grammarId = fitting.includes(primary) ? primary : weightedChoice(weights, fitting, `${parcel.seed}/grammar-fit`);
+  let grammarId: BuildingGrammarId;
+  if (fitting.includes(primary)) {
+    grammarId = primary;
+  } else {
+    // Micro grammars fill slivers only: a parcel that fits any main grammar must get a
+    // main grammar, or every mid-size parcel floods with kiosks/annexes.
+    const fittingMain = fitting.filter((id) => !MICRO_BUILDING_GRAMMAR_IDS.has(id));
+    const pool = fittingMain.length > 0 ? fittingMain : fitting;
+    grammarId = weightedChoice(weights, pool, `${parcel.seed}/grammar-fit`);
+  }
   const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
   const supportedUses = grammar.compatibleUses.filter((use) => (useWeights[use] ?? 0) > 0);
   const compatibleWeights = Object.fromEntries(
@@ -1394,6 +1434,9 @@ function parcelPartitionCandidates(
     for (const grammarId of BUILDING_GRAMMAR_IDS) {
       const weight = weights[grammarId] ?? 0;
       if (weight <= 0) continue;
+      // Micro grammars never partition a parcel: a big parcel should split into
+      // main-grammar-sized cells (towers/slabs), not a grid of kiosks.
+      if (MICRO_BUILDING_GRAMMAR_IDS.has(grammarId)) continue;
       const limits = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!.siteLimits;
       let best: ParcelPartition | null = null;
       const maxColumns = Math.min(64, Math.ceil(bounds.width / limits.minWidthM));
