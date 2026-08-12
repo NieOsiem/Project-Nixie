@@ -140,12 +140,12 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("float edge = max(min(halfW - abs(local.x), halfH - abs(local.y)), 0.0);");
     expect(CITY_FRAG).toContain("float parapetLight = clamp(");
     expect(CITY_FRAG).toContain("mat2(ca, -sa, sa, ca)");
-    expect(CITY_FRAG).toContain("float lip = 1.0 - smoothstep(0.0, 0.28, edge);");
-    expect(CITY_FRAG).toContain("float tileLine = slab(tx, 0.985, 1.0, aa / TILE_M)");
+    expect(CITY_FRAG).toContain("float lipW = min(0.28, extent * 0.12);");
+    expect(CITY_FRAG).toContain("float tileLine = slab(tx, 0.985, 1.0, aa / tileM)");
     // Style features are world-anchored (metre scale), not bbox-relative.
     expect(CITY_FRAG).toContain("float skylight = skyRow * skyOn;");
     expect(CITY_FRAG).toContain("float solar = slab(sx, 0.08, 0.92, aa / SOLAR_M)");
-    expect(CITY_FRAG).toContain("float accentStyle = step(0.95, style);");
+    expect(CITY_FRAG).toContain("float accentStyle = step(0.95, style) * styleGate;");
     expect(CITY_FRAG).not.toMatch(/\bradial\b|fract\(cell\)/);
   });
 
