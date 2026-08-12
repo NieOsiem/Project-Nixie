@@ -7,8 +7,9 @@
   "scripts": {
     "build": "node node_modules/vite/bin/vite.js build",
     "watch": "NIXIE_WATCH=1 node node_modules/vite/bin/vite.js build --watch",
-    "test": "node node_modules/vitest/vitest.mjs run",
-    "test:watch": "node node_modules/vitest/vitest.mjs",
+    "test": "node node_modules/vitest/vitest.mjs run --project fast",
+    "test:acceptance": "node node_modules/vitest/vitest.mjs run --project acceptance",
+    "test:watch": "node node_modules/vitest/vitest.mjs --project fast",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit"
   },
   "devDependencies": {

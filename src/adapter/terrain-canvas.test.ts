@@ -854,7 +854,7 @@ describe("full generation", () => {
     expect(generationPreflight()).toMatchObject({ kind: "supported", revision: 2 });
     expect(generationState().active).toBe(false);
     expect(generationState().phase).toBe("idle");
-  });
+  }, 120_000);
 
   it("rejects a retry when the Scene moved past the confirmed operation", async () => {
     vi.stubGlobal("Worker", undefined);

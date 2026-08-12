@@ -1,5 +1,6 @@
 /// <reference types="vitest/config" />
 import { defineConfig, type LibraryOptions } from "vite";
+import { defaultExclude } from "vitest/config";
 
 const watching = Boolean(process.env.NIXIE_WATCH);
 
@@ -40,10 +41,32 @@ export default defineConfig({
       await builder.build(builder.environments.worker!);
     }
   },
+  // WHY: complete-city-plan.test.ts runs ~11 minutes of full-city generation on its own and
+  // would otherwise pin the whole suite; it lives in its own project run via test:acceptance.
+  // Inline projects do not inherit root test options, so each project is fully explicit.
   test: {
-    include: ["src/**/*.test.ts"],
-    environment: "node",
-    pool: "threads",
-    maxWorkers: 1
+    // WHY: caps every project's worker pool; per-project maxWorkers is not part of the
+    // inline project config type, so the cap lives at the root (acceptance is one file
+    // and uses a single worker regardless).
+    maxWorkers: 6,
+    projects: [
+      {
+        test: {
+          name: "fast",
+          include: ["src/**/*.test.ts"],
+          exclude: [...defaultExclude, "src/core/gen/complete-city-plan.test.ts"],
+          environment: "node",
+          pool: "threads"
+        }
+      },
+      {
+        test: {
+          name: "acceptance",
+          include: ["src/core/gen/complete-city-plan.test.ts"],
+          environment: "node",
+          pool: "threads"
+        }
+      }
+    ]
   }
 });
