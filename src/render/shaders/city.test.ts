@@ -6,24 +6,25 @@ import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 describe("city fragment shader", () => {
   it("keeps architectural emission outside the wall canyon falloff", () => {
     expect(CITY_FRAG).toContain(
-      "vBase * vShade * canyon * articulation * (1.0 - 0.58 * recess)"
+      "vBase * (vShade * canyon * articulation * mechTone * (1.0 - 0.3 * recess))"
     );
-    expect(CITY_FRAG).toContain("+ vAccent * max(0.96 * lit, 0.88 * shop)");
+    expect(CITY_FRAG).toContain("col += vAccent * (0.95 * lit * glass * 0.6");
   });
 
-  it("uses four coarse facade families and clustered four-to-eight-floor sections", () => {
-    expect(CITY_FRAG).toContain("const float GRID_M = 4.6;");
-    expect(CITY_FRAG).toContain("const float RIBBON_M = 1.35;");
-    expect(CITY_FRAG).toContain("const float FIN_M = 3.8;");
-    expect(CITY_FRAG).toContain("const float FEATURE_M = 18.0;");
-    expect(CITY_FRAG).toContain("floor(mix(4.0, 9.0,");
-    expect(CITY_FRAG).toContain("float gridStyle = 1.0 - step(0.35, family);");
-    expect(CITY_FRAG).toContain("float ribbonStyle = step(0.35, family)");
-    expect(CITY_FRAG).toContain("float finStyle = step(0.65, family)");
-    expect(CITY_FRAG).toContain("float featureStyle = step(0.85, family);");
-    expect(CITY_FRAG).toContain("float litThreshold = mix(0.20, 0.40,");
-    expect(CITY_FRAG).toContain("floor(vU / (GRID_M * 2.0))");
-    expect(CITY_FRAG).toContain("floor(floorId / 2.0)");
+  it("uses five facade families, per-window cells and three-to-six-floor sections", () => {
+    expect(CITY_FRAG).toContain("const float FLOOR_M = 3.4;");
+    expect(CITY_FRAG).toContain("const float BAY_M = 2.4;");
+    expect(CITY_FRAG).toContain("floor(hash11(seed + 1.73) * 4.0)");
+    expect(CITY_FRAG).toContain("float curtain = 1.0 - step(0.32, family);");
+    expect(CITY_FRAG).toContain("float punched = step(0.32, family)");
+    expect(CITY_FRAG).toContain("float ribbon = step(0.58, family)");
+    expect(CITY_FRAG).toContain("float industrial = step(0.78, family)");
+    expect(CITY_FRAG).toContain("float feature = step(0.92, family);");
+    expect(CITY_FRAG).toContain("float cellX = floor(vU / BAY_M);");
+    expect(CITY_FRAG).toContain("float lit = step(litThreshold,");
+    // Mechanical floors: every 5-8 floors a louvered band with windows gated off.
+    expect(CITY_FRAG).toContain("float mechFloor = step(0.85, fract((floorId + 0.5) / mechEvery));");
+    expect(CITY_FRAG).toContain("float mechWindows = 1.0 - mechFloor;");
   });
 
   it("samples a strong district accent independently of the body material", () => {
@@ -40,16 +41,17 @@ describe("city fragment shader", () => {
     );
   });
 
-  it("has a uniform moving branch and gates architecture off short props", () => {
+  it("has a uniform moving branch, a dedicated low-rise style, and gates architecture off short props", () => {
     expect(CITY_FRAG).toContain("uniform float uDetailQuality;");
     expect(CITY_FRAG.match(/if \(uDetailQuality < 0\.5\)/g)).toHaveLength(2);
-    expect(CITY_FRAG).toContain("const float ARCHITECTURE_MIN_M = 6.0;");
-    expect(CITY_FRAG).toContain("if (architecture < 0.5) return vBase * vShade + vEmissive;");
-    expect(CITY_FRAG).toContain("moving frames skip cell work");
+    expect(CITY_FRAG).toContain("const float ARCHITECTURE_MIN_M = 5.0;");
+    // Low-rise (<5 m) gets a real shed style instead of a blank wall.
+    expect(CITY_FRAG).toContain("float corr = slab(fract(h / CORRUG_M)");
+    expect(CITY_FRAG).toContain("Moving frames");
   });
 
   it("uses the saturated body and restrained ambient look dials", () => {
-    expect(CITY_FRAG).toContain("float canyon = mix(0.68, 1.0,");
+    expect(CITY_FRAG).toContain("float canyon = mix(0.70, 1.0,");
     // Bodies are exposed, emissives are not: gaining them would move what clears the threshold.
     expect(CITY_VERT).toContain("vBase = base.rgb * 1.7;");
     expect(CITY_VERT).toContain("vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);");
@@ -58,12 +60,12 @@ describe("city fragment shader", () => {
 
   it("gates parapet emission to a minority and caps the rest by value", () => {
     expect(CITY_FRAG).toContain("float parapetGlow = step(0.62, hash11(seed + 3.41));");
-    expect(CITY_FRAG).toContain("float coping = parapet * (1.0 - parapetGlow);");
-    // Both quality branches gate off the same decision, or a building would change style
+    expect(CITY_FRAG).toContain("coping + parapetShadow");
+    // Both quality branches use the same gated glow, or a building would change style
     // when the camera settles. One assignment, two uses.
     expect(CITY_FRAG.match(/float parapetGlow = /g)).toHaveLength(1);
-    expect(CITY_FRAG.match(/parapet \* parapetGlow/g)).toHaveLength(2);
-    expect(CITY_FRAG.match(/1\.0 \+ 0\.30 \* coping/g)).toHaveLength(2);
+    expect(CITY_FRAG.match(/0\.8 \* coping \* parapetGlow/g)).toHaveLength(3);
+    expect(CITY_FRAG.match(/0\.55 \* coping/g)).toHaveLength(2);
   });
 
   it("hashes a snapped seed, never the raw varying", () => {
@@ -106,7 +108,6 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("const float GROUND_COARSE_AMP = 0.107;");
     expect(CITY_FRAG).toContain("const float GROUND_FINE_AMP = 0.053;");
     expect(CITY_FRAG).toContain("vec2 w = f * f * (3.0 - 2.0 * f);");
-    expect(CITY_FRAG.match(/hash21\(cell/g)).toHaveLength(4);
 
     const flat = CITY_FRAG.slice(
       CITY_FRAG.indexOf("vec3 flatGround()"),
@@ -134,18 +135,17 @@ describe("city fragment shader", () => {
     );
   });
 
-  it("gives roofs large inset, rim and skylight regions with a directional bevel", () => {
-    expect(CITY_FRAG).toContain("vec2 extentM = max(vec2(vU, abs(vShade))");
-    expect(CITY_FRAG).toContain("float structured = step(0.0, vShade) * architecture;");
-    expect(CITY_FRAG).toContain("float plane = mix(1.08, 0.82, slope);");
-    expect(CITY_FRAG).toContain("float angle = vTop;");
+  it("gives roofs a world-scale tile grid, a directional parapet lip, and style features", () => {
+    expect(CITY_FRAG).toContain("const float TILE_M = 2.6;");
+    expect(CITY_FRAG).toContain("float edge = max(min(halfW - abs(local.x), halfH - abs(local.y)), 0.0);");
+    expect(CITY_FRAG).toContain("float parapetLight = clamp(");
     expect(CITY_FRAG).toContain("mat2(ca, -sa, sa, ca)");
-    expect(CITY_FRAG).toContain("float directionalBevel = clamp(");
-    expect(CITY_FRAG).toContain("float insetOuter = slab(local.x, -0.70, 0.70,");
-    expect(CITY_FRAG).toContain("float insetInner = slab(local.x, -0.57, 0.57,");
-    expect(CITY_FRAG).toContain("float skylightArea = slab(local.x, -0.68, 0.68,");
-    expect(CITY_FRAG).toContain("float stripe = fract((local.y + 0.58) / 0.28);");
-    expect(CITY_FRAG).toContain("0.92 * skylightStyle * skylightBars");
+    expect(CITY_FRAG).toContain("float lip = 1.0 - smoothstep(0.0, 0.28, edge);");
+    expect(CITY_FRAG).toContain("float tileLine = slab(tx, 0.985, 1.0, aa / TILE_M)");
+    // Style features are world-anchored (metre scale), not bbox-relative.
+    expect(CITY_FRAG).toContain("float skylight = skyRow * skyOn;");
+    expect(CITY_FRAG).toContain("float solar = slab(sx, 0.08, 0.92, aa / SOLAR_M)");
+    expect(CITY_FRAG).toContain("float accentStyle = step(0.95, style);");
     expect(CITY_FRAG).not.toMatch(/\bradial\b|fract\(cell\)/);
   });
 
