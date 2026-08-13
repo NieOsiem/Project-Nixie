@@ -141,6 +141,10 @@ const float CORRUG_M = 0.5;
 const float ARCHITECTURE_MIN_M = 5.0;
 const float ROOF_STRIP_M = 2.4;
 const float ROOF_CROSS_M = 7.2;
+const float ROOF_PANEL_U_M = 5.2;
+const float ROOF_PANEL_V_M = 3.6;
+const float ROOF_RIB_M = 1.1;
+const float ROOF_PATCH_M = 5.6;
 const float WEAR_M = 9.0;
 const float GROUND_COARSE_M = 34.0;
 const float GROUND_FINE_M = 8.5;
@@ -183,6 +187,13 @@ float slab(float t, float lo, float hi, float w) {
 // A pattern of this period, seen at this many px/metre: full at 4 px, gone under 1.5.
 float lod(float metres, float pxPerMetre) {
   return smoothstep(1.5, 4.0, metres * pxPerMetre);
+}
+
+float seamLine(float metres, float periodM, float pxPerMetre) {
+  float phase = fract(metres / periodM);
+  float edge = min(phase, 1.0 - phase);
+  float width = 0.8 / max(periodM * pxPerMetre, 1.0);
+  return (1.0 - smoothstep(0.0, width, edge)) * lod(periodM, pxPerMetre);
 }
 
 // Roads, pavements and ground blocks are ~40% of the screen and share a handful of flat
@@ -349,27 +360,54 @@ vec3 roof() {
 
   // WHY: real geometry supplies parapets, skylights and utilities; bbox-relative painted
   // substitutes break on L-shapes and trapezoids.
-  vec2 offset = vec2(seed * 31.0, seed * 17.0);
-  vec2 cell = (local + offset) / vec2(ROOF_CROSS_M, ROOF_STRIP_M);
-  vec2 inCell = fract(cell);
-  vec2 edgeInCell = min(inCell, 1.0 - inCell);
-  vec2 seamWidth = 0.8 / max(
-    vec2(ROOF_CROSS_M, ROOF_STRIP_M) * uScreenPxPerMetre,
-    vec2(1.0));
-  float crossSeam = 1.0 - smoothstep(0.0, seamWidth.x, edgeInCell.x);
-  float stripSeam = 1.0 - smoothstep(0.0, seamWidth.y, edgeInCell.y);
-  float detailLod = lod(ROOF_STRIP_M, uScreenPxPerMetre);
-  float seam = max(crossSeam * 0.45, stripSeam) * detailLod;
+  vec2 shifted = local + vec2(seed * 31.0, seed * 17.0);
+  float family = hash11(seed + 12.59);
+  float membraneStyle = 1.0 - step(0.40, family);
+  float panelStyle = step(0.40, family) * (1.0 - step(0.70, family));
+  float ribStyle = step(0.70, family) * (1.0 - step(0.90, family));
+  float repairStyle = step(0.90, family);
 
-  vec2 panel = floor(cell);
-  float panelTone = (hash21(panel + vec2(seed * 7.3, seed * 11.7)) - 0.5)
-    * 0.035 * detailLod;
-  float wear = (valueNoise((vWorldM + offset) / WEAR_M) - 0.5) * 0.08
+  float membraneSeam = max(
+    seamLine(shifted.y, ROOF_STRIP_M, uScreenPxPerMetre),
+    seamLine(shifted.x, ROOF_CROSS_M, uScreenPxPerMetre) * 0.45);
+  float panelSeam = max(
+    seamLine(shifted.x, ROOF_PANEL_U_M, uScreenPxPerMetre),
+    seamLine(shifted.y, ROOF_PANEL_V_M, uScreenPxPerMetre));
+  float ribSeam = max(
+    seamLine(shifted.y, ROOF_RIB_M, uScreenPxPerMetre) * 0.75,
+    seamLine(shifted.x, ROOF_CROSS_M * 1.25, uScreenPxPerMetre) * 0.3);
+  float seam = membraneStyle * membraneSeam
+    + panelStyle * panelSeam
+    + ribStyle * ribSeam;
+
+  vec2 tonePeriod = membraneStyle * vec2(ROOF_CROSS_M, ROOF_STRIP_M)
+    + panelStyle * vec2(ROOF_PANEL_U_M, ROOF_PANEL_V_M)
+    + ribStyle * vec2(ROOF_CROSS_M * 1.25, ROOF_RIB_M)
+    + repairStyle * vec2(ROOF_PATCH_M);
+  vec2 toneCell = floor(shifted / tonePeriod);
+  float toneLod = lod(min(tonePeriod.x, tonePeriod.y), uScreenPxPerMetre);
+  float panelTone = (hash21(toneCell + vec2(seed * 7.3, seed * 11.7)) - 0.5)
+    * 0.05 * toneLod;
+
+  vec2 patchCell = shifted / ROOF_PATCH_M;
+  vec2 patchUv = fract(patchCell);
+  float patchWidth = 0.8 / max(ROOF_PATCH_M * uScreenPxPerMetre, 1.0);
+  float patch = repairStyle
+    * step(0.72, hash21(floor(patchCell) + vec2(seed * 5.3, seed * 9.1)))
+    * slab(patchUv.x, 0.12, 0.88, patchWidth)
+    * slab(patchUv.y, 0.16, 0.84, patchWidth)
+    * lod(ROOF_PATCH_M, uScreenPxPerMetre);
+
+  float wear = (valueNoise(shifted / WEAR_M) - 0.5) * 0.09
     * lod(WEAR_M, uScreenPxPerMetre);
-  float material = 0.96 + panelTone + wear - seam * 0.075;
+  float fineWear = (valueNoise(shifted / (WEAR_M * 0.38)) - 0.5) * 0.035
+    * lod(WEAR_M * 0.38, uScreenPxPerMetre);
+  float familyTone = (hash11(seed + 8.41) - 0.5) * 0.07;
+  float material = 0.96 + familyTone + panelTone + wear + fineWear
+    - seam * 0.085 - patch * 0.07;
 
   if (uDetailQuality < 0.5) {
-    return vBase * (0.96 + wear * 0.5) + vEmissive * 0.03;
+    return vBase * (0.96 + familyTone + wear * 0.5) + vEmissive * 0.03;
   }
   return vBase * material + vEmissive * 0.03;
 }

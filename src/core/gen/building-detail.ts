@@ -7,7 +7,7 @@ import {
 } from "../geom/extrude.js";
 import { KIND, MeshBuilder, mergeMeshes, type MeshBuffers } from "../geom/mesh.js";
 import { triangulate } from "../geom/tessellate.js";
-import { ringBounds, ringCentroid, type Ring, type Vec2 } from "../geom/types.js";
+import { ringCentroid, type Ring, type Vec2 } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT } from "../palette.js";
 import { hash2 } from "./hash.js";
 
@@ -430,12 +430,18 @@ function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPr
 export function prismMesh(prism: DetailPrism): MeshBuffers {
   const footprint = withPositiveArea(prism.footprint);
   const cap = triangulate([footprint]);
-  const bounds = ringBounds(footprint);
+  const frame = roofFrame(footprint, 1);
   const builder = new MeshBuilder(footprint.length * 5, footprint.length * 3 - 2);
   const capBase = builder.vertexCount;
   for (const p of cap.positions) {
-    const u = bounds.width > 0 ? ((p.x - bounds.x) / bounds.width) * 2 - 1 : 0;
-    const v = bounds.height > 0 ? ((p.y - bounds.y) / bounds.height) * 2 - 1 : 0;
+    const dx = frame === null ? 0 : p.x - frame.centre.x;
+    const dy = frame === null ? 0 : p.y - frame.centre.y;
+    const u = frame === null || frame.extentU <= 0
+      ? 0
+      : (dx * frame.ux + dy * frame.uy) / frame.extentU;
+    const v = frame === null || frame.extentV <= 0
+      ? 0
+      : (-dx * frame.uy + dy * frame.ux) / frame.extentV;
     builder.vertex(
       p.x,
       p.y,

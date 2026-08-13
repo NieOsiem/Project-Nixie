@@ -5,7 +5,8 @@ import { rectRing, type Ring } from "../geom/types.js";
 import { BANK_SIZE, DISTRICT_SLOT } from "../palette.js";
 import {
   BUILDING_DETAIL_MIN_HEIGHT_M,
-  buildingDetailMesh
+  buildingDetailMesh,
+  prismMesh
 } from "./building-detail.js";
 
 const PPM = 25;
@@ -27,7 +28,10 @@ const vertexAt = (mesh: MeshBuffers, index: number) => {
     y: mesh.vertices[at + 1]!,
     height: mesh.vertices[at + 2]!,
     material: mesh.vertices[at + 3]!,
-    kind: mesh.vertices[at + 5]!
+    shade: mesh.vertices[at + 4]!,
+    kind: mesh.vertices[at + 5]!,
+    u: mesh.vertices[at + 6]!,
+    top: mesh.vertices[at + 7]!
   };
 };
 
@@ -49,6 +53,31 @@ describe("buildingDetailMesh", () => {
       expect(Number.isFinite(vertex.y)).toBe(true);
       expect(Number.isFinite(vertex.height)).toBe(true);
     }
+  });
+
+  it("encodes rotated prism caps in the prism's local frame", () => {
+    const centre = { x: 180, y: -75 };
+    const angle = 0.73;
+    const along = { x: Math.cos(angle), y: Math.sin(angle) };
+    const across = { x: -along.y, y: along.x };
+    const halfU = 64;
+    const halfV = 21;
+    const corner = (u: number, v: number) => ({
+      x: centre.x + along.x * u * halfU + across.x * v * halfV,
+      y: centre.y + along.y * u * halfU + across.y * v * halfV
+    });
+    const mesh = prismMesh({
+      footprint: [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)],
+      baseHeight: 50,
+      topHeight: 53,
+      material: 4,
+      seed: 0.4
+    });
+
+    const cap = Array.from({ length: 4 }, (_, index) => vertexAt(mesh, index));
+    expect(cap.every((vertex) => Math.abs(vertex.u) === 1)).toBe(true);
+    expect(cap.every((vertex) => Math.abs(vertex.top) === 1)).toBe(true);
+    expect(new Set(cap.map((vertex) => `${vertex.u},${vertex.top}`)).size).toBe(4);
   });
 
   it("adds projections, rooftop height, and neon structure", () => {

@@ -135,18 +135,24 @@ describe("city fragment shader", () => {
     );
   });
 
-  it("keeps restrained roof material detail fixed in the footprint's local frame", () => {
+  it("keeps varied roof materials fixed in the footprint's local frame", () => {
     expect(CITY_VERT).toContain("vWorldM = aPos / uPixelsPerMetre;");
     expect(CITY_VERT).toContain("vRoofCentreM = aRoofCentre / uPixelsPerMetre;");
     expect(CITY_VERT).not.toContain("vWorldM = leaned / uPixelsPerMetre;");
     expect(CITY_FRAG).toContain("const float ROOF_STRIP_M = 2.4;");
-    expect(CITY_FRAG).toContain("const float ROOF_CROSS_M = 7.2;");
+    expect(CITY_FRAG).toContain("const float ROOF_PANEL_U_M = 5.2;");
+    expect(CITY_FRAG).toContain("const float ROOF_RIB_M = 1.1;");
+    expect(CITY_FRAG).toContain("const float ROOF_PATCH_M = 5.6;");
     expect(CITY_FRAG).toContain("vec2 along = vec2(cos(vTop), sin(vTop));");
     expect(CITY_FRAG).toContain("vec2 across = vec2(-along.y, along.x);");
     expect(CITY_FRAG).toContain(
       "vec2 local = vec2(dot(fromCentre, along), dot(fromCentre, across));"
     );
-    expect(CITY_FRAG).toContain("float material = 0.96 + panelTone + wear - seam * 0.075;");
+    expect(CITY_FRAG).toContain("float membraneStyle = 1.0 - step(0.40, family);");
+    expect(CITY_FRAG).toContain("float panelStyle = step(0.40, family)");
+    expect(CITY_FRAG).toContain("float ribStyle = step(0.70, family)");
+    expect(CITY_FRAG).toContain("float repairStyle = step(0.90, family);");
+    expect(CITY_FRAG).toContain("- seam * 0.085 - patch * 0.07;");
     expect(CITY_FRAG).not.toMatch(
       /\bparapet\b|\bskylight\b|\bsolar\b|\baccentStyle\b|\bpanelRim\b/
     );
