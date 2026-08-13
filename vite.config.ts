@@ -64,7 +64,12 @@ export default defineConfig({
           name: "acceptance",
           include: ["src/core/gen/complete-city-plan.test.ts"],
           environment: "node",
-          pool: "threads"
+          pool: "threads",
+          // WHY: the file's heavy tests run concurrently (it.concurrent). Six parallel
+          // builds starve each other on this CPU/RAM-bandwidth-saturated box (measured:
+          // 6-way = 537 s + timeout, 3-way = 501 s green); 3 is the measured sweet spot
+          // here. Raise to 6 on a quiet machine/CI, where each build gets real bandwidth.
+          maxConcurrency: 3
         }
       }
     ]

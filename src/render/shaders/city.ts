@@ -87,12 +87,10 @@ void main() {
   vU = aU;
   vTop = aTop;
   vSeed = aSeed;
-  // WHY: anchor to the leaned surface so roof patterns ride the fake-3D shift instead of sliding off it.
-  vWorldM = leaned / uPixelsPerMetre;
-  // WHY: the roof surface leans about uPivot, so the pattern frame must lean with it.
-  // An un-leaned centroid leaves a uPivot term in (vWorldM - vRoofCentreM), and the
-  // whole roof texture slides across the surface while panning.
-  vRoofCentreM = (aRoofCentre + (aRoofCentre - uPivot) * (hpx / eye) * uLeanStrength) / uPixelsPerMetre;
+  // WHY: interpolated object-space varyings already follow transformed vertices. Including
+  // camera lean here made roof material scale change with zoom.
+  vWorldM = aPos / uPixelsPerMetre;
+  vRoofCentreM = aRoofCentre / uPixelsPerMetre;
 
   // d(lean)/dh: screen pixels a metre of *height* covers. Falls to zero at the pivot, so
   // the facade must antialias against this, not against uScreenPxPerMetre.
@@ -141,12 +139,9 @@ const float BAY_M = 2.4;
 const float RIB_M = 4.6;
 const float CORRUG_M = 0.5;
 const float ARCHITECTURE_MIN_M = 5.0;
-const float TILE_M = 2.6;
-const float PANEL_M = 6.8;
-const float EDGE_GRIME_M = 1.6;
-const float SKY_M = 3.2;
+const float ROOF_STRIP_M = 2.4;
+const float ROOF_CROSS_M = 7.2;
 const float WEAR_M = 9.0;
-const float SOLAR_M = 2.2;
 const float GROUND_COARSE_M = 34.0;
 const float GROUND_FINE_M = 8.5;
 const float GROUND_COARSE_AMP = 0.107;
@@ -348,87 +343,35 @@ vec3 facade() {
 vec3 roof() {
   float seed = buildingSeed(vSeed);
   vec2 fromCentre = vWorldM - vRoofCentreM;
-  float ca = cos(-vTop);
-  float sa = sin(-vTop);
-  vec2 local = mat2(ca, -sa, sa, ca) * fromCentre;
-  float halfW = max(vU, 0.0001);
-  float halfH = max(abs(vShade), 0.0001);
-  // WHY: the structured gate used to send non-rect footprints (trapezoids, L-shapes) to a
-  // flat fallback with no parapet or edge. The patterns are world-anchored now, so every
-  // polygon gets the full treatment.
-  float extent = max(min(halfW, halfH), 0.0001);
-  float aa = 0.75 / max(extent * uScreenPxPerMetre, 1.0);
-  float detailLod = lod(extent, uScreenPxPerMetre);
-  float rad = max(length(local), 0.0001);
+  vec2 along = vec2(cos(vTop), sin(vTop));
+  vec2 across = vec2(-along.y, along.x);
+  vec2 local = vec2(dot(fromCentre, along), dot(fromCentre, across));
 
-  // Metres from the nearest roof edge (exact for rect footprints; the bbox distance
-  // for others, which the soft treatments hide).
-  float edge = max(min(halfW - abs(local.x), halfH - abs(local.y)), 0.0);
-  float slope = clamp(0.5 + 0.5 * dot(local / rad, vec2(0.5, 0.866)), 0.0, 1.0);
-  float plane = mix(1.04, 0.78, slope);
+  // WHY: real geometry supplies parapets, skylights and utilities; bbox-relative painted
+  // substitutes break on L-shapes and trapezoids.
+  vec2 offset = vec2(seed * 31.0, seed * 17.0);
+  vec2 cell = (local + offset) / vec2(ROOF_CROSS_M, ROOF_STRIP_M);
+  vec2 inCell = fract(cell);
+  vec2 edgeInCell = min(inCell, 1.0 - inCell);
+  vec2 seamWidth = 0.8 / max(
+    vec2(ROOF_CROSS_M, ROOF_STRIP_M) * uScreenPxPerMetre,
+    vec2(1.0));
+  float crossSeam = 1.0 - smoothstep(0.0, seamWidth.x, edgeInCell.x);
+  float stripSeam = 1.0 - smoothstep(0.0, seamWidth.y, edgeInCell.y);
+  float detailLod = lod(ROOF_STRIP_M, uScreenPxPerMetre);
+  float seam = max(crossSeam * 0.45, stripSeam) * detailLod;
 
-  // Parapet: bright lip on the lit side, shadow on the far side.
-  // Parapet width scales with the roof so tiny roofs do not become all rim.
-  float rimW = min(0.7, extent * 0.25);
-  float lipW = min(0.28, extent * 0.12);
-  float rim = 1.0 - smoothstep(0.0, rimW, edge);
-  float lip = 1.0 - smoothstep(0.0, lipW, edge);
-  float parapetLight = clamp(0.5 + 0.5 * dot(local / rad, vec2(0.5, 0.866)), 0.0, 1.0);
-  float parapet = rim * mix(0.55, 1.3, parapetLight) * detailLod + lip * 0.25;
-  float edgeGrime = 1.0 - 0.32 * (1.0 - smoothstep(0.0, EDGE_GRIME_M, edge));
-  float wear = (valueNoise(vec2(vWorldM.x / WEAR_M, vWorldM.y / WEAR_M)) - 0.5) * 0.24;
-
-  // Tile pitch adapts to the roof so narrow roofs get a coherent grid instead of slivers.
-  float tileM = clamp(extent * 0.85, 1.1, TILE_M);
-  float tx = fract(local.x / tileM);
-  float ty = fract(local.y / tileM);
-  float tileLine = slab(tx, 0.985, 1.0, aa / tileM) + slab(ty, 0.985, 1.0, aa / tileM);
-  float tileTone = hash21(vec2(floor(local.x / tileM) + seed * 7.3, floor(local.y / tileM) + seed * 11.7)) * 0.08 - 0.04;
-
-  float px = fract(local.x / PANEL_M);
-  float py = fract(local.y / PANEL_M);
-  float panelRim = (slab(px, 0.04, 0.96, aa / PANEL_M) + slab(py, 0.04, 0.96, aa / PANEL_M)) * 0.5;
-  float panelTone = hash21(vec2(floor(local.x / PANEL_M) + seed * 3.1, floor(local.y / PANEL_M) + seed * 5.7));
-
-  float skyOff = seed * 20.0;
-  float skyRow = slab(fract((local.y + skyOff) / SKY_M), 0.18, 0.62, aa / SKY_M);
-  float skyOn = step(0.5, hash21(vec2(floor((local.y + skyOff) / SKY_M) + seed * 9.1, 1.0)));
-  float skylight = skyRow * skyOn;
-
-  float sx = fract((local.x + seed * 40.0) / SOLAR_M);
-  float sy = fract((local.y + seed * 17.0) / SOLAR_M);
-  float solar = slab(sx, 0.08, 0.92, aa / SOLAR_M) * slab(sy, 0.08, 0.92, aa / SOLAR_M);
-
-  // Style features need a roof at least ~4.4 m across; tiny roofs keep base tiling.
-  float styleGate = step(2.2, extent);
-  float style = hash11(seed + 12.59);
-  float tileStyle = 1.0 - step(0.35, style);
-  float panelStyle = step(0.35, style) * (1.0 - step(0.6, style)) * styleGate;
-  float skyStyle = step(0.6, style) * (1.0 - step(0.82, style)) * styleGate;
-  float solarStyle = step(0.82, style) * (1.0 - step(0.95, style)) * styleGate;
-  float accentStyle = step(0.95, style) * styleGate;
-
-  float structure = 1.0
-    + tileLine * 0.16
-    + tileTone * 2.0
-    + panelStyle * (panelRim * 0.42 + panelTone * 0.18 - 0.09)
-    + skyStyle * (skylight * 0.9)
-    + solarStyle * (solar * 0.85)
-    + wear;
+  vec2 panel = floor(cell);
+  float panelTone = (hash21(panel + vec2(seed * 7.3, seed * 11.7)) - 0.5)
+    * 0.035 * detailLod;
+  float wear = (valueNoise((vWorldM + offset) / WEAR_M) - 0.5) * 0.08
+    * lod(WEAR_M, uScreenPxPerMetre);
+  float material = 0.96 + panelTone + wear - seam * 0.075;
 
   if (uDetailQuality < 0.5) {
-    return vBase * (plane * (1.0 + tileLine * 0.10) * edgeGrime * (1.0 + parapet * 0.35))
-      + vEmissive * 0.06
-      + vAccent * (0.12 * parapet * (1.0 - parapetLight));
+    return vBase * (0.96 + wear * 0.5) + vEmissive * 0.03;
   }
-
-  vec3 col = vBase * (plane * structure * edgeGrime * (1.0 + parapet * 0.45));
-  col += vEmissive * 0.06;
-  float accentBand = accentStyle * (1.0 - smoothstep(0.4, 2.6, edge)) * 0.4;
-  col += vAccent * (0.15 * parapet * (1.0 - parapetLight) + accentBand * detailLod);
-  if (skyStyle > 0.5) col = mix(col, vec3(0.03, 0.05, 0.09), skylight * 0.75 * detailLod);
-  if (solarStyle > 0.5) col = mix(col, vec3(0.02, 0.05, 0.09), solar * 0.55 * detailLod);
-  return col;
+  return vBase * material + vEmissive * 0.03;
 }
 vec3 clutter() {
   float cap = 1.0 - step(-0.5, vShade);

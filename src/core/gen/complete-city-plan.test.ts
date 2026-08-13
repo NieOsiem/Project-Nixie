@@ -103,10 +103,27 @@ const ringSource = (
   };
 };
 
+// WHY: nine tests plan the identical ringSource(4)/ringSource(16) city; a build is 27–63 s
+// of pure generation, so identical builds are computed once per worker and shared. The
+// generator is deterministic (asserted below) and the pipeline keeps no module-level state,
+// so a shared plan is observationally identical to a fresh one. Tests that tamper with the
+// plan (injected-failure cases) spread-copy it and never mutate the shared object.
+const sharedPlans = new Map<string, CompleteCityPlan>();
+function sharedPlan(key: string, build: () => CompleteCityPlan): CompleteCityPlan {
+  let plan = sharedPlans.get(key);
+  if (plan === undefined) {
+    plan = build();
+    sharedPlans.set(key, plan);
+  }
+  return plan;
+}
+const ringFourPlan = (): CompleteCityPlan => sharedPlan("ringSource(4)", () => buildCompleteCityPlan(ringSource(4)));
+const ringSixteenPlan = (): CompleteCityPlan => sharedPlan("ringSource(16)", () => buildCompleteCityPlan(ringSource(16)));
+
 describe("buildCompleteCityPlan", () => {
-  it("produces a validating complete plan over all 16 districts with all four landmarks", () => {
+  it.concurrent("produces a validating complete plan over all 16 districts with all four landmarks", () => {
     const source = ringSource(16);
-    const plan = buildCompleteCityPlan(source);
+    const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.diagnostics.landmarkCount).toBe(4);
     expect(plan.diagnostics.landmarkSkipped).toEqual([]);
@@ -133,7 +150,7 @@ describe("buildCompleteCityPlan", () => {
       expect(type, landmark.id).toBeDefined();
       expect(grammar.compatibilityTags.some((tag) => type!.compatibilityTags.includes(tag)), landmark.id).toBe(true);
     }
-  }, 120_000);
+  }, 300_000);
 
   it("is deterministic and identical under source permutation and origin shift", () => {
     const source = crossSource();
@@ -147,7 +164,7 @@ describe("buildCompleteCityPlan", () => {
     const shifted: CitySourceV3 = { ...source, origin: { x: source.origin.x + 12345, y: source.origin.y - 6789 } };
     expect(buildCompleteCityPlan(shifted)).toEqual(plan);
     expect(buildCompleteCityPlan(source)).toEqual(plan);
-  }, 120_000);
+  }, 300_000);
 
   it("stamps revision, action token, build token, and epoch deterministically", () => {
     const source = crossSource();
@@ -162,9 +179,9 @@ describe("buildCompleteCityPlan", () => {
     expect(stamped.actionToken).not.toBe(plan.actionToken);
     expect(stamped.buildToken).toBe(plan.buildToken);
     expect(validateCompleteCityPlan(stamped)).toEqual([]);
-  }, 120_000);
+  }, 300_000);
 
-  it("honors global none, a district override above none, and landmark-required open space", () => {
+  it.concurrent("honors global none, a district override above none, and landmark-required open space", () => {
     const nonePlan = buildCompleteCityPlan(ringSource(4, "none"));
     expect(validateCompleteCityPlan(nonePlan)).toEqual([]);
     expect(nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null)).toEqual([]);
@@ -186,9 +203,9 @@ describe("buildCompleteCityPlan", () => {
     expect(validateCompleteCityPlan(overriddenPlan)).toEqual([]);
     const ordinary = overriddenPlan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null && openSpace.districtId === overriddenSource.districts[3]!.id);
     expect(ordinary.length).toBeGreaterThan(0);
-  }, 120_000);
+  }, 300_000);
 
-  it("produces final geometry for pocket, small, large, and whole-block sizes", () => {
+  it.concurrent("produces final geometry for pocket, small, large, and whole-block sizes", () => {
     const source = ringSource(4, "none");
     source.districts = source.districts.map((district, index) =>
       index === 2 ? {
@@ -215,10 +232,10 @@ describe("buildCompleteCityPlan", () => {
     const sizes = new Set(mediumPlan.openSpaces.map((openSpace) => openSpace.size));
     expect(mediumPlan.openSpaces.length).toBeGreaterThan(0);
     for (const size of sizes) expect(["pocket", "small", "large", "whole-block"]).toContain(size);
-  }, 120_000);
+  }, 300_000);
 
-  it("keeps every building mass inside its parcel, masses disjoint, parcels disjoint, and buildings clear of open spaces", () => {
-    const plan = buildCompleteCityPlan(ringSource(4));
+  it.concurrent("keeps every building mass inside its parcel, masses disjoint, parcels disjoint, and buildings clear of open spaces", () => {
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
     for (const building of plan.buildings) {
@@ -251,10 +268,10 @@ describe("buildCompleteCityPlan", () => {
         }
       }
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("keeps landmark sites road-free, disjoint from parcels, and masses inside sites", () => {
-    const plan = buildCompleteCityPlan(ringSource(4));
+  it.concurrent("keeps landmark sites road-free, disjoint from parcels, and masses inside sites", () => {
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     for (const landmark of plan.landmarks) {
       expect(overlapMulti(landmark.sitePolygon, plan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
@@ -265,9 +282,9 @@ describe("buildCompleteCityPlan", () => {
         expect(overlap(mass.footprint, landmark.sitePolygon), mass.id).toBeGreaterThan(Math.abs(ringArea(mass.footprint)) - 0.5);
       }
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("honors pre-reserved major landmark sites verbatim", () => {
+  it.concurrent("honors pre-reserved major landmark sites verbatim", () => {
     const source = ringSource(16);
     const reserved = reserveMajorLandmarkSites(source);
     expect(reserved.length).toBe(4);
@@ -282,9 +299,9 @@ describe("buildCompleteCityPlan", () => {
       expect(landmark.placementLineage).toBe(reservation.lineage);
     }
     expect(derivePaletteBanks(source)).toEqual(plan.paletteBanks);
-  }, 120_000);
+  }, 300_000);
 
-  it("honors explicit full-generation sites verbatim when their districts are compatible", () => {
+  it.concurrent("honors explicit full-generation sites verbatim when their districts are compatible", () => {
     const source = ringSource(16);
     const reservations = [
       manualReservation("hero-tower-plaza", 10, 100),
@@ -306,9 +323,9 @@ describe("buildCompleteCityPlan", () => {
       const grammar = LANDMARK_GRAMMAR_REGISTRY.get(reservation.grammarId)!;
       expect(grammar.compatibilityTags.some((tag) => type.compatibilityTags.includes(tag)), reservation.grammarId).toBe(true);
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("keeps explicit reservations verbatim even with district contrast and records a warning", () => {
+  it.concurrent("keeps explicit reservations verbatim even with district contrast and records a warning", () => {
     const source = ringSource(4);
     // ringSource(4) strips: corporate-core (formal), commercial-highrise (formal),
     // mixed-use-centre, residential-megablocks (campus) — the infrastructure reservation
@@ -330,13 +347,13 @@ describe("buildCompleteCityPlan", () => {
       expect(landmark.sitePolygon).toEqual(reservation.sitePolygon);
       expect(landmark.placementLineage).toBe(reservation.lineage);
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("returns dropped internal reservation sites to explicit parcel accounting", () => {
+  it.concurrent("returns dropped internal reservation sites to explicit parcel accounting", () => {
     // Internal planning may drop a pre-road reservation (road overlap or an incompatible
     // cell); the dropped site must reappear as parcels/open spaces, never a void.
     const source = ringSource(4);
-    const plan = buildCompleteCityPlan(source);
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const reserved = reserveMajorLandmarkSites(source);
     expect(reserved.length).toBe(4);
@@ -353,17 +370,17 @@ describe("buildCompleteCityPlan", () => {
       expect(multiArea(intersection(ringAsMulti(reservation.sitePolygon), covering)), reservation.grammarId).toBeGreaterThan(siteArea * 0.98);
     }
     expect(droppedSites).toBeGreaterThan(0);
-  }, 120_000);
+  }, 300_000);
 
-  it("throws a structural error when an explicit reservation cannot materialize", () => {
+  it.concurrent("throws a structural error when an explicit reservation cannot materialize", () => {
     const source = ringSource(4);
     // A degenerate zero-area site can never carry a landmark; the explicit path must
     // fail loudly instead of returning a plan with fewer landmarks than reservations.
     const degenerate = manualReservation("hero-tower-plaza", 10, 100, 0, 0);
     expect(() => buildCompleteCityPlan(source, 1, 0, [degenerate])).toThrow();
-  }, 120_000);
+  }, 300_000);
 
-  it("never validates a plan with fewer landmarks than explicit reservations", () => {
+  it.concurrent("never validates a plan with fewer landmarks than explicit reservations", () => {
     const source = ringSource(4);
     const reservations = [
       manualReservation("hero-tower-plaza", 10, 100),
@@ -380,7 +397,7 @@ describe("buildCompleteCityPlan", () => {
       openSpaces: plan.openSpaces.filter((openSpace) => openSpace.landmarkId !== removed.id)
     };
     expect(validateCompleteCityPlan(tampered).some((message) => message.includes("explicit reservations"))).toBe(true);
-  }, 120_000);
+  }, 300_000);
 
   it("skips landmarks with no compatible district and falls back to compatible block-inscribed sites", () => {
     const plan = buildCompleteCityPlan(crossSource());
@@ -398,10 +415,10 @@ describe("buildCompleteCityPlan", () => {
     for (const landmark of fallbackPlan.landmarks) {
       expect(overlapMulti(landmark.sitePolygon, fallbackPlan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("classifies parcels with no fitting grammar as explicitly unbuilt open parcels", () => {
-    const plan = buildCompleteCityPlan(ringSource(4));
+  it.concurrent("classifies parcels with no fitting grammar as explicitly unbuilt open parcels", () => {
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const builtIds = new Set(plan.buildings.map((building) => building.parcelId));
     // Three kinds of parcel-linked open spaces exist (parcelId !== null):
@@ -442,7 +459,7 @@ describe("buildCompleteCityPlan", () => {
     expect(intentional.some((openSpace) => openSpace.material !== MATERIAL.GROUND)).toBe(true);
     // The classification is deterministic.
     expect(buildCompleteCityPlan(ringSource(4))).toEqual(plan);
-  }, 120_000);
+  }, 300_000);
  it("materializes every shipping grammar and all seven archetypes through the production path", () => {
     // Fixed legal breadth gallery: one deterministic parcel per grammar built from its
     // own declared limits, materialized through the same exported production path that
@@ -632,10 +649,10 @@ describe("buildCompleteCityPlan", () => {
     expect(planParcelBuilding(parcel, weights, useWeights, undefined, new Map())!.appearanceSeed).toBe("iso/parcel/appearance");
   }, 30_000);
 
-  it("reaches every archetype and a broad grammar set in a single whole-city plan", () => {
+  it.concurrent("reaches every archetype and a broad grammar set in a single whole-city plan", () => {
     // Ordinary whole-city reachability sanity: one deterministic plan must produce all
     // seven archetypes and most shipping grammars as generated outputs.
-    const plan = buildCompleteCityPlan(ringSource(16));
+    const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.buildings.length).toBeGreaterThan(0);
     const grammars = new Set(plan.buildings.map((building) => building.grammarId));
@@ -648,10 +665,10 @@ describe("buildCompleteCityPlan", () => {
       expect(building.heightM, building.id).toBeLessThanOrEqual(grammar.height.maxM);
       expect(Math.max(...building.masses.map((mass) => mass.elevationM + mass.heightM)), building.id).toBeCloseTo(building.heightM, 9);
     }
-  }, 120_000);
+  }, 300_000);
 
-  it("rejects injected illegal cross-occupancy, missing landmark open space, and non-fitting grammars", () => {
-    const plan = buildCompleteCityPlan(ringSource(4));
+  it.concurrent("rejects injected illegal cross-occupancy, missing landmark open space, and non-fitting grammars", () => {
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.buildings.length).toBeGreaterThan(0);
     const hero = plan.landmarks.find((landmark) => landmark.landmarkGrammarId === "hero-tower-plaza")!;
@@ -702,10 +719,10 @@ describe("buildCompleteCityPlan", () => {
       )
     };
     expect(validateCompleteCityPlan(badNeon).some((message) => message.includes("invalid neon flag"))).toBe(true);
-  }, 120_000);
+  }, 300_000);
 
-  it("rejects injected building totals outside the grammar's declared height range", () => {
-    const plan = buildCompleteCityPlan(ringSource(4));
+  it.concurrent("rejects injected building totals outside the grammar's declared height range", () => {
+    const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const first = plan.buildings[0]!;
     const grammar = BUILDING_GRAMMAR_REGISTRY.get(first.grammarId)!;
@@ -736,7 +753,7 @@ describe("buildCompleteCityPlan", () => {
     const tallProblems = validateCompleteCityPlan(tallMass);
     expect(tallProblems.some((message) => message.includes("declared maximum height"))).toBe(true);
     expect(tallProblems.some((message) => message.includes("masses' peak"))).toBe(true);
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("frontage placement", () => {
@@ -819,10 +836,10 @@ describe("frontage placement", () => {
     }
   });
 
-  it("keeps whole-city density above the pre-pass moat baseline", () => {
+  it.concurrent("keeps whole-city density above the pre-pass moat baseline", () => {
     // Regression floor for the Phase 4.5 density pass: before it, the median parcel
     // occupancy on the ring fixture was ~0.25 (buildings centered with all-side moats).
-    const plan = buildCompleteCityPlan(ringSource(16));
+    const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const parcelById = new Map(plan.parcels.map((p) => [p.id, p]));
     const ratios = plan.buildings
@@ -864,5 +881,5 @@ describe("frontage placement", () => {
     spans.sort((a, b) => a - b);
     expect(spans[Math.floor(spans.length / 2)]!).toBeGreaterThan(0.7);
     expect(spans[0]!).toBeGreaterThan(0.25);
-  }, 120_000);
+  }, 300_000);
 });
