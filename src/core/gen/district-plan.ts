@@ -18,6 +18,39 @@ const MIN_CELL_AREA_M2 = 1;
 const MAX_CELLS_PER_FRAGMENT = 384;
 const CELL_GAP_M = 0.1;
 
+/**
+ * Ordinary (non-planning-band) cells must present an oriented minor dimension of at
+ * least this (metres) in their own frame. Boundary/stagger clipping can shave a grid
+ * cell down to a w/2 sliver at the fragment edge; such pieces are reclassified as
+ * planning bands (open-space intent) so no ordinary cell ever comes out thinner than
+ * the thin-building emission floor downstream.
+ */
+const MIN_ORDINARY_CELL_MINOR_M = 6;
+
+/** Shorter side of a ring's own bounding box, measured in its own frame. */
+function orientedMinorDimension(ring: Ring): number {
+  if (ring.length < 2) return 0;
+  const angle = Math.atan2(ring[1]!.y - ring[0]!.y, ring[1]!.x - ring[0]!.x);
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  const centre = ringCentroid(ring);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const point of ring) {
+    const dx = point.x - centre.x;
+    const dy = point.y - centre.y;
+    const localX = dx * cosine + dy * sine;
+    const localY = -dx * sine + dy * cosine;
+    if (localX < minX) minX = localX;
+    if (localX > maxX) maxX = localX;
+    if (localY < minY) minY = localY;
+    if (localY > maxY) maxY = localY;
+  }
+  return Math.min(maxX - minX, maxY - minY);
+}
+
 export interface StructuralInputSignature {
   terrain: string;
   roads: string;
@@ -112,7 +145,9 @@ interface GrammarShape {
 
 const GRAMMAR_SHAPES: Readonly<Record<BlockGrammarId, GrammarShape>> = {
   "perimeter-courtyard": { widthFactor: 0.85, depthFactor: 0.72, angleOffset: 0, stagger: 0, sparse: 0.04 }, // Tuned: reduced skip rate for tighter residential grain
-  "fine-grain-frontage": { widthFactor: 0.48, depthFactor: 0.72, angleOffset: 0, stagger: 0.5, sparse: 0 },
+  // Tuned: width/depth floors raised so fine-grain cells never produce sub-6m slivers
+  // (nominal width min = minCellWidthM × 0.62 across the shipping fine-grain districts)
+  "fine-grain-frontage": { widthFactor: 0.62, depthFactor: 0.78, angleOffset: 0, stagger: 0.5, sparse: 0 },
   "rotated-bands": { widthFactor: 0.72, depthFactor: 1.2, angleOffset: 0, stagger: 0.5, sparse: 0 }, // Tuned: aligned with street frontage
   "irregular-mosaic": { widthFactor: 0.78, depthFactor: 0.82, angleOffset: 0, stagger: 0.35, sparse: 0.08 },
   "superblock-compound": { widthFactor: 1.7, depthFactor: 1.55, angleOffset: 0, stagger: 0, sparse: 0.05 },
@@ -120,7 +155,8 @@ const GRAMMAR_SHAPES: Readonly<Record<BlockGrammarId, GrammarShape>> = {
   "industrial-yard": { widthFactor: 1.1, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.05 }, // Tuned: aligned with street frontage
   "logistics-sheds": { widthFactor: 0.92, depthFactor: 1.35, angleOffset: 0, stagger: 0.5, sparse: 0.08 },
   "campus-pavilions": { widthFactor: 1.25, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.18 }, // Tuned: aligned with street frontage
-  "market-alley": { widthFactor: 0.38, depthFactor: 0.62, angleOffset: 0, stagger: 0.5, sparse: 0.05 },
+  // Tuned: width/depth floors raised so market cells never produce sub-6m slivers
+  "market-alley": { widthFactor: 0.62, depthFactor: 0.7, angleOffset: 0, stagger: 0.5, sparse: 0.05 },
   "radial-fan": { widthFactor: 1, depthFactor: 1, angleOffset: 0, stagger: 0, sparse: 0 },
   "waterfront-terraces": { widthFactor: 0.78, depthFactor: 1.45, angleOffset: 0, stagger: 0.5, sparse: 0.12 }
 };
@@ -644,7 +680,10 @@ function radialCells(fragment: DistrictBlockFragment, ring: Ring, grammarId: Blo
     for (const polygon of available) {
       for (const cellRing of canonicalHoleFreePieces(polygon)) {
         if (Math.abs(ringArea(cellRing)) < MIN_CELL_AREA_M2) continue;
-        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|fan-${index}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: `fan-${index}`, rotationRad: rotation, frontageRoadId });
+        // Fan wedges taper toward the apex; sub-floor apex pieces become planning
+        // bands instead of ordinary thin cells.
+        const role = orientedMinorDimension(cellRing) < MIN_ORDINARY_CELL_MINOR_M ? `planning-band-fan-${index}` : `fan-${index}`;
+        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${role}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: role, rotationRad: rotation, frontageRoadId });
         occupied = union([occupied, ringAsMulti(cellRing)]);
       }
     }
@@ -692,7 +731,13 @@ function gridCells(
     for (const polygon of available) {
       for (const cellRing of canonicalHoleFreePieces(polygon)) {
         if (Math.abs(ringArea(cellRing)) < minimumArea) continue;
-        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${localRole}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole, rotationRad: rotation, frontageRoadId });
+        // WHY: boundary/stagger clipping can shave a grid piece below the emission
+        // floor. Give it an explicit diagnostic role; final planning classifies every
+        // sub-floor parcel as unbuilt landscaping.
+        const role = localRole.startsWith("planning-band") || orientedMinorDimension(cellRing) >= MIN_ORDINARY_CELL_MINOR_M
+          ? localRole
+          : `edge-sliver-${localRole}`;
+        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${role}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: role, rotationRad: rotation, frontageRoadId });
         occupied = union([occupied, ringAsMulti(cellRing)]);
       }
     }
@@ -705,8 +750,12 @@ function gridCells(
   if (grammarId === "perimeter-courtyard") {
     reserveBand(localBounds.x + localBounds.width * 0.31, localBounds.y + localBounds.height * 0.31, localBounds.width * 0.38, localBounds.height * 0.38, "courtyard");
   } else if (grammarId === "superblock-compound") {
-    reserveBand(localBounds.x + localBounds.width * 0.47, localBounds.y, localBounds.width * 0.06, localBounds.height, "compound-spine");
-    reserveBand(localBounds.x, localBounds.y + localBounds.height * 0.47, localBounds.width, localBounds.height * 0.06, "compound-crossing");
+    // A single central compound yard, not a spine + crossing: two orthogonal full-span
+    // reserve bands resolved into thin bar parcels that read as an accidental plus/red
+    // cross across the block. The yard keeps the mega-block grain (the surrounding
+    // 1.7x1.55 cells ring it) while staying below megablock-ring's declared limits so
+    // the core resolves to one coherent block instead of bar slivers.
+    reserveBand(localBounds.x + localBounds.width * 0.33, localBounds.y + localBounds.height * 0.33, localBounds.width * 0.34, localBounds.height * 0.34, "compound-yard");
   } else if (grammarId === "tower-podium-field") {
     addCandidate(localRect(localBounds.x + localBounds.width * 0.27, localBounds.y + localBounds.height * 0.27, localBounds.width * 0.46, localBounds.height * 0.46), "podium-anchor");
   } else if (grammarId === "industrial-yard") {
@@ -714,19 +763,26 @@ function gridCells(
   } else if (grammarId === "logistics-sheds") {
     reserveBand(localBounds.x, localBounds.y, localBounds.width * 0.08, localBounds.height, "loading-spine");
   } else if (grammarId === "campus-pavilions") {
-    reserveBand(localBounds.x + localBounds.width * 0.43, localBounds.y, localBounds.width * 0.08, localBounds.height, "campus-walk");
-    reserveBand(localBounds.x, localBounds.y + localBounds.height * 0.43, localBounds.width, localBounds.height * 0.08, "campus-green");
+    // One central quad instead of a walk + green crossing pair; the two full-span bands
+    // resolved into an orthogonal cross of thin built strips.
+    reserveBand(localBounds.x + localBounds.width * 0.31, localBounds.y + localBounds.height * 0.31, localBounds.width * 0.38, localBounds.height * 0.38, "campus-quad");
   } else if (grammarId === "market-alley") {
+    // Keep the market street itself (the defining fine-grain alley) and drop the
+    // crossing lane that turned the block into a plus of thin bars.
     reserveBand(localBounds.x, localBounds.y + localBounds.height * 0.45, localBounds.width, localBounds.height * 0.1, "market-alley");
-    reserveBand(localBounds.x + localBounds.width * 0.63, localBounds.y, localBounds.width * 0.07, localBounds.height, "market-cross-alley");
   } else if (grammarId === "waterfront-terraces") {
     reserveBand(localBounds.x, localBounds.y, localBounds.width, localBounds.height * 0.16, "promenade");
   }
   const columns = Math.max(1, Math.ceil(localBounds.width / width));
   const rows = Math.max(1, Math.ceil(localBounds.height / depth));
   for (let row = 0; row < rows; row++) {
-    const rowOffset = row % 2 === 1 ? width * shape.stagger : 0;
-    for (let column = -1; column <= columns; column++) {
+    const staggered = row % 2 === 1 && shape.stagger > 0;
+    const rowOffset = staggered ? width * shape.stagger : 0;
+    // Stagger alignment: an off-grid leading column (column -1) clips against the
+    // fragment edge into a w/2 sliver (a 4-5 m ordinary cell). Staggered rows start at
+    // column 0 instead; the uncovered left notch falls to the planning-band remainder
+    // path below, and trailing residuals are reclassified by the addCandidate gate.
+    for (let column = staggered ? 0 : -1; column <= columns; column++) {
       const role = `${row}-${column}`;
       const random = hashUnit(`${seed}/cell/${role}`);
       const variation = grammarId === "irregular-mosaic" ? 0.72 + random * 0.28 : 1;

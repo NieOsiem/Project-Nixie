@@ -3,10 +3,10 @@ import { intersection, ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring } from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_GRAMMARS, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, MICRO_BUILDING_GRAMMAR_IDS, isTowerGrammar, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
-import { DISTRICT_PALETTE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
-import { buildCompleteCityPlan, derivePaletteBanks, planParcelBuilding, reserveMajorLandmarkSites, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
+import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
+import { buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -164,6 +164,62 @@ describe("buildCompleteCityPlan", () => {
     const shifted: CitySourceV3 = { ...source, origin: { x: source.origin.x + 12345, y: source.origin.y - 6789 } };
     expect(buildCompleteCityPlan(shifted)).toEqual(plan);
     expect(buildCompleteCityPlan(source)).toEqual(plan);
+  }, 300_000);
+
+  it("plans cross-prone grammars on a large block with no orthogonal full-span band crosses", () => {
+    // One 300×300 block under a district type whose grammar pool includes the layouts
+    // that used to reserve two crossing full-span bands (superblock-compound,
+    // campus-pavilions, market-alley). The plan must stay valid (contained, disjoint
+    // masses), deterministic, and no fragment's reserved bands may span both block axes
+    // as thin arms — that is the accidental plus/red-cross layout.
+    const size = 300;
+    const largeBlock = (typeId: DistrictTypeId): CitySourceV3 => ({
+      origin: { x: 700, y: 300 },
+      citySeed: `complete-plan-large-block-${typeId}`,
+      generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "none" },
+      terrain: { land: rectRing({ x: 0, y: 0, width: size, height: size }), urbanFootprint: null },
+      roads: {
+        nodes: [node("a", 0, 0), node("b", size, 0), node("c", size, size), node("d", 0, size)],
+        routes: [route("ring")],
+        edges: [edge("ab", "a", "b", "ring"), edge("bc", "b", "c", "ring"), edge("cd", "c", "d", "ring"), edge("da", "d", "a", "ring")]
+      },
+      districts: [{ id: "big", polygon: rectRing({ x: 0, y: 0, width: size, height: size }), seed: "big-seed", typeId, paletteId: DISTRICT_PALETTE_IDS[0]!, origin: "generated", locked: false, openSpaceOverride: null }]
+    });
+    const crossGrammars: Readonly<Record<string, boolean>> = { "superblock-compound": true, "campus-pavilions": true, "market-alley": true };
+    for (const typeId of ["residential-megablocks", "utility-infrastructure"] as const) {
+      const source = largeBlock(typeId);
+      const plan = buildCompleteCityPlan(source);
+      expect(validateCompleteCityPlan(plan)).toEqual([]);
+      expect(plan.districtPlan.developmentCells.some((cell) => crossGrammars[cell.grammarId])).toBe(true);
+      expect(buildCompleteCityPlan(source)).toEqual(plan);
+      const cellsByFragment = new Map<string, ReturnType<typeof buildCompleteCityPlan>["districtPlan"]["developmentCells"]>();
+      for (const cell of plan.districtPlan.developmentCells) cellsByFragment.set(cell.fragmentId, [...(cellsByFragment.get(cell.fragmentId) ?? []), cell]);
+      for (const [fragmentId, cells] of cellsByFragment) {
+        const bands = cells.filter((cell) => cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("planning-band-remainder") && !/^planning-band--?\d+-/.test(cell.localRole) && Math.abs(ringArea(cell.polygon)) >= 1);
+        if (bands.length === 0) continue;
+        const allX: number[] = [];
+        const allY: number[] = [];
+        for (const cell of cells) for (const point of cell.polygon) {
+          allX.push(point.x);
+          allY.push(point.y);
+        }
+        const fragmentWidth = Math.max(...allX) - Math.min(...allX);
+        const fragmentHeight = Math.max(...allY) - Math.min(...allY);
+        const bandUnion = union(bands.map((cell) => ringAsMulti(cell.polygon)));
+        const bandX: number[] = [];
+        const bandY: number[] = [];
+        for (const polygon of bandUnion) for (const point of polygon[0]!) {
+          bandX.push(point.x);
+          bandY.push(point.y);
+        }
+        const bandWidth = Math.max(...bandX) - Math.min(...bandX);
+        const bandHeight = Math.max(...bandY) - Math.min(...bandY);
+        const bandArea = multiArea(bandUnion);
+        const spansBothAxes = fragmentWidth > 0 && bandWidth >= 0.8 * fragmentWidth && fragmentHeight > 0 && bandHeight >= 0.8 * fragmentHeight;
+        const thinArms = bandWidth > 0 && bandHeight > 0 && bandArea < 0.6 * bandWidth * bandHeight;
+        expect(spansBothAxes && thinArms, `${fragmentId} reserved bands form an orthogonal full-span cross`).toBe(false);
+      }
+    }
   }, 300_000);
 
   it("stamps revision, action token, build token, and epoch deterministically", () => {
@@ -882,4 +938,262 @@ describe("frontage placement", () => {
     expect(spans[Math.floor(spans.length / 2)]!).toBeGreaterThan(0.7);
     expect(spans[0]!).toBeGreaterThan(0.25);
   }, 300_000);
+});
+
+describe("block height coherence", () => {
+  it.concurrent("keeps every block's ordinary buildings inside one coherent height band", () => {
+    const plan = ringFourPlan();
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const districtById = new Map(ringSource(4).districts.map((district) => [district.id, district]));
+    const bands = deriveBlockHeightBands(plan.parcels, districtById);
+    const heightsByBlock = new Map<string, number[]>();
+    for (const building of plan.buildings) {
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)!;
+      if (isTowerGrammar(grammar) || MICRO_BUILDING_GRAMMAR_IDS.has(building.grammarId)) continue;
+      const band = bands.get(building.blockId);
+      expect(band, building.id).toBeDefined();
+      // Every ordinary height draws from its block's band, or from a deterministic
+      // shoulder window strictly inside the grammar's declared range when the band lies
+      // outside it (a shopfront in a tower block hugs the top of its 22-48 m range
+      // instead of joining the megatower).
+      expect(building.heightM, building.id).toBeGreaterThanOrEqual(Math.min(band!.minM, grammar.height.minM) - 1e-9);
+      expect(building.heightM, building.id).toBeLessThanOrEqual(Math.max(band!.maxM, grammar.height.maxM) + 1e-9);
+      heightsByBlock.set(building.blockId, [...(heightsByBlock.get(building.blockId) ?? []), building.heightM]);
+    }
+    // No block mixes sub-15 m and over-100 m ordinary fabric: the realized spread inside
+    // any block is bounded by the band ratio (<= ~2.4) plus clamp effects.
+    let coherentBlocks = 0;
+    for (const [blockId, heights] of heightsByBlock) {
+      if (heights.length < 2) continue;
+      coherentBlocks++;
+      expect(Math.max(...heights) / Math.min(...heights), blockId).toBeLessThanOrEqual(3);
+    }
+    expect(coherentBlocks).toBeGreaterThanOrEqual(2);
+  }, 300_000);
+
+  it("derives deterministic per-block height bands that vary between blocks", () => {
+    const definition = DISTRICT_TYPE_REGISTRY.get("commercial-highrise")!;
+    const first = heightBandForBlock("coherence-a", definition)!;
+    expect(heightBandForBlock("coherence-a", definition)).toEqual(first);
+    expect(first.minM).toBeGreaterThan(0);
+    expect(first.maxM).toBeGreaterThan(first.minM);
+    expect(heightBandForBlock("coherence-b", definition)!.minM).not.toBeCloseTo(first.minM, 6);
+  });
+
+  it("keeps banded heights inside every grammar's declared range even under extreme bands", () => {
+    for (const grammar of BUILDING_GRAMMARS) {
+      for (const band of [{ minM: 6, maxM: 14 }, { minM: 300, maxM: 500 }] as const) {
+        for (const roll of [0, 0.5, 1]) {
+          const heightM = shapeBuildingHeight(grammar, band, roll);
+          expect(heightM, grammar.id).toBeGreaterThanOrEqual(grammar.height.minM - 1e-9);
+          expect(heightM, grammar.id).toBeLessThanOrEqual(grammar.height.maxM + 1e-9);
+        }
+      }
+    }
+  });
+
+  it("samples the grammar/band intersection when the band overlaps the range", () => {
+    const shopfront = BUILDING_GRAMMAR_REGISTRY.get("narrow-shopfront")!; // 22-48
+    const band = { minM: 38, maxM: 84 };
+    expect(shapeBuildingHeight(shopfront, band, 0)).toBe(38);
+    expect(shapeBuildingHeight(shopfront, band, 1)).toBe(48);
+    expect(shapeBuildingHeight(shopfront, band, 0.5)).toBe(43);
+  });
+
+  it("samples interior grammar shoulders instead of pinning exact caps/floors when the band is disjoint", () => {
+    const shopfront = BUILDING_GRAMMAR_REGISTRY.get("narrow-shopfront")!; // 22-48
+    const farAbove = { minM: 200, maxM: 260 };
+    const above = [0, 0.5, 1].map((roll) => shapeBuildingHeight(shopfront, farAbove, roll));
+    // No cap plateau: the roll endpoints vary across the upper shoulder instead of
+    // every building collapsing onto the exact 48 m cap.
+    expect(new Set(above).size).toBe(3);
+    expect(above[0]!).toBeLessThan(above[1]!);
+    expect(above[1]!).toBeLessThan(above[2]!);
+    for (const heightM of above) {
+      expect(heightM, "upper shoulder stays inside the declared range").toBeGreaterThan(shopfront.height.minM);
+      expect(heightM, "upper shoulder stays inside the declared range").toBeLessThan(shopfront.height.maxM);
+    }
+    const flatiron = BUILDING_GRAMMAR_REGISTRY.get("corner-flatiron")!; // 36-190
+    const farBelow = { minM: 10, maxM: 14 };
+    const below = [0, 0.5, 1].map((roll) => shapeBuildingHeight(flatiron, farBelow, roll));
+    expect(new Set(below).size).toBe(3);
+    expect(below[0]!).toBeLessThan(below[1]!);
+    expect(below[1]!).toBeLessThan(below[2]!);
+    for (const heightM of below) {
+      expect(heightM, "lower shoulder stays inside the declared range").toBeGreaterThan(flatiron.height.minM);
+      expect(heightM, "lower shoulder stays inside the declared range").toBeLessThan(flatiron.height.maxM);
+    }
+    const touchingCap = [0, 0.5, 1].map((roll) =>
+      shapeBuildingHeight(shopfront, { minM: shopfront.height.maxM, maxM: 84 }, roll)
+    );
+    expect(new Set(touchingCap).size).toBe(3);
+    expect(touchingCap.every((heightM) => heightM < shopfront.height.maxM)).toBe(true);
+    // Same inputs stay deterministic.
+    expect(shapeBuildingHeight(shopfront, farAbove, 0.37)).toBe(shapeBuildingHeight(shopfront, farAbove, 0.37));
+    expect(shapeBuildingHeight(flatiron, farBelow, 0.37)).toBe(shapeBuildingHeight(flatiron, farBelow, 0.37));
+  });
+});
+
+describe("thin-building emission floor", () => {
+  const rotate = (point: { x: number; y: number }, origin: { x: number; y: number }, angle: number): { x: number; y: number } => {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = point.x - origin.x;
+    const dy = point.y - origin.y;
+    return { x: origin.x + dx * cos - dy * sin, y: origin.y + dx * sin + dy * cos };
+  };
+
+  const orientedMinor = (ring: Ring): number => {
+    const angle = Math.atan2(ring[1]!.y - ring[0]!.y, ring[1]!.x - ring[0]!.x);
+    const centre = ringCentroid(ring);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const point of ring) {
+      const localX = (point.x - centre.x) * Math.cos(angle) + (point.y - centre.y) * Math.sin(angle);
+      const localY = -(point.x - centre.x) * Math.sin(angle) + (point.y - centre.y) * Math.cos(angle);
+      if (localX < minX) minX = localX;
+      if (localX > maxX) maxX = localX;
+      if (localY < minY) minY = localY;
+      if (localY > maxY) maxY = localY;
+    }
+    return Math.min(maxX - minX, maxY - minY);
+  };
+
+  const allWeights = Object.fromEntries(BUILDING_GRAMMAR_IDS.map((id) => [id, 1])) as Record<BuildingGrammarId, number>;
+  const allUses = Object.fromEntries(BUILDING_USE_IDS.map((use) => [use, 1])) as Record<BuildingUseId, number>;
+
+  it("never emits a non-micro mass with an oriented minor dimension below six metres", () => {
+    // Realistic thin-boundary parcels: narrow strips, shallow cells, and rotated
+    // (diagonal) cells whose AABB overstates the true oriented width. Whichever
+    // non-micro grammar is chosen, every emitted mass must clear the 6 m floor.
+    const boundaries: Array<[number, number, number]> = [
+      [4.5, 30, 0],
+      [5, 28, 0],
+      [5.5, 26, 0],
+      [6, 24, 0],
+      [6.5, 22, 0],
+      [7.5, 30, 0],
+      [8, 22, 0],
+      [9, 20, 0],
+      [10, 18, 0],
+      [12, 16, 0],
+      [14, 16, 0],
+      [26, 6.5, Math.PI / 6],
+      [26, 6.5, Math.PI / 4],
+      [24, 8, Math.PI / 3],
+      [30, 9, Math.PI / 5]
+    ];
+    let emitted = 0;
+    for (const [width, height, angle] of boundaries) {
+      for (let index = 0; index < 12; index++) {
+        const origin = { x: width / 2, y: height / 2 };
+        const polygon = rectRing({ x: 0, y: 0, width, height }).map((point) => rotate(point, origin, angle));
+        const building = planParcelBuilding(
+          { id: `thin-${width}-${height}-${index}`, blockId: "thin-block", fragmentId: "thin-frag", districtId: null, polygon, frontageAngleRad: 0, seed: `thin/${width}/${height}/${index}`, areaM2: width * height },
+          allWeights,
+          allUses,
+          undefined,
+          new Map()
+        );
+        if (building === null) continue;
+        // Micro grammars fill sub-floor slivers intentionally; the floor binds only
+        // ordinary (non-micro) masses.
+        if (MICRO_BUILDING_GRAMMAR_IDS.has(building.grammarId)) continue;
+        emitted++;
+        for (const mass of building.masses) {
+          expect(orientedMinor(mass.footprint), `${building.grammarId} ${building.id}`).toBeGreaterThanOrEqual(6 - 1e-6);
+        }
+      }
+    }
+    expect(emitted).toBeGreaterThan(0);
+  });
+
+  it("builds narrow strip parcels only at credible widths", () => {
+    const only = (id: BuildingGrammarId): Record<BuildingGrammarId, number> =>
+      Object.fromEntries(BUILDING_GRAMMAR_IDS.map((grammarId) => [grammarId, grammarId === id ? 1 : 0])) as Record<BuildingGrammarId, number>;
+    // A 6 m strip is below the raised narrow-strip floor and must not emit a 4 m bar.
+    const belowFloor = planParcelBuilding(
+      { id: "strip-6", blockId: "b", fragmentId: "f", districtId: null, polygon: rectRing({ x: 0, y: 0, width: 6, height: 30 }), frontageAngleRad: 0, seed: "strip/6", areaM2: 180 },
+      only("narrow-strip"),
+      allUses,
+      undefined,
+      new Map()
+    );
+    expect(belowFloor).toBeNull();
+    // A 7.5 m strip builds, and every mass clears the floor.
+    const credible = planParcelBuilding(
+      { id: "strip-7", blockId: "b", fragmentId: "f", districtId: null, polygon: rectRing({ x: 0, y: 0, width: 7.5, height: 30 }), frontageAngleRad: 0, seed: "strip/7", areaM2: 225 },
+      only("narrow-strip"),
+      allUses,
+      undefined,
+      new Map()
+    );
+    expect(credible, "a 7.5 m strip must still build").not.toBeNull();
+    for (const mass of credible!.masses) {
+      expect(orientedMinor(mass.footprint), credible!.id).toBeGreaterThanOrEqual(6 - 1e-6);
+    }
+  });
+
+  it("keeps rotated thin-boundary cells from emitting sub-six-metre bars", () => {
+    // A 6.5 m-deep diagonal strip: the cell-frame AABB reads ~23 m, but the true
+    // oriented width is below the floor. The fitted mass collapses to the true width,
+    // so the emission guard must reject it rather than emit a pathological bar.
+    for (const angle of [Math.PI / 6, Math.PI / 4, Math.PI / 3]) {
+      const origin = { x: 13, y: 3.25 };
+      const polygon = rectRing({ x: 0, y: 0, width: 26, height: 6.5 }).map((point) => rotate(point, origin, angle));
+      const building = planParcelBuilding(
+        { id: `diag-${angle}`, blockId: "b", fragmentId: "f", districtId: null, polygon, frontageAngleRad: 0, seed: `diag/${angle}`, areaM2: 26 * 6.5 },
+        allWeights,
+        allUses,
+        undefined,
+        new Map()
+      );
+      if (building === null) continue;
+      if (MICRO_BUILDING_GRAMMAR_IDS.has(building.grammarId)) continue;
+      for (const mass of building.masses) {
+        expect(orientedMinor(mass.footprint), `${building.grammarId} at ${angle}`).toBeGreaterThanOrEqual(6 - 1e-6);
+      }
+    }
+  });
+
+  it("never builds a building on a sub-six-metre parcel in a whole-city plan", () => {
+    // The production path routes clipped boundary/stagger slivers (parcels whose own
+    // frame is thinner than 6 m) straight to the explicit unbuilt classification, so
+    // no grammar — micro included — can raise a sub-floor bar on them.
+    const plan = buildCompleteCityPlan(crossSource());
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
+    const parcelMinor = (parcel: { polygon: Ring; frontageAngleRad: number }): number => {
+      const angle = parcel.frontageAngleRad;
+      const centre = ringCentroid(parcel.polygon);
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minY = Infinity;
+      let maxY = -Infinity;
+      for (const point of parcel.polygon) {
+        const localX = (point.x - centre.x) * Math.cos(angle) + (point.y - centre.y) * Math.sin(angle);
+        const localY = -(point.x - centre.x) * Math.sin(angle) + (point.y - centre.y) * Math.cos(angle);
+        if (localX < minX) minX = localX;
+        if (localX > maxX) maxX = localX;
+        if (localY < minY) minY = localY;
+        if (localY > maxY) maxY = localY;
+      }
+      return Math.min(maxX - minX, maxY - minY);
+    };
+    for (const building of plan.buildings) {
+      const parcel = parcelById.get(building.parcelId)!;
+      expect(parcelMinor(parcel), building.id).toBeGreaterThanOrEqual(6 - 1e-6);
+    }
+    // Every parcel that IS thinner than 6 m stays explicitly unbuilt: it must have a
+    // full-area parcel-linked open space (the /unbuilt landscaping classification).
+    const openByParcel = new Map(plan.openSpaces.filter((openSpace) => openSpace.parcelId !== null).map((openSpace) => [openSpace.parcelId, openSpace]));
+    for (const parcel of plan.parcels) {
+      if (parcelMinor(parcel) >= 6 - 1e-6) continue;
+      const openSpace = openByParcel.get(parcel.id);
+      expect(openSpace, parcel.id).toBeDefined();
+      expect(openSpace!.areaM2).toBeCloseTo(parcel.areaM2, 4);
+    }
+  }, 60_000);
 });

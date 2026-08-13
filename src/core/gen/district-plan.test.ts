@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { validateRouteTopology } from "../graph/topology.js";
-import { intersection, ringAsMulti } from "../geom/boolean.js";
-import { rectRing, ringArea, type Ring } from "../geom/types.js";
+import { intersection, ringAsMulti, union } from "../geom/boolean.js";
+import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { buildDistrictPlan, OPEN_SPACE_PROFILE_CATEGORY_GATES } from "./district-plan.js";
-import { DISTRICT_TYPE_IDS } from "./district-registry.js";
+import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, type DistrictBlockFragment } from "./district-plan.js";
+import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictPlanningBounds } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
@@ -223,6 +223,40 @@ describe("buildDistrictPlan", () => {
     }
   });
 
+  it("never reserves an orthogonal full-span cross of planning bands", () => {
+    // WHY: superblock-compound, campus-pavilions and market-alley used to reserve two
+    // full-span bands crossing at right angles (spine+crossing, walk+green,
+    // alley+cross-alley). Those reserves resolved into thin bar parcels that read as an
+    // accidental plus/red-cross across the block, with the surrounding grid clipped into
+    // incoherent slivers. A coherent yard/quad/alley reserve either spans both axes as a
+    // solid block or spans only one axis as a street band — never two thin full-span arms.
+    const fragment: DistrictBlockFragment = {
+      id: "cross-fixture",
+      blockId: "block",
+      districtId: null,
+      buildable: [[rectRing({ x: 0, y: 0, width: 240, height: 240 })]]
+    };
+    const bounds: DistrictPlanningBounds = { minCellWidthM: 12, maxCellWidthM: 28, minCellDepthM: 14, maxCellDepthM: 34, minAspect: 0.4, maxAspect: 3 };
+    for (const grammar of BLOCK_GRAMMAR_IDS) {
+      const cells = planDistrictFragmentWithGrammar(fragment, grammar, bounds, `fixture/${grammar}`, ["road-1"]);
+      const bands = cells.filter((cell) => cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("planning-band-remainder") && !/^planning-band--?\d+-/.test(cell.localRole) && Math.abs(ringArea(cell.polygon)) >= 1);
+      if (bands.length === 0) continue;
+      const bandUnion = union(bands.map((cell) => ringAsMulti(cell.polygon)));
+      const xs: number[] = [];
+      const ys: number[] = [];
+      for (const polygon of bandUnion) for (const point of polygon[0]!) {
+        xs.push(point.x);
+        ys.push(point.y);
+      }
+      const bandWidth = Math.max(...xs) - Math.min(...xs);
+      const bandHeight = Math.max(...ys) - Math.min(...ys);
+      const bandArea = bandUnion.reduce((sum, polygon) => sum + Math.abs(ringArea(polygon[0]!)), 0);
+      const spansBothAxes = bandWidth >= 0.8 * 240 && bandHeight >= 0.8 * 240;
+      const thinArms = bandArea < 0.6 * bandWidth * bandHeight;
+      expect(spansBothAxes && thinArms, `${grammar} reserved bands form an orthogonal full-span cross`).toBe(false);
+    }
+  });
+
   it("enforces global none, explicit override precedence, and very-low category gating", () => {
     const base = gridSource();
     const district: DistrictSource = { id: "district-a", polygon: rectRing({ x: 0, y: 0, width: 100, height: 100 }), seed: "open", typeId: "heavy-industrial", paletteId: "industrial", origin: "authored", locked: false, openSpaceOverride: null };
@@ -306,5 +340,42 @@ describe("buildDistrictPlan", () => {
     expect(withPath.blocks.map((block) => block.id)).toEqual(vehicleOnly.blocks.map((block) => block.id));
     const multiArea = (multi: ReturnType<typeof buildDistrictPlan>["wallCells"]) => multi.reduce((sum, polygon) => sum + Math.abs(ringArea(polygon[0]!)), 0);
     expect(multiArea(withPath.wallCells)).toBeLessThan(multiArea(vehicleOnly.wallCells));
+  });
+});
+
+
+describe("planning cell minor-dimension floor", () => {
+  const cellMinor = (ring: Ring): number => {
+    const angle = Math.atan2(ring[1]!.y - ring[0]!.y, ring[1]!.x - ring[0]!.x);
+    const centre = ringCentroid(ring);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const point of ring) {
+      const localX = (point.x - centre.x) * Math.cos(angle) + (point.y - centre.y) * Math.sin(angle);
+      const localY = -(point.x - centre.x) * Math.sin(angle) + (point.y - centre.y) * Math.cos(angle);
+      if (localX < minX) minX = localX;
+      if (localX > maxX) maxX = localX;
+      if (localY < minY) minY = localY;
+      if (localY > maxY) maxY = localY;
+    }
+    return Math.min(maxX - minX, maxY - minY);
+  };
+
+  it("keeps ordinary fine-grain and market cells above the six-metre minor-dimension floor", () => {
+    const ring = rectRing({ x: 0, y: 0, width: 120, height: 120 });
+    const fragment: DistrictBlockFragment = { id: "floor-fragment", blockId: "floor-block", districtId: "floor-district", buildable: ringAsMulti(ring) };
+    const bounds = DISTRICT_TYPE_REGISTRY.get("night-market")!.bounds;
+    for (const grammarId of ["fine-grain-frontage", "market-alley", "irregular-mosaic", "rotated-bands"] as const) {
+      const cells = planDistrictFragmentWithGrammar(fragment, grammarId, bounds, `floor/${grammarId}`, []);
+      const ordinary = cells.filter((cell) =>
+        !cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("edge-sliver")
+      );
+      expect(ordinary.length, grammarId).toBeGreaterThan(0);
+      for (const cell of ordinary) {
+        expect(cellMinor(cell.polygon), `${grammarId} ${cell.localRole}`).toBeGreaterThanOrEqual(6);
+      }
+    }
   });
 });

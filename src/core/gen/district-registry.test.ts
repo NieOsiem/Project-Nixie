@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds } from "../geom/types.js";
-import { BLOCK_GRAMMAR_IDS, DISTRICT_PALETTE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_IDS, validateDistrictRegistry } from "./district-registry.js";
+import { BLOCK_GRAMMAR_IDS, DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, validateDistrictRegistry } from "./district-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY } from "./building-registry.js";
 import { districtBreadthGallery, planDistrictFragmentWithGrammar, type DistrictBlockFragment } from "./district-plan.js";
 import { validateRing } from "./terrain.js";
 
@@ -79,4 +80,21 @@ describe("district planning registry", () => {
     const accountedArea = accounted.reduce((sum, polygon) => sum + polygon.reduce((polygonSum, ring, index) => polygonSum + Math.abs(ringArea(ring)) * (index === 0 ? 1 : -1), 0), 0);
     expect(accountedArea).toBeCloseTo(15_000, 1);
   }, 20_000);
+
+  it("declares a valid ordinary height band for every district", () => {
+    for (const entry of DISTRICT_TYPES) {
+      expect(entry.heightBand.minM, entry.id).toBeGreaterThan(0);
+      expect(entry.heightBand.minM, entry.id).toBeLessThanOrEqual(entry.heightBand.maxM);
+    }
+  });
+
+  it("keeps commercial-highrise from weighting low-rise grammars anomalously", () => {
+    const definition = DISTRICT_TYPE_REGISTRY.get("commercial-highrise")!;
+    const lowRiseWeight = BUILDING_GRAMMAR_IDS.filter((id) => (BUILDING_GRAMMAR_REGISTRY.get(id)?.height.maxM ?? 0) <= 60)
+      .reduce((sum, id) => sum + (definition.buildingGrammarWeights[id] ?? 0), 0);
+    expect(lowRiseWeight).toBeLessThan(0.12);
+    const tallWeight = BUILDING_GRAMMAR_IDS.filter((id) => (BUILDING_GRAMMAR_REGISTRY.get(id)?.height.maxM ?? 0) >= 100)
+      .reduce((sum, id) => sum + (definition.buildingGrammarWeights[id] ?? 0), 0);
+    expect(tallWeight).toBeGreaterThan(0.8);
+  });
 });

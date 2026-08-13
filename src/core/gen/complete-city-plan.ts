@@ -4,8 +4,8 @@ import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compile
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, districtStructuralInputSignature, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
-import { DISTRICT_TYPE_REGISTRY } from "./district-registry.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
+import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type HeightBand } from "./district-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
 import { normalizeRing, validateRing } from "./terrain.js";
 
@@ -17,6 +17,16 @@ const KEY_SCALE = 1_000;
 // parcels down to 16 m² and everything smaller stays explicitly unbuilt.
 export const MIN_PARCEL_AREA_M2 = 16;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
+
+/**
+ * Thin-building floor: ordinary (non-micro) building masses must present an oriented
+ * minor dimension of at least this (metres) — the shorter side of the mass footprint's
+ * own bounding box, measured in the footprint's own frame. Enforced twice: at
+ * grammar-fit time (a non-micro grammar must be able to host a mass that reaches the
+ * floor) and again at emission (masses that still come out thinner are rejected).
+ * Micro grammars fill sub-floor slivers intentionally and are the only exception.
+ */
+export const MIN_MASS_MINOR_DIMENSION_M = 6;
 
 /** Deterministic open-space material slot per category (shared with the renderer contract). */
 const OPEN_SPACE_SLOTS: Readonly<Record<OpenSpaceCategory, number>> = Object.freeze({
@@ -85,6 +95,43 @@ function pointKey(point: Vec2): string {
 /** Full canonical vertex signature of a hole-free piece; ids must never collide on it. */
 function ringKey(ring: Ring): string {
   return ring.map((point) => pointKey(point)).join(";");
+}
+
+/**
+ * Bounding-box minor of a ring measured in a given frame angle. For rectilinear
+ * masses this is the true strip width; for concave multi-bar masses (courtyard rings,
+ * L/U bases) it is the overall thickness of the built mass. AABB-in-world overstates
+ * diagonal slivers, so thinness is always measured in a meaningful local frame.
+ */
+function frameMinorDimension(ring: Ring, angleRad: number): number {
+  const cosine = Math.cos(angleRad);
+  const sine = Math.sin(angleRad);
+  const centre = ringCentroid(ring);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const point of ring) {
+    const dx = point.x - centre.x;
+    const dy = point.y - centre.y;
+    const localX = dx * cosine + dy * sine;
+    const localY = -dx * sine + dy * cosine;
+    if (localX < minX) minX = localX;
+    if (localX > maxX) maxX = localX;
+    if (localY < minY) minY = localY;
+    if (localY > maxY) maxY = localY;
+  }
+  return Math.min(maxX - minX, maxY - minY);
+}
+
+/**
+ * Oriented minor dimension of a footprint: the shorter side of its bounding box
+ * measured in the footprint's own frame (its first edge) — the frame the fitted mass
+ * was laid out in.
+ */
+function orientedMinorDimension(ring: Ring): number {
+  if (ring.length < 2) return 0;
+  return frameMinorDimension(ring, Math.atan2(ring[1]!.y - ring[0]!.y, ring[1]!.x - ring[0]!.x));
 }
 
 function rotatePoint(point: Vec2, origin: Vec2, angle: number): Vec2 {
@@ -223,7 +270,21 @@ function grammarFitsParcel(
   const aspect = width / depth;
   if (!(aspect >= limits.minAspect && aspect <= limits.maxAspect)) return false;
   const setbackM = range(`${parcel.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
-  return width - 2 * setbackM > GEOMETRY_EPSILON && depth - 2 * setbackM > GEOMETRY_EPSILON;
+  if (!(width - 2 * setbackM > GEOMETRY_EPSILON && depth - 2 * setbackM > GEOMETRY_EPSILON)) return false;
+  // Thin-floor feasibility: a non-micro grammar must be able to host a mass whose
+  // oriented minor dimension reaches the emission floor even at its declared maximum
+  // setback and minimum occupancy. Micro grammars fill sub-floor slivers intentionally
+  // and are exempt. This steers thin parcels toward grammars that genuinely fit them
+  // instead of letting them flood the emission guard.
+  if (!MICRO_BUILDING_GRAMMAR_IDS.has(grammar.id)) {
+    const mainW = (width - 2 * grammar.footprint.setbackMax) * grammar.frontage.widthFill;
+    const mainH = (depth - 2 * grammar.footprint.setbackMax) *
+      (grammar.frontage.mode === "street-wall"
+        ? grammar.frontage.depthFill
+        : grammar.massing.mainDepthFactor * Math.sqrt(grammar.footprint.occupancyMin));
+    if (Math.min(mainW, mainH) < MIN_MASS_MINOR_DIMENSION_M) return false;
+  }
+  return true;
 }
 
 /** Shrink a rect toward its own centroid until it sits inside the container, or null. */
@@ -1091,6 +1152,90 @@ function parcelBank(district: DistrictSource | undefined, banks: Map<string, num
   return district ? (banks.get(district.paletteId) ?? BASE_BANK) : BASE_BANK;
 }
 
+/**
+ * Ordinary-building height target for unzoned land: a mid-rise mixed fabric, so
+ * district-less blocks still band coherently instead of free-rolling every grammar.
+ */
+const UNZONED_HEIGHT_BAND: HeightBand = Object.freeze({ minM: 18, maxM: 44 });
+
+/**
+ * Deterministic per-block height variation: every block scales its district band by a
+ * factor in [0.82, 1.18], so neighbouring blocks of one district keep different height
+ * characters while every building inside a block draws from the same scaled band.
+ */
+function blockHeightFactor(blockId: string): number {
+  return 0.82 + hashUnit(`${blockId}/height-band`) * 0.36;
+}
+
+/**
+ * Resolve one block's shared height band from its district's band. Returns null for
+ * district-less direct calls so unbanded materialization keeps the plain grammar roll.
+ */
+export function heightBandForBlock(blockId: string, definition: DistrictTypeDefinition | null): HeightBand | null {
+  if (definition === null) return null;
+  const factor = blockHeightFactor(blockId);
+  return { minM: definition.heightBand.minM * factor, maxM: definition.heightBand.maxM * factor };
+}
+
+/**
+ * Shape a [0,1] roll into the block's shared height band, clamped to the grammar's
+ * declared range. When the band overlaps the grammar range the roll samples the
+ * intersection, so every building in a block varies inside the same band window. When
+ * the ranges are disjoint the roll samples a deterministic shoulder strictly inside
+ * the grammar range — the upper shoulder for a band above the grammar, the lower for a
+ * band below it — instead of hard-clamping every building onto the exact cap/floor
+ * (the old clamp stacked whole blocks of shopfronts at a flat 48.0). The shoulder is
+ * 15% of the band width (never wider than the grammar range) and keeps a 1/8 inset at
+ * each end, so even roll 0/1 stay strictly inside the declared range, shoulder
+ * buildings sit within a few storeys of their grammar edge, and the within-block
+ * spread stays under ~3x.
+ */
+export function shapeBuildingHeight(grammar: BuildingGrammarDefinition, band: HeightBand, roll: number): number {
+  const grammarMin = grammar.height.minM;
+  const grammarMax = grammar.height.maxM;
+  const low = Math.max(band.minM, grammarMin);
+  const high = Math.min(band.maxM, grammarMax);
+  if (low < high) return low + roll * (high - low);
+  const range = grammarMax - grammarMin;
+  const shoulder = Math.min(range, (band.maxM - band.minM) * 0.15);
+  const inset = shoulder / 8;
+  if (band.minM >= grammarMax) {
+    const bottom = grammarMax - shoulder + inset;
+    const top = grammarMax - inset;
+    return bottom + roll * (top - bottom);
+  }
+  const bottom = grammarMin + inset;
+  const top = grammarMin + shoulder - inset;
+  return bottom + roll * (top - bottom);
+}
+
+/**
+ * Deterministic block → height-band map for production planning. Mixed blocks blend
+ * their fragments' district bands by parcel area, so every building in a block draws
+ * from ONE band no matter how many districts the block contains; unzoned parcels
+ * contribute the UNZONED_HEIGHT_BAND fallback.
+ */
+export function deriveBlockHeightBands(sourceParcels: readonly ParcelPlan[], districtById: Map<string, DistrictSource>): Map<string, HeightBand> {
+  const totals = new Map<string, { areaM2: number; minM: number; maxM: number }>();
+  for (const parcel of sourceParcels) {
+    const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
+    const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
+    const band = definition ? definition.heightBand : UNZONED_HEIGHT_BAND;
+    const entry = totals.get(parcel.blockId) ?? { areaM2: 0, minM: 0, maxM: 0 };
+    entry.areaM2 += parcel.areaM2;
+    entry.minM += band.minM * parcel.areaM2;
+    entry.maxM += band.maxM * parcel.areaM2;
+    totals.set(parcel.blockId, entry);
+  }
+  const bands = new Map<string, HeightBand>();
+  for (const [blockId, total] of totals) {
+    if (!(total.areaM2 > 0)) continue;
+    const factor = blockHeightFactor(blockId);
+    bands.set(blockId, { minM: (total.minM / total.areaM2) * factor, maxM: (total.maxM / total.areaM2) * factor });
+  }
+  return bands;
+}
+
 function archetypeMasses(
   parcel: { polygon: Ring; frontageAngleRad: number },
   definition: BuildingGrammarDefinition,
@@ -1146,10 +1291,12 @@ function archetypeMasses(
   };
   const mergePieces = (rings: readonly Ring[]): Ring | null => largestHoleFreePiece(union(rings.map((ring) => ringAsMulti(ring))));
   const archetype = definition.archetype;
-  const count = definition.massing.minMasses + Math.floor(hashUnit(`${seed}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+  const declaredCount = definition.massing.minMasses + Math.floor(hashUnit(`${seed}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
 
   if (archetype === "rectangle") {
     const masses: RawMass[] = [];
+    // Vertical slab split: never slice a mass thinner than the emission floor.
+    const count = Math.min(declaredCount, Math.max(1, Math.floor(mainH / MIN_MASS_MINOR_DIMENSION_M)));
     const barH = (mainH - gap * (count - 1)) / count;
     for (let index = 0; index < count; index++) {
       const mass = put(localRect(bounds, angle, centre, baseX, baseY + index * (barH + gap), mainW, barH), "slab", 0, peerHeight(`slab-${index}`, index));
@@ -1160,6 +1307,8 @@ function archetypeMasses(
   }
   if (archetype === "trapezoid") {
     const masses: RawMass[] = [];
+    // Wedge split: never slice a wedge thinner than the emission floor.
+    const count = Math.min(declaredCount, Math.max(1, Math.floor(mainW / MIN_MASS_MINOR_DIMENSION_M)));
     const wedgeW = (mainW - gap * (count - 1)) / count;
     for (let index = 0; index < count; index++) {
       const rect = localRect(bounds, angle, centre, baseX + index * (wedgeW + gap), baseY, wedgeW, mainH);
@@ -1192,6 +1341,8 @@ function archetypeMasses(
     if (!merged) return [];
     const base = fitRectInside(merged, container);
     if (!base || base.length <= 4) return [];
+    // The stacked slab must itself clear the emission floor, else a single L mass.
+    const count = declaredCount >= 2 && (mainH - wingH) * 0.55 >= MIN_MASS_MINOR_DIMENSION_M ? declaredCount : 1;
     if (count < 2) return [{ footprint: base, elevationM: 0, heightM, kind: "l-shape" }];
     // WHY: the upper slab must complete, not exceed, the grammar's declared total height.
     const baseShare = 0.6 + hashUnit(`${seed}/stack-share`) * 0.2;
@@ -1215,6 +1366,8 @@ function archetypeMasses(
     if (!merged) return [];
     const base = fitRectInside(merged, container);
     if (!base || base.length <= 4) return [];
+    // The stacked cross slab must itself clear the emission floor, else a single U mass.
+    const count = declaredCount >= 2 && mainW - 2 * barW >= MIN_MASS_MINOR_DIMENSION_M && barH >= MIN_MASS_MINOR_DIMENSION_M ? declaredCount : 1;
     if (count < 2) return [{ footprint: base, elevationM: 0, heightM, kind: "u-shape" }];
     // The base takes most of the declared height and the stacked slab completes it exactly,
     // so base + slab can never leave the grammar's declared total range.
@@ -1228,14 +1381,17 @@ function archetypeMasses(
     ];
   }
   if (archetype === "courtyard") {
-    const barW = mainW * 0.28;
-    const barH = mainH * 0.28;
+    // Ring bars are emitted as individual masses, so their thickness must clear the
+    // emission floor on any parcel the grammar accepts (0.36 × main dimension; the
+    // grammars' raised minimum site sizes guarantee the worst case still passes).
+    const barW = mainW * 0.36;
+    const barH = mainH * 0.36;
     const top = localRect(bounds, angle, centre, baseX, baseY, mainW, barH);
     const bottom = localRect(bounds, angle, centre, baseX, baseY + mainH - barH, mainW, barH);
     const left = localRect(bounds, angle, centre, baseX, baseY + barH, barW, mainH - 2 * barH);
     const right = localRect(bounds, angle, centre, baseX + mainW - barW, baseY + barH, barW, mainH - 2 * barH);
     const bars = [top, bottom, left, right] as const;
-    const kept = count < 4 ? bars.filter((_, index) => index !== Math.floor(hashUnit(`${seed}/court-drop`) * 4)) : bars;
+    const kept = declaredCount < 4 ? bars.filter((_, index) => index !== Math.floor(hashUnit(`${seed}/court-drop`) * 4)) : bars;
     const masses: RawMass[] = [];
     for (let index = 0; index < kept.length; index++) {
       const mass = put(kept[index]!, "ring-bar", 0, peerHeight("ring-bar", index));
@@ -1250,7 +1406,7 @@ function archetypeMasses(
     if (!podium) return [];
     const podiumMulti = ringAsMulti(podium);
     const masses: RawMass[] = [{ footprint: podium, elevationM: 0, heightM: baseHeight, kind: "podium" }];
-    const towerCount = count - 1;
+    const towerCount = declaredCount - 1;
     const towerHeight = heightM - baseHeight;
     if (towerCount === 1) {
       const towerW = mainW * 0.55;
@@ -1275,6 +1431,10 @@ function archetypeMasses(
   }
   // clustered compound
   const masses: RawMass[] = [];
+  // Unit split: never slice a compound unit thinner than the emission floor (the 0.78
+  // occupancy factor is the worst case for the sampled unit width).
+  let count = declaredCount;
+  while (count > 1 && (mainW * (1 - gap * (count - 1)) / count) * 0.78 < MIN_MASS_MINOR_DIMENSION_M) count--;
   const unit = (1 - gap * (count - 1)) / count;
   for (let index = 0; index < count; index++) {
     // Tighter internal fill: compounds now cover 0.78-1.0 x 0.55-0.9 of their cell so
@@ -1318,7 +1478,8 @@ export function planParcelBuilding(
   district: DistrictSource | undefined,
   banks: Map<string, number>,
   appearanceSeedOverride?: string,
-  frontage: FrontageSide | null = null
+  frontage: FrontageSide | null = null,
+  heightBand: HeightBand | null = null
 ): BuildingPlan | null {
   const active = BUILDING_GRAMMAR_IDS.filter((id) => (weights[id] ?? 0) > 0);
   const fitting = active.filter((id) => grammarFitsParcel(BUILDING_GRAMMAR_REGISTRY.get(id)!, parcel));
@@ -1342,11 +1503,30 @@ export function planParcelBuilding(
   const visualUse = supportedUses.length > 0 ? weightedChoice(compatibleWeights, supportedUses, `${parcel.seed}/use`) : grammar.compatibleUses[0]!;
   const geometrySeed = `${parcel.seed}/geometry`;
   const appearanceSeed = appearanceSeedOverride ?? `${parcel.seed}/appearance`;
-  const heightM = range(`${geometrySeed}/height`, grammar.height.minM, grammar.height.maxM) * (1 - grammar.height.skylineBias) +
-    range(`${geometrySeed}/height-sky`, grammar.height.minM, grammar.height.maxM) * grammar.height.skylineBias;
+  // Deterministic [0,1] roll fraction; skylineBias pushes it toward the top of whatever
+  // band the parcel draws from (identical distribution to the old min..max roll).
+  const heightRoll = range(`${geometrySeed}/height`, 0, 1) * (1 - grammar.height.skylineBias) +
+    range(`${geometrySeed}/height-sky`, 0, 1) * grammar.height.skylineBias;
+  // Block height coherence: ordinary buildings draw from the block's shared band, so a
+  // low-rise grammar never sits beside a megatower by accident. Tower grammars (podiums,
+  // high-skyline anchors) and micro grammars stay deliberate outliers with their own
+  // rolls; the grammar's declared range is the hard clamp either way.
+  const band = heightBand ?? (district ? heightBandForBlock(parcel.blockId, DISTRICT_TYPE_REGISTRY.get(district.typeId) ?? null) : null);
+  const shaped = band !== null && !isTowerGrammar(grammar) && !MICRO_BUILDING_GRAMMAR_IDS.has(grammarId);
+  const heightM = shaped
+    ? shapeBuildingHeight(grammar, band, heightRoll)
+    : grammar.height.minM + heightRoll * (grammar.height.maxM - grammar.height.minM);
   const setbackM = range(`${parcel.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
   const rawMasses = archetypeMasses(parcel, grammar, geometrySeed, heightM, setbackM, frontage);
   if (rawMasses.length === 0) return null;
+  // Thin-building floor: ordinary masses must present an oriented minor dimension of at
+  // least MIN_MASS_MINOR_DIMENSION_M. Micro grammars fill slivers intentionally and are
+  // exempt; any other mass that comes out thinner (diagonal sliver parcels collapse the
+  // fitted rect to the parcel's true width) is rejected at the source rather than
+  // emitted as a pathological bar.
+  if (!MICRO_BUILDING_GRAMMAR_IDS.has(grammarId) && rawMasses.some((raw) => orientedMinorDimension(raw.footprint) < MIN_MASS_MINOR_DIMENSION_M)) {
+    return null;
+  }
   const bank = parcelBank(district, banks);
   const buildingId = stableId("building", `${parcel.id}|${grammarId}|${rawMasses.map((mass) => pointKey(mass.footprint[0]!)).join("+")}`);
   const masses: BuildingMassPlan[] = rawMasses.map((raw, index) => {
@@ -1485,7 +1665,8 @@ function refineParcelVariant(
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
   banks: Map<string, number>,
-  frontage: FrontageSide | null
+  frontage: FrontageSide | null,
+  heightBands: ReadonlyMap<string, HeightBand>
 ): RefinedParcelResult | null {
   const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
@@ -1525,6 +1706,14 @@ function refineParcelVariant(
             pieceIndex++;
             continue;
           }
+          // Sub-floor partition pieces (diagonal/boundary clippings) never build, even
+          // via micro grammars; they fall to the residual vacant classification.
+          if (frameMinorDimension(piece, partition.angleRad) < MIN_MASS_MINOR_DIMENSION_M) {
+            unbuilt.push(piece);
+            candidateIndex++;
+            pieceIndex++;
+            continue;
+          }
           const lineage = `${partition.orientation}/${partition.grammarId}/${offsetX}/${offsetY}/${row}/${column}/${pieceIndex}`;
           const candidate: ParcelPlan = {
             id: stableId("parcel", `${parcel.id}|refined|${lineage}|${ringKey(piece)}`),
@@ -1539,7 +1728,7 @@ function refineParcelVariant(
             seed: `${parcel.seed}/refined/${lineage}`,
             areaM2: pieceAreaM2
           };
-          const building = planParcelBuilding(candidate, weights, useWeights, district, banks, undefined, cellFrontage);
+          const building = planParcelBuilding(candidate, weights, useWeights, district, banks, undefined, cellFrontage, heightBands.get(candidate.blockId) ?? null);
           if (building !== null) {
             parcels.push(candidate);
             buildings.push(building);
@@ -1561,13 +1750,14 @@ function refineParcel(
   useWeights: Readonly<Record<BuildingUseId, number>>,
   district: DistrictSource | undefined,
   banks: Map<string, number>,
-  frontage: FrontageSide | null
+  frontage: FrontageSide | null,
+  heightBands: ReadonlyMap<string, HeightBand>
 ): RefinedParcelResult | null {
   let best: RefinedParcelResult | null = null;
   for (const partition of parcelPartitionCandidates(parcel, weights)) {
     for (let offsetX = 0; offsetX < 3; offsetX++) {
       for (let offsetY = 0; offsetY < 3; offsetY++) {
-        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks, frontage);
+        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks, frontage, heightBands);
         if (result !== null && (best === null || result.areaM2 > best.areaM2)) best = result;
         if (best !== null && best.areaM2 >= parcel.areaM2 * 0.97) return best;
       }
@@ -1623,6 +1813,31 @@ function residualParcelPlans(
   return { parcels, openSpaces };
 }
 
+/**
+ * Explicitly unbuilt parcel classification: landscaping surface (paving + planters) so
+ * sub-floor slivers and no-fitting-grammar parcels blend with the sidewalk instead of
+ * reading as derelict scrub. One open space per parcel, full-area, ground material.
+ */
+function unbuiltOpenSpacePlan(parcel: ParcelPlan): OpenSpacePlan {
+  return {
+    id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
+    parcelId: parcel.id,
+    blockId: parcel.blockId,
+    fragmentId: parcel.fragmentId,
+    districtId: parcel.districtId,
+    landmarkId: null,
+    category: "landscaping",
+    size: "large",
+    polygon: parcel.polygon,
+    surfaceStyle: "paving",
+    detailStyle: OPEN_SPACE_DETAIL_STYLES.landscaping,
+    lineage: parcel.seed,
+    seed: `${parcel.seed}/unbuilt`,
+    areaM2: parcel.areaM2,
+    material: MATERIAL.GROUND
+  };
+}
+
 function planBuildings(
   sourceParcels: ParcelPlan[],
   districtById: Map<string, DistrictSource>,
@@ -1636,19 +1851,31 @@ function planBuildings(
   let refinedCount = 0;
   let unbuiltCount = 0;
   const occBoxes = occupancyBoxes(occupancy);
+  const heightBands = deriveBlockHeightBands(sourceParcels, districtById);
   for (const parcel of sourceParcels) {
+    // Thin-parcel floor: a parcel whose own-frame oriented minor dimension is below
+    // the emission floor is a clipped boundary/stagger sliver. Route it straight to
+    // the explicit unbuilt path — no grammar, micro included, may raise a sub-floor
+    // bar on it. Normal (>= 6 m) parcels proceed unchanged, so intentional micro
+    // sites on credible parcels still build.
+    if (frameMinorDimension(parcel.polygon, parcel.frontageAngleRad) < MIN_MASS_MINOR_DIMENSION_M) {
+      parcels.push(parcel);
+      unbuiltCount++;
+      openSpaces.push(unbuiltOpenSpacePlan(parcel));
+      continue;
+    }
     const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
     const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
     const weights = definition ? definition.buildingGrammarWeights : UNZONED_BUILDING_GRAMMAR_WEIGHTS;
     const useWeights = definition ? definition.visualUseWeights : UNZONED_VISUAL_USE_WEIGHTS;
     const frontage = detectFrontage(parcel, occBoxes);
-    const building = planParcelBuilding(parcel, weights, useWeights, district, banks, undefined, frontage);
+    const building = planParcelBuilding(parcel, weights, useWeights, district, banks, undefined, frontage, heightBands.get(parcel.blockId) ?? null);
     if (building !== null) {
       parcels.push(parcel);
       buildings.push(building);
       continue;
     }
-    const refined = refineParcel(parcel, weights, useWeights, district, banks, frontage);
+    const refined = refineParcel(parcel, weights, useWeights, district, banks, frontage, heightBands);
     if (refined !== null) {
       const residual = residualParcelPlans(parcel, refined);
       parcels.push(...refined.parcels, ...residual.parcels);
@@ -1662,23 +1889,7 @@ function planBuildings(
     unbuiltCount++;
     // Unbuilt parcels (too small or no fitting grammar) become landscaping rather
     // than vacant scrub, so they blend with sidewalk surface instead of looking derelict.
-    openSpaces.push({
-      id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
-      parcelId: parcel.id,
-      blockId: parcel.blockId,
-      fragmentId: parcel.fragmentId,
-      districtId: parcel.districtId,
-      landmarkId: null,
-      category: "landscaping",
-      size: "large",
-      polygon: parcel.polygon,
-      surfaceStyle: "paving",
-      detailStyle: OPEN_SPACE_DETAIL_STYLES.landscaping,
-      lineage: parcel.seed,
-      seed: `${parcel.seed}/unbuilt`,
-      areaM2: parcel.areaM2,
-      material: MATERIAL.GROUND
-    });
+    openSpaces.push(unbuiltOpenSpacePlan(parcel));
   }
   if (refinedCount > 0) warnings.push(`${refinedCount} planning parcels were partitioned into building-compatible final parcels.`);
   if (unbuiltCount > 0) warnings.push(`${unbuiltCount} parcels have no fitting building grammar and remain explicitly unbuilt.`);
