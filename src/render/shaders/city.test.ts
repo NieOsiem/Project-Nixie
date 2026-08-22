@@ -26,6 +26,18 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("float mechWindows = 1.0 - mechFloor;");
   });
 
+  it("reads facades as dense cool-lit towers with glowing street levels", () => {
+    expect(CITY_FRAG).toContain("float litThreshold = mix(0.18, 0.5,");
+    expect(CITY_FRAG).not.toContain("mix(0.35, 0.68");
+    expect(CITY_FRAG).toContain("vec3(0.72, 0.92, 1.0)");
+    expect(CITY_FRAG).toContain("step(0.75, litHue)");
+    expect(CITY_FRAG).toContain("neonWin");
+    expect(CITY_FRAG).toMatch(/float on = step\(0\.22,/);
+    expect(CITY_FRAG).toContain("vec3(0.08, 0.13, 0.21)");
+    expect(CITY_FRAG).toContain("glassC + vEmissive * 0.35, shop * 0.85");
+    expect(CITY_FRAG).toContain("(0.85 * signStrip + 0.30 * shop) * signOn * shopTone");
+  });
+
   it("samples a strong district accent independently of the body material", () => {
     expect(CITY_VERT).toContain("float accentSlot = mix(");
     expect(CITY_VERT).toContain("6.0,");
@@ -49,7 +61,9 @@ describe("city fragment shader", () => {
   });
 
   it("uses the saturated body exposure and a district-hued ambient spill, not a lavender lift", () => {
-    expect(CITY_FRAG).toContain("float canyon = mix(0.76, 1.0,");
+    expect(CITY_FRAG).toContain("float canyon = mix(0.84, 1.0,");
+    expect(CITY_FRAG).toContain("- 0.22 * (1.0 - smoothstep(0.0, 9.0, h))");
+    expect(CITY_FRAG).toContain("- 0.08 * (valueNoise(vec2(vU / 3.0, h / 3.0)) - 0.5)");
     expect(CITY_VERT).toContain("vBase = base.rgb * 1.7;");
     expect(CITY_VERT).toContain("vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);");
     expect(CITY_VERT).toContain("varying vec3 vAmbient;");
@@ -100,8 +114,8 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("if (vKind < 0.5) colour = flatGround();");
     expect(CITY_FRAG).toContain("const float GROUND_COARSE_M = 34.0;");
     expect(CITY_FRAG).toContain("const float GROUND_FINE_M = 8.5;");
-    expect(CITY_FRAG).toContain("const float GROUND_COARSE_AMP = 0.107;");
-    expect(CITY_FRAG).toContain("const float GROUND_FINE_AMP = 0.053;");
+    expect(CITY_FRAG).toContain("const float GROUND_COARSE_AMP = 0.125;");
+    expect(CITY_FRAG).toContain("const float GROUND_FINE_AMP = 0.062;");
     expect(CITY_FRAG).toContain("vec2 w = f * f * (3.0 - 2.0 * f);");
 
     const flat = CITY_FRAG.slice(
@@ -146,6 +160,8 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("float ribStyle = step(0.70, family)");
     expect(CITY_FRAG).toContain("float repairStyle = step(0.90, family);");
     expect(CITY_FRAG).toContain("- seam * 0.085 - patch * 0.07;");
+    expect(CITY_FRAG).toContain("(hash11(seed + 8.41) - 0.5) * 0.12;");
+    expect(CITY_FRAG).toContain("* 0.09 * toneLod;");
     expect(CITY_FRAG).not.toMatch(
       /\bparapet\b|\bskylight\b|\bsolar\b|\baccentStyle\b|\bpanelRim\b/
     );
@@ -154,7 +170,7 @@ describe("city fragment shader", () => {
   it("separates rooftop clutter caps with an inset value split and bright rim", () => {
     expect(CITY_FRAG).toContain("float cap = 1.0 - step(-0.5, vShade);");
     expect(CITY_FRAG).toContain("smoothstep(0.68, 0.84, max(abs(vU), abs(vTop)))");
-    expect(CITY_FRAG).toContain("vBase * 1.12 + vEmissive * 0.10");
+    expect(CITY_FRAG).toContain("vBase * 1.2 + vEmissive * 0.10");
     expect(CITY_FRAG).toContain("else if (vKind > 3.5 && vKind < 4.5) colour = clutter();");
   });
 

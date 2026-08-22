@@ -9,19 +9,19 @@
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 import { glslFloat } from "./weather.js";
 
-const THRESHOLD = 0.55;
+const THRESHOLD = 0.40;
 /** Half-width of the quadratic knee below the threshold. Softens the cut-in. */
-const KNEE = 0.25;
+const KNEE = 0.20;
 
 const LUMA = "vec3(0.299, 0.587, 0.114)";
 
 /** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG.
- * BODY_CHROMA sits at 1.0 so the grade never desaturates the district albedo undertones;
- * only bright signage gets the 1.15 boost. */
-const BODY_CHROMA = 1.0;
-const NEON_CHROMA = 1.15;
+ * BODY_CHROMA adds a mild global vibrance at 1.05 over the district albedo undertones;
+ * bright signage gets the stronger 1.25 boost. */
+const BODY_CHROMA = 1.05;
+const NEON_CHROMA = 1.25;
 /** Darkening at the far edge of the depth falloff. */
-const DEPTH_FALLOFF = 0.16;
+const DEPTH_FALLOFF = 0.10;
 /** WHY: saturation must not lift black surfaces into purple fog. */
 const BLACK_FLOOR = 0.004;
 
@@ -336,11 +336,14 @@ void main() {
 
   float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
     * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
-  c *= 1.0 - 0.32 * castShadow;
+  c *= 1.0 - 0.22 * castShadow;
 
   float ao = texture2D(uAo, vUv * uAoUvScale).r;
   float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);
   c *= 1.0 - uAoStrength * ao * lowness * covered;
+  // Cool neon-night grade: the reference city sits on an indigo base — red damped, blue
+  // lifted, a whisper of violet in the floor. Neon hues pass through the chroma stage after.
+  c = c * vec3(0.94, 0.91, 1.10) + vec3(0.008, 0.005, 0.022);
 
   // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
   // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
@@ -355,8 +358,7 @@ void main() {
   vec3 haze = vec3(uFogTintR, uFogTintG, uFogTintB) + wideBloom * uFogInscatter;
   c = mix(c, haze, clamp(fog, 0.0, 1.0));
 
-  // Grade: body chroma passes the district albedo undertones through untouched; neon chroma
-  // boosts bright signage only.
+  // Grade: body chroma adds a mild global vibrance; neon chroma boosts bright signage harder.
   float l = dot(c, ${LUMA});
   float chroma = mix(${glslFloat(BODY_CHROMA)}, ${glslFloat(NEON_CHROMA)}, smoothstep(0.18, 0.62, l));
   c = max(mix(vec3(l), c, chroma) - vec3(${BLACK_FLOOR}), vec3(0.0));

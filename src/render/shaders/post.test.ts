@@ -22,9 +22,9 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG).toContain("texture2D(uBloomWide,");
   });
 
-  it("keeps body chroma, boosts bright signage, and preserves a black floor", () => {
+  it("adds mild body vibrance, boosts bright signage, and preserves a black floor", () => {
     expect(COMPOSITE_FRAG).toContain(
-      "float chroma = mix(1.0, 1.15, smoothstep(0.18, 0.62, l));"
+      "float chroma = mix(1.05, 1.25, smoothstep(0.18, 0.62, l));"
     );
     expect(COMPOSITE_FRAG).toContain(
       "c = max(mix(vec3(l), c, chroma) - vec3(0.004), vec3(0.0));"
@@ -34,7 +34,7 @@ describe("composite shader", () => {
   it("falls off with screen distance from the projection pivot, not the frame centre", () => {
     expect(COMPOSITE_FRAG).toContain("uniform vec2 uPivotUv;");
     expect(COMPOSITE_FRAG).toContain(
-      "c *= 1.0 - 0.16 * smoothstep(0.20, 0.72, length(vUv - uPivotUv));"
+      "c *= 1.0 - 0.1 * smoothstep(0.20, 0.72, length(vUv - uPivotUv));"
     );
   });
 
@@ -47,7 +47,7 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG).toContain(
       "texture2D(uBuildingMask, vUv * uMaskUvScale).a"
     );
-    expect(COMPOSITE_FRAG).toContain("c *= 1.0 - 0.32 * castShadow;");
+    expect(COMPOSITE_FRAG).toContain("c *= 1.0 - 0.22 * castShadow;");
   });
 
   it("samples only the active frame of reusable render-target capacity", () => {
@@ -224,21 +224,21 @@ describe("streak shader", () => {
 describe("look dials", () => {
   it("keeps the agreed defaults", () => {
     expect(DEFAULT_LOOK_DIALS).toEqual({
-      fogStrength: 0.35,
+      fogStrength: 0.12,
       fogDensity: 3.2,
       fogHeightM: 36,
       fogInscatter: 32,
-      fogTintR: 0.055,
-      fogTintG: 0.045,
-      fogTintB: 0.085,
-      aoStrength: 0.45,
+      fogTintR: 0.075,
+      fogTintG: 0.055,
+      fogTintB: 0.13,
+      aoStrength: 0.30,
       aoHeightM: 18,
-      streakStrength: 1.3,
+      streakStrength: 1.5,
       wetStrength: 0.7,
       puddleCoverage: 0.45,
       puddleScaleM: 4,
       wetDarken: 0.78,
-      wetGloss: 0.6,
+      wetGloss: 0.75,
       smearStrength: 1,
       smearHeightM: 50,
       rainDrops: 0.55,

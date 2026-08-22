@@ -155,8 +155,8 @@ const float ROOF_PATCH_M = 5.6;
 const float WEAR_M = 9.0;
 const float GROUND_COARSE_M = 34.0;
 const float GROUND_FINE_M = 8.5;
-const float GROUND_COARSE_AMP = 0.107;
-const float GROUND_FINE_AMP = 0.053;
+const float GROUND_COARSE_AMP = 0.125;
+const float GROUND_FINE_AMP = 0.062;
 const float SCENE_HEIGHT_NORM_M = ${SCENE_HEIGHT_NORM_M}.0;
 const float SCENE_ALPHA_FLOOR = ${SCENE_ALPHA_FLOOR};
 
@@ -206,9 +206,9 @@ float seamLine(float metres, float periodM, float pxPerMetre) {
 // Roads, pavements and ground blocks are ~40% of the screen and share a handful of flat
 // palette entries, so untouched they read as one poured sheet.
 //
-// WHY: modulates vBase only. CITY_SURFACES hold to max(emissive) * strength * EMISSIVE_MAX
-// < 0.55 so broad ground never clears the bloom threshold; a noise term on vEmissive would
-// push part of that area over it and bloom the whole city into mush.
+// WHY: modulates vBase only. Broad ground stays under the 0.36 luma budget (the bloom gate
+// sits at 0.40), so emissive stays out of the mottle; a noise term on vEmissive would push
+// part of that area over the gate and bloom the whole city into mush.
 vec3 flatGround() {
   float coarse = (valueNoise(vWorldM / GROUND_COARSE_M) - 0.5)
     * lod(GROUND_COARSE_M, uScreenPxPerMetre);
@@ -235,9 +235,9 @@ vec3 facade() {
   float section = floor(floorId / sectionFloors);
   float sectionTone = mix(0.88, 1.05, hash11(seed + section * 13.37 + 2.19));
   float fy = fract(above / FLOOR_M);
-  float canyon = mix(0.76, 1.0, smoothstep(0.0, 14.0, vHeight));
-  float grime = 1.0 - 0.32 * (1.0 - smoothstep(0.0, 9.0, h))
-    - 0.12 * (valueNoise(vec2(vU / 3.0, h / 3.0)) - 0.5);
+  float canyon = mix(0.84, 1.0, smoothstep(0.0, 14.0, vHeight));
+  float grime = 1.0 - 0.22 * (1.0 - smoothstep(0.0, 9.0, h))
+    - 0.08 * (valueNoise(vec2(vU / 3.0, h / 3.0)) - 0.5);
 
   float coping = smoothstep(vTop - 0.8 - wUp, vTop - 0.8 + wUp, h);
   float parapetShadow = slab(h, vTop - 2.1, vTop - 0.9, wUp);
@@ -258,13 +258,13 @@ vec3 facade() {
   // Moving frames skip per-window cell work: one section-coherent band.
   if (uDetailQuality < 0.5) {
     float band = slab(fy, 0.16, 0.84, wUp / FLOOR_M) * upper;
-    float on = step(0.3, hash21(vec2(floor(vU / BAY_M) + seed * 21.0, floorId + seed * 7.0)));
-    float litBand = band * on * mix(0.4, 0.7, hash21(vec2(floor(vU / BAY_M) + seed * 5.0, floorId)));
+    float on = step(0.22, hash21(vec2(floor(vU / BAY_M) + seed * 21.0, floorId + seed * 7.0)));
+    float litBand = band * on * mix(0.5, 0.8, hash21(vec2(floor(vU / BAY_M) + seed * 5.0, floorId)));
     vec3 body = vBase * (vShade * canyon * sectionTone * grime);
     body = body * (1.0 + 0.55 * coping - 0.42 * parapetShadow);
     return body
       + vEmissive * (0.10 + 0.8 * coping * parapetGlow)
-      + vAccent * (0.7 * litBand);
+      + vAccent * (0.85 * litBand);
   }
 
   float family = hash11(seed + 0.37);
@@ -278,8 +278,8 @@ vec3 facade() {
   float cellX = floor(vU / BAY_M);
   float cellY = floorId;
   float cellJit = hash21(vec2(cellX + seed * 81.3, cellY + seed * 17.9));
-  float jw = 0.13 + 0.07 * cellJit;
-  float jh = 0.10 + 0.06 * hash21(vec2(cellX + seed * 3.7, cellY + seed * 61.3));
+  float jw = 0.08 + 0.05 * cellJit;
+  float jh = 0.06 + 0.04 * hash21(vec2(cellX + seed * 3.7, cellY + seed * 61.3));
 
   float mechEvery = 5.0 + floor(hash11(seed + 44.1) * 4.0);
   float mechFloor = step(0.85, fract((floorId + 0.5) / mechEvery));
@@ -290,19 +290,19 @@ vec3 facade() {
 
   float winH = slab(bay, jw, 1.0 - jw, wAlong / BAY_M);
   float winV = slab(fy, jh, 1.0 - jh, wUp / FLOOR_M);
-  float glassH = slab(bay, jw + 0.08, 1.0 - jw - 0.08, wAlong / BAY_M);
-  float glassV = slab(fy, jh + 0.07, 1.0 - jh - 0.07, wUp / FLOOR_M);
+  float glassH = slab(bay, jw + 0.05, 1.0 - jw - 0.05, wAlong / BAY_M);
+  float glassV = slab(fy, jh + 0.04, 1.0 - jh - 0.04, wUp / FLOOR_M);
   if (punched > 0.5) {
-    winH = slab(bay, 0.28, 0.72, wAlong / BAY_M);
-    winV = slab(fy, 0.16, 0.78, wUp / FLOOR_M);
-    glassH = slab(bay, 0.34, 0.66, wAlong / BAY_M);
-    glassV = slab(fy, 0.22, 0.72, wUp / FLOOR_M);
+    winH = slab(bay, 0.20, 0.80, wAlong / BAY_M);
+    winV = slab(fy, 0.10, 0.86, wUp / FLOOR_M);
+    glassH = slab(bay, 0.26, 0.74, wAlong / BAY_M);
+    glassV = slab(fy, 0.16, 0.80, wUp / FLOOR_M);
   } else if (ribbon > 0.5) {
-    winV = slab(fy, 0.04, 0.9, wUp / FLOOR_M);
-    glassV = slab(fy, 0.10, 0.84, wUp / FLOOR_M);
+    winV = slab(fy, 0.02, 0.95, wUp / FLOOR_M);
+    glassV = slab(fy, 0.07, 0.90, wUp / FLOOR_M);
   }
 
-  float litThreshold = mix(0.35, 0.68, hash11(seed + section * 5.23 + 6.11));
+  float litThreshold = mix(0.18, 0.5, hash11(seed + section * 5.23 + 6.11));
   float lit = step(litThreshold, hash21(vec2(cellX + seed * 53.7, cellY + seed * 91.3)));
   float glassTone = mix(0.4, 0.8, hash21(vec2(cellX + seed * 12.1, cellY + seed * 33.7)));
   // Random neon windows are reduced to rare accents, not pervasive saturated washes.
@@ -313,20 +313,28 @@ vec3 facade() {
   float frame = win * (1.0 - glass);
   float recessShadow = (1.0 - smoothstep(0.0, 0.3, fy)) * 0.45;
   float sheen = smoothstep(0.3, 0.7, fract((vU - above * 0.4) / 34.0));
-  vec3 glassC = vec3(0.07, 0.11, 0.18) * (vShade * (0.7 + 0.3 * glassTone)
+  vec3 glassC = vec3(0.08, 0.13, 0.21) * (vShade * (0.7 + 0.3 * glassTone)
     * (0.7 + 0.3 * (1.0 - fract(above / FLOOR_M)) + 0.5 * sheen) * (1.0 - recessShadow));
-  vec3 warmC = vec3(1.0, 0.86, 0.68) * (vShade * 0.55);
-  vec3 litC = mix(warmC, warmC + vAccent * 0.6, neonWin * 0.4);
+  // Lit glass: dominant cool interior light — a bright white-cyan core carrying the district
+  // hue, a ~25% warm minority — plus rare neonWin saturations. Tone keeps pre-grade luma in
+  // the 0.5-0.95 band so lit towers clear the 0.40 bloom gate.
+  float litHue = hash21(vec2(cellX + seed * 47.9, cellY + seed * 23.3));
+  vec3 districtHue = normalize(vEmissive + vec3(0.12));
+  vec3 coolC = vec3(0.72, 0.92, 1.0) * 0.75 + districtHue * 0.22;
+  vec3 warmC = vec3(1.0, 0.84, 0.66) * 0.85;
+  vec3 litC = mix(mix(coolC, warmC, step(0.75, litHue)),
+    vAccent * 2.4 + districtHue * 0.2, neonWin * 0.7) * mix(0.75, 1.0, glassTone);
   vec3 frameC = vBase * (vShade * 0.5);
 
-  // Ground-floor storefront: darker base, glass bays, a sign strip.
+  // Ground-floor storefront: darker base, glowing glass bays and an emissive sign strip so
+  // streets read alive at play zoom.
   float bay2 = fract(vU / (BAY_M * 1.7));
   float shop = slab(bay2, 0.06, 0.94, wAlong / (BAY_M * 1.7)) * slab(h, 0.2, GROUND_BAND_M - 0.4, wUp) * (1.0 - upper);
   float signOn = step(0.4, hash21(vec2(floor(vU / (BAY_M * 1.7)) + seed * 29.0, 2.0)));
   float shopTone = mix(0.45, 1.0, hash21(vec2(floor(vU / (BAY_M * 1.7)) + seed * 41.0, 3.0)));
-  float signStrip = slab(h, GROUND_BAND_M - 1.1, GROUND_BAND_M - 0.3, wUp) * (1.0 - upper) * 0.8;
+  float signStrip = slab(h, GROUND_BAND_M - 1.1, GROUND_BAND_M - 0.3, wUp) * (1.0 - upper) * 0.9;
   vec3 baseC = vBase * (vShade * mix(0.55, 0.75, signOn) * grime);
-  vec3 shopGlass = mix(baseC, glassC, shop * 0.85);
+  vec3 shopGlass = mix(baseC, glassC + vEmissive * 0.35, shop * 0.85);
 
   float joint = slab(fract(vU / 7.0), 0.965, 1.0, wAlong / 7.0) * 0.2;
   float recess = glass * (1.0 - lit) * 0.65;
@@ -350,7 +358,8 @@ vec3 facade() {
   col = mix(col, shopGlass, 1.0 - upper);
   col = mix(col, vBase * (vShade * 0.55), louver);
   col += vEmissive * (0.10 + 0.8 * coping * parapetGlow);
-  col += vAccent * (0.95 * lit * glass * 0.6 + 0.85 * shop * signOn * shopTone + 0.9 * signStrip * signOn * shopTone);
+  col += vAccent * (0.95 * lit * glass * 0.6 + 0.85 * shop * signOn * shopTone + 1.05 * signStrip * signOn * shopTone);
+  col += vEmissive * ((0.85 * signStrip + 0.30 * shop) * signOn * shopTone);
   if (feature > 0.5) {
     float band = slab(fract(above / (FLOOR_M * 2.0)), 0.3, 0.7, wUp / (FLOOR_M * 2.0)) * upper * 0.5;
     col += vAccent * band;
@@ -394,7 +403,7 @@ vec3 roof() {
   vec2 toneCell = floor(shifted / tonePeriod);
   float toneLod = lod(min(tonePeriod.x, tonePeriod.y), uScreenPxPerMetre);
   float panelTone = (hash21(toneCell + vec2(seed * 7.3, seed * 11.7)) - 0.5)
-    * 0.05 * toneLod;
+    * 0.09 * toneLod;
 
   vec2 patchCell = shifted / ROOF_PATCH_M;
   vec2 patchUv = fract(patchCell);
@@ -409,14 +418,16 @@ vec3 roof() {
     * lod(WEAR_M, uScreenPxPerMetre);
   float fineWear = (valueNoise(shifted / (WEAR_M * 0.38)) - 0.5) * 0.035
     * lod(WEAR_M * 0.38, uScreenPxPerMetre);
-  float familyTone = (hash11(seed + 8.41) - 0.5) * 0.07;
+  float familyTone = (hash11(seed + 8.41) - 0.5) * 0.12;
+  // Variance lifted a touch so roof caps read as coloured panels; the emissive wash stays
+  // far under the 0.2 luma ceiling.
   float material = 0.96 + familyTone + panelTone + wear + fineWear
     - seam * 0.085 - patch * 0.07;
 
   if (uDetailQuality < 0.5) {
-    return vBase * (0.96 + familyTone + wear * 0.5) + vEmissive * 0.03;
+    return vBase * (0.96 + familyTone + wear * 0.5) + vEmissive * 0.05;
   }
-  return vBase * material + vEmissive * 0.03;
+  return vBase * material + vEmissive * 0.05;
 }
 
 vec3 clutter() {
@@ -425,7 +436,7 @@ vec3 clutter() {
   vec3 sideColour = vBase * vShade + vEmissive;
   // Cap lighter than the roof it sits on and the lip darker, not the reverse: a raised box
   // catches more sky than the deck.
-  vec3 capColour = vBase * 1.12 + vEmissive * 0.10;
+  vec3 capColour = vBase * 1.2 + vEmissive * 0.10;
   vec3 rimColour = vBase * 0.72 + vEmissive * 0.05;
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
@@ -463,6 +474,10 @@ void main() {
   // Low-frequency ambient reflected spill replaces the old flat lavender lift: it is a single
   // per-material add, so it carries the district hue onto every body without graying it out.
   colour += vAmbient;
+  // Sky ambient lift: the reference look reads bodies near mid luminance while roads stay
+  // dark, so scale the albedo up by exposure above street level — hue-preserving, and it
+  // fades to nothing at the ground so asphalt never lifts into a grey wash.
+  colour += vBase * (0.12 * smoothstep(-2.0, 22.0, vHeight));
   float sceneAlpha = SCENE_ALPHA_FLOOR
     + (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);
   gl_FragColor = vec4(colour, sceneAlpha);

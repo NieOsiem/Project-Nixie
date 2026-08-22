@@ -233,27 +233,33 @@ describe("shipped palettes", () => {
   });
 
   it("keeps the ground plane and paint below the bloom threshold", () => {
-    for (const m of CITY_SURFACES) {
+    const surfaces = [
+      ...CITY_SURFACES,
+      ...PALETTE_PRESETS.flatMap((p) => p.materials.slice(0, DISTRICT_SLOT.NEON_A))
+    ];
+    for (const m of surfaces) {
       const peak =
         Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength * EMISSIVE_MAX;
-      expect(peak).toBeLessThan(0.55);
+      expect(peak).toBeLessThan(0.36);
     }
   });
 
   it("separates Neon Sprawl bodies, wall light, and strong architectural accents", () => {
     const [wallA, wallB, wallC, , , , neonA, neonB] = DEFAULT_DISTRICT_PALETTE.materials;
     expect(wallA).toMatchObject({
-      base: { r: 0.150, g: 0.122, b: 0.185 },
-      emissive: { r: 0.32, g: 0.45, b: 0.55 },
-      emissiveStrength: 0.06
+      base: { r: 0.240, g: 0.190, b: 0.340 },
+      emissive: { r: 0.42, g: 0.30, b: 0.62 },
+      emissiveStrength: 0.07
     });
     expect(wallB).toMatchObject({
-      emissive: { r: 0.45, g: 0.38, b: 0.52 },
-      emissiveStrength: 0.05
+      base: { r: 0.110, g: 0.280, b: 0.300 },
+      emissive: { r: 0.20, g: 0.60, b: 0.62 },
+      emissiveStrength: 0.06
     });
     expect(wallC).toMatchObject({
-      emissive: { r: 0.28, g: 0.42, b: 0.50 },
-      emissiveStrength: 0.06
+      base: { r: 0.310, g: 0.140, b: 0.270 },
+      emissive: { r: 0.62, g: 0.22, b: 0.48 },
+      emissiveStrength: 0.07
     });
     expect(neonA).toMatchObject({
       emissive: { r: 1.0, g: 0.18, b: 0.58 },
@@ -345,17 +351,44 @@ describe("built-in district palettes", () => {
     DISTRICT_SLOT.ROOF_C
   ];
 
+  const WALL_SLOTS = [DISTRICT_SLOT.WALL_A, DISTRICT_SLOT.WALL_B, DISTRICT_SLOT.WALL_C];
+  const ROOF_SLOTS = [DISTRICT_SLOT.ROOF_A, DISTRICT_SLOT.ROOF_B, DISTRICT_SLOT.ROOF_C];
+  const ALL_PALETTES = [...PALETTE_PRESETS, ...DISTRICT_PALETTE_IDS.map(builtinPalette)];
+
   const luma = (m: Material): number =>
     0.299 * m.base.r + 0.587 * m.base.g + 0.114 * m.base.b;
 
-  it("keeps wall and roof physical base luminance in readable midtone bands", () => {
-    for (const id of DISTRICT_PALETTE_IDS) {
-      const palette = builtinPalette(id);
-      for (const slot of GROUND_SLOTS) {
-        const m = palette.materials[slot]!;
-        const l = luma(m);
-        expect(l, `${id} slot ${slot} luma`).toBeGreaterThanOrEqual(0.09);
-        expect(l, `${id} slot ${slot} luma`).toBeLessThanOrEqual(0.20);
+  it("keeps wall albedo in the saturated midtone band and roof albedo darker below it", () => {
+    for (const palette of ALL_PALETTES) {
+      for (const slot of WALL_SLOTS) {
+        const l = luma(palette.materials[slot]!);
+        expect(l, `${palette.name} wall slot ${slot} luma`).toBeGreaterThanOrEqual(0.16);
+        expect(l, `${palette.name} wall slot ${slot} luma`).toBeLessThanOrEqual(0.30);
+      }
+      for (const slot of ROOF_SLOTS) {
+        const l = luma(palette.materials[slot]!);
+        expect(l, `${palette.name} roof slot ${slot} luma`).toBeGreaterThanOrEqual(0.12);
+        expect(l, `${palette.name} roof slot ${slot} luma`).toBeLessThanOrEqual(0.24);
+      }
+    }
+  });
+
+  it("keeps every roof darker than its palette's walls", () => {
+    for (const palette of ALL_PALETTES) {
+      const walls = WALL_SLOTS.map((slot) => luma(palette.materials[slot]!));
+      const roofs = ROOF_SLOTS.map((slot) => luma(palette.materials[slot]!));
+      expect(Math.max(...roofs), `${palette.name} roof vs wall luma`).toBeLessThan(
+        Math.min(...walls)
+      );
+    }
+  });
+
+  it("holds neon accents in the 1.2-1.7 strength band", () => {
+    for (const palette of ALL_PALETTES) {
+      for (const slot of [DISTRICT_SLOT.NEON_A, DISTRICT_SLOT.NEON_B]) {
+        const s = palette.materials[slot]!.emissiveStrength;
+        expect(s, `${palette.name} neon slot ${slot}`).toBeGreaterThanOrEqual(1.2);
+        expect(s, `${palette.name} neon slot ${slot}`).toBeLessThanOrEqual(1.7);
       }
     }
   });
@@ -441,7 +474,7 @@ describe("built-in district palettes", () => {
         const m = builtinPalette(id).materials[slot]!;
         const peak =
           Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength * EMISSIVE_MAX;
-        expect(peak).toBeLessThan(0.55);
+        expect(peak).toBeLessThan(0.36);
       }
     }
   });

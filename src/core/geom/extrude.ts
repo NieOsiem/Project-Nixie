@@ -46,8 +46,8 @@ export interface BuildingMassing {
 /** Direction the key light arrives from, in world space (y grows downward). */
 export const LIGHT_DIRECTION: Vec2 = { x: -0.5547, y: -0.8321 };
 export const SHADOW_LENGTH = 0.65;
-export const SHADE_MIN = 0.32;
-export const SHADE_MAX = 0.72;
+export const SHADE_MIN = 0.42;
+export const SHADE_MAX = 0.86;
 export const ROOF_SHADE = 1;
 
 export const DETAILED_MASSING_MIN_HEIGHT_M = 34;
