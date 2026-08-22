@@ -1,9 +1,9 @@
-import { difference, intersection, isSnapNoise, ringAsMulti, union } from "../geom/boolean.js";
+import { difference, intersectMultiWithRing, intersection, isSnapNoise, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
-import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, districtStructuralInputSignature, type DevelopmentCellPlan, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
+import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, DEVELOPMENT_SPACE_CATEGORIES, districtStructuralInputSignature, type DevelopmentCellPlan, type DevelopmentSpaceRole, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type HeightBand } from "./district-registry.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
@@ -17,6 +17,7 @@ const KEY_SCALE = 1_000;
 // parcels down to 16 m² and everything smaller stays explicitly unbuilt.
 export const MIN_PARCEL_AREA_M2 = 16;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
+const MAX_RESIDUAL_REFINEMENT_DEPTH = 1;
 
 /**
  * Thin-building floor: ordinary (non-micro) building masses must present an oriented
@@ -160,6 +161,26 @@ function longestEdgeAngle(ring: Ring): number {
 
 function multiArea(multi: MultiPolygon): number {
   return multi.reduce((sum, polygon) => sum + polygon.reduce((polygonSum, ring, index) => polygonSum + Math.abs(ringArea(ring)) * (index === 0 ? 1 : -1), 0), 0);
+}
+
+
+/**
+ * Distinct canonical pieces of one planning polygon. The earcut fallback for
+ * degenerate (self-touching, repeated-vertex) slivers can hand the same triangle
+ * back twice; minting both would stamp one planned space with two identical
+ * open-space or parcel ids, so composition dedupes by full ring signature before
+ * anything is emitted or subtracted.
+ */
+function distinctHoleFreePieces(polygon: MultiPolygon[number]): Ring[] {
+  const seen = new Set<string>();
+  const pieces: Ring[] = [];
+  for (const piece of canonicalHoleFreePieces(polygon)) {
+    const signature = ringKey(piece);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    pieces.push(piece);
+  }
+  return pieces;
 }
 
 function largestPiece(multi: MultiPolygon): Ring | null {
@@ -553,6 +574,7 @@ export interface OpenSpacePlan {
   fragmentId: string;
   districtId: string | null;
   landmarkId: string | null;
+  semanticRole?: DevelopmentSpaceRole;
   category: OpenSpaceCategory;
   size: OpenSpaceSize;
   polygon: Ring;
@@ -698,7 +720,7 @@ function largestHoleFreePiece(multi: MultiPolygon): Ring | null {
   let best: Ring | null = null;
   let bestArea = 0;
   for (const polygon of multi) {
-    for (const piece of canonicalHoleFreePieces(polygon)) {
+    for (const piece of distinctHoleFreePieces(polygon)) {
       const area = Math.abs(ringArea(piece));
       if (area > bestArea) {
         best = piece;
@@ -1030,6 +1052,7 @@ function carveLandmarkOpenSpaces(
   return { openSpaces, regions, failedLandmarkIds, failures };
 }
 
+
 function planFragments(
   districtPlan: DistrictPlan,
   landmarkSites: Map<string, Ring>,
@@ -1048,35 +1071,101 @@ function planFragments(
     for (const fragment of block.districtFragments) {
       let available = fragment.buildable;
       for (const site of landmarkSites.values()) {
-        if (intersection(available, ringAsMulti(site)).length > 0) available = difference(available, [ringAsMulti(site)]);
+        if (intersectMultiWithRing(available, site).length > 0) available = subtractPieceFromMulti(available, site);
       }
+      const district = fragment.districtId ? districtById.get(fragment.districtId) : undefined;
+      const bank = district ? (banks.get(district.paletteId) ?? BASE_BANK) : BASE_BANK;
+      // WHY: the id material is the full planned-space identity (fragment, semantic
+      // role, source lineage, canonical ring). The same material can only mean the same
+      // space surfacing again (duplicate polygon members or a repeated earcut triangle),
+      // so a repeat is skipped instead of minting a second id for one planned space.
+      const emittedDerived = new Set<string>();
+      const emitDerivedOpenSpace = (piece: Ring, semanticRole: DevelopmentSpaceRole, lineage: string, category = DEVELOPMENT_SPACE_CATEGORIES[semanticRole]): void => {
+        const areaM2 = Math.abs(ringArea(piece));
+        const material = `${fragment.id}|${semanticRole}|${lineage}|${ringKey(piece)}`;
+        if (emittedDerived.has(material)) return;
+        emittedDerived.add(material);
+        const size: OpenSpaceSize = areaM2 < 150 ? "pocket" : areaM2 < 1_200 ? "small" : "large";
+        openSpaces.push({
+          id: stableId("open", material),
+          parcelId: null,
+          blockId: block.id,
+          fragmentId: fragment.id,
+          districtId: fragment.districtId,
+          landmarkId: null,
+          semanticRole,
+          category,
+          size,
+          polygon: piece,
+          surfaceStyle: OPEN_SPACE_SURFACE_STYLES[category],
+          detailStyle: OPEN_SPACE_DETAIL_STYLES[category],
+          lineage,
+          seed: `${lineage}/open`,
+          areaM2,
+          material: materialIndex(bank, OPEN_SPACE_SLOTS[category])
+        });
+      };
       const intent = intentByFragment.get(fragment.id);
-      let openPiece: Ring | null = null;
-      if (intent && intent.targetShare > 0 && intent.category) {
-        openPiece = openSpacePolygonForIntent(available, intent.seed, intent.size ?? "small", intent.targetShare);
-        if (openPiece) {
-          available = difference(available, [ringAsMulti(openPiece)]);
-        } else if (intent.targetShare > 0.55) {
-          warnings.push(`Fragment "${fragment.id}" open-space intent could not carve final geometry.`);
-        }
+      const openPiece = intent && intent.targetShare > 0 && intent.category
+        ? openSpacePolygonForIntent(available, intent.seed, intent.size ?? "small", intent.targetShare)
+        : null;
+      if (openPiece && intent?.category) {
+        available = subtractPieceFromMulti(available, openPiece);
+        openSpaces.push({
+          id: stableId("open", `${fragment.id}|${intent.category}|${intent.seed}|${ringKey(openPiece)}`),
+          parcelId: null,
+          blockId: block.id,
+          fragmentId: fragment.id,
+          districtId: fragment.districtId,
+          landmarkId: null,
+          category: intent.category,
+          size: intent.size ?? "small",
+          polygon: openPiece,
+          surfaceStyle: OPEN_SPACE_SURFACE_STYLES[intent.category],
+          detailStyle: OPEN_SPACE_DETAIL_STYLES[intent.category],
+          lineage: intent.seed,
+          seed: `${intent.seed}/open`,
+          areaM2: Math.abs(ringArea(openPiece)),
+          material: materialIndex(bank, OPEN_SPACE_SLOTS[intent.category])
+        });
+      } else if (intent && intent.targetShare > 0.55) {
+        warnings.push(`Fragment "${fragment.id}" open-space intent could not carve final geometry.`);
       }
+
       const cells = (cellsByFragment.get(fragment.id) ?? []).sort((a, b) => a.id.localeCompare(b.id));
+      for (const cell of cells) {
+        if (cell.classification === "building") continue;
+        const clipped = intersectMultiWithRing(available, cell.polygon);
+        const semanticRole = cell.semanticRole ?? cell.classification;
+        const category = cell.openSpaceCategory ?? DEVELOPMENT_SPACE_CATEGORIES[semanticRole];
+        let carved = false;
+        for (const polygon of clipped) {
+          for (const piece of distinctHoleFreePieces(polygon)) {
+            if (Math.abs(ringArea(piece)) <= GEOMETRY_EPSILON) continue;
+            emitDerivedOpenSpace(piece, semanticRole, cell.id, category);
+            carved = true;
+          }
+        }
+        if (carved) available = subtractPieceFromMulti(available, cell.polygon);
+      }
+
       const indexByCell = new Map(cells.map((cell, index) => [cell.id, index]));
-      const placed: { bounds: Rect; multi: MultiPolygon }[] = [];
       const localParcels: ParcelPlan[] = [];
       let parcelIndex = 0;
       for (const cell of cells) {
-        // Sequential carving: each parcel subtracts only the already-placed parcels whose
-        // bounds overlap this cell (bbox prefilter), so sub-snap cell protrusions can
-        // never make final parcels overlap while the boolean work stays linear.
-        const cellBounds = ringBounds(cell.polygon);
-        const relevant = placed.filter((entry) => rectsIntersect(cellBounds, entry.bounds));
-        const cuts = relevant.length > 0 ? [union(relevant.map((entry) => entry.multi))] : [];
-        const clipped = difference(intersection(cell.polygon.length > 0 ? ringAsMulti(cell.polygon) : [], available), cuts);
+        if (cell.classification !== "building") continue;
+        const clipped = intersectMultiWithRing(available, cell.polygon);
+        let claimed = false;
         for (const polygon of clipped) {
-          for (const piece of canonicalHoleFreePieces(polygon)) {
+          for (const piece of distinctHoleFreePieces(polygon)) {
             const area = Math.abs(ringArea(piece));
-            if (area < MIN_PARCEL_AREA_M2) continue;
+            if (area < MIN_PARCEL_AREA_M2 || frameMinorDimension(piece, cell.rotationRad) < MIN_MASS_MINOR_DIMENSION_M) {
+              if (area > GEOMETRY_EPSILON) {
+                emitDerivedOpenSpace(piece, "landscape", `${cell.id}/boundary-sliver`);
+                claimed = true;
+              }
+              continue;
+            }
             const index = indexByCell.get(cell.id) ?? parcelIndex;
             localParcels.push({
               id: stableId("parcel", `${fragment.id}|${index}|${cell.localRole}|${ringKey(piece)}`),
@@ -1091,56 +1180,42 @@ function planFragments(
               seed: `${fragment.id}/parcel/${index}`,
               areaM2: area
             });
-            placed.push({ bounds: ringBounds(piece), multi: ringAsMulti(piece) });
+            claimed = true;
           }
         }
+        if (claimed) available = subtractPieceFromMulti(available, cell.polygon);
         parcelIndex++;
       }
-      const occupied = union(placed.map((entry) => entry.multi));
-      const remainder = difference(available, occupied.length > 0 ? [occupied] : []);
-      for (const polygon of remainder) {
-        for (const piece of canonicalHoleFreePieces(polygon)) {
-          const area = Math.abs(ringArea(piece));
-          if (area < MIN_PARCEL_AREA_M2) continue;
-          localParcels.push({
-            id: stableId("parcel", `${fragment.id}|remainder-${parcelIndex}|${ringKey(piece)}`),
-            blockId: block.id,
-            fragmentId: fragment.id,
-            districtId: fragment.districtId,
-            index: 1000 + parcelIndex,
-            polygon: piece,
-            frontageRoadId: null,
-            frontageAngleRad: longestEdgeAngle(piece),
-            role: `planning-band-remainder-${parcelIndex}`,
-            seed: `${fragment.id}/parcel/remainder-${parcelIndex}`,
-            areaM2: area
-          });
-          parcelIndex++;
+      let residualIndex = 0;
+      for (const polygon of available) {
+        for (const piece of distinctHoleFreePieces(polygon)) {
+          const areaM2 = Math.abs(ringArea(piece));
+          if (areaM2 <= GEOMETRY_EPSILON) continue;
+          const index = cells.length + residualIndex;
+          const frontageAngleRad = longestEdgeAngle(piece);
+          if (areaM2 >= MIN_PARCEL_AREA_M2 && frameMinorDimension(piece, frontageAngleRad) >= MIN_MASS_MINOR_DIMENSION_M) {
+            const role = `infill-frontage-residual-${residualIndex}`;
+            localParcels.push({
+              id: stableId("parcel", `${fragment.id}|${index}|${role}|${ringKey(piece)}`),
+              blockId: block.id,
+              fragmentId: fragment.id,
+              districtId: fragment.districtId,
+              index,
+              polygon: piece,
+              frontageRoadId: block.boundaryRoadIds.length > 0 ? block.boundaryRoadIds[fnv1a(`${fragment.id}/residual/${residualIndex}`) % block.boundaryRoadIds.length]! : null,
+              frontageAngleRad,
+              role,
+              seed: `${fragment.id}/parcel/${index}`,
+              areaM2
+            });
+          } else {
+            emitDerivedOpenSpace(piece, "landscape", `${fragment.id}/boundary-sliver/${residualIndex}`);
+          }
+          residualIndex++;
         }
       }
       localParcels.sort((a, b) => a.index - b.index || a.id.localeCompare(b.id));
       parcels.push(...localParcels);
-      if (openPiece && intent) {
-        const district = fragment.districtId ? districtById.get(fragment.districtId) : undefined;
-        const bank = district ? (banks.get(district.paletteId) ?? BASE_BANK) : BASE_BANK;
-        openSpaces.push({
-          id: stableId("open", `${fragment.id}|${intent.category}|${intent.seed}|${pointKey(openPiece[0]!)}`),
-          parcelId: null,
-          blockId: block.id,
-          fragmentId: fragment.id,
-          districtId: fragment.districtId,
-          landmarkId: null,
-          category: intent.category!,
-          size: intent.size ?? "small",
-          polygon: openPiece,
-          surfaceStyle: OPEN_SPACE_SURFACE_STYLES[intent.category!],
-          detailStyle: OPEN_SPACE_DETAIL_STYLES[intent.category!],
-          lineage: intent.seed,
-          seed: `${intent.seed}/open`,
-          areaM2: Math.abs(ringArea(openPiece)),
-          material: materialIndex(bank, OPEN_SPACE_SLOTS[intent.category!])
-        });
-      }
     }
   }
   parcels.sort((a, b) => a.id.localeCompare(b.id));
@@ -1699,7 +1774,7 @@ function refineParcelVariant(
       }
       for (const polygon of clipped) {
         let pieceIndex = 0;
-        for (const piece of canonicalHoleFreePieces(polygon)) {
+        for (const piece of distinctHoleFreePieces(polygon)) {
           const pieceAreaM2 = Math.abs(ringArea(piece));
           if (pieceAreaM2 < MIN_PARCEL_AREA_M2) {
             if (pieceAreaM2 > GEOMETRY_EPSILON) unbuilt.push(piece);
@@ -1769,8 +1844,9 @@ function refineParcel(
 function residualParcelPlans(
   parcel: ParcelPlan,
   refined: RefinedParcelResult
-): { parcels: ParcelPlan[]; openSpaces: OpenSpacePlan[] } {
+): { parcels: ParcelPlan[]; retryParcels: ParcelPlan[]; openSpaces: OpenSpacePlan[] } {
   const parcels: ParcelPlan[] = [];
+  const retryParcels: ParcelPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
   let index = 0;
   for (const piece of refined.unbuilt) {
@@ -1790,6 +1866,11 @@ function residualParcelPlans(
       seed,
       areaM2
     };
+    if (areaM2 >= MIN_PARCEL_AREA_M2 && frameMinorDimension(piece, parcel.frontageAngleRad) >= MIN_MASS_MINOR_DIMENSION_M) {
+      retryParcels.push(residualParcel);
+      index++;
+      continue;
+    }
     parcels.push(residualParcel);
     openSpaces.push({
       id: stableId("open", `${residualParcel.id}|${ringKey(piece)}`),
@@ -1810,7 +1891,7 @@ function residualParcelPlans(
     });
     index++;
   }
-  return { parcels, openSpaces };
+  return { parcels, retryParcels, openSpaces };
 }
 
 /**
@@ -1852,7 +1933,9 @@ function planBuildings(
   let unbuiltCount = 0;
   const occBoxes = occupancyBoxes(occupancy);
   const heightBands = deriveBlockHeightBands(sourceParcels, districtById);
-  for (const parcel of sourceParcels) {
+  const pending = sourceParcels.map((parcel) => ({ parcel, residualDepth: 0 }));
+  for (let pendingIndex = 0; pendingIndex < pending.length; pendingIndex++) {
+    const { parcel, residualDepth } = pending[pendingIndex]!;
     // Thin-parcel floor: a parcel whose own-frame oriented minor dimension is below
     // the emission floor is a clipped boundary/stagger sliver. Route it straight to
     // the explicit unbuilt path — no grammar, micro included, may raise a sub-floor
@@ -1881,6 +1964,13 @@ function planBuildings(
       parcels.push(...refined.parcels, ...residual.parcels);
       buildings.push(...refined.buildings);
       openSpaces.push(...residual.openSpaces);
+      if (residualDepth < MAX_RESIDUAL_REFINEMENT_DEPTH) {
+        pending.push(...residual.retryParcels.map((retryParcel) => ({ parcel: retryParcel, residualDepth: residualDepth + 1 })));
+      } else {
+        parcels.push(...residual.retryParcels);
+        openSpaces.push(...residual.retryParcels.map(unbuiltOpenSpacePlan));
+        unbuiltCount += residual.retryParcels.length;
+      }
       refinedCount++;
       unbuiltCount += residual.parcels.length;
       continue;

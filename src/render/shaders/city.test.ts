@@ -22,7 +22,6 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("float feature = step(0.92, family);");
     expect(CITY_FRAG).toContain("float cellX = floor(vU / BAY_M);");
     expect(CITY_FRAG).toContain("float lit = step(litThreshold,");
-    // Mechanical floors: every 5-8 floors a louvered band with windows gated off.
     expect(CITY_FRAG).toContain("float mechFloor = step(0.85, fract((floorId + 0.5) / mechEvery));");
     expect(CITY_FRAG).toContain("float mechWindows = 1.0 - mechFloor;");
   });
@@ -45,33 +44,32 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("uniform float uDetailQuality;");
     expect(CITY_FRAG.match(/if \(uDetailQuality < 0\.5\)/g)).toHaveLength(2);
     expect(CITY_FRAG).toContain("const float ARCHITECTURE_MIN_M = 5.0;");
-    // Low-rise (<5 m) gets a real shed style instead of a blank wall.
     expect(CITY_FRAG).toContain("float corr = slab(fract(h / CORRUG_M)");
     expect(CITY_FRAG).toContain("Moving frames");
   });
 
-  it("uses the saturated body and restrained ambient look dials", () => {
-    expect(CITY_FRAG).toContain("float canyon = mix(0.70, 1.0,");
-    // Bodies are exposed, emissives are not: gaining them would move what clears the threshold.
+  it("uses the saturated body exposure and a district-hued ambient spill, not a lavender lift", () => {
+    expect(CITY_FRAG).toContain("float canyon = mix(0.76, 1.0,");
     expect(CITY_VERT).toContain("vBase = base.rgb * 1.7;");
     expect(CITY_VERT).toContain("vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);");
-    expect(CITY_FRAG).toContain("colour + vec3(0.020, 0.014, 0.035)");
+    expect(CITY_VERT).toContain("varying vec3 vAmbient;");
+    expect(CITY_VERT).toContain(
+      "vAmbient = min(emissive.rgb * (emissive.a * uEmissiveMax) * 0.55, vec3(0.070));"
+    );
+    expect(CITY_FRAG).toContain("varying vec3 vAmbient;");
+    expect(CITY_FRAG).toContain("colour += vAmbient;");
+    expect(CITY_FRAG).not.toContain("vec3(0.020, 0.014, 0.035)");
   });
 
   it("gates parapet emission to a minority and caps the rest by value", () => {
     expect(CITY_FRAG).toContain("float parapetGlow = step(0.62, hash11(seed + 3.41));");
     expect(CITY_FRAG).toContain("coping + parapetShadow");
-    // Both quality branches use the same gated glow, or a building would change style
-    // when the camera settles. One assignment, two uses.
     expect(CITY_FRAG.match(/float parapetGlow = /g)).toHaveLength(1);
     expect(CITY_FRAG.match(/0\.8 \* coping \* parapetGlow/g)).toHaveLength(3);
     expect(CITY_FRAG.match(/0\.55 \* coping/g)).toHaveLength(2);
   });
 
   it("hashes a snapped seed, never the raw varying", () => {
-    // WHY: wall quads carry a varying w, so vSeed interpolates ~1 ULP off the constant the
-    // four vertices agree on. hash11 multiplies by 78233 before the sin, which turned that
-    // into a different facade style per band on NVIDIA while AMD happened to be exact.
     expect(CITY_FRAG).toContain(
       `return floor(raw * ${SEED_STEPS}.0 + 0.5) / ${SEED_STEPS}.0;`
     );
@@ -94,9 +92,7 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain(
       "+ (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);"
     );
-    expect(CITY_FRAG).toContain("colour + vec3(0.020, 0.014, 0.035), sceneAlpha);");
-    // The floor is what separates "ground at height 0" from "nothing drawn", so it cannot
-    // be an integer literal the interpolation would emit without a decimal point.
+    expect(CITY_FRAG).toContain("gl_FragColor = vec4(colour, sceneAlpha);");
     expect(CITY_FRAG).toMatch(/const float SCENE_ALPHA_FLOOR = 0\.\d+;/);
   });
 
@@ -104,7 +100,6 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toContain("if (vKind < 0.5) colour = flatGround();");
     expect(CITY_FRAG).toContain("const float GROUND_COARSE_M = 34.0;");
     expect(CITY_FRAG).toContain("const float GROUND_FINE_M = 8.5;");
-    // Fine octave at half the coarse amplitude, +/-8% peak into vBase.
     expect(CITY_FRAG).toContain("const float GROUND_COARSE_AMP = 0.107;");
     expect(CITY_FRAG).toContain("const float GROUND_FINE_AMP = 0.053;");
     expect(CITY_FRAG).toContain("vec2 w = f * f * (3.0 - 2.0 * f);");
@@ -117,8 +112,6 @@ describe("city fragment shader", () => {
     expect(flat).toContain("valueNoise(vWorldM / GROUND_FINE_M)");
     expect(flat).toContain("lod(GROUND_COARSE_M, uScreenPxPerMetre)");
     expect(flat).toContain("lod(GROUND_FINE_M, uScreenPxPerMetre)");
-    // Broad surfaces must keep max(emissive) * strength * EMISSIVE_MAX < 0.55, so the noise
-    // multiplies vBase and vEmissive is passed through untouched.
     expect(flat).toContain("return vBase * vShade * mottle + vEmissive;");
     expect(flat.match(/vEmissive/g)).toHaveLength(1);
     expect(flat).not.toMatch(/vEmissive\s*\*|\*\s*vEmissive/);

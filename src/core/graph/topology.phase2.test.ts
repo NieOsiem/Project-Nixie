@@ -9,6 +9,7 @@ import {
   validateRouteTopology,
   weldNodes
 } from "./topology.js";
+import { ROUTE_CLASS_REGISTRY } from "../gen/city.js";
 import type { RoadSource } from "../gen/city.js";
 
 const empty = (): RoadSource => ({ nodes: [], routes: [], edges: [] });
@@ -168,9 +169,13 @@ describe("Phase 2 explicit road topology", () => {
     const stubs = deleted.edges.map((edge) => edge.a === "north" || edge.a === "east" || edge.a === "south" || edge.a === "west" ? edge.b : edge.a);
     expect(new Set(stubs).size).toBe(4);
     expect(stubs.every((id) => id !== "junction")).toBe(true);
+    // Every incident edge is a street, so each stub must clear the street corridor radius plus the
+    // source's 0.25 m safety gap from the removed junction.
+    const street = ROUTE_CLASS_REGISTRY.get("street")!;
+    const stubClearance = street.widthM / 2 + street.sidewalkM + 0.25;
     for (const id of stubs) {
       const point = deleted.nodes.find((node) => node.id === id)!;
-      expect(Math.hypot(point.x, point.y)).toBeGreaterThanOrEqual(7.25 - 1e-9);
+      expect(Math.hypot(point.x, point.y)).toBeGreaterThanOrEqual(stubClearance - 1e-9);
     }
     expect(validateRouteTopology(deleted)).toMatchObject({ ok: true });
   });

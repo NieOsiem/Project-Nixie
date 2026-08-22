@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { rectRing, ringBounds } from "../geom/types.js";
-import type { CitySourceV3, DistrictSource, RoadEdgeSource } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictSource, type RoadEdgeSource } from "./city.js";
 import {
   DistrictEditError,
   districtDeleteCandidate,
@@ -111,14 +111,18 @@ describe("district edit candidates", () => {
   });
 
   it("absorbs reclaimed land into one unlocked neighbor without changing a merely adjacent lock", () => {
+    const street = ROUTE_CLASS_REGISTRY.get("street")!;
+    // Districts grow up to the road clearance corridor, so the reclaimed corridor exactly fills the
+    // gap between them and touches the unlocked west district (and the locked east district).
+    const corridorHalf = street.widthM / 2 + street.sidewalkM;
     const before = {
       ...baseSource(),
       roads: verticalRoad("street"),
-      districts: [district("west", 0, 93), district("east", 107, 93, true)]
+      districts: [district("west", 0, 100 - corridorHalf), district("east", 100 + corridorHalf, 100 - corridorHalf, true)]
     };
     const after = { ...before, roads: { nodes: [], routes: [], edges: [] } };
     const result = reconcileDistrictsForRoadEdit(before, after);
-    expect(ringBounds(result.find((value) => value.id === "west")!.polygon).width).toBeGreaterThan(93);
+    expect(ringBounds(result.find((value) => value.id === "west")!.polygon).width).toBeGreaterThan(100 - corridorHalf);
     expect(result.find((value) => value.id === "east")!.polygon).toEqual(before.districts[1]!.polygon);
   });
 

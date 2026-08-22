@@ -50,7 +50,7 @@ describe("district planning registry", () => {
     const fragment: DistrictBlockFragment = { id: "aspect-fragment", blockId: "aspect-block", districtId: "aspect-district", buildable: ringAsMulti(ring) };
     const cells = planDistrictFragmentWithGrammar(fragment, "fine-grain-frontage", { minCellWidthM: 10, maxCellWidthM: 10, minCellDepthM: 10, maxCellDepthM: 10, minAspect: 2, maxAspect: 2 }, "aspect", []);
     const centre = { x: 70, y: 55 };
-    const ratios = cells.filter((cell) => cell.localRole.startsWith("fine-grain-frontage")).map((cell) => {
+    const ratios = cells.filter((cell) => cell.classification === "building").map((cell) => {
       const cosine = Math.cos(-cell.rotationRad);
       const sine = Math.sin(-cell.rotationRad);
       const local = cell.polygon.map((point) => {

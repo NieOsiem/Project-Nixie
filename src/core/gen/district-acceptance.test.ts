@@ -3,8 +3,8 @@ import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, type Ring } from "../geom/types.js";
 import { validateCitySourceV3, type CitySourceV3 } from "./city.js";
 import { generateInitialDistricts } from "./district-generator.js";
-import { buildDistrictPlan, districtBreadthGallery, planDistrictFragmentWithGrammar, type DistrictBlockFragment } from "./district-plan.js";
-import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_REGISTRY } from "./district-registry.js";
+import { buildDistrictPlan, districtBreadthGallery, planDistrictFragmentWithGrammar, type DevelopmentCellPlan, type DistrictBlockFragment } from "./district-plan.js";
+import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_REGISTRY, type BlockGrammarId, type DistrictTypeDefinition } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 import { validateRing } from "./terrain.js";
 
@@ -62,7 +62,7 @@ function withAcceptanceOverride(districts: CitySourceV3["districts"]): CitySourc
   } : district);
 }
 
-function planningSignature(cells: ReturnType<typeof planDistrictFragmentWithGrammar>): string {
+function planningSignature(cells: DevelopmentCellPlan[]): string {
   const rotations = [...new Set(cells.map((cell) => cell.rotationRad.toFixed(4)))].sort();
   const roles = [...new Set(cells.map((cell) => cell.localRole.replace(/-?\d+$/u, "")))].sort();
   const totalArea = cells.reduce((sum, cell) => sum + area(cell.polygon), 0);
@@ -133,6 +133,11 @@ describe("Phase 3 district acceptance fixtures", () => {
 
     const ring = rectRing({ x: 0, y: 0, width: 140, height: 110 });
     const fragment: DistrictBlockFragment = { id: "gallery-fragment", blockId: "gallery-block", districtId: "gallery-district", buildable: ringAsMulti(ring) };
+    const dominantGrammar = (definition: DistrictTypeDefinition): BlockGrammarId =>
+      [...BLOCK_GRAMMAR_IDS].sort((a, b) => definition.grammarWeights[b] - definition.grammarWeights[a] || a.localeCompare(b))[0]!;
+
+    // Every block grammar materializes a distinct planning form, so a district family's
+    // dominant form is observable without palette colour.
     const grammarSignatures = new Set<string>();
     for (const grammarId of BLOCK_GRAMMAR_IDS) {
       const definition = DISTRICT_TYPES.find((entry) => entry.id === "mixed-use-centre")!;
@@ -144,15 +149,43 @@ describe("Phase 3 district acceptance fixtures", () => {
     }
     expect(grammarSignatures.size).toBe(BLOCK_GRAMMAR_IDS.length);
 
-    const typeSignatures = new Set<string>();
+    // Types sharing a dominant grammar form a family. Shared forms (formal towers,
+    // residential courtyards, industrial sheds, fine-grain streetfronts) are deliberate
+    // correlated metropolitan materials, so family members may materialize the same
+    // dominant-form fixture; each member must still differ from its family peers in a
+    // durable non-colour planning dimension: height band, cell scale, grammar mix, or
+    // building/use DNA.
+    const families = new Map<BlockGrammarId, DistrictTypeDefinition[]>();
     for (const typeId of DISTRICT_TYPE_IDS) {
       const definition = DISTRICT_TYPE_REGISTRY.get(typeId)!;
-      const grammarId = [...BLOCK_GRAMMAR_IDS].sort((a, b) => definition.grammarWeights[b] - definition.grammarWeights[a] || a.localeCompare(b))[0]!;
-      const cells = planDistrictFragmentWithGrammar(fragment, grammarId, definition.bounds, `gallery/type/${typeId}`);
-      expect(cells.length).toBeGreaterThan(0);
-      typeSignatures.add(JSON.stringify({ grammarId, plan: planningSignature(cells) }));
+      const dominant = dominantGrammar(definition);
+      const cells = planDistrictFragmentWithGrammar(fragment, dominant, definition.bounds, `gallery/type/${typeId}`);
+      expect(cells.length, typeId).toBeGreaterThan(0);
+      expect(cells.every((cell) => validateRing(cell.polygon).ok), typeId).toBe(true);
+      expect(cells.every((cell) => cell.grammarId === dominant), typeId).toBe(true);
+      families.set(dominant, [...(families.get(dominant) ?? []), definition]);
     }
-    expect(typeSignatures.size).toBe(DISTRICT_TYPE_IDS.length);
+
+    const grammarMix = (definition: DistrictTypeDefinition): string =>
+      BLOCK_GRAMMAR_IDS
+        .filter((id) => definition.grammarWeights[id] > 0)
+        .sort((a, b) => definition.grammarWeights[b] - definition.grammarWeights[a] || a.localeCompare(b))
+        .join(">");
+
+    for (const [dominant, members] of families) {
+      for (let first = 0; first < members.length; first++) {
+        for (let second = first + 1; second < members.length; second++) {
+          const a = members[first]!;
+          const b = members[second]!;
+          const distinct = JSON.stringify(a.heightBand) !== JSON.stringify(b.heightBand) ||
+            JSON.stringify(a.bounds) !== JSON.stringify(b.bounds) ||
+            grammarMix(a) !== grammarMix(b) ||
+            JSON.stringify(a.buildingGrammarWeights) !== JSON.stringify(b.buildingGrammarWeights) ||
+            JSON.stringify(a.visualUseWeights) !== JSON.stringify(b.visualUseWeights);
+          expect(distinct, `${dominant}: ${a.id} and ${b.id} are planning twins`).toBe(true);
+        }
+      }
+    }
   }, 45_000);
 
   it("serializes only authoritative source fields and round-trips validation", () => {

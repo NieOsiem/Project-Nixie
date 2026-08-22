@@ -30,9 +30,6 @@ describe("weather presets", () => {
   });
 
   it("varies only the rain character, leaving the shared look alone", () => {
-    // The point of a preset being four numbers: fog, AO, streak, tint, haze and splash *size* are
-    // identical across all three, so tuning a shared value is not a three-way edit. If a preset
-    // starts carrying post-chain dials, applyWeather's markContentDirty becomes load-bearing.
     const allowed = new Set([
       "wetStrength",
       "rainDrops",
@@ -49,15 +46,11 @@ describe("weather presets", () => {
   });
 
   it("clear is explicitly dry while drawing nothing at all", () => {
-    // strength 0 multiplies rainStrength, and the renderer hides the quad at or below 0 — so a dry
-    // night costs no fill. The composite still needs an explicit wetness zero to stay dry.
     expect(WEATHER_PRESETS[WEATHER.CLEAR].strength).toBe(0);
     expect(WEATHER_PRESETS[WEATHER.CLEAR].dials).toEqual({ wetStrength: 0 });
   });
 
   it("orders drizzle, rain and storm monotonically on every dial they vary", () => {
-    // Not decoration: these are the three the user tuned by eye, and a preset that went backwards
-    // on one dial would read as the wrong weather while looking deliberate.
     const ladder: Weather[] = [WEATHER.DRIZZLE, WEATHER.RAIN, WEATHER.STORM];
     for (const key of [
       "wetStrength",
@@ -74,8 +67,6 @@ describe("weather presets", () => {
   });
 
   it("gives every wet preset a full set of the dials it is responsible for", () => {
-    // A preset that omits one silently inherits whatever the previous preset left behind, which
-    // makes the selector order-dependent.
     const owned = new Set(Object.keys(WEATHER_PRESETS[WEATHER.RAIN].dials));
     for (const name of wet) {
       expect(new Set(Object.keys(WEATHER_PRESETS[name].dials)), name).toEqual(owned);

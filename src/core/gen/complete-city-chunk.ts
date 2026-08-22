@@ -44,8 +44,13 @@ import type {
   LandmarkPlan,
   OpenSpacePlan
 } from "./complete-city-plan.js";
-import { BUILDING_GRAMMAR_REGISTRY } from "./building-registry.js";
+import {
+  BUILDING_GRAMMAR_REGISTRY,
+  MICRO_BUILDING_GRAMMAR_IDS,
+  type BuildingUseId
+} from "./building-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
+import { type DistrictTypeId } from "./district-registry.js";
 import { validateCompleteCityPlan } from "./complete-city-plan.js";
 
 /**
@@ -71,6 +76,10 @@ import { validateCompleteCityPlan } from "./complete-city-plan.js";
  *   emitted uncut in its owner chunk — it may overhang the chunk rect, and `boundsPx`
  *   grows to cover the overhang, its shadows, its detail tier and its neon glow so
  *   culling never drops it.
+ * - Elevated connectors (skybridges, circulation bridges, service conduits) are planned
+ *   once per plan, capped per block, and owned by the midpoint between their two
+ *   endpoint buildings, half-open like everything else, so each connector is emitted by
+ *   exactly one chunk and never duplicated.
  *
  * The three mesh outputs match the renderer's `ChunkGeometry` split: everything opaque
  * in `mesh`, higher-quality architecture in `detail`, and additive neon quads in `neon`.
@@ -99,8 +108,14 @@ export interface CompleteChunkBuild {
   buildingIds: string[];
   /** Ids of the landmarks this chunk owns, uncut. Disjoint across chunks. */
   landmarkIds: string[];
+  /**
+   * Elevated connectors this chunk owns by midpoint, uncut. Disjoint across chunks:
+   * every plan connector is emitted by exactly the chunk containing its midpoint.
+   */
+  connectors: BlockConnector[];
   buildingCount: number;
   landmarkCount: number;
+  connectorCount: number;
   openSpaceCount: number;
   waterTriangleCount: number;
   exposedLandTriangleCount: number;
@@ -115,6 +130,7 @@ export interface CompleteChunksBuild {
   chunks: CompleteChunkBuild[];
   buildingCount: number;
   landmarkCount: number;
+  connectorCount: number;
   openSpaceCount: number;
   markingTriangleCount: number;
   /** Geometry totals across mesh + detail + neon (the whole transferred payload). */
@@ -439,6 +455,313 @@ function massOverhangPx(spec: BuildingSpec, pixelsPerMetre: number, withClutter:
   return [footprint, shadowRectPx(footprint, shadowHeight, pixelsPerMetre)];
 }
 
+/**
+ * Phase 4 block-scale infrastructure: bounded elevated connectors between compatible
+ * nearby buildings inside one block. Deliberately sparse and typology-aware — never a
+ * universal decoration. No signs, cars, street props or elevated citywide rail: every
+ * connector is one `DetailPrism` deck rendered in the detail tier, so shadows and
+ * culling bounds ride along with the existing detail pass.
+ */
+export type ConnectorKind = "skybridge" | "circulation" | "conduit";
+
+/** One deterministic elevated connector between two buildings of the same block. */
+export interface BlockConnector {
+  id: string;
+  blockId: string;
+  kind: ConnectorKind;
+  /** Endpoint building ids, in stable plan order. */
+  aId: string;
+  bId: string;
+  /** Deck slab endpoints in plan metre space (world frame, same as mass footprints). */
+  start: Vec2;
+  end: Vec2;
+  /** Deck slab vertical band in world metres. */
+  deckBaseM: number;
+  deckTopM: number;
+  /** Deck slab width across the span, metres. */
+  widthM: number;
+  /** Horizontal deck length, metres. */
+  spanM: number;
+  material: number;
+  seed: number;
+  /**
+   * Deterministic owner point. The chunk containing it (half-open, matching
+   * `ownsCentroid`) emits the connector uncut, exactly like building ownership, so no
+   * connector is ever duplicated across chunks.
+   */
+  midpoint: Vec2;
+}
+
+interface ConnectorConfig {
+  kind: ConnectorKind;
+  /** Deck slab width across the span, metres. */
+  deckWidthM: number;
+  /** Deck slab thickness, metres. */
+  deckHeightM: number;
+  /** Minimum shared vertical range between the two buildings, metres. */
+  minOverlapM: number;
+  /** Maximum horizontal span (centroid distance and deck length), metres. */
+  maxSpanM: number;
+  /** Deck bottom must clear the ground by at least this much, metres. */
+  minClearanceM: number;
+  /** Sparse per-block cap per kind. */
+  budgetPerBlock: number;
+  /** Both endpoint buildings must use one of these uses. */
+  uses: Readonly<Partial<Record<BuildingUseId, true>>>;
+}
+
+/**
+ * District families: corporate/commercial/civic may carry restrained enclosed
+ * skybridges, residential megablocks/dense blocks utilitarian shared circulation
+ * bridges, and industrial/logistics/utility sparse service conduits. Everything else
+ * (night-market, old-city, waterfront, derelict, mixed-use, low-rise, unzoned) gets no
+ * connectors.
+ */
+const SKYBRIDGE_DISTRICT_IDS: Readonly<Partial<Record<DistrictTypeId, true>>> = Object.freeze({
+  "corporate-core": true,
+  "commercial-highrise": true,
+  "civic-institutional": true
+});
+const CIRCULATION_DISTRICT_IDS: Readonly<Partial<Record<DistrictTypeId, true>>> = Object.freeze({
+  "residential-megablocks": true,
+  "dense-residential": true
+});
+const CONDUIT_DISTRICT_IDS: Readonly<Partial<Record<DistrictTypeId, true>>> = Object.freeze({
+  "heavy-industrial": true,
+  "light-industrial": true,
+  "logistics-port": true,
+  "utility-infrastructure": true
+});
+
+const CONNECTOR_CONFIGS: Readonly<Record<ConnectorKind, ConnectorConfig>> = Object.freeze({
+  skybridge: Object.freeze({
+    kind: "skybridge",
+    deckWidthM: 5.5,
+    deckHeightM: 3.4,
+    minOverlapM: 14,
+    maxSpanM: 60,
+    minClearanceM: 6,
+    budgetPerBlock: 2,
+    uses: Object.freeze({ commercial: true, civic: true, "mixed-use": true })
+  }),
+  circulation: Object.freeze({
+    kind: "circulation",
+    deckWidthM: 4,
+    deckHeightM: 0.7,
+    minOverlapM: 10,
+    maxSpanM: 50,
+    minClearanceM: 4.5,
+    budgetPerBlock: 2,
+    uses: Object.freeze({ residential: true, "mixed-use": true })
+  }),
+  conduit: Object.freeze({
+    kind: "conduit",
+    deckWidthM: 2.4,
+    deckHeightM: 0.9,
+    minOverlapM: 7,
+    maxSpanM: 45,
+    minClearanceM: 2.5,
+    budgetPerBlock: 2,
+    uses: Object.freeze({ industrial: true, logistics: true, utility: true })
+  })
+});
+
+function connectorKindForDistrict(districtId: string | null): ConnectorKind | null {
+  if (districtId !== null && SKYBRIDGE_DISTRICT_IDS[districtId as DistrictTypeId] === true) return "skybridge";
+  if (districtId !== null && CIRCULATION_DISTRICT_IDS[districtId as DistrictTypeId] === true) return "circulation";
+  if (districtId !== null && CONDUIT_DISTRICT_IDS[districtId as DistrictTypeId] === true) return "conduit";
+  return null;
+}
+
+/** Union of every mass footprint of a building, in plan metre space. */
+function buildingBoundsM(building: BuildingPlan): Rect {
+  let bounds: Rect | null = null;
+  for (const mass of building.masses) {
+    const part = ringBounds(mass.footprint);
+    bounds = bounds === null ? part : unionRect(bounds, part);
+  }
+  return bounds ?? { x: 0, y: 0, width: 0, height: 0 };
+}
+
+/** Lowest base and highest top across a building's masses, in world metres. */
+function buildingVerticalM(building: BuildingPlan): { baseM: number; topM: number } {
+  let baseM = Number.POSITIVE_INFINITY;
+  let topM = Number.NEGATIVE_INFINITY;
+  for (const mass of building.masses) {
+    baseM = Math.min(baseM, mass.elevationM);
+    topM = Math.max(topM, mass.elevationM + mass.heightM);
+  }
+  return Number.isFinite(baseM) ? { baseM, topM } : { baseM: 0, topM: 0 };
+}
+
+/**
+ * Both endpoints must share one district family (they may still sit in different
+ * fragments of a mixed block), carry a compatible use, and be real buildings — micro
+ * filler grammars never anchor infrastructure.
+ */
+function pairConnectorKind(a: BuildingPlan, b: BuildingPlan): ConnectorKind | null {
+  if (MICRO_BUILDING_GRAMMAR_IDS.has(a.grammarId) || MICRO_BUILDING_GRAMMAR_IDS.has(b.grammarId)) {
+    return null;
+  }
+  const kind = connectorKindForDistrict(a.districtId);
+  if (kind === null || connectorKindForDistrict(b.districtId) !== kind) return null;
+  const uses = CONNECTOR_CONFIGS[kind].uses;
+  if (uses[a.visualUse] !== true || uses[b.visualUse] !== true) return null;
+  return kind;
+}
+
+/**
+ * Build one connector if the pair is plausible: a bounded horizontal span, a shared
+ * vertical band deep enough for the deck, and a deck elevation deterministically placed
+ * inside that band clear of the ground and of the lower roof.
+ */
+function makeConnector(
+  a: BuildingPlan,
+  b: BuildingPlan,
+  kind: ConnectorKind,
+  config: ConnectorConfig
+): BlockConnector | null {
+  const aRange = buildingVerticalM(a);
+  const bRange = buildingVerticalM(b);
+  const overlapM = Math.min(aRange.topM, bRange.topM) - Math.max(aRange.baseM, bRange.baseM);
+  if (overlapM < config.minOverlapM) return null;
+
+  const aBounds = buildingBoundsM(a);
+  const bBounds = buildingBoundsM(b);
+  const aCentre = { x: aBounds.x + aBounds.width / 2, y: aBounds.y + aBounds.height / 2 };
+  const bCentre = { x: bBounds.x + bBounds.width / 2, y: bBounds.y + bBounds.height / 2 };
+  const dx = bCentre.x - aCentre.x;
+  const dy = bCentre.y - aCentre.y;
+  const centreSpanM = Math.hypot(dx, dy);
+  if (centreSpanM < 1e-6 || centreSpanM > config.maxSpanM) return null;
+  const u = { x: dx / centreSpanM, y: dy / centreSpanM };
+
+  // Support of each building's AABB along the span (exact for axis-aligned footprints,
+  // conservative otherwise). The deck pokes 0.8 m past the facade line so the slab reads
+  // attached instead of floating; buildings are opaque so the poke is hidden.
+  const supportA = (aBounds.width / 2) * Math.abs(u.x) + (aBounds.height / 2) * Math.abs(u.y);
+  const supportB = (bBounds.width / 2) * Math.abs(u.x) + (bBounds.height / 2) * Math.abs(u.y);
+  const start = { x: aCentre.x + u.x * (supportA - 0.8), y: aCentre.y + u.y * (supportA - 0.8) };
+  const end = { x: bCentre.x - u.x * (supportB - 0.8), y: bCentre.y - u.y * (supportB - 0.8) };
+  const spanM = Math.hypot(end.x - start.x, end.y - start.y);
+  if (spanM < 2 || spanM > config.maxSpanM) return null;
+
+  const pairKey = `${a.id}|${b.id}`;
+  const salt = fnv1a(pairKey);
+  const ratio = 0.35 + hash2(salt, 11) * 0.4;
+  const maxBaseM = Math.max(aRange.baseM, bRange.baseM);
+  const minTopM = Math.min(aRange.topM, bRange.topM);
+  const deckBaseM = maxBaseM + ratio * (overlapM - config.deckHeightM);
+  const deckTopM = deckBaseM + config.deckHeightM;
+  if (deckBaseM - maxBaseM < config.minClearanceM) return null;
+  if (deckTopM > minTopM - 0.5) return null;
+
+  // Deterministic anchor building for the deck material; the material itself is the
+  // grammar-produced mass finish (roof for conduits, wall for enclosed decks).
+  const anchor = a.id < b.id ? a : b;
+  const primary = anchor.masses[0]!;
+  return {
+    id: `con_${fnv1a(pairKey).toString(16).padStart(8, "0")}`,
+    blockId: a.blockId,
+    kind,
+    aId: a.id,
+    bId: b.id,
+    start,
+    end,
+    deckBaseM,
+    deckTopM,
+    widthM: config.deckWidthM,
+    spanM,
+    material: kind === "conduit" ? primary.roofMaterial : primary.wallMaterial,
+    seed: hash2(salt, 5),
+    midpoint: { x: (aCentre.x + bCentre.x) / 2, y: (aCentre.y + bCentre.y) / 2 }
+  };
+}
+
+/**
+ * The plan-wide connector set: same-block eligible pairs, ranked by a pure hash of the
+ * pair id and cut at each kind's sparse per-block budget. Blocks are road-network faces,
+ * so a same-block pair can never have a vehicle road between its endpoints. Deterministic
+ * in every chunk, which is what lets one owner emit each connector.
+ */
+function planConnectors(plan: CompleteCityPlan): readonly BlockConnector[] {
+  const byBlock = new Map<string, BuildingPlan[]>();
+  for (const building of plan.buildings) {
+    const list = byBlock.get(building.blockId);
+    if (list === undefined) byBlock.set(building.blockId, [building]);
+    else list.push(building);
+  }
+  const kept: BlockConnector[] = [];
+  for (const [, buildings] of byBlock) {
+    const eligible: BlockConnector[] = [];
+    for (let i = 0; i < buildings.length; i++) {
+      const a = buildings[i]!;
+      if (a.masses.length === 0) continue;
+      for (let j = i + 1; j < buildings.length; j++) {
+        const b = buildings[j]!;
+        if (b.masses.length === 0) continue;
+        const kind = pairConnectorKind(a, b);
+        if (kind === null) continue;
+        const connector = makeConnector(a, b, kind, CONNECTOR_CONFIGS[kind]);
+        if (connector !== null) eligible.push(connector);
+      }
+    }
+    eligible.sort(
+      (p, q) =>
+        hash2(fnv1a(p.id), 3) - hash2(fnv1a(q.id), 3) ||
+        (p.id < q.id ? -1 : p.id > q.id ? 1 : 0)
+    );
+    const spent: Partial<Record<ConnectorKind, number>> = {};
+    for (const connector of eligible) {
+      const used = spent[connector.kind] ?? 0;
+      if (used >= CONNECTOR_CONFIGS[connector.kind].budgetPerBlock) continue;
+      spent[connector.kind] = used + 1;
+      kept.push(connector);
+    }
+  }
+  return kept;
+}
+
+/**
+ * The connector set depends only on the plan, so it is derived once per plan object and
+ * shared by every chunk build of that plan (the batch already shares the surface
+ * derivation the same way). The WeakMap key keeps the public chunk signature unchanged.
+ */
+const planConnectorCache = new WeakMap<CompleteCityPlan, readonly BlockConnector[]>();
+
+function connectorsForPlan(plan: CompleteCityPlan): readonly BlockConnector[] {
+  let connectors = planConnectorCache.get(plan);
+  if (connectors === undefined) {
+    connectors = planConnectors(plan);
+    planConnectorCache.set(plan, connectors);
+  }
+  return connectors;
+}
+
+/**
+ * One elevated connector as a single `DetailPrism` slab: a solid deck (enclosed for
+ * skybridges, a thin deck for circulation bridges, a narrow box for conduits) rendered
+ * in the detail tier with the standard 10-triangle prism.
+ */
+function connectorPrism(connector: BlockConnector, origin: Vec2, pixelsPerMetre: number): MeshBuffers {
+  const ux = (connector.end.x - connector.start.x) / connector.spanM;
+  const uy = (connector.end.y - connector.start.y) / connector.spanM;
+  const halfWidth = connector.widthM / 2;
+  const footprint: Ring = [
+    { x: connector.start.x - uy * halfWidth, y: connector.start.y + ux * halfWidth },
+    { x: connector.start.x + uy * halfWidth, y: connector.start.y - ux * halfWidth },
+    { x: connector.end.x + uy * halfWidth, y: connector.end.y - ux * halfWidth },
+    { x: connector.end.x - uy * halfWidth, y: connector.end.y + ux * halfWidth }
+  ];
+  return prismMesh({
+    footprint: toPixelsRing(footprint, origin, pixelsPerMetre),
+    baseHeight: connector.deckBaseM,
+    topHeight: connector.deckTopM,
+    material: connector.material,
+    seed: connector.seed
+  });
+}
+
 export function buildCompleteCityChunk(
   source: CitySourceV3,
   plan: CompleteCityPlan,
@@ -468,8 +791,10 @@ export function buildCompleteCityChunk(
     surfaces: emptySurfaces(),
     buildingIds: [],
     landmarkIds: [],
+    connectors: [],
     buildingCount: 0,
     landmarkCount: 0,
+    connectorCount: 0,
     openSpaceCount: 0,
     waterTriangleCount: 0,
     exposedLandTriangleCount: 0,
@@ -570,11 +895,17 @@ export function buildCompleteCityChunk(
       .filter((mass) => mass.detailPolicy === "detail" || mass.detailPolicy === "both")
       .map((mass) => massSpec(mass, origin, pixelsPerMetre))
   );
+  // Connectors are owned by their midpoint's chunk, never clipped, exactly like
+  // buildings — a connector spanning the seam is emitted uncut by its owner.
+  const connectors = connectorsForPlan(plan).filter((connector) =>
+    ownsCentroid(boundsM, connector.midpoint)
+  );
   const detail = mergeMeshes([
     buildingDetailMesh(detailBuildingSpecs, pixelsPerMetre),
     buildingDetailMesh(detailLandmarkSpecs, pixelsPerMetre),
     openSpaceDetailMesh(openSpaces, origin, pixelsPerMetre),
-    ...silhouetteVolumeSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre))
+    ...silhouetteVolumeSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
+    ...connectors.map((connector) => connectorPrism(connector, origin, pixelsPerMetre))
   ]);
   const neon = neonMesh([...buildingSpecs, ...landmarkSpecs], pixelsPerMetre);
 
@@ -606,8 +937,10 @@ export function buildCompleteCityChunk(
     surfaces: clipSurfaces(all, clip),
     buildingIds: ownedBuildings.map((building) => building.id),
     landmarkIds: ownedLandmarks.map((landmark) => landmark.id),
+    connectors,
     buildingCount: ownedBuildings.length,
     landmarkCount: ownedLandmarks.length,
+    connectorCount: connectors.length,
     openSpaceCount,
     waterTriangleCount: surfaceParts[0]!.triangleCount,
     exposedLandTriangleCount: surfaceParts[1]!.triangleCount,
@@ -691,6 +1024,7 @@ export function buildCompleteCityChunks(
     chunks,
     buildingCount: chunks.reduce((sum, chunk) => sum + chunk.buildingCount, 0),
     landmarkCount: chunks.reduce((sum, chunk) => sum + chunk.landmarkCount, 0),
+    connectorCount: chunks.reduce((sum, chunk) => sum + chunk.connectorCount, 0),
     openSpaceCount: chunks.reduce((sum, chunk) => sum + chunk.openSpaceCount, 0),
     markingTriangleCount: chunks.reduce((sum, chunk) => sum + chunk.markingTriangleCount, 0),
     vertexCount: chunks.reduce(

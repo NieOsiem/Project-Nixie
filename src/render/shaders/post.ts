@@ -15,13 +15,15 @@ const KNEE = 0.25;
 
 const LUMA = "vec3(0.299, 0.587, 0.114)";
 
-/** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG. */
-const BODY_CHROMA = 0.93;
+/** Chroma kept where the image is dark, and where it is bright. See the grade in COMPOSITE_FRAG.
+ * BODY_CHROMA sits at 1.0 so the grade never desaturates the district albedo undertones;
+ * only bright signage gets the 1.15 boost. */
+const BODY_CHROMA = 1.0;
 const NEON_CHROMA = 1.15;
 /** Darkening at the far edge of the depth falloff. */
 const DEPTH_FALLOFF = 0.16;
 /** WHY: saturation must not lift black surfaces into purple fog. */
-const BLACK_FLOOR = 0.012;
+const BLACK_FLOOR = 0.004;
 
 /** Ground height shared with the weather splash mask. */
 const WET_GROUND_HEIGHT_M = 2.5;
@@ -161,13 +163,6 @@ const STREAK_ATTENUATION = 0.94;
 /**
  * One directional streak pass: uniformly spaced taps with geometric falloff.
  *
- * **Not `BLUR_FRAG` with an inflated `uTexel`.** That shader's offsets (1.3846 / 3.2308) are the
- * linear-sampling ones, which only work at unit texel steps — each is meant to be a bilinear
- * blend of two *adjacent* texels. Scaled up they become isolated point samples with several
- * unsampled texels between them, so a bright source resolves as five discrete ghost copies
- * rather than a streak. It hides on horizontal lines, because smearing a horizontal bar along x
- * lands on more bar, and is glaring on points and vertical bars, which have no x extent.
- *
  * Contiguity here is structural: taps are one `uStep` apart, so a pass covers `STREAK_TAPS`
  * strides with no gaps, and the next pass uses a stride of exactly `STREAK_TAPS` texels — each
  * of its taps carries the previous pass's full contiguous smear. Two passes therefore cover
@@ -306,7 +301,7 @@ void main() {
 
   // The projection leans geometry away from the pivot. A mirror image therefore samples away
   // from the pivot too; the reach is exactly zero at the pivot and grows radially with uRadialSmear.
-  // Wide bloom is already blurred, so four geometrically weighted taps are enough for a smooth tail.
+  // Wide bloom is already blurred, so geometrically weighted taps are enough for a smooth broken tail.
   float smearAmount = wet * clamp(uSmearStrength, 0.0, 1.0);
   vec2 smearReach = (vUv - uPivotUv) * uRadialSmear;
   vec3 smearSample = vec3(0.0);
@@ -341,7 +336,7 @@ void main() {
 
   float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
     * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
-  c *= 1.0 - 0.38 * castShadow;
+  c *= 1.0 - 0.32 * castShadow;
 
   float ao = texture2D(uAo, vUv * uAoUvScale).r;
   float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);
@@ -349,23 +344,21 @@ void main() {
 
   // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
   // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
-  // rather than the frame centre. Deliberately not aspect-corrected: on a 2.39:1 panel a
-  // screen-circular falloff reaches the top and bottom edges and never the left and right.
+  // rather than the frame centre.
   c *= 1.0 - ${DEPTH_FALLOFF} * smoothstep(0.20, 0.72, length(vUv - uPivotUv));
 
-  // WHY: fog keys off the same radial term the depth falloff darkens with, so the two stack
+  // Fog keys off the same radial term the depth falloff darkens with, so the two stack
   // at the frame edge. Tune them together, never one alone.
-  // Bounded mix toward a haze already carrying the wide bloom: the tone map is an exact clamp
-  // at 1.0, so an additive inscatter would vanish instead of reading as aerial perspective.
   float radial = length(vUv - uPivotUv);
   float density = exp(-heightM / max(uFogHeightM, 0.001));
   float fog = (1.0 - exp(-uFogDensity * radial)) * density * covered * uFogStrength;
   vec3 haze = vec3(uFogTintR, uFogTintG, uFogTintB) + wideBloom * uFogInscatter;
   c = mix(c, haze, clamp(fog, 0.0, 1.0));
 
-  // WHY: body chroma carries the palette; the toe keeps that saturation from lifting black.
+  // Grade: body chroma passes the district albedo undertones through untouched; neon chroma
+  // boosts bright signage only.
   float l = dot(c, ${LUMA});
-  float chroma = mix(${BODY_CHROMA}, ${NEON_CHROMA}, smoothstep(0.18, 0.62, l));
+  float chroma = mix(${glslFloat(BODY_CHROMA)}, ${glslFloat(NEON_CHROMA)}, smoothstep(0.18, 0.62, l));
   c = max(mix(vec3(l), c, chroma) - vec3(${BLACK_FLOOR}), vec3(0.0));
 
   float m = max(max(c.r, c.g), c.b);

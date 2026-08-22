@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { intersection } from "../geom/boolean.js";
 import { rectRing, ringArea, type MultiPolygon, type Rect } from "../geom/types.js";
 import { citySurfaces } from "./city-chunk.js";
-import type { CitySourceV2 } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV2 } from "./city.js";
 
 const SCENE: Rect = { x: 0, y: 0, width: 100, height: 100 };
 const SOURCE: CitySourceV2 = {
@@ -37,8 +37,15 @@ describe("Phase 2 route clearance partition", () => {
     const surfaces = citySurfaces(SOURCE, SCENE);
     const carriageway = area(surfaces.vehicleCarriageway);
     const sidewalk = area(surfaces.vehicleSidewalk);
-    expect(carriageway).toBeGreaterThan(60 * 9);
-    expect(sidewalk).toBeGreaterThan(60 * 5);
+    const street = ROUTE_CLASS_REGISTRY.get("street")!;
+    const length = 80 - 20;
+    // The corridor core is a widthM-wide carriageway quad flanked by sidewalkM strips, so both
+    // surfaces must cover at least their rectangular cores; each terminal node contributes a disc
+    // cap, at most a half-disc beyond the quad, so the surfaces stay under core + full-disc caps.
+    expect(carriageway).toBeGreaterThan(length * street.widthM);
+    expect(carriageway).toBeLessThan(length * street.widthM + Math.PI * (street.widthM / 2) ** 2);
+    expect(sidewalk).toBeGreaterThan(length * 2 * street.sidewalkM);
+    expect(sidewalk).toBeLessThan(length * 2 * street.sidewalkM + Math.PI * (street.widthM / 2 + street.sidewalkM) ** 2);
     expect(area(intersection(surfaces.exposedLand, surfaces.vehicleCarriageway))).toBeCloseTo(0, 4);
     expect(area(intersection(surfaces.exposedLand, surfaces.vehicleSidewalk))).toBeCloseTo(0, 4);
     expect(area(intersection(surfaces.exposedLand, surfaces.nonVehicleRoute))).toBeCloseTo(0, 4);
@@ -46,7 +53,8 @@ describe("Phase 2 route clearance partition", () => {
 
   it("keeps non-vehicle route occupancy in the shared partition and clear of vehicle pavement", () => {
     const surfaces = citySurfaces(SOURCE, SCENE);
-    expect(area(surfaces.nonVehicleRoute)).toBeGreaterThan(60 * 3);
+    const cycleway = ROUTE_CLASS_REGISTRY.get("cycleway")!;
+    expect(area(surfaces.nonVehicleRoute)).toBeGreaterThan((80 - 20) * cycleway.widthM);
     expect(area(intersection(surfaces.nonVehicleRoute, surfaces.vehicleCarriageway))).toBeCloseTo(0, 4);
     expect(area(intersection(surfaces.nonVehicleRoute, surfaces.vehicleSidewalk))).toBeCloseTo(0, 4);
   });

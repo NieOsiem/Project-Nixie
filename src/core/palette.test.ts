@@ -149,8 +149,6 @@ describe("bank layout", () => {
   });
 
   it("derives banks from palette ids alone, never district order or district ids", () => {
-    // Two cities with the same palette set resolve the same id to the same bank, however
-    // their districts are arranged — that is what makes retinting stable across edits.
     const first = paletteBanks(["corporate", "night-market"]);
     const second = paletteBanks(["night-market", "corporate"]);
     expect([...first.entries()]).toEqual([...second.entries()]);
@@ -193,7 +191,6 @@ describe("bank layout", () => {
       expect(slot).toBeGreaterThanOrEqual(0);
       expect(slot).toBeLessThan(BANK_SIZE);
     }
-    // The two categories that share a plan slot must separate here: park vs service-yard.
     expect(OPEN_SPACE_SURFACE_SLOTS["grass"]).not.toBe(OPEN_SPACE_SURFACE_SLOTS["gravel"]);
   });
 
@@ -236,10 +233,6 @@ describe("shipped palettes", () => {
   });
 
   it("keeps the ground plane and paint below the bloom threshold", () => {
-    // WHY: broad shared surfaces wash out the scene above 0.55; paint above it floats in a halo.
-    // Scaled by EMISSIVE_MAX because that is what the shader multiplies by — without it this
-    // read 4x low and let KERB sit at 0.95, drawing a lit cyan outline along every street.
-    // Covers all of CITY_SURFACES: the slice(0, 5) this replaces skipped KERB entirely.
     for (const m of CITY_SURFACES) {
       const peak =
         Math.max(m.emissive.r, m.emissive.g, m.emissive.b) * m.emissiveStrength * EMISSIVE_MAX;
@@ -250,31 +243,95 @@ describe("shipped palettes", () => {
   it("separates Neon Sprawl bodies, wall light, and strong architectural accents", () => {
     const [wallA, wallB, wallC, , , , neonA, neonB] = DEFAULT_DISTRICT_PALETTE.materials;
     expect(wallA).toMatchObject({
-      base: { r: 0.17, g: 0.105, b: 0.3 },
-      emissive: { r: 0.18, g: 1, b: 0.78 },
-      emissiveStrength: 0.34
+      base: { r: 0.150, g: 0.122, b: 0.185 },
+      emissive: { r: 0.32, g: 0.45, b: 0.55 },
+      emissiveStrength: 0.06
     });
     expect(wallB).toMatchObject({
-      emissive: { r: 1, g: 0.2, b: 0.62 },
-      emissiveStrength: 0.36
+      emissive: { r: 0.45, g: 0.38, b: 0.52 },
+      emissiveStrength: 0.05
     });
     expect(wallC).toMatchObject({
-      emissive: { r: 0.18, g: 0.78, b: 1 },
-      emissiveStrength: 0.34
+      emissive: { r: 0.28, g: 0.42, b: 0.50 },
+      emissiveStrength: 0.06
     });
     expect(neonA).toMatchObject({
-      emissive: { r: 1, g: 0.18, b: 0.58 },
+      emissive: { r: 1.0, g: 0.18, b: 0.58 },
       emissiveStrength: 1.65
     });
     expect(neonB).toMatchObject({
-      emissive: { r: 0.18, g: 1, b: 0.82 },
+      emissive: { r: 0.18, g: 0.95, b: 0.92 },
       emissiveStrength: 1.55
     });
+  });
+
+  const luma = (m: Material): number =>
+    0.299 * m.base.r + 0.587 * m.base.g + 0.114 * m.base.b;
+
+  it("enforces clear luminance hierarchy and minimum slot separation in shared surfaces", () => {
+    const water = CITY_SURFACES[CITY_SLOT.WATER]!;
+    const ground = CITY_SURFACES[CITY_SLOT.GROUND]!;
+    const road = CITY_SURFACES[CITY_SLOT.ROAD]!;
+    const route = CITY_SURFACES[CITY_SLOT.NON_VEHICLE_ROUTE]!;
+    const kerb = CITY_SURFACES[CITY_SLOT.KERB]!;
+    const sidewalk = CITY_SURFACES[CITY_SLOT.SIDEWALK]!;
+    const laneMark = CITY_SURFACES[CITY_SLOT.LANE_MARK]!;
+    const crossing = CITY_SURFACES[CITY_SLOT.CROSSING]!;
+
+    const lWater = luma(water);
+    const lGround = luma(ground);
+    const lRoad = luma(road);
+    const lRoute = luma(route);
+    const lKerb = luma(kerb);
+    const lSidewalk = luma(sidewalk);
+    const lLaneMark = luma(laneMark);
+    const lCrossing = luma(crossing);
+
+    // Monotonic dark-to-light progression
+    expect(lWater).toBeLessThan(lGround);
+    expect(lGround).toBeLessThan(lRoad);
+    expect(lRoad).toBeLessThan(lRoute);
+    expect(lRoute).toBeLessThan(lKerb);
+    expect(lKerb).toBeLessThan(lSidewalk);
+    expect(lSidewalk).toBeLessThan(lLaneMark);
+    expect(lLaneMark).toBeLessThan(lCrossing);
+
+    // Minimum slot separation to prevent mud
+    expect(lRoad - lGround).toBeGreaterThanOrEqual(0.015);
+    expect(lSidewalk - lRoad).toBeGreaterThanOrEqual(0.05);
+    expect(lLaneMark - lSidewalk).toBeGreaterThanOrEqual(0.04);
+
+    // Bounded luminance bands
+    expect(lGround).toBeGreaterThanOrEqual(0.06);
+    expect(lGround).toBeLessThanOrEqual(0.08);
+    expect(lRoad).toBeGreaterThanOrEqual(0.075);
+    expect(lRoad).toBeLessThanOrEqual(0.10);
+    expect(lSidewalk).toBeGreaterThanOrEqual(0.135);
+    expect(lSidewalk).toBeLessThanOrEqual(0.17);
+    expect(lLaneMark).toBeGreaterThanOrEqual(0.18);
   });
 
   it("finds presets by name and nothing else", () => {
     expect(presetByName(DEFAULT_DISTRICT_PALETTE.name)).toEqual(DEFAULT_DISTRICT_PALETTE);
     expect(presetByName("no such preset")).toBeNull();
+  });
+
+  it("gives every preset at least two meaningfully chromed, hue-separated body materials", () => {
+    const chroma = (m: Material): number =>
+      Math.max(m.base.r, m.base.g, m.base.b) - Math.min(m.base.r, m.base.g, m.base.b);
+    const distance = (a: Material, b: Material): number =>
+      Math.abs(a.base.r - b.base.r) + Math.abs(a.base.g - b.base.g) + Math.abs(a.base.b - b.base.b);
+    for (const preset of PALETTE_PRESETS) {
+      const bodies = [0, 1, 2, 3, 4, 5].map((slot) => preset.materials[slot]!);
+      expect(bodies.filter((m) => chroma(m) >= 0.045).length, `${preset.name} chromed bodies`).toBeGreaterThanOrEqual(2);
+      let best = 0;
+      for (let i = 0; i < bodies.length; i++) {
+        for (let j = i + 1; j < bodies.length; j++) {
+          best = Math.max(best, distance(bodies[i]!, bodies[j]!));
+        }
+      }
+      expect(best, `${preset.name} body hue separation`).toBeGreaterThanOrEqual(0.06);
+    }
   });
 });
 
@@ -287,6 +344,73 @@ describe("built-in district palettes", () => {
     DISTRICT_SLOT.ROOF_B,
     DISTRICT_SLOT.ROOF_C
   ];
+
+  const luma = (m: Material): number =>
+    0.299 * m.base.r + 0.587 * m.base.g + 0.114 * m.base.b;
+
+  it("keeps wall and roof physical base luminance in readable midtone bands", () => {
+    for (const id of DISTRICT_PALETTE_IDS) {
+      const palette = builtinPalette(id);
+      for (const slot of GROUND_SLOTS) {
+        const m = palette.materials[slot]!;
+        const l = luma(m);
+        expect(l, `${id} slot ${slot} luma`).toBeGreaterThanOrEqual(0.09);
+        expect(l, `${id} slot ${slot} luma`).toBeLessThanOrEqual(0.20);
+      }
+    }
+  });
+
+  it("keeps at least two meaningfully chromed, hue-separated non-neon body materials", () => {
+    const chroma = (m: Material): number =>
+      Math.max(m.base.r, m.base.g, m.base.b) - Math.min(m.base.r, m.base.g, m.base.b);
+    const distance = (a: Material, b: Material): number =>
+      Math.abs(a.base.r - b.base.r) + Math.abs(a.base.g - b.base.g) + Math.abs(a.base.b - b.base.b);
+    for (const id of DISTRICT_PALETTE_IDS) {
+      const palette = builtinPalette(id);
+      const bodies = GROUND_SLOTS.map((slot) => palette.materials[slot]!);
+      expect(
+        bodies.filter((m) => chroma(m) >= 0.045).length,
+        `${id} chromed bodies`
+      ).toBeGreaterThanOrEqual(2);
+      let best = 0;
+      for (let i = 0; i < bodies.length; i++) {
+        for (let j = i + 1; j < bodies.length; j++) {
+          best = Math.max(best, distance(bodies[i]!, bodies[j]!));
+        }
+      }
+      expect(best, `${id} body hue separation`).toBeGreaterThanOrEqual(0.06);
+    }
+  });
+
+  it("preserves Night Market dual red/pink and yellow neon accents", () => {
+    const nm = builtinPalette("night-market");
+    const neonA = nm.materials[DISTRICT_SLOT.NEON_A]!;
+    const neonB = nm.materials[DISTRICT_SLOT.NEON_B]!;
+
+    // NEON_A: vivid red/pink lantern
+    expect(neonA.emissive.r).toBeGreaterThan(0.9);
+    expect(neonA.emissive.r).toBeGreaterThan(neonA.emissive.g * 2);
+    expect(neonA.emissiveStrength).toBeGreaterThanOrEqual(1.5);
+
+    // NEON_B: brilliant yellow market signage
+    expect(neonB.emissive.r).toBeGreaterThan(0.9);
+    expect(neonB.emissive.g).toBeGreaterThan(0.85);
+    expect(neonB.emissive.b).toBeLessThan(0.3);
+    expect(neonB.emissiveStrength).toBeGreaterThanOrEqual(1.5);
+  });
+
+  it("differentiates primary and secondary neon hues across all districts", () => {
+    for (const id of DISTRICT_PALETTE_IDS) {
+      const palette = builtinPalette(id);
+      const a = palette.materials[DISTRICT_SLOT.NEON_A]!;
+      const b = palette.materials[DISTRICT_SLOT.NEON_B]!;
+      const dr = Math.abs(a.emissive.r - b.emissive.r);
+      const dg = Math.abs(a.emissive.g - b.emissive.g);
+      const db = Math.abs(a.emissive.b - b.emissive.b);
+      const hueDiff = dr + dg + db;
+      expect(hueDiff, `${id} neon A/B hue distinction`).toBeGreaterThanOrEqual(0.3);
+    }
+  });
 
   const bankRegion = (packed: Uint8Array, bank: number): string =>
     [...packed.slice(bank * BANK_SIZE * 4, (bank + 1) * BANK_SIZE * 4)].join(",");
@@ -312,9 +436,6 @@ describe("built-in district palettes", () => {
   });
 
   it("keeps ground-sampled wall and roof slots under the whole-ground bloom threshold", () => {
-    // WHY: open-space ground surfaces sample these slots (paving -> WALL_A, tarmac ->
-    // WALL_B, grass -> ROOF_A, ...). The shader multiplies by EMISSIVE_MAX, so the peak
-    // must stay under the 0.55 luma threshold a broad ground would otherwise clear.
     for (const id of DISTRICT_PALETTE_IDS) {
       for (const slot of GROUND_SLOTS) {
         const m = builtinPalette(id).materials[slot]!;

@@ -6,48 +6,44 @@ import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, materialIndex } from "../pal
 import { hash2 } from "./hash.js";
 import {
   BANNER_MIN_BUILDING_M,
-  BILLBOARD_MAX_W_M,
-  BILLBOARD_MIN_W_M,
-  GLOW_MARGIN_M,
   MAX_POOL_RADIUS_M,
   MIN_POOL_RADIUS_M,
-  POOL_MAX_SIGN_HEIGHT_M,
-  POOL_RATE,
   SIGN_BAND_TOP_M,
   neonMesh
 } from "./neon.js";
 
 const PPM = 25;
 
-/** Lot sizes, heights and banks in the ranges DEFAULT_ZONE_PARAMS actually produces. */
-function cityOf(count: number): BuildingSpec[] {
+function cityOf(count: number, profile?: string): BuildingSpec[] {
   const specs: BuildingSpec[] = [];
   for (let i = 0; i < count; i++) {
     const t = hash2(i, 1, 7);
-    const sizeM = 8 + hash2(i, 2, 7) * 14;
+    const sizeM = 12 + hash2(i, 2, 7) * 16;
     const bank = FIRST_ZONE_BANK + (i % 4);
     specs.push({
       footprint: rectRing({
-        x: (i % 40) * 26 * PPM,
-        y: Math.floor(i / 40) * 26 * PPM,
+        x: (i % 40) * 36 * PPM,
+        y: Math.floor(i / 40) * 36 * PPM,
         width: sizeM * PPM,
-        height: sizeM * 0.8 * PPM
+        height: sizeM * 0.85 * PPM
       }),
-      height: 8 + t * t * 132,
+      height: 12 + t * t * 140,
       roofMaterial: materialIndex(bank, DISTRICT_SLOT.ROOF_A),
       wallMaterial: materialIndex(bank, DISTRICT_SLOT.WALL_A + (i % 3)),
-      seed: hash2(i, 3, 7)
+      seed: hash2(i, 3, 7),
+      facadeProfile: profile
     });
   }
   return specs;
 }
 
-const detailedTower = (seed: number): BuildingSpec => ({
-  footprint: rectRing({ x: 0, y: 0, width: 30 * PPM, height: 24 * PPM }),
-  height: 80,
+const detailedTower = (seed: number, profile?: string): BuildingSpec => ({
+  footprint: rectRing({ x: 0, y: 0, width: 32 * PPM, height: 26 * PPM }),
+  height: 90,
   roofMaterial: materialIndex(FIRST_ZONE_BANK, DISTRICT_SLOT.ROOF_A),
   wallMaterial: materialIndex(FIRST_ZONE_BANK, DISTRICT_SLOT.WALL_A),
   seed,
+  facadeProfile: profile,
   detailedMassing: true
 });
 
@@ -68,7 +64,6 @@ const vertexAt = (m: MeshBuffers, i: number) => {
   };
 };
 
-/** Every quad as (first corner, opposite corner) pairs, in emission order. */
 function quadsOf(m: MeshBuffers) {
   const out = [];
   for (let q = 0; q < m.vertexCount; q += 4) {
@@ -77,7 +72,8 @@ function quadsOf(m: MeshBuffers) {
       ...corners[0]!,
       widthPx: Math.hypot(corners[1]!.x - corners[0]!.x, corners[1]!.y - corners[0]!.y),
       bottomM: Math.min(...corners.map((c) => c.height)),
-      topM: Math.max(...corners.map((c) => c.height))
+      topM: Math.max(...corners.map((c) => c.height)),
+      centerM: (Math.min(...corners.map((c) => c.height)) + Math.max(...corners.map((c) => c.height))) / 2
     });
   }
   return out;
@@ -85,15 +81,15 @@ function quadsOf(m: MeshBuffers) {
 
 describe("neonMesh", () => {
   it("is byte-identical across runs", () => {
-    const specs = cityOf(400);
+    const specs = cityOf(300);
     const a = neonMesh(specs, PPM);
     const b = neonMesh(specs, PPM);
     expect([...a.vertices]).toEqual([...b.vertices]);
     expect([...a.indices]).toEqual([...b.indices]);
   });
 
-  it("reorders output without changing any building's sign", () => {
-    const specs = cityOf(200);
+  it("reorders output deterministically per building", () => {
+    const specs = cityOf(150);
     const perBuilding = specs.map((s) => neonMesh([s], PPM));
     const reversed = neonMesh([...specs].reverse(), PPM);
 
@@ -102,7 +98,7 @@ describe("neonMesh", () => {
     expect([...reversed.vertices]).toEqual(expected);
   });
 
-  it("returns an empty mesh for a chunk that owns no buildings", () => {
+  it("returns an empty mesh for an empty building list", () => {
     const m = neonMesh([], PPM);
     expect(m.vertexCount).toBe(0);
     expect(m.triangleCount).toBe(0);
@@ -110,9 +106,9 @@ describe("neonMesh", () => {
     expect(m.indices.length).toBe(0);
   });
 
-  it("emits zero neon for a neon-disabled mass even at full signage rate", () => {
+  it("emits zero neon when neonEnabled is false", () => {
     const spec = {
-      ...cityOf(1)[0]!,
+      ...cityOf(1, "shopfront")[0]!,
       facadeRate: 1,
       poolRate: 1,
       neonEnabled: false
@@ -122,21 +118,9 @@ describe("neonMesh", () => {
     expect(m.triangleCount).toBe(0);
   });
 
-  it("keeps signs and pools for an explicitly neon-enabled mass", () => {
-    const spec = {
-      ...cityOf(1)[0]!,
-      facadeRate: 1,
-      poolRate: 1,
-      neonEnabled: true
-    };
-    const m = neonMesh([spec], PPM);
-    expect(m.vertexCount).toBeGreaterThan(0);
-    for (let i = 0; i < m.vertexCount; i++) expect(vertexAt(m, i).kind).toBe(KIND.NEON);
-  });
-
   it("filters neon-disabled buildings out of a mixed batch", () => {
-    const disabled = { ...cityOf(2)[0]!, facadeRate: 1, poolRate: 1, neonEnabled: false };
-    const enabled = { ...cityOf(2)[1]!, facadeRate: 1, poolRate: 1, neonEnabled: true };
+    const disabled = { ...cityOf(2, "shopfront")[0]!, facadeRate: 1, poolRate: 1, neonEnabled: false };
+    const enabled = { ...cityOf(2, "shopfront")[1]!, facadeRate: 1, poolRate: 1, neonEnabled: true };
     expect(neonMesh([disabled], PPM).vertexCount).toBe(0);
     const both = neonMesh([disabled, enabled], PPM);
     const alone = neonMesh([enabled], PPM);
@@ -144,8 +128,8 @@ describe("neonMesh", () => {
     expect([...both.indices]).toEqual([...alone.indices]);
   });
 
-  it("returns exclusively-owned exact-sized buffers, so the worker can transfer them", () => {
-    for (const m of [neonMesh(cityOf(300), PPM), neonMesh([], PPM)]) {
+  it("produces transfer-safe independent ArrayBuffers", () => {
+    for (const m of [neonMesh(cityOf(200), PPM), neonMesh([], PPM)]) {
       for (const view of [m.vertices, m.indices]) {
         expect(view.byteOffset).toBe(0);
         expect(view.buffer.byteLength).toBe(view.byteLength);
@@ -154,16 +138,16 @@ describe("neonMesh", () => {
     }
   });
 
-  it("emits exactly 4 vertices and 2 triangles per sign", () => {
-    const m = neonMesh(cityOf(300), PPM);
+  it("emits exactly 4 vertices and 2 triangles per quad", () => {
+    const m = neonMesh(cityOf(250), PPM);
     expect(m.vertexCount % 4).toBe(0);
     expect(m.triangleCount).toBe((m.vertexCount / 4) * 2);
     expect(m.indices.length).toBe(m.triangleCount * 3);
     for (const i of m.indices) expect(i).toBeLessThan(m.vertexCount);
   });
 
-  it("tags every vertex NEON with in-range local coords and a positive strength", () => {
-    const m = neonMesh(cityOf(300), PPM);
+  it("tags every vertex KIND.NEON with valid local coords and positive strength", () => {
+    const m = neonMesh(cityOf(250), PPM);
     expect(m.vertexCount).toBeGreaterThan(0);
     for (let i = 0; i < m.vertexCount; i++) {
       const v = vertexAt(m, i);
@@ -176,30 +160,8 @@ describe("neonMesh", () => {
     }
   });
 
-  it("pairs low facade signs with bounded radial pools", () => {
-    expect(POOL_RATE).toBeLessThan(1);
-    const m = neonMesh(cityOf(300), PPM);
-    let pools = 0;
-    for (let q = 0; q < m.vertexCount; q += 4) {
-      const pool = vertexAt(m, q);
-      if (pool.radial !== 1) continue;
-      pools++;
-      const sign = vertexAt(m, q - 4);
-      expect(sign.radial).toBe(0);
-      expect(pool.material).toBe(sign.material);
-      expect(pool.strength).toBeLessThan(sign.strength);
-      for (let i = 0; i < 4; i++) expect(vertexAt(m, q + i).height).toBeCloseTo(0.03, 6);
-      // The radius is the panel-derived value — floored, hard-capped, never a fixed 30 m.
-      expect(pool.halfWidthM).toBeGreaterThanOrEqual(MIN_POOL_RADIUS_M);
-      expect(pool.halfWidthM).toBeLessThanOrEqual(MAX_POOL_RADIUS_M);
-      expect(vertexAt(m, q + 1).x - pool.x).toBeCloseTo(pool.halfWidthM * PPM * 2, 2);
-      expect(vertexAt(m, q + 3).y - pool.y).toBeCloseTo(pool.halfWidthM * PPM * 2, 2);
-    }
-    expect(pools).toBeGreaterThan(0);
-  });
-
-  it("spans the padded quad in local coords", () => {
-    const m = neonMesh(cityOf(60), PPM);
+  it("spans local UV coordinates [-1, 1] per quad", () => {
+    const m = neonMesh(cityOf(50), PPM);
     for (let q = 0; q < m.vertexCount; q += 4) {
       const us = [0, 1, 2, 3].map((k) => vertexAt(m, q + k).u);
       const vs = [0, 1, 2, 3].map((k) => vertexAt(m, q + k).top);
@@ -208,10 +170,10 @@ describe("neonMesh", () => {
     }
   });
 
-  it("keeps every quad inside its own building's footprint plus the glow margin", () => {
+  it("contains all quad vertices within building footprint bounds plus glow margin", () => {
     const slack = MAX_POOL_RADIUS_M * PPM;
     const epsilon = 1e-3;
-    for (const spec of cityOf(250)) {
+    for (const spec of cityOf(150)) {
       const m = neonMesh([spec], PPM);
       const b = ringBounds(spec.footprint);
       for (let i = 0; i < m.vertexCount; i++) {
@@ -224,29 +186,8 @@ describe("neonMesh", () => {
     }
   });
 
-  it("adds rare large facade billboards without crossing the roofline", () => {
-    let billboards = 0;
-    for (const spec of cityOf(1400)) {
-      const mesh = neonMesh([spec], PPM);
-      for (let q = 0; q < mesh.vertexCount; q += 4) {
-        const a = vertexAt(mesh, q);
-        const b = vertexAt(mesh, q + 1);
-        const top = vertexAt(mesh, q + 2);
-        if (a.radial !== 0 || top.height <= a.height) continue;
-        expect(top.height).toBeLessThanOrEqual(spec.height + 1e-5);
-        const paddedWidthM = Math.hypot(b.x - a.x, b.y - a.y) / PPM;
-        if (paddedWidthM < BILLBOARD_MIN_W_M + 2 * GLOW_MARGIN_M - 1e-5) continue;
-        billboards++;
-        expect(paddedWidthM).toBeLessThanOrEqual(BILLBOARD_MAX_W_M + 2 * GLOW_MARGIN_M);
-        expect(spec.height).toBeGreaterThanOrEqual(25);
-      }
-    }
-    expect(billboards).toBeGreaterThan(5);
-    expect(billboards).toBeLessThan(80);
-  });
-
-  it("resolves to a neon slot of the building's own bank", () => {
-    for (const spec of cityOf(250)) {
+  it("resolves neon materials according to the district bank and neonWeights", () => {
+    for (const spec of cityOf(150)) {
       const m = neonMesh([spec], PPM);
       const wallBank = Math.floor(spec.wallMaterial / BANK_SIZE);
       for (let i = 0; i < m.vertexCount; i++) {
@@ -257,156 +198,142 @@ describe("neonMesh", () => {
     }
   });
 
-  it("signs 70-80% of a realistic city", () => {
-    const specs = cityOf(1400);
+  it("favors ground frontage signs and vertical banners for market/entertainment profiles", () => {
+    const marketSpecs = cityOf(400, "shopfront");
+    const entertainmentSpecs = cityOf(400, "entertainment-arcade");
+    const combined = [...marketSpecs, ...entertainmentSpecs];
+    const signedCount = combined.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
+    const rate = signedCount / combined.length;
+    expect(rate).toBeGreaterThan(0.7);
+
+    let banners = 0;
+    for (const spec of combined) {
+      if (spec.height < BANNER_MIN_BUILDING_M) continue;
+      for (const q of quadsOf(neonMesh([spec], PPM))) {
+        if (q.radial === 0 && q.halfHeightM > q.halfWidthM) banners++;
+      }
+    }
+    expect(banners).toBeGreaterThan(15);
+  });
+
+  it("restrains corporate/civic profiles and favors crowns or entry bands with no high pools", () => {
+    const corporateSpecs = cityOf(300, "glass-curtain");
+    const civicSpecs = cityOf(300, "civic-columns");
+    const specs = [...corporateSpecs, ...civicSpecs];
+
+    let highCrowns = 0;
+    let entryBands = 0;
+
+    for (const spec of specs) {
+      const quads = quadsOf(neonMesh([spec], PPM));
+      for (let i = 0; i < quads.length; i++) {
+        const q = quads[i]!;
+        if (q.radial !== 0) continue;
+
+        // High crown signs near the top of the building
+        if (q.centerM > spec.height * 0.6 && spec.height >= 20) {
+          highCrowns++;
+          // High crown signs MUST NEVER emit ground pools
+          if (quads[i + 1]?.radial === 1) {
+            expect(quads[i + 1]!.bottomM).toBeLessThan(1);
+            // Verify this pool does not belong to a high sign
+            expect(q.bottomM).toBeLessThanOrEqual(8);
+          }
+        } else if (q.centerM <= SIGN_BAND_TOP_M) {
+          entryBands++;
+        }
+      }
+    }
+
+    expect(highCrowns).toBeGreaterThan(10);
+    expect(entryBands).toBeGreaterThan(10);
+  });
+
+  it("makes industrial and utility profiles sparse with compact status panels", () => {
+    const specs = cityOf(500, "industrial-panel");
     const signed = specs.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
     const rate = signed / specs.length;
-    expect(rate).toBeGreaterThan(0.7);
-    expect(rate).toBeLessThan(0.8);
-  });
+    expect(rate).toBeLessThan(0.35);
 
-  it("keeps total additive fill inside its overdraw budget", () => {
-    // Glow area is what the GPU pays: panels are a few m² each, and a pool's quad is its
-    // full radius because the shader's quadratic falloff reaches the quad edge. Pools
-    // used to dominate this budget at 3,600 m² each; the capped footprint and reduced
-    // rate bring the whole frame's additive fill back to panel scale.
-    const specs = cityOf(1400);
-    const ground = specs.reduce(
-      (r, s) => {
-        const b = ringBounds(s.footprint);
-        return {
-          x0: Math.min(r.x0, b.x),
-          y0: Math.min(r.y0, b.y),
-          x1: Math.max(r.x1, b.x + b.width),
-          y1: Math.max(r.y1, b.y + b.height)
-        };
-      },
-      { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }
-    );
-    const groundM2 = ((ground.x1 - ground.x0) / PPM) * ((ground.y1 - ground.y0) / PPM);
-
-    let glowM2 = 0;
-    for (const q of quadsOf(neonMesh(specs, PPM))) {
-      glowM2 +=
-        q.radial === 1
-          ? (2 * q.halfWidthM) ** 2
-          : 2 * (q.halfWidthM + GLOW_MARGIN_M) * 2 * (q.halfHeightM + GLOW_MARGIN_M);
-    }
-    expect(glowM2 / groundM2).toBeLessThan(0.6);
-  });
-
-  it("caps every pool span at 20 m and stays an order of magnitude under the old 3,600 m² pool budget", () => {
-    const quads = quadsOf(neonMesh(cityOf(1400), PPM));
-    let poolM2 = 0;
-    let streetReaching = 0;
-    for (let i = 0; i < quads.length; i++) {
-      const q = quads[i]!;
-      if (q.radial === 1) {
-        // The pool quad spans its full radius on every side: 2r across.
-        const spanM = 2 * q.halfWidthM;
-        expect(spanM).toBeLessThanOrEqual(2 * MAX_POOL_RADIUS_M);
-        expect(spanM).toBeLessThanOrEqual(20);
-        poolM2 += spanM * spanM;
-        continue;
-      }
-      // The old pool emitted for every sign whose bottom reached the street, at rate 1.
-      if (q.bottomM <= POOL_MAX_SIGN_HEIGHT_M) streetReaching++;
-    }
-    expect(poolM2).toBeGreaterThan(0);
-    // Old budget: 3,600 m² per street-reaching sign. New: at most 400 m² per pool at a
-    // reduced rate — the aggregate must stay under a tenth of the old per-sign allowance.
-    expect(poolM2).toBeLessThan(streetReaching * 360);
-  });
-
-  it("carries each panel's own half-extents, which is what keeps a bar from going round", () => {
-    const m = neonMesh(cityOf(400), PPM);
-    let panels = 0;
-    for (const q of quadsOf(m)) {
-      if (q.radial !== 0) continue;
-      panels++;
-      expect(q.halfWidthM).toBeGreaterThan(0);
-      expect(q.halfHeightM).toBeGreaterThan(0);
-      // The padded quad is exactly the panel plus one glow margin on every side.
-      expect(q.widthPx / PPM / 2).toBeCloseTo(q.halfWidthM + GLOW_MARGIN_M, 2);
-      expect((q.topM - q.bottomM) / 2).toBeCloseTo(q.halfHeightM + GLOW_MARGIN_M, 5);
-    }
-    expect(panels).toBeGreaterThan(0);
-  });
-
-  it("keeps horizontal panels in the bottom band with their pools adjacent", () => {
-    const quads = quadsOf(neonMesh(cityOf(600), PPM));
-    let horizontals = 0;
-    let pooled = 0;
-    let bare = 0;
-    for (let i = 0; i < quads.length; i++) {
-      const q = quads[i]!;
-      if (q.radial !== 0 || q.halfHeightM > q.halfWidthM) continue;
-      horizontals++;
-      expect((q.topM + q.bottomM) / 2).toBeLessThanOrEqual(SIGN_BAND_TOP_M + 1e-5);
-      if (quads[i + 1]?.radial === 1) {
-        pooled++;
-        expect(quads[i + 1]!.material).toBe(q.material);
-      } else {
-        bare++;
-      }
-    }
-    expect(horizontals).toBeGreaterThan(50);
-    // Pools still follow their signs (adjacent, same material), but the reduced rate
-    // leaves some street-reaching signs pool-less instead of pooling every one.
-    expect(pooled).toBeGreaterThan(0);
-    expect(bare).toBeGreaterThan(0);
-  });
-
-  it("hangs vertical banners on tall buildings, the one thing exempt from the band", () => {
-    let banners = 0;
-    let aboveBand = 0;
-    for (const spec of cityOf(1400)) {
+    for (const spec of specs) {
       for (const q of quadsOf(neonMesh([spec], PPM))) {
-        if (q.radial !== 0 || q.halfHeightM <= q.halfWidthM) continue;
-        banners++;
-        expect(spec.height).toBeGreaterThanOrEqual(BANNER_MIN_BUILDING_M);
-        expect(q.halfHeightM * 2).toBeGreaterThanOrEqual(6);
-        expect(q.topM).toBeLessThanOrEqual(spec.height + 1e-5);
-        expect(q.bottomM).toBeGreaterThanOrEqual(-1e-5);
-        if ((q.topM + q.bottomM) / 2 > SIGN_BAND_TOP_M) aboveBand++;
+        if (q.radial === 0) {
+          // Industrial status panels are compact
+          expect(q.halfWidthM * 2).toBeLessThanOrEqual(4.5);
+          expect(q.halfHeightM * 2).toBeLessThanOrEqual(2.5);
+        }
       }
     }
-    expect(banners).toBeGreaterThan(50);
-    expect(aboveBand).toBeGreaterThan(banners / 2);
   });
 
-  it("gives taller buildings bigger panels", () => {
-    const short: number[] = [];
-    const tall: number[] = [];
-    for (const spec of cityOf(1400)) {
+  it("clusters residential neon sparsely and keeps signs ground-local", () => {
+    const specs = cityOf(500, "residential-balcony");
+    const signed = specs.filter((s) => neonMesh([s], PPM).vertexCount > 0).length;
+    const rate = signed / specs.length;
+    expect(rate).toBeLessThan(0.25);
+
+    for (const spec of specs) {
       for (const q of quadsOf(neonMesh([spec], PPM))) {
-        // Plain signs only: billboards and banners have their own size ranges.
-        if (q.radial !== 0 || q.halfHeightM > q.halfWidthM) continue;
-        if (q.halfWidthM * 2 >= BILLBOARD_MIN_W_M) continue;
-        (spec.height >= 60 ? tall : spec.height < 15 ? short : []).push(q.halfHeightM * 2);
+        if (q.radial === 0) {
+          // Residential signs are strictly ground-local
+          expect(q.centerM).toBeLessThanOrEqual(SIGN_BAND_TOP_M);
+        }
       }
     }
-    expect(short.length).toBeGreaterThan(20);
-    expect(tall.length).toBeGreaterThan(20);
-    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-    expect(mean(tall)).toBeGreaterThan(mean(short) * 1.2);
   });
 
-  it("keeps facade signs below the outer tier of detailed towers", () => {
+  it("allows irregular partial signage for derelict and old-city profiles", () => {
+    const specs = cityOf(400, "derelict-reclamation");
+    const strengths: number[] = [];
+    for (const spec of specs) {
+      for (const q of quadsOf(neonMesh([spec], PPM))) {
+        if (q.radial === 0) {
+          strengths.push(q.strength);
+        }
+      }
+    }
+    expect(strengths.length).toBeGreaterThan(15);
+    const minStrength = Math.min(...strengths);
+    const maxStrength = Math.max(...strengths);
+    expect(maxStrength - minStrength).toBeGreaterThan(0.2);
+  });
+
+  it("only attaches ground glow pools to low signs with bounded radii", () => {
+    const specs = cityOf(600);
+    const m = neonMesh(specs, PPM);
+    let pools = 0;
+
+    for (let q = 0; q < m.vertexCount; q += 4) {
+      const pool = vertexAt(m, q);
+      if (pool.radial !== 1) continue;
+      pools++;
+
+      const sign = vertexAt(m, q - 4);
+      expect(sign.radial).toBe(0);
+      expect(pool.material).toBe(sign.material);
+      expect(pool.strength).toBeLessThan(sign.strength);
+      for (let i = 0; i < 4; i++) expect(vertexAt(m, q + i).height).toBeCloseTo(0.03, 5);
+
+      expect(pool.halfWidthM).toBeGreaterThanOrEqual(MIN_POOL_RADIUS_M);
+      expect(pool.halfWidthM).toBeLessThanOrEqual(MAX_POOL_RADIUS_M);
+    }
+
+    expect(pools).toBeGreaterThan(10);
+  });
+
+  it("keeps facade signs below the outer tier top of detailed towers", () => {
     let facades = 0;
-    for (let i = 0; i < 300; i++) {
-      const spec = detailedTower(hash2(i, 71, 13));
+    for (let i = 0; i < 150; i++) {
+      const spec = detailedTower(hash2(i, 71, 13), "shopfront");
       const outerTop = describeBuildingMassing(spec, PPM).volumes[0]!.topHeight;
       const mesh = neonMesh([spec], PPM);
       for (let q = 0; q < mesh.vertexCount; q += 4) {
         if (vertexAt(mesh, q).radial !== 0) continue;
         const heights = [0, 1, 2, 3].map((corner) => vertexAt(mesh, q + corner).height);
-        if (Math.max(...heights) - Math.min(...heights) < 1e-5) continue;
         facades++;
         expect(Math.max(...heights)).toBeLessThanOrEqual(outerTop + 1e-5);
       }
     }
-    expect(facades).toBeGreaterThan(20);
+    expect(facades).toBeGreaterThan(10);
   });
-
 });

@@ -42,6 +42,7 @@ uniform sampler2D uPalette;
 varying vec3 vBase;
 varying vec3 vEmissive;
 varying vec3 vAccent;
+varying vec3 vAmbient;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -81,6 +82,11 @@ void main() {
   vBase = base.rgb * 1.7;
   vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);
   vAccent = accent.rgb * (accent.a * uEmissiveMax) * 0.36;
+  // District-hued ambient reflected spill: each material's own emissive tint, scaled down
+  // and capped, added uniformly in the fragment shader so every wall and roof picks up the
+  // district colour even where no light fixture exists. The cap keeps the added radiance
+  // under the bloom knee; walls/roofs store strengths <= 0.07, so this lands ~0.02-0.07.
+  vAmbient = min(emissive.rgb * (emissive.a * uEmissiveMax) * 0.55, vec3(0.070));
   vShade = aShade;
   vKind = aKind;
   vHeight = aHeight;
@@ -120,6 +126,7 @@ precision highp float;
 varying vec3 vBase;
 varying vec3 vEmissive;
 varying vec3 vAccent;
+varying vec3 vAmbient;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -197,7 +204,7 @@ float seamLine(float metres, float periodM, float pxPerMetre) {
 }
 
 // Roads, pavements and ground blocks are ~40% of the screen and share a handful of flat
-// palette entries, so untouched they read as one poured violet sheet.
+// palette entries, so untouched they read as one poured sheet.
 //
 // WHY: modulates vBase only. CITY_SURFACES hold to max(emissive) * strength * EMISSIVE_MAX
 // < 0.55 so broad ground never clears the bloom threshold; a noise term on vEmissive would
@@ -210,7 +217,6 @@ vec3 flatGround() {
   float mottle = 1.0 + GROUND_COARSE_AMP * coarse + GROUND_FINE_AMP * fine;
   return vBase * vShade * mottle + vEmissive;
 }
-
 
 vec3 facade() {
   float seed = buildingSeed(vSeed);
@@ -229,9 +235,9 @@ vec3 facade() {
   float section = floor(floorId / sectionFloors);
   float sectionTone = mix(0.88, 1.05, hash11(seed + section * 13.37 + 2.19));
   float fy = fract(above / FLOOR_M);
-  float canyon = mix(0.70, 1.0, smoothstep(0.0, 14.0, vHeight));
-  float grime = 1.0 - 0.45 * (1.0 - smoothstep(0.0, 9.0, h))
-    - 0.14 * (valueNoise(vec2(vU / 3.0, h / 3.0)) - 0.5);
+  float canyon = mix(0.76, 1.0, smoothstep(0.0, 14.0, vHeight));
+  float grime = 1.0 - 0.32 * (1.0 - smoothstep(0.0, 9.0, h))
+    - 0.12 * (valueNoise(vec2(vU / 3.0, h / 3.0)) - 0.5);
 
   float coping = smoothstep(vTop - 0.8 - wUp, vTop - 0.8 + wUp, h);
   float parapetShadow = slab(h, vTop - 2.1, vTop - 0.9, wUp);
@@ -299,7 +305,8 @@ vec3 facade() {
   float litThreshold = mix(0.35, 0.68, hash11(seed + section * 5.23 + 6.11));
   float lit = step(litThreshold, hash21(vec2(cellX + seed * 53.7, cellY + seed * 91.3)));
   float glassTone = mix(0.4, 0.8, hash21(vec2(cellX + seed * 12.1, cellY + seed * 33.7)));
-  float neonWin = step(0.85, hash21(vec2(cellX + seed * 61.1, cellY + seed * 73.9)));
+  // Random neon windows are reduced to rare accents, not pervasive saturated washes.
+  float neonWin = step(0.92, hash21(vec2(cellX + seed * 61.1, cellY + seed * 73.9)));
 
   float win = winH * winV * upper * mechWindows;
   float glass = glassH * glassV * upper * mechWindows;
@@ -309,7 +316,7 @@ vec3 facade() {
   vec3 glassC = vec3(0.07, 0.11, 0.18) * (vShade * (0.7 + 0.3 * glassTone)
     * (0.7 + 0.3 * (1.0 - fract(above / FLOOR_M)) + 0.5 * sheen) * (1.0 - recessShadow));
   vec3 warmC = vec3(1.0, 0.86, 0.68) * (vShade * 0.55);
-  vec3 litC = mix(warmC, warmC + vAccent * 0.8, neonWin * 0.6);
+  vec3 litC = mix(warmC, warmC + vAccent * 0.6, neonWin * 0.4);
   vec3 frameC = vBase * (vShade * 0.5);
 
   // Ground-floor storefront: darker base, glass bays, a sign strip.
@@ -411,13 +418,13 @@ vec3 roof() {
   }
   return vBase * material + vEmissive * 0.03;
 }
+
 vec3 clutter() {
   float cap = 1.0 - step(-0.5, vShade);
   float edge = smoothstep(0.68, 0.84, max(abs(vU), abs(vTop))) * cap;
   vec3 sideColour = vBase * vShade + vEmissive;
   // Cap lighter than the roof it sits on and the lip darker, not the reverse: a raised box
-  // catches more sky than the deck. Inverted, and with emissive on the rim, every box read as
-  // a dark hole in a lit frame — dozens of neon picture frames scattered over the skyline.
+  // catches more sky than the deck.
   vec3 capColour = vBase * 1.12 + vEmissive * 0.10;
   vec3 rimColour = vBase * 0.72 + vEmissive * 0.05;
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
@@ -453,8 +460,11 @@ void main() {
   else if (vKind > 3.5 && vKind < 4.5) colour = clutter();
   else if (vKind > 4.5 && vKind < 5.5) colour = architectureDetail();
   else if (vKind > 5.5 && vKind < 6.5) colour = car();
+  // Low-frequency ambient reflected spill replaces the old flat lavender lift: it is a single
+  // per-material add, so it carries the district hue onto every body without graying it out.
+  colour += vAmbient;
   float sceneAlpha = SCENE_ALPHA_FLOOR
     + (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);
-  gl_FragColor = vec4(colour + vec3(0.020, 0.014, 0.035), sceneAlpha);
+  gl_FragColor = vec4(colour, sceneAlpha);
 }
 `;

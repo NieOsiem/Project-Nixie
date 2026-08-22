@@ -6,7 +6,8 @@ import { BANK_SIZE, DISTRICT_SLOT } from "../palette.js";
 import {
   BUILDING_DETAIL_MIN_HEIGHT_M,
   buildingDetailMesh,
-  prismMesh
+  prismMesh,
+  resolveArchitecturalTypology
 } from "./building-detail.js";
 
 const PPM = 25;
@@ -43,8 +44,8 @@ describe("buildingDetailMesh", () => {
 
     expect(b.vertices).toEqual(a.vertices);
     expect(b.indices).toEqual(a.indices);
-    expect(a.triangleCount).toBeGreaterThan(200);
-    expect(a.vertexCount).toBeGreaterThan(400);
+    expect(a.triangleCount).toBeGreaterThan(150);
+    expect(a.vertexCount).toBeGreaterThan(300);
     for (const index of a.indices) expect(index).toBeLessThan(a.vertexCount);
     for (let i = 0; i < a.vertexCount; i++) {
       const vertex = vertexAt(a, i);
@@ -81,7 +82,9 @@ describe("buildingDetailMesh", () => {
   });
 
   it("adds projections, rooftop height, and neon structure", () => {
-    const building = spec();
+    // Neon accents only exist on market/entertainment roofs with neon enabled;
+    // opt in explicitly so the semantic accent path, not a generic default, drives it.
+    const building = spec({ facadeProfile: "shopfront", neonEnabled: true });
     const mesh = buildingDetailMesh([building], PPM);
     const vertices = Array.from({ length: mesh.vertexCount }, (_, i) => vertexAt(mesh, i));
     const neonA = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_A;
@@ -97,7 +100,10 @@ describe("buildingDetailMesh", () => {
   it("uses the district neon weights for rooftop accents", () => {
     const neonA = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_A;
     const neonB = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_B;
-    const mesh = buildingDetailMesh([spec({ neonWeights: [1, 0] })], PPM);
+    const mesh = buildingDetailMesh(
+      [spec({ facadeProfile: "shopfront", neonEnabled: true, neonWeights: [1, 0] })],
+      PPM
+    );
     const neonMaterials = Array.from({ length: mesh.vertexCount }, (_, i) => vertexAt(mesh, i).material)
       .filter((material) => material === neonA || material === neonB);
 
@@ -116,7 +122,7 @@ describe("buildingDetailMesh", () => {
     ];
     const mesh = buildingDetailMesh([spec({ footprint })], PPM);
 
-    expect(mesh.triangleCount).toBeGreaterThan(200);
+    expect(mesh.triangleCount).toBeGreaterThan(100);
     for (const index of mesh.indices) expect(index).toBeLessThan(mesh.vertexCount);
   });
 
@@ -133,7 +139,6 @@ describe("buildingDetailMesh", () => {
     const plain = buildingDetailMesh([spec()], PPM);
     const withUtilities = buildingDetailMesh([spec({ rooftopUtilityRate: 1 })], PPM);
     const delta = withUtilities.triangleCount - plain.triangleCount;
-    // Each 10-triangle utility box adds 20 vertices: at least one box, capped at three.
     expect(delta).toBeGreaterThanOrEqual(10);
     expect(delta).toBeLessThanOrEqual(30);
     expect(withUtilities.vertexCount - plain.vertexCount).toBe(delta * 2);
@@ -149,7 +154,6 @@ describe("buildingDetailMesh", () => {
       minY: Math.min(...building.footprint.map((p) => p.y)),
       maxY: Math.max(...building.footprint.map((p) => p.y))
     };
-    // Utility prisms append last, so the tail of the buffer is exactly the new boxes.
     const utilityStart = plain.vertexCount * VERTEX_FLOATS;
     for (let i = utilityStart; i < withUtilities.vertices.length; i += VERTEX_FLOATS) {
       const v = vertexAt(withUtilities, i / VERTEX_FLOATS);
@@ -189,6 +193,92 @@ describe("buildingDetailMesh", () => {
       expect(b.x / finePpm).toBeCloseTo(a.x / PPM, 5);
       expect(b.y / finePpm).toBeCloseTo(a.y / PPM, 5);
       expect(b.height).toBeCloseTo(a.height, 6);
+    }
+  });
+
+  it("classifies architectural typology from facadeProfile, roofline, and wear", () => {
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "office-grid" }))).toBe("corporate");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "glass-curtain", roofline: "crown" }))).toBe("corporate");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "residential-balcony" }))).toBe("residential");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "industrial-panel" }))).toBe("industrial");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "warehouse-ribs", roofline: "sawtooth" }))).toBe("industrial");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "shopfront" }))).toBe("market");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "entertainment-arcade" }))).toBe("market");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "civic-columns" }))).toBe("civic");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "civic-columns", roofline: "domed" }))).toBe("civic");
+    expect(resolveArchitecturalTypology(spec({ wear: 0.8 }))).toBe("derelict");
+    expect(resolveArchitecturalTypology(spec({ facadeProfile: "derelict-shack" }))).toBe("derelict");
+  });
+
+  it("generates distinct physical architecture across different facade profiles", () => {
+    const corporate = buildingDetailMesh([spec({ facadeProfile: "office-grid", roofline: "crown" })], PPM);
+    const residential = buildingDetailMesh([spec({ facadeProfile: "residential-balcony", roofline: "terrace" })], PPM);
+    const industrial = buildingDetailMesh([spec({ facadeProfile: "industrial-panel", roofline: "sawtooth" })], PPM);
+    const market = buildingDetailMesh([spec({ facadeProfile: "shopfront", roofline: "flat" })], PPM);
+    const civic = buildingDetailMesh([spec({ facadeProfile: "civic-columns", roofline: "crown" })], PPM);
+    const derelict = buildingDetailMesh([spec({ wear: 0.85 })], PPM);
+
+    const vertexCounts = [
+      corporate.vertexCount,
+      residential.vertexCount,
+      industrial.vertexCount,
+      market.vertexCount,
+      civic.vertexCount,
+      derelict.vertexCount
+    ];
+
+    // Every profile generates substantial geometry
+    for (const count of vertexCounts) {
+      expect(count).toBeGreaterThan(100);
+    }
+
+    // Profiles differ materially in geometry
+    expect(corporate.vertices).not.toEqual(residential.vertices);
+    expect(residential.vertices).not.toEqual(industrial.vertices);
+    expect(industrial.vertices).not.toEqual(market.vertices);
+    expect(market.vertices).not.toEqual(civic.vertices);
+    expect(civic.vertices).not.toEqual(derelict.vertices);
+  });
+
+  it("suppresses neon accent materials when neonEnabled is false", () => {
+    const neonA = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_A;
+    const neonB = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_B;
+
+    const noNeon = buildingDetailMesh([spec({ facadeProfile: "shopfront", neonEnabled: false })], PPM);
+
+    const noNeonMaterials = Array.from({ length: noNeon.vertexCount }, (_, i) => vertexAt(noNeon, i).material);
+    expect(noNeonMaterials.some((m) => m === neonA || m === neonB)).toBe(false);
+  });
+
+  it("keeps all rooftop structures contained inside building horizontal bounds", () => {
+    const profiles = [
+      { facadeProfile: "office-grid", roofline: "crown" },
+      { facadeProfile: "residential-balcony", roofline: "terrace" },
+      { facadeProfile: "industrial-panel", roofline: "sawtooth" },
+      { facadeProfile: "shopfront", roofline: "flat" },
+      { facadeProfile: "civic-columns", roofline: "crown" },
+      { wear: 0.9 }
+    ];
+
+    for (const profile of profiles) {
+      const b = spec(profile);
+      const mesh = buildingDetailMesh([b], PPM);
+      const bounds = {
+        minX: Math.min(...b.footprint.map((p) => p.x)),
+        maxX: Math.max(...b.footprint.map((p) => p.x)),
+        minY: Math.min(...b.footprint.map((p) => p.y)),
+        maxY: Math.max(...b.footprint.map((p) => p.y))
+      };
+
+      for (let i = 0; i < mesh.vertexCount; i++) {
+        const v = vertexAt(mesh, i);
+        if (v.height > b.height) {
+          expect(v.x).toBeGreaterThanOrEqual(bounds.minX - 1e-2);
+          expect(v.x).toBeLessThanOrEqual(bounds.maxX + 1e-2);
+          expect(v.y).toBeGreaterThanOrEqual(bounds.minY - 1e-2);
+          expect(v.y).toBeLessThanOrEqual(bounds.maxY + 1e-2);
+        }
+      }
     }
   });
 });

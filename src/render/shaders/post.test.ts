@@ -24,10 +24,10 @@ describe("composite shader", () => {
 
   it("keeps body chroma, boosts bright signage, and preserves a black floor", () => {
     expect(COMPOSITE_FRAG).toContain(
-      "float chroma = mix(0.93, 1.15, smoothstep(0.18, 0.62, l));"
+      "float chroma = mix(1.0, 1.15, smoothstep(0.18, 0.62, l));"
     );
     expect(COMPOSITE_FRAG).toContain(
-      "c = max(mix(vec3(l), c, chroma) - vec3(0.012), vec3(0.0));"
+      "c = max(mix(vec3(l), c, chroma) - vec3(0.004), vec3(0.0));"
     );
   });
 
@@ -47,7 +47,7 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG).toContain(
       "texture2D(uBuildingMask, vUv * uMaskUvScale).a"
     );
-    expect(COMPOSITE_FRAG).toContain("c *= 1.0 - 0.38 * castShadow;");
+    expect(COMPOSITE_FRAG).toContain("c *= 1.0 - 0.32 * castShadow;");
   });
 
   it("samples only the active frame of reusable render-target capacity", () => {
@@ -104,7 +104,6 @@ describe("composite shader", () => {
       "vec3 haze = vec3(uFogTintR, uFogTintG, uFogTintB) + wideBloom * uFogInscatter;"
     );
     expect(COMPOSITE_FRAG).toContain("c = mix(c, haze, clamp(fog, 0.0, 1.0));");
-    // The tone map is an exact clamp at 1.0, so an additive haze would vanish instead of reading.
     expect(COMPOSITE_FRAG).not.toMatch(/c\s*\+=[^;]*haze/);
     expect(COMPOSITE_FRAG).toContain("float density = exp(-heightM / max(uFogHeightM, 0.001));");
     expect(COMPOSITE_FRAG).toContain(
@@ -193,10 +192,6 @@ describe("composite shader", () => {
 
 describe("streak shader", () => {
   it("spaces taps uniformly so passes tile without gaps", () => {
-    // The bug this replaced: BLUR_FRAG with an inflated uTexel. Its 1.3846 / 3.2308 offsets are
-    // the linear-sampling ones and only hold at unit texel steps; scaled up they leave several
-    // unsampled texels between taps, so a bright source resolved as five ghost copies rather
-    // than a streak — invisible on horizontal lines, glaring on points and vertical bars.
     expect(STREAK_FRAG).toContain("vec2 o = uStep * t;");
     expect(STREAK_FRAG).not.toContain("1.3846");
     expect(STREAK_FRAG).not.toContain("3.2307");
@@ -204,7 +199,6 @@ describe("streak shader", () => {
   });
 
   it("weights geometrically, which is what makes two passes compose into one kernel", () => {
-    // a^t1 * a^t2 = a^(t1+t2), so the two-pass kernel is exactly a^t over the whole reach.
     expect(STREAK_FRAG).toContain("float w = pow(0.94, t * uSpan);");
     expect(STREAK_FRAG).toContain(`for (int i = 1; i <= ${STREAK_TAPS}; i++) {`);
   });

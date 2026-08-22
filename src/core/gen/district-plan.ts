@@ -1,5 +1,5 @@
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
-import { difference, intersection, ringAsMulti, union } from "../geom/boolean.js";
+import { difference, intersection, intersectMultiWithRing, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
 import { triangulate } from "../geom/tessellate.js";
 import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
@@ -19,11 +19,9 @@ const MAX_CELLS_PER_FRAGMENT = 384;
 const CELL_GAP_M = 0.1;
 
 /**
- * Ordinary (non-planning-band) cells must present an oriented minor dimension of at
- * least this (metres) in their own frame. Boundary/stagger clipping can shave a grid
- * cell down to a w/2 sliver at the fragment edge; such pieces are reclassified as
- * planning bands (open-space intent) so no ordinary cell ever comes out thinner than
- * the thin-building emission floor downstream.
+ * Building cells must present an oriented minor dimension of at least this (metres)
+ * in their own frame. Boundary and stagger clipping can shave a candidate below the
+ * floor; those pieces become explicit landscape cells rather than thin buildings.
  */
 const MIN_ORDINARY_CELL_MINOR_M = 6;
 
@@ -51,6 +49,11 @@ function orientedMinorDimension(ring: Ring): number {
   return Math.min(maxX - minX, maxY - minY);
 }
 
+function isViableBuildingCell(ring: Ring): boolean {
+  return Math.abs(ringArea(ring)) >= MIN_ORDINARY_CELL_MINOR_M * MIN_ORDINARY_CELL_MINOR_M
+    && orientedMinorDimension(ring) >= MIN_ORDINARY_CELL_MINOR_M;
+}
+
 export interface StructuralInputSignature {
   terrain: string;
   roads: string;
@@ -72,6 +75,21 @@ export interface DerivedBlock {
   boundaryRoadIds: string[];
   districtFragments: DistrictBlockFragment[];
 }
+export type DevelopmentSpaceRole = "courtyard" | "plaza" | "alley" | "promenade" | "service" | "loading" | "campus" | "landscape";
+
+export type DevelopmentCellClassification = "building" | DevelopmentSpaceRole;
+export const DEVELOPMENT_SPACE_CATEGORIES: Readonly<Record<DevelopmentSpaceRole, OpenSpaceCategory>> = Object.freeze({
+  courtyard: "landscaping",
+  plaza: "plaza",
+  alley: "plaza",
+  promenade: "landscaping",
+  service: "service-yard",
+  loading: "service-yard",
+  campus: "landscaping",
+  landscape: "landscaping"
+});
+
+
 
 export interface DevelopmentCellPlan {
   id: string;
@@ -81,7 +99,10 @@ export interface DevelopmentCellPlan {
   grammarId: BlockGrammarId;
   polygon: Ring;
   localRole: string;
+  classification: DevelopmentCellClassification;
   rotationRad: number;
+  semanticRole: DevelopmentSpaceRole | null;
+  openSpaceCategory: OpenSpaceCategory | null;
   frontageRoadId: string | null;
 }
 
@@ -140,25 +161,22 @@ interface GrammarShape {
   depthFactor: number;
   angleOffset: number;
   stagger: number;
-  sparse: number;
 }
 
 const GRAMMAR_SHAPES: Readonly<Record<BlockGrammarId, GrammarShape>> = {
-  "perimeter-courtyard": { widthFactor: 0.85, depthFactor: 0.72, angleOffset: 0, stagger: 0, sparse: 0.04 }, // Tuned: reduced skip rate for tighter residential grain
-  // Tuned: width/depth floors raised so fine-grain cells never produce sub-6m slivers
-  // (nominal width min = minCellWidthM × 0.62 across the shipping fine-grain districts)
-  "fine-grain-frontage": { widthFactor: 0.62, depthFactor: 0.78, angleOffset: 0, stagger: 0.5, sparse: 0 },
-  "rotated-bands": { widthFactor: 0.72, depthFactor: 1.2, angleOffset: 0, stagger: 0.5, sparse: 0 }, // Tuned: aligned with street frontage
-  "irregular-mosaic": { widthFactor: 0.78, depthFactor: 0.82, angleOffset: 0, stagger: 0.35, sparse: 0.08 },
-  "superblock-compound": { widthFactor: 1.7, depthFactor: 1.55, angleOffset: 0, stagger: 0, sparse: 0.05 },
-  "tower-podium-field": { widthFactor: 1.25, depthFactor: 1.25, angleOffset: 0, stagger: 0.25, sparse: 0.03 }, // Tuned: aligned with street frontage
-  "industrial-yard": { widthFactor: 1.1, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.05 }, // Tuned: aligned with street frontage
-  "logistics-sheds": { widthFactor: 0.92, depthFactor: 1.35, angleOffset: 0, stagger: 0.5, sparse: 0.08 },
-  "campus-pavilions": { widthFactor: 1.25, depthFactor: 1.1, angleOffset: 0, stagger: 0.5, sparse: 0.18 }, // Tuned: aligned with street frontage
-  // Tuned: width/depth floors raised so market cells never produce sub-6m slivers
-  "market-alley": { widthFactor: 0.62, depthFactor: 0.7, angleOffset: 0, stagger: 0.5, sparse: 0.05 },
-  "radial-fan": { widthFactor: 1, depthFactor: 1, angleOffset: 0, stagger: 0, sparse: 0 },
-  "waterfront-terraces": { widthFactor: 0.78, depthFactor: 1.45, angleOffset: 0, stagger: 0.5, sparse: 0.12 }
+  "perimeter-courtyard": { widthFactor: 0.85, depthFactor: 0.72, angleOffset: 0, stagger: 0 },
+  // Width/depth floors keep fine-grain and market frontage above the six-metre floor.
+  "fine-grain-frontage": { widthFactor: 0.62, depthFactor: 0.78, angleOffset: 0, stagger: 0.5 },
+  "rotated-bands": { widthFactor: 0.72, depthFactor: 1.2, angleOffset: Math.PI / 8, stagger: 0.5 },
+  "irregular-mosaic": { widthFactor: 0.78, depthFactor: 0.82, angleOffset: 0, stagger: 0.35 },
+  "superblock-compound": { widthFactor: 1.7, depthFactor: 1.55, angleOffset: 0, stagger: 0 },
+  "tower-podium-field": { widthFactor: 1.25, depthFactor: 1.25, angleOffset: 0, stagger: 0.25 },
+  "industrial-yard": { widthFactor: 1.1, depthFactor: 1.1, angleOffset: 0, stagger: 0.5 },
+  "logistics-sheds": { widthFactor: 0.92, depthFactor: 1.35, angleOffset: 0, stagger: 0.5 },
+  "campus-pavilions": { widthFactor: 1.25, depthFactor: 1.1, angleOffset: 0, stagger: 0.5 },
+  "market-alley": { widthFactor: 0.62, depthFactor: 0.7, angleOffset: 0, stagger: 0.5 },
+  "radial-fan": { widthFactor: 1, depthFactor: 1, angleOffset: 0, stagger: 0 },
+  "waterfront-terraces": { widthFactor: 0.78, depthFactor: 1.45, angleOffset: 0, stagger: 0.5 }
 };
 
 const PROFILE_RATES = { none: 0, "very-low": 0.025, low: 0.075, medium: 0.14, high: 0.23 } as const;
@@ -297,6 +315,7 @@ function multiSignature(multi: MultiPolygon): string {
 function multiArea(multi: MultiPolygon): number {
   return multi.reduce((sum, polygon) => sum + polygon.reduce((polygonSum, ring, index) => polygonSum + Math.abs(ringArea(ring)) * (index === 0 ? 1 : -1), 0), 0);
 }
+
 
 function segmentIntersection(a: Vec2, b: Vec2, c: Vec2, d: Vec2): { point: Vec2; t: number; u: number } | null {
   const rx = b.x - a.x;
@@ -667,39 +686,78 @@ function rotate(point: Vec2, origin: Vec2, angle: number): Vec2 {
 
 function radialCells(fragment: DistrictBlockFragment, ring: Ring, grammarId: BlockGrammarId, rotation: number, seed: string, frontageRoadId: string | null): DevelopmentCellPlan[] {
   const centre = ringCentroid(ring);
-  const count = Math.max(5, Math.min(14, ring.length + Math.floor(hashUnit(`${seed}/count`) * 5)));
-  const radius = Math.max(ringBounds(ring).width, ringBounds(ring).height) * 2 + 1;
+  const bounds = ringBounds(ring.map((point) => rotate(point, centre, -rotation)));
+  const count = Math.max(6, Math.min(14, ring.length + 3 + Math.floor(hashUnit(`${seed}/count`) * 4)));
+  const radius = Math.max(bounds.width, bounds.height) * 2 + 1;
   const planningArea = ringAsMulti(ring);
   const cells: DevelopmentCellPlan[] = [];
-  let occupied: MultiPolygon = [];
-  for (let index = 0; index < count; index++) {
-    const a = rotation + (index / count) * Math.PI * 2;
-    const b = rotation + ((index + 1) / count) * Math.PI * 2;
-    const wedge = [centre, { x: centre.x + Math.cos(a) * radius, y: centre.y + Math.sin(a) * radius }, { x: centre.x + Math.cos(b) * radius, y: centre.y + Math.sin(b) * radius }];
-    const available = difference(intersection(planningArea, ringAsMulti(wedge)), occupied.length > 0 ? [occupied] : []);
-    for (const polygon of available) {
-      for (const cellRing of canonicalHoleFreePieces(polygon)) {
-        if (Math.abs(ringArea(cellRing)) < MIN_CELL_AREA_M2) continue;
-        // Fan wedges taper toward the apex; sub-floor apex pieces become planning
-        // bands instead of ordinary thin cells.
-        const role = orientedMinorDimension(cellRing) < MIN_ORDINARY_CELL_MINOR_M ? `planning-band-fan-${index}` : `fan-${index}`;
-        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${role}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: role, rotationRad: rotation, frontageRoadId });
-        occupied = union([occupied, ringAsMulti(cellRing)]);
+  let available = planningArea;
+
+  const pushPiece = (cellRing: Ring, localRole: string, classification: DevelopmentCellClassification): void => {
+    const resolvedClassification = classification === "building" && !isViableBuildingCell(cellRing) ? "landscape" : classification;
+    const resolvedRole = resolvedClassification === classification ? localRole : `boundary-sliver-${localRole}`;
+    cells.push({
+      id: stableId("cell", `${fragment.id}|${grammarId}|${resolvedClassification}|${resolvedRole}|${seed}|${ringSignature(cellRing)}`),
+      blockId: fragment.blockId,
+      fragmentId: fragment.id,
+      districtId: fragment.districtId,
+      grammarId,
+      polygon: cellRing,
+      localRole: resolvedRole,
+      classification: resolvedClassification,
+      semanticRole: resolvedClassification === "building" ? null : resolvedClassification,
+      openSpaceCategory: resolvedClassification === "building" ? null : DEVELOPMENT_SPACE_CATEGORIES[resolvedClassification],
+      rotationRad: rotation,
+      frontageRoadId
+    });
+  };
+
+  const plaza = rectRing({
+    x: bounds.x + bounds.width * 0.39,
+    y: bounds.y + bounds.height * 0.39,
+    width: bounds.width * 0.22,
+    height: bounds.height * 0.22
+  }).map((point) => rotate(point, centre, rotation));
+
+  let carvedPlaza = false;
+  for (const polygon of intersectMultiWithRing(available, plaza)) {
+    for (const piece of canonicalHoleFreePieces(polygon)) {
+      if (Math.abs(ringArea(piece)) > GEOMETRY_EPSILON) {
+        pushPiece(piece, "radial-centre-plaza", "plaza");
+        carvedPlaza = true;
       }
     }
   }
-  const remainder = difference(planningArea, occupied.length > 0 ? [occupied] : []);
-  for (let index = 0; index < remainder.length; index++) {
-    const polygon = remainder[index]!;
-    for (const cellRing of canonicalHoleFreePieces(polygon)) {
-      if (Math.abs(ringArea(cellRing)) <= GEOMETRY_EPSILON) continue;
-      cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|planning-band-remainder-${index}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: `planning-band-remainder-${index}`, rotationRad: rotation, frontageRoadId });
+  if (carvedPlaza) available = subtractPieceFromMulti(available, plaza);
+
+  for (let index = 0; index < count; index++) {
+    const a = rotation + (index / count) * Math.PI * 2;
+    const b = rotation + ((index + 1) / count) * Math.PI * 2;
+    const wedge: Ring = [centre, { x: centre.x + Math.cos(a) * radius, y: centre.y + Math.sin(a) * radius }, { x: centre.x + Math.cos(b) * radius, y: centre.y + Math.sin(b) * radius }];
+    const clipped = intersectMultiWithRing(available, wedge);
+    let carvedWedge = false;
+    for (const polygon of clipped) {
+      for (const piece of canonicalHoleFreePieces(polygon)) {
+        if (Math.abs(ringArea(piece)) > GEOMETRY_EPSILON) {
+          pushPiece(piece, `radial-frontage-${index}`, "building");
+          carvedWedge = true;
+        }
+      }
+    }
+    if (carvedWedge) available = subtractPieceFromMulti(available, wedge);
+  }
+
+  let remainderIndex = 0;
+  for (const polygon of available) {
+    for (const piece of canonicalHoleFreePieces(polygon)) {
+      if (Math.abs(ringArea(piece)) <= GEOMETRY_EPSILON) continue;
+      pushPiece(piece, `radial-infill-frontage-residual-${remainderIndex++}`, "building");
     }
   }
   return cells.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function gridCells(
+function composedCells(
   fragment: DistrictBlockFragment,
   ring: Ring,
   grammarId: BlockGrammarId,
@@ -725,84 +783,137 @@ function gridCells(
     depth *= scale;
   }
   const cells: DevelopmentCellPlan[] = [];
-  let occupied: MultiPolygon = [];
-  const addCandidate = (candidate: Ring, localRole: string, minimumArea = MIN_CELL_AREA_M2): void => {
-    const available = difference(intersection(planningArea, ringAsMulti(candidate)), occupied.length > 0 ? [occupied] : []);
-    for (const polygon of available) {
+  let available = planningArea;
+
+  const pushPiece = (cellRing: Ring, localRole: string, classification: DevelopmentCellClassification): void => {
+    const resolvedClassification = classification === "building" && !isViableBuildingCell(cellRing) ? "landscape" : classification;
+    const resolvedRole = resolvedClassification === classification ? localRole : `boundary-sliver-${localRole}`;
+    cells.push({
+      id: stableId("cell", `${fragment.id}|${grammarId}|${resolvedClassification}|${resolvedRole}|${seed}|${ringSignature(cellRing)}`),
+      blockId: fragment.blockId,
+      fragmentId: fragment.id,
+      districtId: fragment.districtId,
+      grammarId,
+      polygon: cellRing,
+      localRole: resolvedRole,
+      classification: resolvedClassification,
+      semanticRole: resolvedClassification === "building" ? null : resolvedClassification,
+      openSpaceCategory: resolvedClassification === "building" ? null : DEVELOPMENT_SPACE_CATEGORIES[resolvedClassification],
+      rotationRad: rotation,
+      frontageRoadId
+    });
+  };
+  const addCandidate = (candidate: Ring, localRole: string, classification: DevelopmentCellClassification): void => {
+    const clipped = intersectMultiWithRing(available, candidate);
+    let added = false;
+    for (const polygon of clipped) {
       for (const cellRing of canonicalHoleFreePieces(polygon)) {
-        if (Math.abs(ringArea(cellRing)) < minimumArea) continue;
-        // WHY: boundary/stagger clipping can shave a grid piece below the emission
-        // floor. Give it an explicit diagnostic role; final planning classifies every
-        // sub-floor parcel as unbuilt landscaping.
-        const role = localRole.startsWith("planning-band") || orientedMinorDimension(cellRing) >= MIN_ORDINARY_CELL_MINOR_M
-          ? localRole
-          : `edge-sliver-${localRole}`;
-        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${role}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: role, rotationRad: rotation, frontageRoadId });
-        occupied = union([occupied, ringAsMulti(cellRing)]);
+        if (Math.abs(ringArea(cellRing)) <= GEOMETRY_EPSILON) continue;
+        pushPiece(cellRing, localRole, classification);
+        added = true;
       }
     }
+    if (added) available = subtractPieceFromMulti(available, candidate);
   };
+
   const localRect = (x: number, y: number, widthM: number, heightM: number): Ring =>
     rectRing({ x, y, width: Math.max(CELL_GAP_M, widthM), height: Math.max(CELL_GAP_M, heightM) }).map((point) => rotate(point, centre, rotation));
-  const reserveBand = (x: number, y: number, widthM: number, heightM: number, role: string): void =>
-    addCandidate(localRect(x, y, widthM, heightM), `planning-band-${role}`, GEOMETRY_EPSILON);
+  const at = (x: number, y: number, widthFactor: number, heightFactor: number): Ring =>
+    localRect(localBounds.x + localBounds.width * x, localBounds.y + localBounds.height * y, localBounds.width * widthFactor, localBounds.height * heightFactor);
+  const addOpen = (x: number, y: number, w: number, h: number, role: DevelopmentSpaceRole, name: string = role): void =>
+    addCandidate(at(x, y, w, h), name, role);
+  const addBuilding = (x: number, y: number, w: number, h: number, role: string): void =>
+    addCandidate(at(x, y, w, h), role, "building");
 
   if (grammarId === "perimeter-courtyard") {
-    reserveBand(localBounds.x + localBounds.width * 0.31, localBounds.y + localBounds.height * 0.31, localBounds.width * 0.38, localBounds.height * 0.38, "courtyard");
+    addOpen(0.3, 0.3, 0.4, 0.4, "courtyard", "perimeter-courtyard");
+    addBuilding(0, 0, 1, 0.3, "frontage-north");
+    addBuilding(0, 0.7, 1, 0.3, "frontage-south");
+    addBuilding(0, 0.3, 0.3, 0.4, "corner-frontage-west");
+    addBuilding(0.7, 0.3, 0.3, 0.4, "corner-frontage-east");
   } else if (grammarId === "superblock-compound") {
-    // A single central compound yard, not a spine + crossing: two orthogonal full-span
-    // reserve bands resolved into thin bar parcels that read as an accidental plus/red
-    // cross across the block. The yard keeps the mega-block grain (the surrounding
-    // 1.7x1.55 cells ring it) while staying below megablock-ring's declared limits so
-    // the core resolves to one coherent block instead of bar slivers.
-    reserveBand(localBounds.x + localBounds.width * 0.33, localBounds.y + localBounds.height * 0.33, localBounds.width * 0.34, localBounds.height * 0.34, "compound-yard");
+    addOpen(0.36, 0.32, 0.28, 0.32, "plaza", "compound-plaza");
+    addOpen(0.47, 0.64, 0.06, 0.36, "service", "compound-service-lane");
+    addBuilding(0, 0, 0.5, 0.32, "megablock-frontage-north-west");
+    addBuilding(0.5, 0, 0.5, 0.32, "megablock-frontage-north-east");
+    addBuilding(0, 0.32, 0.36, 0.68, "megablock-west-wing");
+    addBuilding(0.64, 0.32, 0.36, 0.68, "megablock-east-wing");
+    addBuilding(0.36, 0.64, 0.11, 0.36, "megablock-south-west");
+    addBuilding(0.53, 0.64, 0.11, 0.36, "megablock-south-east");
   } else if (grammarId === "tower-podium-field") {
-    addCandidate(localRect(localBounds.x + localBounds.width * 0.27, localBounds.y + localBounds.height * 0.27, localBounds.width * 0.46, localBounds.height * 0.46), "podium-anchor");
+    addBuilding(0.3, 0.3, 0.4, 0.4, "podium-anchor");
+    addOpen(0.18, 0.18, 0.64, 0.12, "plaza", "podium-plaza-north");
+    addOpen(0.18, 0.7, 0.64, 0.12, "plaza", "podium-plaza-south");
+    addOpen(0.18, 0.3, 0.12, 0.4, "plaza", "podium-plaza-west");
+    addOpen(0.7, 0.3, 0.12, 0.4, "plaza", "podium-plaza-east");
+    addBuilding(0, 0, 0.18, 0.18, "corner-tower-north-west");
+    addBuilding(0.82, 0, 0.18, 0.18, "corner-tower-north-east");
+    addBuilding(0, 0.82, 0.18, 0.18, "corner-tower-south-west");
+    addBuilding(0.82, 0.82, 0.18, 0.18, "corner-tower-south-east");
   } else if (grammarId === "industrial-yard") {
-    reserveBand(localBounds.x, localBounds.y, localBounds.width, localBounds.height * 0.12, "service-yard");
+    addOpen(0.08, 0.38, 0.84, 0.44, "service", "industrial-service-yard");
+    addOpen(0, 0.82, 1, 0.1, "loading", "industrial-loading-apron");
+    addBuilding(0, 0, 0.58, 0.38, "industrial-main-hall");
+    addBuilding(0.58, 0, 0.42, 0.38, "industrial-frontage-workshop");
+    addBuilding(0, 0.92, 0.5, 0.08, "industrial-frontage-gatehouse-west");
+    addBuilding(0.5, 0.92, 0.5, 0.08, "industrial-frontage-gatehouse-east");
   } else if (grammarId === "logistics-sheds") {
-    reserveBand(localBounds.x, localBounds.y, localBounds.width * 0.08, localBounds.height, "loading-spine");
+    addOpen(0.46, 0, 0.08, 1, "loading", "logistics-loading-spine");
+    addOpen(0, 0.44, 1, 0.12, "service", "logistics-turning-yard");
+    addBuilding(0, 0, 0.46, 0.44, "logistics-shed-north-west");
+    addBuilding(0.54, 0, 0.46, 0.44, "logistics-shed-north-east");
+    addBuilding(0, 0.56, 0.46, 0.44, "logistics-shed-south-west");
+    addBuilding(0.54, 0.56, 0.46, 0.44, "logistics-shed-south-east");
   } else if (grammarId === "campus-pavilions") {
-    // One central quad instead of a walk + green crossing pair; the two full-span bands
-    // resolved into an orthogonal cross of thin built strips.
-    reserveBand(localBounds.x + localBounds.width * 0.31, localBounds.y + localBounds.height * 0.31, localBounds.width * 0.38, localBounds.height * 0.38, "campus-quad");
+    addOpen(0.3, 0.3, 0.4, 0.4, "campus", "campus-quad");
+    addOpen(0.46, 0, 0.08, 0.3, "landscape", "campus-north-walk");
+    addOpen(0.46, 0.7, 0.08, 0.3, "landscape", "campus-south-walk");
+    addBuilding(0, 0, 0.46, 0.3, "campus-pavilion-north-west");
+    addBuilding(0.54, 0, 0.46, 0.3, "campus-pavilion-north-east");
+    addBuilding(0, 0.7, 0.46, 0.3, "campus-pavilion-south-west");
+    addBuilding(0.54, 0.7, 0.46, 0.3, "campus-pavilion-south-east");
+    addBuilding(0, 0.3, 0.3, 0.4, "campus-pavilion-west");
+    addBuilding(0.7, 0.3, 0.3, 0.4, "campus-pavilion-east");
   } else if (grammarId === "market-alley") {
-    // Keep the market street itself (the defining fine-grain alley) and drop the
-    // crossing lane that turned the block into a plus of thin bars.
-    reserveBand(localBounds.x, localBounds.y + localBounds.height * 0.45, localBounds.width, localBounds.height * 0.1, "market-alley");
+    addOpen(0, 0.44, 0.82, 0.12, "alley", "market-main-alley");
+    addOpen(0.82, 0.34, 0.18, 0.32, "plaza", "market-entry-plaza");
+    for (let index = 0; index < 4; index++) {
+      addBuilding(index * 0.205, 0, 0.205, 0.44, `market-frontage-north-${index}`);
+      addBuilding(index * 0.205, 0.56, 0.205, 0.44, `market-frontage-south-${index}`);
+    }
   } else if (grammarId === "waterfront-terraces") {
-    reserveBand(localBounds.x, localBounds.y, localBounds.width, localBounds.height * 0.16, "promenade");
-  }
-  const columns = Math.max(1, Math.ceil(localBounds.width / width));
-  const rows = Math.max(1, Math.ceil(localBounds.height / depth));
-  for (let row = 0; row < rows; row++) {
-    const staggered = row % 2 === 1 && shape.stagger > 0;
-    const rowOffset = staggered ? width * shape.stagger : 0;
-    // Stagger alignment: an off-grid leading column (column -1) clips against the
-    // fragment edge into a w/2 sliver (a 4-5 m ordinary cell). Staggered rows start at
-    // column 0 instead; the uncovered left notch falls to the planning-band remainder
-    // path below, and trailing residuals are reclassified by the addCandidate gate.
-    for (let column = staggered ? 0 : -1; column <= columns; column++) {
-      const role = `${row}-${column}`;
-      const random = hashUnit(`${seed}/cell/${role}`);
-      const variation = grammarId === "irregular-mosaic" ? 0.72 + random * 0.28 : 1;
-      const localCell = rectRing({
-        x: localBounds.x + column * width + rowOffset + CELL_GAP_M / 2,
-        y: localBounds.y + row * depth + CELL_GAP_M / 2,
-        width: Math.max(CELL_GAP_M, width * variation - CELL_GAP_M),
-        height: Math.max(CELL_GAP_M, depth * (grammarId === "waterfront-terraces" ? 0.72 + (row % 3) * 0.12 : 1) - CELL_GAP_M)
-      }).map((point) => rotate(point, centre, rotation));
-      const sparse = random < shape.sparse;
-      const localRole = sparse ? `planning-band-${role}` : `${grammarId}-${role}`;
-      addCandidate(localCell, localRole);
+    addOpen(0, 0, 1, 0.18, "promenade", "waterfront-promenade");
+    addOpen(0.46, 0.18, 0.08, 0.82, "landscape", "waterfront-terrace-steps");
+    addBuilding(0, 0.18, 0.46, 0.24, "waterfront-terrace-low-west");
+    addBuilding(0.54, 0.18, 0.46, 0.24, "waterfront-terrace-low-east");
+    addBuilding(0, 0.42, 0.46, 0.28, "waterfront-terrace-mid-west");
+    addBuilding(0.54, 0.42, 0.46, 0.28, "waterfront-terrace-mid-east");
+    addBuilding(0, 0.7, 0.46, 0.3, "waterfront-terrace-high-west");
+    addBuilding(0.54, 0.7, 0.46, 0.3, "waterfront-terrace-high-east");
+  } else {
+    const columns = Math.max(1, Math.ceil(localBounds.width / width));
+    const rows = Math.max(1, Math.ceil(localBounds.height / depth));
+    for (let row = 0; row < rows; row++) {
+      const staggered = row % 2 === 1 && shape.stagger > 0;
+      const rowOffset = staggered ? width * shape.stagger : 0;
+      for (let column = staggered ? 0 : -1; column <= columns; column++) {
+        const role = `${row}-${column}`;
+        const candidate = rectRing({
+          x: localBounds.x + column * width + rowOffset,
+          y: localBounds.y + row * depth,
+          width,
+          height: depth
+        }).map((point) => rotate(point, centre, rotation));
+        const edge = row === 0 || row === rows - 1 || column <= 0 || column >= columns - 1;
+        addCandidate(candidate, `${edge ? "frontage" : "interior"}-${grammarId}-${role}`, "building");
+      }
     }
   }
-  const remainder = difference(planningArea, occupied.length > 0 ? [occupied] : []);
-  for (let index = 0; index < remainder.length; index++) {
-    const polygon = remainder[index]!;
+  let remainderIndex = 0;
+  for (const polygon of available) {
     for (const cellRing of canonicalHoleFreePieces(polygon)) {
       if (Math.abs(ringArea(cellRing)) <= GEOMETRY_EPSILON) continue;
-      cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|planning-band-remainder-${index}|${seed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: `planning-band-remainder-${index}`, rotationRad: rotation, frontageRoadId });
+      pushPiece(cellRing, `infill-frontage-residual-${remainderIndex++}`, "building");
     }
   }
   return cells.sort((a, b) => a.id.localeCompare(b.id));
@@ -827,13 +938,15 @@ export function planDistrictFragmentWithGrammar(
       const frontageRoadId = boundaryRoadIds.length > 0 ? boundaryRoadIds[fnv1a(pieceSeed) % boundaryRoadIds.length]! : null;
       if (decomposed) {
         const cellRing = canonicalRing(ring);
-        if (!validateRing(cellRing).ok) throw new Error(`Fragment "${fragment.id}" could not be decomposed into valid planning bands.`);
-        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|planning-band-hole-${pieceIndex}|${pieceSeed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole: `planning-band-hole-decomposition-${pieceIndex}`, rotationRad: rotation, frontageRoadId });
+        if (!validateRing(cellRing).ok) throw new Error(`Fragment "${fragment.id}" could not be decomposed into valid planning geometry.`);
+        const classification = isViableBuildingCell(cellRing) ? "building" as const : "landscape" as const;
+        const localRole = classification === "building" ? `decomposed-infill-frontage-${pieceIndex}` : `boundary-sliver-decomposition-${pieceIndex}`;
+        cells.push({ id: stableId("cell", `${fragment.id}|${grammarId}|${classification}|${localRole}|${pieceSeed}|${ringSignature(cellRing)}`), blockId: fragment.blockId, fragmentId: fragment.id, districtId: fragment.districtId, grammarId, polygon: cellRing, localRole, classification, semanticRole: classification === "building" ? null : "landscape", openSpaceCategory: classification === "building" ? null : DEVELOPMENT_SPACE_CATEGORIES.landscape, rotationRad: rotation, frontageRoadId });
         continue;
       }
       cells.push(...(grammarId === "radial-fan"
         ? radialCells(pieceFragment, ring, grammarId, rotation, pieceSeed, frontageRoadId)
-        : gridCells(pieceFragment, ring, grammarId, rotation, bounds, pieceSeed, frontageRoadId)));
+        : composedCells(pieceFragment, ring, grammarId, rotation, bounds, pieceSeed, frontageRoadId)));
     }
   }
   return cells.sort((a, b) => a.id.localeCompare(b.id));
@@ -903,7 +1016,7 @@ function planFragments(source: CitySourceV3, blocks: DerivedBlock[]): { cells: D
       const planningBounds = definition?.bounds ?? { minCellWidthM: 12, maxCellWidthM: 28, minCellDepthM: 14, maxCellDepthM: 34, minAspect: 0.4, maxAspect: 3 };
       const planned = planDistrictFragmentWithGrammar(fragment, grammarId, planningBounds, grammarSeed, block.boundaryRoadIds);
       cells.push(...(intent.size === "whole-block" && intent.targetShare > 0
-        ? planned.map((cell) => ({ ...cell, id: stableId("cell", `${cell.id}|whole-block-open-space`), localRole: "planning-band-whole-block-open-space" }))
+        ? planned.map((cell) => ({ ...cell, id: stableId("cell", `${cell.id}|whole-block-open-space`), localRole: "whole-block-open-space", classification: "landscape" as const, semanticRole: "landscape" as const, openSpaceCategory: DEVELOPMENT_SPACE_CATEGORIES.landscape }))
         : planned));
     }
   }

@@ -42,12 +42,12 @@ export interface RouteClassDefinition {
 
 // WHY: Keeping the registry code-owned prevents width/material tables from leaking into every Scene flag.
 export const ROUTE_CLASSES: readonly RouteClassDefinition[] = [
-  { id: "highway", vehicle: true, widthM: 24, sidewalkM: 3, surface: "vehicle", centreMarking: true },
-  { id: "arterial", vehicle: true, widthM: 16, sidewalkM: 3, surface: "vehicle", centreMarking: true },
-  { id: "street", vehicle: true, widthM: 9, sidewalkM: 2.5, surface: "vehicle", centreMarking: true },
-  { id: "narrow", vehicle: true, widthM: 6, sidewalkM: 2, surface: "vehicle", centreMarking: false },
-  { id: "lane", vehicle: true, widthM: 4, sidewalkM: 1.5, surface: "vehicle", centreMarking: false },
-  { id: "alley", vehicle: true, widthM: 2, sidewalkM: 0, surface: "vehicle", centreMarking: false },
+  { id: "highway", vehicle: true, widthM: 24, sidewalkM: 3.5, surface: "vehicle", centreMarking: true },
+  { id: "arterial", vehicle: true, widthM: 16, sidewalkM: 3.0, surface: "vehicle", centreMarking: true },
+  { id: "street", vehicle: true, widthM: 8, sidewalkM: 2.0, surface: "vehicle", centreMarking: true },
+  { id: "narrow", vehicle: true, widthM: 5.5, sidewalkM: 1.5, surface: "vehicle", centreMarking: false },
+  { id: "lane", vehicle: true, widthM: 3.5, sidewalkM: 1.0, surface: "vehicle", centreMarking: false },
+  { id: "alley", vehicle: true, widthM: 2.5, sidewalkM: 0, surface: "vehicle", centreMarking: false },
   { id: "pedestrian-path", vehicle: false, widthM: 3, sidewalkM: 0, surface: "non-vehicle", centreMarking: false },
   { id: "park-path", vehicle: false, widthM: 2.5, sidewalkM: 0, surface: "non-vehicle", centreMarking: false },
   { id: "plaza-route", vehicle: false, widthM: 4, sidewalkM: 0, surface: "non-vehicle", centreMarking: false },

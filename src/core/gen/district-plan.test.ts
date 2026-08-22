@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { validateRouteTopology } from "../graph/topology.js";
-import { intersection, ringAsMulti, union } from "../geom/boolean.js";
+import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
 import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, type DistrictBlockFragment } from "./district-plan.js";
@@ -223,38 +223,93 @@ describe("buildDistrictPlan", () => {
     }
   });
 
-  it("never reserves an orthogonal full-span cross of planning bands", () => {
-    // WHY: superblock-compound, campus-pavilions and market-alley used to reserve two
-    // full-span bands crossing at right angles (spine+crossing, walk+green,
-    // alley+cross-alley). Those reserves resolved into thin bar parcels that read as an
-    // accidental plus/red-cross across the block, with the surrounding grid clipped into
-    // incoherent slivers. A coherent yard/quad/alley reserve either spans both axes as a
-    // solid block or spans only one axis as a street band — never two thin full-span arms.
+  it("composes each architectural grammar from explicit building and circulation cells", () => {
     const fragment: DistrictBlockFragment = {
-      id: "cross-fixture",
+      id: "composition-fixture",
       blockId: "block",
       districtId: null,
       buildable: [[rectRing({ x: 0, y: 0, width: 240, height: 240 })]]
     };
     const bounds: DistrictPlanningBounds = { minCellWidthM: 12, maxCellWidthM: 28, minCellDepthM: 14, maxCellDepthM: 34, minAspect: 0.4, maxAspect: 3 };
-    for (const grammar of BLOCK_GRAMMAR_IDS) {
-      const cells = planDistrictFragmentWithGrammar(fragment, grammar, bounds, `fixture/${grammar}`, ["road-1"]);
-      const bands = cells.filter((cell) => cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("planning-band-remainder") && !/^planning-band--?\d+-/.test(cell.localRole) && Math.abs(ringArea(cell.polygon)) >= 1);
-      if (bands.length === 0) continue;
-      const bandUnion = union(bands.map((cell) => ringAsMulti(cell.polygon)));
-      const xs: number[] = [];
-      const ys: number[] = [];
-      for (const polygon of bandUnion) for (const point of polygon[0]!) {
-        xs.push(point.x);
-        ys.push(point.y);
+    const requiredRoles = {
+      "perimeter-courtyard": ["courtyard"],
+      "superblock-compound": ["plaza", "service"],
+      "tower-podium-field": ["plaza"],
+      "industrial-yard": ["service", "loading"],
+      "logistics-sheds": ["loading", "service"],
+      "campus-pavilions": ["campus", "landscape"],
+      "market-alley": ["alley", "plaza"],
+      "waterfront-terraces": ["promenade", "landscape"]
+    } as const;
+    const geometrySignatures = new Set<string>();
+    for (const grammarId of Object.keys(requiredRoles) as (keyof typeof requiredRoles)[]) {
+      const cells = planDistrictFragmentWithGrammar(fragment, grammarId, bounds, `fixture/${grammarId}`, ["road-1"]);
+      expect(cells.some((cell) => cell.classification === "building"), grammarId).toBe(true);
+      for (const role of requiredRoles[grammarId]) {
+        expect(cells.some((cell) => cell.classification === role), `${grammarId} ${role}`).toBe(true);
       }
-      const bandWidth = Math.max(...xs) - Math.min(...xs);
-      const bandHeight = Math.max(...ys) - Math.min(...ys);
-      const bandArea = bandUnion.reduce((sum, polygon) => sum + Math.abs(ringArea(polygon[0]!)), 0);
-      const spansBothAxes = bandWidth >= 0.8 * 240 && bandHeight >= 0.8 * 240;
-      const thinArms = bandArea < 0.6 * bandWidth * bandHeight;
-      expect(spansBothAxes && thinArms, `${grammar} reserved bands form an orthogonal full-span cross`).toBe(false);
+      expect(cells.every((cell) => cell.classification === "building"
+        ? cell.semanticRole === null && cell.openSpaceCategory === null
+        : cell.semanticRole === cell.classification && cell.openSpaceCategory !== null), `${grammarId} classification metadata`).toBe(true);
+      for (let left = 0; left < cells.length; left++) {
+        for (let right = left + 1; right < cells.length; right++) {
+          const overlapArea = intersection(ringAsMulti(cells[left]!.polygon), ringAsMulti(cells[right]!.polygon))
+            .reduce((sum, polygon) => sum + Math.abs(ringArea(polygon[0]!)), 0);
+          expect(overlapArea, `${grammarId} ${cells[left]!.localRole}/${cells[right]!.localRole}`).toBeLessThan(1e-5);
+        }
+      }
+      expect(cells.every((cell) => cell.classification !== "building" || /frontage|corner|podium|hall|workshop|shed|pavilion|terrace|megablock/.test(cell.localRole)), grammarId).toBe(true);
+      geometrySignatures.add(cells
+        .map((cell) => `${cell.classification}:${cell.localRole}:${area(cell.polygon).toFixed(2)}`)
+        .sort()
+        .join("|"));
     }
+    expect(geometrySignatures.size).toBe(Object.keys(requiredRoles).length);
+  });
+
+  it("builds viable residuals while retaining only tightly bounded boundary slivers", () => {
+    const bounds: DistrictPlanningBounds = { minCellWidthM: 12, maxCellWidthM: 28, minCellDepthM: 14, maxCellDepthM: 34, minAspect: 0.4, maxAspect: 3 };
+    const ring = rectRing({ x: 0, y: 0, width: 240, height: 240 });
+    const fragment: DistrictBlockFragment = { id: "residual-fixture", blockId: "block", districtId: null, buildable: ringAsMulti(ring) };
+    for (const grammarId of BLOCK_GRAMMAR_IDS) {
+      const cells = planDistrictFragmentWithGrammar(fragment, grammarId, bounds, `residual/${grammarId}`, ["road-1"]);
+      const accountedArea = cells.reduce((sum, cell) => sum + area(cell.polygon), 0);
+      const anonymousLandscape = cells.filter((cell) =>
+        cell.classification === "landscape" && /residual|sliver|decomposition/.test(cell.localRole)
+      );
+      const anonymousArea = anonymousLandscape.reduce((sum, cell) => sum + area(cell.polygon), 0);
+      expect(Math.abs(accountedArea - area(ring)), `${grammarId} accounting`).toBeLessThan(0.25);
+      expect(anonymousArea / accountedArea, `${grammarId} anonymous landscape share`).toBeLessThan(0.03);
+      expect(anonymousLandscape.every((cell) => cell.localRole.includes("sliver")), grammarId).toBe(true);
+    }
+
+    const hole = [...rectRing({ x: 90, y: 90, width: 60, height: 60 })].reverse();
+    const holedFragment: DistrictBlockFragment = { ...fragment, id: "holed-residual-fixture", buildable: [[ring, hole]] };
+    const holedCells = planDistrictFragmentWithGrammar(holedFragment, "irregular-mosaic", bounds, "residual/holed", ["road-1"]);
+    const sourceArea = area(ring) - area(hole);
+    const buildingArea = holedCells.filter((cell) => cell.classification === "building").reduce((sum, cell) => sum + area(cell.polygon), 0);
+    const anonymousArea = holedCells.filter((cell) => cell.classification === "landscape").reduce((sum, cell) => sum + area(cell.polygon), 0);
+    expect(Math.abs(buildingArea + anonymousArea - sourceArea)).toBeLessThan(0.1);
+    expect(buildingArea / sourceArea).toBeGreaterThan(0.95);
+    expect(anonymousArea / sourceArea).toBeLessThan(0.03);
+  });
+
+  it("keeps fine-grain, rotated, irregular, and radial grammars geometrically distinct", () => {
+    const fragment: DistrictBlockFragment = {
+      id: "distinct-fixture",
+      blockId: "block",
+      districtId: null,
+      buildable: ringAsMulti(rectRing({ x: 0, y: 0, width: 180, height: 140 }))
+    };
+    const bounds: DistrictPlanningBounds = { minCellWidthM: 10, maxCellWidthM: 22, minCellDepthM: 12, maxCellDepthM: 28, minAspect: 0.4, maxAspect: 3 };
+    const grammars = ["fine-grain-frontage", "rotated-bands", "irregular-mosaic", "radial-fan"] as const;
+    const signatures = grammars.map((grammarId) => {
+      const cells = planDistrictFragmentWithGrammar(fragment, grammarId, bounds, `distinct/${grammarId}`, ["road-1"]);
+      if (grammarId === "radial-fan") expect(cells.some((cell) => cell.classification === "plaza")).toBe(true);
+      expect(cells.filter((cell) => cell.classification === "landscape").every((cell) => /landscape|sliver/.test(cell.localRole))).toBe(true);
+      return cells.map((cell) => `${cell.classification}:${cell.polygon.length}:${ringCentroid(cell.polygon).x.toFixed(2)},${ringCentroid(cell.polygon).y.toFixed(2)}`).sort().join("|");
+    });
+    expect(new Set(signatures).size).toBe(grammars.length);
   });
 
   it("enforces global none, explicit override precedence, and very-low category gating", () => {
@@ -271,7 +326,7 @@ describe("buildDistrictPlan", () => {
     expect(shares).toEqual([...shares].sort((a, b) => a - b));
     const wholeBlockOverride: DistrictOpenSpaceOverride = { ...override(), sizeWeights: { pocket: 0, small: 0, large: 0, "whole-block": 1 } };
     const wholeBlock = buildDistrictPlan({ ...base, districts: [{ ...district, openSpaceOverride: wholeBlockOverride }] });
-    expect(wholeBlock.developmentCells.filter((cell) => cell.districtId === district.id).every((cell) => cell.localRole === "planning-band-whole-block-open-space")).toBe(true);
+    expect(wholeBlock.developmentCells.filter((cell) => cell.districtId === district.id).every((cell) => cell.localRole === "whole-block-open-space" && cell.classification === "landscape")).toBe(true);
     const gates = ["very-low", "low", "medium", "high"] as const;
     for (let index = 1; index < gates.length; index++) {
       expect(OPEN_SPACE_PROFILE_CATEGORY_GATES[gates[index - 1]!].every((category) => OPEN_SPACE_PROFILE_CATEGORY_GATES[gates[index]!].includes(category))).toBe(true);
@@ -369,9 +424,7 @@ describe("planning cell minor-dimension floor", () => {
     const bounds = DISTRICT_TYPE_REGISTRY.get("night-market")!.bounds;
     for (const grammarId of ["fine-grain-frontage", "market-alley", "irregular-mosaic", "rotated-bands"] as const) {
       const cells = planDistrictFragmentWithGrammar(fragment, grammarId, bounds, `floor/${grammarId}`, []);
-      const ordinary = cells.filter((cell) =>
-        !cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("edge-sliver")
-      );
+      const ordinary = cells.filter((cell) => cell.classification === "building");
       expect(ordinary.length, grammarId).toBeGreaterThan(0);
       for (const cell of ordinary) {
         expect(cellMinor(cell.polygon), `${grammarId} ${cell.localRole}`).toBeGreaterThanOrEqual(6);

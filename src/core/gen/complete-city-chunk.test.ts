@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
+import { LIGHT_DIRECTION, SHADOW_LENGTH } from "../geom/extrude.js";
 import { KIND, VERTEX_FLOATS, type MeshBuffers } from "../geom/mesh.js";
 import {
   rectRing,
@@ -13,7 +14,7 @@ import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, OPEN_SPACE_SURFACE
 import { compileRouteNetwork } from "../graph/compiler.js";
 import { compiledRouteOccupancy } from "./district-plan.js";
 import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type OpenSpaceCategory } from "./city.js";
-import type { BuildingGrammarId } from "./building-registry.js";
+import type { BuildingGrammarId, BuildingUseId } from "./building-registry.js";
 import { citySurfaces, type CitySurfacePartitions } from "./city-chunk.js";
 import { chunkId, chunkKeyAt, chunkRect, chunksCovering } from "./chunks.js";
 import {
@@ -423,6 +424,27 @@ describe("buildCompleteCityChunk", () => {
     expect(
       batch.chunks.reduce((sum, chunk) => sum + chunk.openSpaceTriangleCount, 0)
     ).toBeGreaterThan(0);
+  });
+
+  it("separates roadway, sidewalk, non-vehicle, and ground surface bands without overlap", () => {
+    const batch = buildCompleteCityChunks(SOURCE, PLAN, chunksCovering(SCENE), SCENE, PPM);
+    const combined = combine(batch.chunks.map((chunk) => chunk.surfaces));
+
+    // Carriageway and sidewalk bands are strictly disjoint
+    const roadSidewalkOverlap = area(intersection(combined.vehicleCarriageway, combined.vehicleSidewalk));
+    expect(roadSidewalkOverlap).toBeLessThanOrEqual(1e-4);
+
+    // Carriageway and non-vehicle routes are strictly disjoint
+    const roadNonVehicleOverlap = area(intersection(combined.vehicleCarriageway, combined.nonVehicleRoute));
+    expect(roadNonVehicleOverlap).toBeLessThanOrEqual(1e-4);
+
+    // Sidewalk and non-vehicle routes are strictly disjoint
+    const sidewalkNonVehicleOverlap = area(intersection(combined.vehicleSidewalk, combined.nonVehicleRoute));
+    expect(sidewalkNonVehicleOverlap).toBeLessThanOrEqual(1e-4);
+
+    // Both vehicle and sidewalk geometry exist in chunk output for vehicle routes
+    expect(batch.chunks.reduce((sum, c) => sum + c.vehicleTriangleCount, 0)).toBeGreaterThan(0);
+    expect(batch.chunks.reduce((sum, c) => sum + c.sidewalkTriangleCount, 0)).toBeGreaterThan(0);
   });
 
   it("grows culling bounds over every emitted vertex, including overhang, shadow and neon", () => {
@@ -953,5 +975,311 @@ describe("openCompleteCityChunkBatch", () => {
       buildings: [{ ...buildingA, masses: [] }]
     };
     expect(() => openCompleteCityChunkBatch(SOURCE, broken, KEYS, SCENE, PPM)).toThrow(/invalid/i);
+  });
+});
+
+describe("connectors (block-scale infrastructure)", () => {
+  const connectorBuilding = (
+    id: string,
+    rect: Rect,
+    heightM: number,
+    visualUse: BuildingUseId,
+    districtId: string | null,
+    over: Partial<BuildingPlan> = {}
+  ): BuildingPlan => ({
+    id,
+    parcelId: `parcel-${id}`,
+    blockId: "block-0",
+    fragmentId: "frag-0",
+    districtId,
+    grammarId: "residential-slab",
+    visualUse,
+    archetype: "rectangle",
+    seed: `${id}-seed`,
+    appearanceSeed: `${id}-appearance`,
+    heightM,
+    masses: [mass(`${id}-mass`, id, 0, rectRing(rect), 0, heightM, "both")],
+    areaM2: rect.width * rect.height,
+    ...over
+  });
+
+  // Direct chunk calls: no parcels means the buildings are not owned, so the detail
+  // mesh contains exactly the connectors — clean isolation for connector assertions.
+  const connectorPlan = (buildings: BuildingPlan[]): CompleteCityPlan => ({
+    ...PLAN,
+    landmarks: [],
+    openSpaces: [],
+    parcels: [],
+    buildings,
+    diagnostics: {
+      ...PLAN.diagnostics,
+      blockCount: 1,
+      parcelCount: 0,
+      openSpaceCount: 0,
+      buildingCount: buildings.length,
+      landmarkCount: 0,
+      massCount: buildings.length
+    }
+  });
+
+  it("connects only eligible same-block pairs as bounded skybridges", () => {
+    const build = buildCompleteCityChunk(
+      SOURCE,
+      connectorPlan([
+        connectorBuilding("sky-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+        connectorBuilding("sky-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core")
+      ]),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    expect(build.connectors).toHaveLength(1);
+    const connector = build.connectors[0]!;
+    expect(connector.kind).toBe("skybridge");
+    expect(connector.blockId).toBe("block-0");
+    expect(new Set([connector.aId, connector.bId])).toEqual(new Set(["sky-a", "sky-b"]));
+    // Bounded horizontal span: long enough to bridge the gap, short of the cap.
+    expect(connector.spanM).toBeGreaterThan(2);
+    expect(connector.spanM).toBeLessThanOrEqual(60);
+    // Elevation: deck sits inside both buildings' vertical bands, clear of the ground
+    // and of the lower roof, with the enclosed skybridge deck height.
+    expect(connector.deckBaseM).toBeGreaterThanOrEqual(6);
+    expect(connector.deckBaseM).toBeLessThanOrEqual(60);
+    expect(connector.deckTopM).toBeLessThanOrEqual(60 - 0.5);
+    expect(connector.deckTopM - connector.deckBaseM).toBeCloseTo(3.4, 6);
+    expect(connector.widthM).toBeCloseTo(5.5, 6);
+    // The owner chunk is the one holding the midpoint.
+    expect(chunkKeyAt(connector.midpoint)).toEqual({ cx: 0, cy: 0 });
+    expect(build.connectorCount).toBe(1);
+  });
+
+  it("rejects ineligible pairs: wrong use, unzoned land, micro grammar, other block, or span over the bound", () => {
+    const none = (a: BuildingPlan, b: BuildingPlan): CompleteChunkBuild =>
+      buildCompleteCityChunk(SOURCE, connectorPlan([a, b]), { cx: 0, cy: 0 }, SCENE, PPM);
+    // Mixed uses never pair even inside a skybridge district.
+    expect(
+      none(
+        connectorBuilding("mx-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+        connectorBuilding("mx-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "residential", "corporate-core")
+      ).connectors
+    ).toEqual([]);
+    // Unzoned land carries no connectors at all.
+    expect(
+      none(
+        connectorBuilding("uz-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", null),
+        connectorBuilding("uz-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "commercial", null)
+      ).connectors
+    ).toEqual([]);
+    // Micro filler grammars never anchor infrastructure.
+    expect(
+      none(
+        connectorBuilding("mi-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core", {
+          grammarId: "street-kiosk"
+        }),
+        connectorBuilding("mi-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core")
+      ).connectors
+    ).toEqual([]);
+    // Buildings in different blocks never connect, however close they are.
+    expect(
+      none(
+        connectorBuilding("xb-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+        connectorBuilding("xb-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core", {
+          blockId: "block-1"
+        })
+      ).connectors
+    ).toEqual([]);
+    // A pair beyond the bounded span never connects.
+    expect(
+      none(
+        connectorBuilding("fa-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+        connectorBuilding("fa-b", { x: 200, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core")
+      ).connectors
+    ).toEqual([]);
+  });
+
+  it("picks the connector family from the district type", () => {
+    const build = (buildings: BuildingPlan[]): CompleteChunkBuild =>
+      buildCompleteCityChunk(SOURCE, connectorPlan(buildings), { cx: 0, cy: 0 }, SCENE, PPM);
+    const circulation = build([
+      connectorBuilding("ci-a", { x: 60, y: 10, width: 20, height: 20 }, 50, "residential", "residential-megablocks"),
+      connectorBuilding("ci-b", { x: 95, y: 10, width: 20, height: 20 }, 55, "residential", "residential-megablocks")
+    ]);
+    expect(circulation.connectors).toHaveLength(1);
+    expect(circulation.connectors[0]!.kind).toBe("circulation");
+    expect(circulation.connectors[0]!.deckTopM - circulation.connectors[0]!.deckBaseM).toBeCloseTo(0.7, 6);
+
+    const conduit = build([
+      connectorBuilding("co-a", { x: 60, y: 10, width: 20, height: 20 }, 24, "industrial", "heavy-industrial"),
+      connectorBuilding("co-b", { x: 95, y: 10, width: 20, height: 20 }, 26, "industrial", "heavy-industrial")
+    ]);
+    expect(conduit.connectors).toHaveLength(1);
+    expect(conduit.connectors[0]!.kind).toBe("conduit");
+    expect(conduit.connectors[0]!.deckTopM - conduit.connectors[0]!.deckBaseM).toBeCloseTo(0.9, 6);
+
+    // Night-market and other non-infrastructure districts stay bare.
+    const none = build([
+      connectorBuilding("no-a", { x: 60, y: 10, width: 20, height: 20 }, 40, "commercial", "night-market"),
+      connectorBuilding("no-b", { x: 95, y: 10, width: 20, height: 20 }, 40, "commercial", "night-market")
+    ]);
+    expect(none.connectors).toEqual([]);
+  });
+
+  it("caps connectors per block and keeps the output sparse", () => {
+    const cluster: [number, number][] = [
+      [60, 10],
+      [85, 10],
+      [110, 10],
+      [60, 35],
+      [85, 35],
+      [110, 35]
+    ];
+    const buildings = cluster.flatMap(([x, y], index) =>
+      connectorBuilding(`sp-${index}`, { x, y, width: 20, height: 20 }, 40 + index * 6, "commercial", "corporate-core")
+    );
+    // 15 mutually-eligible pairs within one block; the budget keeps exactly two.
+    const build = buildCompleteCityChunk(SOURCE, connectorPlan(buildings), { cx: 0, cy: 0 }, SCENE, PPM);
+    expect(build.connectors).toHaveLength(2);
+    // Every kept connector is one 10-triangle deck prism in the detail mesh.
+    expect(build.detail.triangleCount).toBe(2 * 10);
+  });
+
+  it("emits each connector in exactly one deterministic chunk", () => {
+    const plan = (): CompleteCityPlan => ({
+      ...PLAN,
+      buildings: [
+        { ...buildingA, visualUse: "commercial" },
+        { ...buildingB, visualUse: "commercial" },
+        { ...buildingC, visualUse: "commercial" },
+        connectorBuilding("blk1-f", { x: 140, y: 60, width: 20, height: 20 }, 50, "commercial", "corporate-core", {
+          parcelId: "parcel-f",
+          blockId: "block-1",
+          fragmentId: "frag-1"
+        }),
+        connectorBuilding("blk1-g", { x: 180, y: 60, width: 20, height: 20 }, 40, "commercial", "corporate-core", {
+          parcelId: "parcel-g",
+          blockId: "block-1",
+          fragmentId: "frag-1"
+        })
+      ],
+      parcels: [
+        ...PLAN.parcels,
+        { ...parcel("parcel-f", rectRing({ x: 140, y: 60, width: 20, height: 20 })), blockId: "block-1", fragmentId: "frag-1" },
+        { ...parcel("parcel-g", rectRing({ x: 180, y: 60, width: 20, height: 20 })), blockId: "block-1", fragmentId: "frag-1" }
+      ],
+      districtPlan: {
+        ...PLAN.districtPlan,
+        blocks: [
+          ...PLAN.districtPlan.blocks,
+          {
+            id: "block-1",
+            zoningFace: rectRing({ x: 128, y: 0, width: 128, height: 128 }),
+            buildable: ringAsMulti(rectRing({ x: 128, y: 0, width: 128, height: 128 })),
+            boundaryRoadIds: [],
+            districtFragments: [
+              {
+                id: "frag-1",
+                blockId: "block-1",
+                districtId: "corporate-core",
+                buildable: ringAsMulti(rectRing({ x: 128, y: 0, width: 128, height: 128 }))
+              }
+            ]
+          }
+        ]
+      },
+      diagnostics: {
+        ...PLAN.diagnostics,
+        blockCount: 2,
+        parcelCount: 5,
+        buildingCount: 5,
+        massCount: 6
+      }
+    });
+
+    const fixture = plan();
+    const batch = buildCompleteCityChunks(SOURCE, fixture, chunksCovering(SCENE), SCENE, PPM);
+    const all = batch.chunks.flatMap((chunk) => chunk.connectors);
+    // block-0 yields the (a,b) and (a,c) pairs; block-1 the (f,g) pair; (b,c) is beyond the span.
+    expect(all).toHaveLength(3);
+    expect(batch.connectorCount).toBe(3);
+    expect(new Set(all.map((connector) => connector.id)).size).toBe(all.length);
+    // Same-block pairing only.
+    for (const connector of all) {
+      expect(connector.blockId).toBe(
+        fixture.buildings.find((building) => building.id === connector.aId)!.blockId
+      );
+      expect(connector.blockId).toBe(
+        fixture.buildings.find((building) => building.id === connector.bId)!.blockId
+      );
+    }
+    // Exactly one owner per connector, and it is the chunk holding the midpoint.
+    for (const connector of all) {
+      const owners = batch.chunks.filter((chunk) =>
+        chunk.connectors.some((candidate) => candidate.id === connector.id)
+      );
+      expect(owners).toHaveLength(1);
+      expect(owners[0]!.key).toEqual(chunkKeyAt(connector.midpoint));
+    }
+    expect(new Set(all.map((connector) => connector.blockId))).toEqual(new Set(["block-0", "block-1"]));
+    // A fresh plan object derives the same set (the per-plan cache cannot mask drift).
+    const again = buildCompleteCityChunks(SOURCE, plan(), chunksCovering(SCENE), SCENE, PPM);
+    expect(again.chunks.flatMap((chunk) => chunk.connectors)).toEqual(all);
+  });
+
+  it("renders the deck into the detail mesh and grows culling bounds over its overhang and shadow", () => {
+    // Both buildings sit in block-0 but on opposite sides of the x = 128 m seam; the
+    // deck's midpoint lands in chunk (1,0), which must emit the whole connector uncut.
+    const seam = connectorPlan([
+      connectorBuilding("sea-a", { x: 100, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+      connectorBuilding("sea-b", { x: 150, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core")
+    ]);
+    const owner = buildCompleteCityChunk(SOURCE, seam, { cx: 1, cy: 0 }, SCENE, PPM);
+    expect(owner.connectors).toHaveLength(1);
+    const connector = owner.connectors[0]!;
+    expect(chunkKeyAt(connector.midpoint)).toEqual({ cx: 1, cy: 0 });
+    expect(connector.start.x).toBeLessThan(128);
+    expect(connector.end.x).toBeGreaterThan(128);
+
+    // The deck is exactly one 10-triangle DetailPrism in the detail mesh.
+    expect(owner.detail.triangleCount).toBe(10);
+    expect(kindsOf(owner.detail).has(KIND.DETAIL)).toBe(true);
+
+    // Every emitted detail vertex — the deck included — sits inside the culling bounds.
+    for (let i = 0; i < owner.detail.vertexCount; i++) {
+      const at = i * VERTEX_FLOATS;
+      const x = owner.detail.vertices[at]!;
+      const y = owner.detail.vertices[at + 1]!;
+      expect(x).toBeGreaterThanOrEqual(owner.boundsPx.x - 1e-3);
+      expect(x).toBeLessThanOrEqual(owner.boundsPx.x + owner.boundsPx.width + 1e-3);
+      expect(y).toBeGreaterThanOrEqual(owner.boundsPx.y - 1e-3);
+      expect(y).toBeLessThanOrEqual(owner.boundsPx.y + owner.boundsPx.height + 1e-3);
+    }
+    // The deck overhangs the owner's west edge, so the bounds grow past the chunk rect...
+    expect(owner.boundsPx.x).toBeLessThanOrEqual(SOURCE.origin.x + connector.start.x * PPM + 1e-3);
+    expect(owner.boundsPx.x).toBeLessThan(SOURCE.origin.x + 128 * PPM);
+    // ...and the deck's own shadow reach extends them east of the far deck end.
+    const shadowReachX = -LIGHT_DIRECTION.x * connector.deckTopM * SHADOW_LENGTH * PPM;
+    expect(owner.boundsPx.x + owner.boundsPx.width).toBeGreaterThanOrEqual(
+      SOURCE.origin.x + connector.end.x * PPM + shadowReachX - 1e-3
+    );
+
+    // The neighbouring chunk never duplicates the deck.
+    const neighbour = buildCompleteCityChunk(SOURCE, seam, { cx: 0, cy: 0 }, SCENE, PPM);
+    expect(neighbour.connectors).toEqual([]);
+    expect(neighbour.connectorCount).toBe(0);
+    expect(neighbour.detail.vertexCount).toBe(0);
+  });
+
+  it("derives the same connectors and geometry from fresh plans every time", () => {
+    const make = (): CompleteCityPlan =>
+      connectorPlan([
+        connectorBuilding("de-a", { x: 60, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core"),
+        connectorBuilding("de-b", { x: 95, y: 10, width: 20, height: 20 }, 70, "commercial", "corporate-core")
+      ]);
+    const first = buildCompleteCityChunk(SOURCE, make(), { cx: 0, cy: 0 }, SCENE, PPM);
+    const second = buildCompleteCityChunk(SOURCE, make(), { cx: 0, cy: 0 }, SCENE, PPM);
+    expect(second.connectors).toEqual(first.connectors);
+    expect([...second.detail.vertices]).toEqual([...first.detail.vertices]);
+    expect([...second.detail.indices]).toEqual([...first.detail.indices]);
+    expect(second.connectorCount).toBe(first.connectorCount);
   });
 });

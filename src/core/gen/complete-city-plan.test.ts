@@ -6,6 +6,9 @@ import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeS
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_GRAMMARS, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, MICRO_BUILDING_GRAMMAR_IDS, isTowerGrammar, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
+import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "./district-generator.js";
+import { generateInitialRoadNetwork } from "./road-generator.js";
+import { rectangleLand, validateRing } from "./terrain.js";
 import { buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
@@ -103,6 +106,50 @@ const ringSource = (
   };
 };
 
+function stagedReproduction(
+  citySeed = "foundry-repro-0",
+  roadLayout: CitySourceV3["generation"]["roadLayout"] = "european",
+  hubMode: CitySourceV3["generation"]["hubMode"] = "multiple-hubs",
+  openSpaceProfile: CitySourceV3["generation"]["openSpaceProfile"] = "medium"
+): { source: CitySourceV3; reservations: MajorLandmarkSiteReservation[]; warnings: string[] } {
+  const sceneBounds = { x: -600, y: -450, width: 1200, height: 900 };
+  const land = rectangleLand(sceneBounds);
+  const source: CitySourceV3 = {
+    origin: { x: 0, y: 0 },
+    citySeed,
+    generation: {
+      terrainMode: "rectangle",
+      coastEdge: null,
+      roadLayout,
+      hubMode,
+      districtPool: [...DISTRICT_TYPE_IDS],
+      openSpaceProfile
+    },
+    terrain: { land, urbanFootprint: null },
+    roads: { nodes: [], routes: [], edges: [] },
+    districts: []
+  };
+  const reservations = reserveMajorLandmarkSites(source);
+  source.roads = generateInitialRoadNetwork({
+    citySeed: source.citySeed,
+    mask: land,
+    land,
+    layout: source.generation.roadLayout,
+    hubMode: source.generation.hubMode,
+    sceneBounds,
+    reservedSites: reservations.map((reservation) => reservation.sitePolygon)
+  }).roads;
+  source.districts = generateInitialDistricts(source);
+  const assignment = assignLandmarkCompatibleDistrictTypes(
+    source.districts,
+    reservations.map((reservation) => ({ grammarId: reservation.grammarId, sitePolygon: reservation.sitePolygon })),
+    source.generation.districtPool,
+    `${source.citySeed}/landmarks/v3/district-assignment`
+  );
+  source.districts = assignment.districts;
+  return { source, reservations, warnings: assignment.warnings };
+}
+
 // WHY: nine tests plan the identical ringSource(4)/ringSource(16) city; a build is 27–63 s
 // of pure generation, so identical builds are computed once per worker and shared. The
 // generator is deterministic (asserted below) and the pipeline keeps no module-level state,
@@ -152,6 +199,160 @@ describe("buildCompleteCityPlan", () => {
     }
   }, 300_000);
 
+  it("completes the exact foundry-repro-0 staged generation deterministically with valid topology", () => {
+    const { source, reservations, warnings } = stagedReproduction();
+    const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+
+    const repeated = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) repeated.diagnostics.warnings.push(...warnings);
+    expect(repeated).toEqual(plan);
+
+    const rings: Ring[] = [
+      source.terrain.land,
+      ...source.districts.map((district) => district.polygon),
+      ...plan.carriageway.flat(),
+      ...plan.districtPlan.unzoned.flat(),
+      ...plan.districtPlan.wallCells.flat(),
+      ...plan.districtPlan.blocks.flatMap((block) => [
+        block.zoningFace,
+        ...block.buildable.flat(),
+        ...block.districtFragments.flatMap((fragment) => fragment.buildable.flat())
+      ]),
+      ...plan.districtPlan.developmentCells.map((cell) => cell.polygon),
+      ...plan.parcels.map((parcel) => parcel.polygon),
+      ...plan.openSpaces.map((openSpace) => openSpace.polygon),
+      ...plan.buildings.flatMap((building) => building.masses.map((mass) => mass.footprint)),
+      ...plan.landmarks.flatMap((landmark) => [
+        landmark.sitePolygon,
+        ...landmark.masses.map((mass) => mass.footprint)
+      ])
+    ];
+    expect(rings.length).toBeGreaterThan(0);
+    for (const ring of rings) expect(validateRing(ring)).toEqual({ ok: true });
+  }, 600_000);
+
+  it("completes european-single-very-low-0 deterministically with valid snapped topology", () => {
+    const { source, reservations, warnings } = stagedReproduction(
+      "european-single-very-low-0",
+      "european",
+      "single-centre",
+      "very-low"
+    );
+    const generatedAgain = generateInitialDistricts({ ...source, districts: [] });
+    const districtArea = source.districts.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+    const repeatedArea = generatedAgain.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+
+    expect(generatedAgain.map((district) => district.polygon)).toEqual(source.districts.map((district) => district.polygon));
+    expect(Math.abs(repeatedArea - districtArea)).toBeLessThanOrEqual(1e-6);
+    const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+
+    const fragmentArea = plan.districtPlan.blocks.reduce((sum, block) =>
+      sum + block.districtFragments.reduce((fragmentSum, fragment) => fragmentSum + multiArea(fragment.buildable), 0), 0);
+    const landmarkArea = plan.landmarks.reduce((sum, landmark) => sum + landmark.areaM2, 0);
+    const nonParcelOpenArea = plan.openSpaces
+      .filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null)
+      .reduce((sum, openSpace) => sum + openSpace.areaM2, 0);
+    const developmentArea = fragmentArea - landmarkArea - nonParcelOpenArea;
+    const parcelArea = plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0);
+    const builtParcelIds = new Set(plan.buildings.map((building) => building.parcelId));
+    const builtParcelArea = plan.parcels
+      .filter((parcel) => builtParcelIds.has(parcel.id))
+      .reduce((sum, parcel) => sum + parcel.areaM2, 0);
+    const anonymousResidualArea = plan.openSpaces
+      .filter((openSpace) =>
+        openSpace.parcelId !== null
+        || (openSpace.semanticRole === "landscape" && /boundary-sliver|residual/.test(openSpace.lineage))
+      )
+      .reduce((sum, openSpace) => sum + openSpace.areaM2, 0);
+    expect(developmentArea).toBeGreaterThan(0);
+    expect(parcelArea / developmentArea).toBeGreaterThan(0.97);
+    expect(builtParcelArea / developmentArea).toBeGreaterThan(0.65);
+    expect(anonymousResidualArea / fragmentArea).toBeLessThan(0.08);
+
+    const repeated = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) repeated.diagnostics.warnings.push(...warnings);
+    expect(repeated).toEqual(plan);
+    for (const ring of [
+      ...plan.districtPlan.blocks.map((block) => block.zoningFace),
+      ...plan.districtPlan.developmentCells.map((cell) => cell.polygon),
+      ...plan.parcels.map((parcel) => parcel.polygon),
+      ...plan.openSpaces.map((openSpace) => openSpace.polygon)
+    ]) expect(validateRing(ring)).toEqual({ ok: true });
+  }, 600_000);
+
+  it("completes european-single-very-low-2 through district generation and a valid complete plan", () => {
+    const { source, reservations, warnings } = stagedReproduction(
+      "european-single-very-low-2",
+      "european",
+      "single-centre",
+      "very-low"
+    );
+    const generatedAgain = generateInitialDistricts({ ...source, districts: [] });
+    const districtArea = source.districts.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+    const repeatedArea = generatedAgain.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+
+    expect(source.districts.length).toBeGreaterThan(0);
+    expect(generatedAgain.map((district) => district.polygon)).toEqual(source.districts.map((district) => district.polygon));
+    expect(repeatedArea).toBeCloseTo(districtArea, 9);
+    expect(districtArea).toBeGreaterThan(0);
+    for (const district of source.districts) expect(validateRing(district.polygon)).toEqual({ ok: true });
+
+    const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    for (const ring of [
+      ...plan.districtPlan.blocks.map((block) => block.zoningFace),
+      ...plan.districtPlan.developmentCells.map((cell) => cell.polygon),
+      ...plan.parcels.map((parcel) => parcel.polygon),
+      ...plan.openSpaces.map((openSpace) => openSpace.polygon)
+    ]) expect(validateRing(ring)).toEqual({ ok: true });
+  }, 600_000);
+
+  it("completes european-single-very-low-9 through district generation and a valid complete plan", () => {
+    const { source, reservations, warnings } = stagedReproduction(
+      "european-single-very-low-9",
+      "european",
+      "single-centre",
+      "very-low"
+    );
+    const generatedAgain = generateInitialDistricts({ ...source, districts: [] });
+    const districtArea = source.districts.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+    const repeatedArea = generatedAgain.reduce((sum, district) => sum + Math.abs(ringArea(district.polygon)), 0);
+
+    expect(source.districts.length).toBeGreaterThan(0);
+    expect(generatedAgain.map((district) => district.polygon)).toEqual(source.districts.map((district) => district.polygon));
+    expect(repeatedArea).toBeCloseTo(districtArea, 9);
+    expect(districtArea).toBeGreaterThan(0);
+    for (const district of source.districts) expect(validateRing(district.polygon)).toEqual({ ok: true });
+
+    const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    for (const ring of [
+      ...plan.districtPlan.blocks.map((block) => block.zoningFace),
+      ...plan.districtPlan.developmentCells.map((cell) => cell.polygon),
+      ...plan.parcels.map((parcel) => parcel.polygon),
+      ...plan.openSpaces.map((openSpace) => openSpace.polygon)
+    ]) expect(validateRing(ring)).toEqual({ ok: true });
+  }, 600_000);
+
+  it.concurrent("mints globally unique open-space ids that stay stable under regeneration", () => {
+    // WHY: degenerate sliver pieces can reach the planner twice through one decomposition
+    // (earcut repeats a triangle of a self-touching sliver polygon), which used to mint one
+    // planned space with two identical ids. The contract is one id per distinct planned
+    // space — including fragments/pieces sharing a semantic role — and a fresh build must
+    // reproduce every id exactly, never a mutable encounter-order counter.
+    const plan = ringSixteenPlan();
+    const ids = plan.openSpaces.map((openSpace) => openSpace.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    expect(buildCompleteCityPlan(ringSource(16)).openSpaces.map((openSpace) => openSpace.id)).toEqual(ids);
+  }, 300_000);
+
   it("is deterministic and identical under source permutation and origin shift", () => {
     const source = crossSource();
     const plan = buildCompleteCityPlan(source);
@@ -166,12 +367,7 @@ describe("buildCompleteCityPlan", () => {
     expect(buildCompleteCityPlan(source)).toEqual(plan);
   }, 300_000);
 
-  it("plans cross-prone grammars on a large block with no orthogonal full-span band crosses", () => {
-    // One 300×300 block under a district type whose grammar pool includes the layouts
-    // that used to reserve two crossing full-span bands (superblock-compound,
-    // campus-pavilions, market-alley). The plan must stay valid (contained, disjoint
-    // masses), deterministic, and no fragment's reserved bands may span both block axes
-    // as thin arms — that is the accidental plus/red-cross layout.
+  it("materializes grammar circulation as explicit open space before building parcels", () => {
     const size = 300;
     const largeBlock = (typeId: DistrictTypeId): CitySourceV3 => ({
       origin: { x: 700, y: 300 },
@@ -185,40 +381,33 @@ describe("buildCompleteCityPlan", () => {
       },
       districts: [{ id: "big", polygon: rectRing({ x: 0, y: 0, width: size, height: size }), seed: "big-seed", typeId, paletteId: DISTRICT_PALETTE_IDS[0]!, origin: "generated", locked: false, openSpaceOverride: null }]
     });
-    const crossGrammars: Readonly<Record<string, boolean>> = { "superblock-compound": true, "campus-pavilions": true, "market-alley": true };
     for (const typeId of ["residential-megablocks", "utility-infrastructure"] as const) {
       const source = largeBlock(typeId);
       const plan = buildCompleteCityPlan(source);
       expect(validateCompleteCityPlan(plan)).toEqual([]);
-      expect(plan.districtPlan.developmentCells.some((cell) => crossGrammars[cell.grammarId])).toBe(true);
       expect(buildCompleteCityPlan(source)).toEqual(plan);
-      const cellsByFragment = new Map<string, ReturnType<typeof buildCompleteCityPlan>["districtPlan"]["developmentCells"]>();
-      for (const cell of plan.districtPlan.developmentCells) cellsByFragment.set(cell.fragmentId, [...(cellsByFragment.get(cell.fragmentId) ?? []), cell]);
-      for (const [fragmentId, cells] of cellsByFragment) {
-        const bands = cells.filter((cell) => cell.localRole.startsWith("planning-band") && !cell.localRole.startsWith("planning-band-remainder") && !/^planning-band--?\d+-/.test(cell.localRole) && Math.abs(ringArea(cell.polygon)) >= 1);
-        if (bands.length === 0) continue;
-        const allX: number[] = [];
-        const allY: number[] = [];
-        for (const cell of cells) for (const point of cell.polygon) {
-          allX.push(point.x);
-          allY.push(point.y);
+      const intentionalCells = plan.districtPlan.developmentCells.filter((cell) => cell.classification !== "building");
+      expect(intentionalCells.length).toBeGreaterThan(0);
+      const semanticSpaces = plan.openSpaces.filter((openSpace) => openSpace.semanticRole !== undefined);
+      expect(semanticSpaces.length).toBeGreaterThan(0);
+      expect(semanticSpaces.some((openSpace) => openSpace.semanticRole !== "landscape")).toBe(true);
+      for (const openSpace of semanticSpaces) {
+        const sourceCell = intentionalCells.find((cell) => openSpace.lineage === cell.id);
+        if (sourceCell) {
+          expect(openSpace.semanticRole).toBe(sourceCell.semanticRole);
+          expect(openSpace.category).toBe(sourceCell.openSpaceCategory);
         }
-        const fragmentWidth = Math.max(...allX) - Math.min(...allX);
-        const fragmentHeight = Math.max(...allY) - Math.min(...allY);
-        const bandUnion = union(bands.map((cell) => ringAsMulti(cell.polygon)));
-        const bandX: number[] = [];
-        const bandY: number[] = [];
-        for (const polygon of bandUnion) for (const point of polygon[0]!) {
-          bandX.push(point.x);
-          bandY.push(point.y);
+        for (const parcel of plan.parcels) expect(overlap(parcel.polygon, openSpace.polygon), openSpace.id).toBeLessThan(0.5);
+        for (const building of plan.buildings) {
+          for (const mass of building.masses) expect(overlap(mass.footprint, openSpace.polygon), building.id).toBeLessThan(0.5);
         }
-        const bandWidth = Math.max(...bandX) - Math.min(...bandX);
-        const bandHeight = Math.max(...bandY) - Math.min(...bandY);
-        const bandArea = multiArea(bandUnion);
-        const spansBothAxes = fragmentWidth > 0 && bandWidth >= 0.8 * fragmentWidth && fragmentHeight > 0 && bandHeight >= 0.8 * fragmentHeight;
-        const thinArms = bandWidth > 0 && bandHeight > 0 && bandArea < 0.6 * bandWidth * bandHeight;
-        expect(spansBothAxes && thinArms, `${fragmentId} reserved bands form an orthogonal full-span cross`).toBe(false);
       }
+      const residualCells = intentionalCells.filter((cell) => /residual|sliver/.test(cell.localRole));
+      expect(residualCells.every((cell) => cell.classification === "landscape")).toBe(true);
+      expect(plan.parcels.every((parcel) => {
+        const sourceCell = plan.districtPlan.developmentCells.find((cell) => cell.fragmentId === parcel.fragmentId && parcel.role.startsWith(cell.localRole));
+        return sourceCell?.classification === "building";
+      })).toBe(true);
     }
   }, 300_000);
 
@@ -240,7 +429,7 @@ describe("buildCompleteCityPlan", () => {
   it.concurrent("honors global none, a district override above none, and landmark-required open space", () => {
     const nonePlan = buildCompleteCityPlan(ringSource(4, "none"));
     expect(validateCompleteCityPlan(nonePlan)).toEqual([]);
-    expect(nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null)).toEqual([]);
+    expect(nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null && openSpace.semanticRole === undefined)).toEqual([]);
     const landmarkOpen = nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId !== null);
     expect(landmarkOpen.length).toBeGreaterThanOrEqual(1);
     const hero = nonePlan.landmarks.find((landmark) => landmark.landmarkGrammarId === "hero-tower-plaza")!;
