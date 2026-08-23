@@ -7,6 +7,15 @@ export interface CityMarkingParts {
   laneMarkings: MultiPolygon;
   crossings: MultiPolygon;
   kerbs: MultiPolygon;
+  /** Dark bands immediately inside the carriageway edge. */
+  gutters: MultiPolygon;
+  /** Fine raised-value line immediately outside the carriageway edge. */
+  curbHighlights: MultiPolygon;
+  /** Non-emissive inlet grates inset into gutters. */
+  drains: MultiPolygon;
+  /** Dark and light deterministic carriageway patch tiers. */
+  repairs: MultiPolygon;
+  repairHighlights: MultiPolygon;
 }
 
 const DASH_LENGTH_M = 3;
@@ -22,6 +31,12 @@ const CLEAR_M = 1.5;
 const MAX_INSET_M = 30;
 const STRAIGHT_THROUGH_DOT = -0.998;
 const PAVEMENT_EPS = 1e-3;
+const GUTTER_WIDTH_M = 0.4;
+const CURB_HIGHLIGHT_WIDTH_M = 0.1;
+const DRAIN_PERIOD_M = 6;
+const DRAIN_APPROACH_M = 18;
+const REPAIR_PERIOD_M = 24;
+const STREET_DRESSING_NAMESPACE = "/street-dressing/v1/";
 
 // WHY: acute-junction kerbs can extend beyond the paved half-width; dirty bounds use this cap.
 export const CITY_MARKING_REACH_M = 26;
@@ -38,6 +53,19 @@ interface MarkingPiece {
 }
 
 const length = (a: Vec2, b: Vec2): number => Math.hypot(b.x - a.x, b.y - a.y);
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return hash >>> 0;
+}
+
+/**
+ * A string namespace keeps the dressing stream separate from every legacy numeric salt.
+ * The compiled span id and absolute route arc cell make a decision stable across chunking.
+ */
+function streetRoll(span: CompiledSpan, feature: string, arcCell: number, side = 0): number {
+  return fnv1a(`${span.id}${STREET_DRESSING_NAMESPACE}${feature}/${arcCell}/${side}`) / 0x1_0000_0000;
+}
 
 function axisFor(span: CompiledSpan): Axis | null {
   const spanLength = length(span.a, span.b);
@@ -153,6 +181,11 @@ export function buildCityMarkings(network: CompiledRouteNetwork): CityMarkingPar
   const lanePieces: MarkingPiece[] = [];
   const crossingPieces: MarkingPiece[] = [];
   const kerbPieces: MarkingPiece[] = [];
+  const gutterPieces: MarkingPiece[] = [];
+  const curbHighlightPieces: MarkingPiece[] = [];
+  const drainPieces: MarkingPiece[] = [];
+  const repairPieces: MarkingPiece[] = [];
+  const repairHighlightPieces: MarkingPiece[] = [];
   const all = network.segments;
   const crossings = new Set<string>();
 
@@ -165,9 +198,9 @@ export function buildCityMarkings(network: CompiledRouteNetwork): CityMarkingPar
       const kerbHalf = span.clearanceM;
       const insetA = pavementInset(network, span, "a", kerbHalf);
       const insetB = pavementInset(network, span, "b", kerbHalf);
+      const roadInsetA = pavementInset(network, span, "a", roadHalf);
+      const roadInsetB = pavementInset(network, span, "b", roadHalf);
       if (cls.centreMarking) {
-        const roadInsetA = pavementInset(network, span, "a", roadHalf);
-        const roadInsetB = pavementInset(network, span, "b", roadHalf);
         const gapA = endpointJunction(network, span, "a") || routeBoundary(route.spans, span, "a") ? roadInsetA + CROSSING_OFFSET_M + CROSSING_DEPTH_M + CLEAR_M : 0;
         const gapB = endpointJunction(network, span, "b") || routeBoundary(route.spans, span, "b") ? roadInsetB + CROSSING_OFFSET_M + CROSSING_DEPTH_M + CLEAR_M : 0;
         const start = Math.max(span.startArcM, span.startArcM + gapA);
@@ -188,9 +221,9 @@ export function buildCityMarkings(network: CompiledRouteNetwork): CityMarkingPar
       crossingPieces.push(...localCrossings);
 
       if (cls.sidewalkM > 0) {
-        const from = span.startArcM + (insetA > 0 ? insetA + CLEAR_M : 0);
-        const to = span.endArcM - (insetB > 0 ? insetB + CLEAR_M : 0);
-        for (const [pieceFrom, pieceTo] of fixedSegments(from, to, KERB_SEGMENT_M)) {
+        const kerbFrom = span.startArcM + (insetA > 0 ? insetA + CLEAR_M : 0);
+        const kerbTo = span.endArcM - (insetB > 0 ? insetB + CLEAR_M : 0);
+        for (const [pieceFrom, pieceTo] of fixedSegments(kerbFrom, kerbTo, KERB_SEGMENT_M)) {
           for (const side of [1, -1] as const) {
             const outer = kerbHalf * side;
             const inner = outer - KERB_WIDTH_M * side;
@@ -200,13 +233,97 @@ export function buildCityMarkings(network: CompiledRouteNetwork): CityMarkingPar
             });
           }
         }
+
+        // The functional kerb is the road/sidewalk seam. Keep both bands out of the
+        // junction fan with the same pavement inset and foreign-pavement rejection as paint.
+        const dressingFrom = span.startArcM + (roadInsetA > 0 ? roadInsetA + CLEAR_M : 0);
+        const dressingTo = span.endArcM - (roadInsetB > 0 ? roadInsetB + CLEAR_M : 0);
+        for (const [pieceFrom, pieceTo] of fixedSegments(dressingFrom, dressingTo, KERB_SEGMENT_M)) {
+          for (const side of [1, -1] as const) {
+            const edge = roadHalf * side;
+            const gutterInner = edge - GUTTER_WIDTH_M * side;
+            const curbOuter = edge + CURB_HIGHLIGHT_WIDTH_M * side;
+            gutterPieces.push({
+              ring: quad(axis, pieceFrom - span.startArcM, pieceTo - span.startArcM, Math.min(edge, gutterInner), Math.max(edge, gutterInner)),
+              span
+            });
+            curbHighlightPieces.push({
+              ring: quad(axis, pieceFrom - span.startArcM, pieceTo - span.startArcM, Math.min(edge, curbOuter), Math.max(edge, curbOuter)),
+              span
+            });
+          }
+        }
+
+        const firstDrainCell = Math.ceil((dressingFrom - DRAIN_PERIOD_M / 2) / DRAIN_PERIOD_M);
+        const lastDrainCell = Math.floor((dressingTo - DRAIN_PERIOD_M / 2) / DRAIN_PERIOD_M);
+        for (let cell = firstDrainCell; cell <= lastDrainCell; cell++) {
+          const centreArc = cell * DRAIN_PERIOD_M + DRAIN_PERIOD_M / 2;
+          const nearApproach =
+            (endpointJunction(network, span, "a") !== undefined && centreArc - dressingFrom <= DRAIN_APPROACH_M) ||
+            (endpointJunction(network, span, "b") !== undefined && dressingTo - centreArc <= DRAIN_APPROACH_M);
+          for (const side of [1, -1] as const) {
+            if (streetRoll(span, "drain/select", cell, side) >= (nearApproach ? 0.48 : 0.07)) continue;
+            const drainLength = 0.65 + streetRoll(span, "drain/length", cell, side) * 0.35;
+            if (centreArc - drainLength / 2 < dressingFrom || centreArc + drainLength / 2 > dressingTo) continue;
+            const edge = roadHalf * side;
+            const drainOuter = edge - 0.07 * side;
+            const drainInner = drainOuter - 0.22 * side;
+            drainPieces.push({
+              ring: quad(
+                axis,
+                centreArc - drainLength / 2 - span.startArcM,
+                centreArc + drainLength / 2 - span.startArcM,
+                Math.min(drainOuter, drainInner),
+                Math.max(drainOuter, drainInner)
+              ),
+              span
+            });
+          }
+        }
+      }
+
+      // Patches are carriageway decoration only: one candidate per 24 m arc cell and a
+      // low keep rate. Their skewed four-corner footprints avoid a tiled texture read.
+      const repairFrom = span.startArcM + (roadInsetA > 0 ? roadInsetA + CLEAR_M : 1);
+      const repairTo = span.endArcM - (roadInsetB > 0 ? roadInsetB + CLEAR_M : 1);
+      const firstRepairCell = Math.ceil((repairFrom - REPAIR_PERIOD_M / 2) / REPAIR_PERIOD_M);
+      const lastRepairCell = Math.floor((repairTo - REPAIR_PERIOD_M / 2) / REPAIR_PERIOD_M);
+      for (let cell = firstRepairCell; cell <= lastRepairCell; cell++) {
+        if (streetRoll(span, "repair/select", cell) >= 0.26) continue;
+        const centreArc = cell * REPAIR_PERIOD_M + REPAIR_PERIOD_M / 2;
+        const patchLength = 3 + streetRoll(span, "repair/length", cell) * 7;
+        if (centreArc - patchLength / 2 < repairFrom || centreArc + patchLength / 2 > repairTo) continue;
+        const halfPatchWidth = Math.min(
+          Math.max(0.7, roadHalf - GUTTER_WIDTH_M - 0.2),
+          0.9 + streetRoll(span, "repair/width", cell) * 1.3
+        );
+        const lateralRoom = Math.max(0, roadHalf - GUTTER_WIDTH_M - halfPatchWidth - 0.2);
+        const centreC = (streetRoll(span, "repair/lateral", cell) * 2 - 1) * lateralRoom;
+        const skew = (streetRoll(span, "repair/skew", cell) * 2 - 1) * Math.min(0.65, patchLength * 0.08);
+        const t0 = centreArc - patchLength / 2 - span.startArcM;
+        const t1 = centreArc + patchLength / 2 - span.startArcM;
+        const ring = [
+          at(axis, t0, centreC - halfPatchWidth * 0.88),
+          at(axis, t1 - skew, centreC - halfPatchWidth),
+          at(axis, t1, centreC + halfPatchWidth * 0.86),
+          at(axis, t0 + skew, centreC + halfPatchWidth)
+        ];
+        const target = streetRoll(span, "repair/tier", cell) < 0.45 ? repairHighlightPieces : repairPieces;
+        target.push({ ring, span });
       }
     }
   }
 
   const keep = (pieces: MarkingPiece[]): Ring[] => pieces.filter((piece) => !onForeignPavement(piece, all)).map((piece) => piece.ring);
-  const lane = union(keep(lanePieces).map(ringAsMulti));
-  const crossing = union(keep(crossingPieces).map(ringAsMulti));
-  const kerbs = union(keep(kerbPieces).map(ringAsMulti));
-  return { laneMarkings: lane, crossings: crossing, kerbs };
+  const merged = (pieces: MarkingPiece[]): MultiPolygon => union(keep(pieces).map(ringAsMulti));
+  return {
+    laneMarkings: merged(lanePieces),
+    crossings: merged(crossingPieces),
+    kerbs: merged(kerbPieces),
+    gutters: merged(gutterPieces),
+    curbHighlights: merged(curbHighlightPieces),
+    drains: merged(drainPieces),
+    repairs: merged(repairPieces),
+    repairHighlights: merged(repairHighlightPieces)
+  };
 }

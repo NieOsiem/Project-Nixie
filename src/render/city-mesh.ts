@@ -3,6 +3,7 @@ import { LIGHT_DIRECTION, SHADOW_LENGTH } from "../core/geom/extrude.js";
 import { EMISSIVE_MAX } from "../core/palette.js";
 import type { PaletteTexture } from "./palette-texture.js";
 import { CITY_FRAG, CITY_VERT } from "./shaders/city.js";
+import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import { BUILDING_MASK_FRAG, BUILDING_MASK_VERT } from "./shaders/occlusion.js";
 import { SHADOW_FRAG, SHADOW_VERT } from "./shaders/shadow.js";
 
@@ -57,6 +58,10 @@ export class CityMesh {
       uDepthFar: 20000,
       uDetailQuality: 1,
       uEmissiveMax: EMISSIVE_MAX,
+      uBodyExposure: DEFAULT_LOOK_DIALS.bodyExposure,
+      uSkyLift: DEFAULT_LOOK_DIALS.skyLift,
+      uEmissiveGain: DEFAULT_LOOK_DIALS.emissiveGain,
+      uDebugNoEmissive: DEFAULT_LOOK_DIALS.debugNoEmissive,
       uPalette: palette.texture
     });
     this.#maskShader = PIXI.Shader.from(BUILDING_MASK_VERT, BUILDING_MASK_FRAG, {
@@ -96,6 +101,18 @@ export class CityMesh {
     m.uCamHeight = c.cameraHeightPx;
     m.uLeanStrength = c.leanStrength;
     this.#shadowShader.uniforms.uPixelsPerMetre = c.pixelsPerMetre;
+  }
+
+  /**
+   * Live look dials for the colour pass. Called from `CityRenderer.update` next to
+   * `setCamera`, so a `markContentDirty` refresh re-pushes them even on a parked camera.
+   */
+  setDials(d: LookDials): void {
+    const u = this.#cityShader.uniforms;
+    u.uBodyExposure = d.bodyExposure;
+    u.uSkyLift = d.skyLift;
+    u.uEmissiveGain = d.emissiveGain;
+    u.uDebugNoEmissive = d.debugNoEmissive;
   }
 
   /** The mask is a flat silhouette, so it neither reads nor writes depth. */

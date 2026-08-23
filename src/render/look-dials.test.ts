@@ -79,10 +79,10 @@ describe("weather presets", () => {
     }
   });
 
-  it("keeps the smear defaults finite and positive where required", () => {
+  it("keeps the live-verified smear defaults finite and positive", () => {
     expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearStrength)).toBe(true);
-    expect(DEFAULT_LOOK_DIALS.smearStrength).toBe(1);
+    expect(DEFAULT_LOOK_DIALS.smearStrength).toBe(1.5);
     expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearHeightM)).toBe(true);
-    expect(DEFAULT_LOOK_DIALS.smearHeightM).toBe(50);
+    expect(DEFAULT_LOOK_DIALS.smearHeightM).toBe(70);
   });
 });

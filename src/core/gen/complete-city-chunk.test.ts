@@ -357,7 +357,12 @@ function combine(chunks: CitySurfacePartitions[]): CitySurfacePartitions {
     markings: chunks.flatMap((chunk) => chunk.markings),
     laneMarkings: chunks.flatMap((chunk) => chunk.laneMarkings),
     crossings: chunks.flatMap((chunk) => chunk.crossings),
-    kerbs: chunks.flatMap((chunk) => chunk.kerbs)
+    kerbs: chunks.flatMap((chunk) => chunk.kerbs),
+    gutters: chunks.flatMap((chunk) => chunk.gutters),
+    curbHighlights: chunks.flatMap((chunk) => chunk.curbHighlights),
+    drains: chunks.flatMap((chunk) => chunk.drains),
+    repairs: chunks.flatMap((chunk) => chunk.repairs),
+    repairHighlights: chunks.flatMap((chunk) => chunk.repairHighlights)
   };
 }
 
@@ -409,7 +414,10 @@ describe("buildCompleteCityChunk", () => {
     const batch = buildCompleteCityChunks(SOURCE, PLAN, chunksCovering(SCENE), SCENE, PPM);
     const whole = citySurfaces(SOURCE, SCENE);
     const combined = combine(batch.chunks.map((chunk) => chunk.surfaces));
-    for (const key of ["water", "exposedLand", "vehicleCarriageway", "vehicleSidewalk", "nonVehicleRoute", "markings"] as const) {
+    for (const key of [
+      "water", "exposedLand", "vehicleCarriageway", "vehicleSidewalk", "nonVehicleRoute",
+      "markings", "gutters", "curbHighlights", "drains", "repairs", "repairHighlights"
+    ] as const) {
       expect(area(combined[key])).toBeCloseTo(area(whole[key]), 4);
     }
     for (const openSpace of PLAN.openSpaces) {

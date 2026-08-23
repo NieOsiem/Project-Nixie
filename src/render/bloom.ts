@@ -88,7 +88,8 @@ export class BloomChain {
     this.#threshold = new ScreenQuad(THRESHOLD_FRAG, {
       uScene: PIXI.Texture.EMPTY,
       uSrcTexel: this.#srcTexel,
-      uSceneUvScale: this.#sceneUvScale
+      uSceneUvScale: this.#sceneUvScale,
+      uBloomThreshold: dials.bloomThreshold
     });
     this.#blurH = new ScreenQuad(BLUR_FRAG, {
       uTex: PIXI.Texture.EMPTY,
@@ -163,6 +164,7 @@ export class BloomChain {
       uNarrowStrength: 1,
       uWideStrength: WIDE_STRENGTH,
       uStreakStrength: dials.streakStrength,
+      uShadowStrength: dials.shadowStrength,
       uAoStrength: dials.aoStrength,
       uAoHeightM: dials.aoHeightM,
       uFogStrength: dials.fogStrength,
@@ -182,6 +184,8 @@ export class BloomChain {
       uWetGloss: dials.wetGloss,
       uRadialSmear: 0,
       uSmearStrength: dials.smearStrength,
+      uBlackLift: dials.blackLift,
+      uDebugGrayscale: dials.debugGrayscale,
       uPivotUv: new Float32Array([0.5, 0.5]),
       uWideTexel: this.#wideTexel,
       uSceneUvScale: this.#sceneUvScale,
@@ -215,6 +219,7 @@ export class BloomChain {
 
     if (this.bloomEnabled) {
       this.#threshold.uniforms.uScene = scene;
+      this.#threshold.uniforms.uBloomThreshold = this.#dials.bloomThreshold;
       renderer.render(this.#threshold.display, { renderTexture: this.#bloomA, clear: true });
 
       this.#downsampleWide.uniforms.uTex = this.#bloomA;
@@ -270,6 +275,7 @@ export class BloomChain {
     // Scaled by bloomStrength like the other two: the streak is a lens artefact off the same
     // thresholded highlights, so the world slider at 0 must not leave streaks behind.
     composite.uStreakStrength = this.bloomEnabled ? strength * dials.streakStrength : 0;
+    composite.uShadowStrength = dials.shadowStrength;
     composite.uAoStrength = dials.aoStrength;
     composite.uAoHeightM = dials.aoHeightM;
     composite.uFogStrength = dials.fogStrength;
@@ -293,6 +299,8 @@ export class BloomChain {
     composite.uWetGloss = dials.wetGloss;
     composite.uRadialSmear = radialSmear;
     composite.uSmearStrength = dials.smearStrength;
+    composite.uBlackLift = dials.blackLift;
+    composite.uDebugGrayscale = dials.debugGrayscale;
     composite.uPivotUv = pivotUv;
     renderer.render(this.#composite.display, { renderTexture: this.#out, clear: true });
 

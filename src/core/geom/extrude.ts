@@ -45,15 +45,15 @@ export interface BuildingMassing {
 
 /** Direction the key light arrives from, in world space (y grows downward). */
 export const LIGHT_DIRECTION: Vec2 = { x: -0.5547, y: -0.8321 };
-export const SHADOW_LENGTH = 0.65;
+export const SHADOW_LENGTH = 0.82;
 export const SHADE_MIN = 0.42;
 export const SHADE_MAX = 0.86;
 export const ROOF_SHADE = 1;
 
 export const DETAILED_MASSING_MIN_HEIGHT_M = 34;
 const DETAILED_MASSING_MIN_EDGE_M = 10;
-
-function supportsRoofStructures(poly: Ring): boolean {
+/** True when the footprint is a rectangle-like quad whose deck can carry rooftop structures. */
+export function supportsRoofStructures(poly: Ring): boolean {
   if (poly.length !== 4) return false;
   return poly.every((p, i) => {
     const prev = poly[(i + poly.length - 1) % poly.length]!;

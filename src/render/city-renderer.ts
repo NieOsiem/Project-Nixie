@@ -482,13 +482,18 @@ export class CityRenderer {
       if (chunk.neon !== null) chunk.neon.display.visible = draw;
       if (!draw) continue;
       chunk.mesh.setCamera(uniforms);
+      // Dial-driven uniforms ride the same dirty-flag refresh as the camera: setLookDials
+      // marks content dirty, which lands here even when the camera has not moved.
+      chunk.mesh.setDials(this.#dials);
       this.#visibleTriangles += chunk.mesh.triangleCount;
       if (chunk.detail !== null && showDetail) {
         chunk.detail.setCamera(uniforms);
+        chunk.detail.setDials(this.#dials);
         this.#visibleDetailTriangles += chunk.detail.triangleCount;
       }
       if (chunk.neon !== null) {
         chunk.neon.setCamera(uniforms);
+        chunk.neon.setDials(this.#dials);
         this.#visibleNeonTriangles += chunk.neon.triangleCount;
       }
     }

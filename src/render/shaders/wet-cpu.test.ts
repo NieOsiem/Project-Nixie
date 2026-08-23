@@ -10,7 +10,14 @@ const PUDDLE_COVERAGE = 0.45;
 const WET_STRENGTH = 0.7;
 const WET_DARKEN = 0.78;
 const WET_GLOSS = 0.6;
-const PUDDLE_EDGE = 0.08;
+const PUDDLE_EDGE_WET = 0.18;
+const PUDDLE_EDGE_DRY = 0.04;
+const PUDDLE_RIM_DARKEN = 0.65;
+const PUDDLE_STRETCH_Y = 1.35;
+const GLOSS_LIFT = 0.5;
+const WET_DARKEN_TINT_R = 0.9;
+const WET_DARKEN_TINT_G = 0.97;
+const WET_DARKEN_TINT_B = 1.06;
 const SMEAR_STRENGTH = 1;
 const SMEAR_HEIGHT_M = 50;
 const CAM_HEIGHT_M = 500;
@@ -58,10 +65,15 @@ function valueNoise(x: number, y: number): number {
   return add(mul(add(a, mul(sub(b, a), wx)), sub(1, wy)), mul(add(c, mul(sub(d, c), wx)), wy));
 }
 
-function puddleMask(coverage: number, noise: number): number {
-  if (coverage <= 0) return 0;
+function puddleField(coverage: number, noise: number): [number, number] {
+  if (coverage <= 0) return [0, 0];
   const threshold = sub(1, clamp(coverage, 0, 1));
-  return smoothstep(sub(threshold, PUDDLE_EDGE), add(threshold, PUDDLE_EDGE), noise);
+  const wetIn = sub(threshold, PUDDLE_EDGE_WET);
+  // Mirrors the shader's asymmetric waterline. The coverage guard above IS the shader's
+  // step(0.0001, uPuddleCoverage) gate, so zero coverage stays exactly dry.
+  const puddle = smoothstep(wetIn, add(threshold, PUDDLE_EDGE_DRY), noise);
+  const rim = mul(smoothstep(wetIn, threshold, noise), sub(1, puddle));
+  return [puddle, rim];
 }
 
 function radialReach(uvX: number, uvY: number, smear = RADIAL_SMEAR): [number, number] {
@@ -124,20 +136,30 @@ function shade(
   let cR = add(base, light);
   let cG = add(mul(base, 0.76), mul(light, 0.65));
   let cB = add(mul(base, 1.12), mul(light, 0.96));
-
-  const puddleNoise = valueNoise(div(worldX, PUDDLE_SCALE_M), div(worldY, PUDDLE_SCALE_M));
-  const puddle = puddleMask(PUDDLE_COVERAGE, puddleNoise);
+  const puddleNoise = valueNoise(
+    div(worldX, PUDDLE_SCALE_M),
+    div(mul(worldY, PUDDLE_STRETCH_Y), PUDDLE_SCALE_M)
+  );
+  const [puddle, rim] = puddleField(PUDDLE_COVERAGE, puddleNoise);
   const wet = mul(WET_STRENGTH, puddle);
-  const darken = add(1, mul(sub(WET_DARKEN, 1), wet));
-  cR = mul(cR, darken);
-  cG = mul(cG, darken);
-  cB = mul(cB, darken);
+  // Saturated cool darkening: per-channel mix toward WET_DARKEN x tint. The damp rim joins the
+  // mask at partial strength and the mask clamps at 1.
+  const wetMask = clamp(add(wet, mul(PUDDLE_RIM_DARKEN, rim)), 0, 1);
+  const darkenR = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_R), 1), wetMask));
+  const darkenG = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_G), 1), wetMask));
+  const darkenB = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_B), 1), wetMask));
+  cR = mul(cR, darkenR);
+  cG = mul(cG, darkenG);
+  cB = mul(cB, darkenB);
   const lit = clamp(add(add(mul(cR, 0.299), mul(cG, 0.587)), mul(cB, 0.114)), 0, 1);
-  const gloss = mul(mul(wet, WET_GLOSS), smoothstep(0.03, 0.72, lit));
-  const lift = add(1, mul(0.35, gloss));
-  cR = mul(cR, lift);
-  cG = mul(cG, lift);
-  cB = mul(cB, lift);
+  const gloss = mul(mul(wet, WET_GLOSS), smoothstep(0.02, 0.6, lit));
+  // Bounded lift: mirrors min(c * (1 + GLOSS_LIFT), vec3(1.0)) in the shader.
+  const liftR = Math.min(mul(cR, add(1, GLOSS_LIFT)), 1);
+  const liftG = Math.min(mul(cG, add(1, GLOSS_LIFT)), 1);
+  const liftB = Math.min(mul(cB, add(1, GLOSS_LIFT)), 1);
+  cR = mixScalar(cR, liftR, gloss);
+  cG = mixScalar(cG, liftG, gloss);
+  cB = mixScalar(cB, liftB, gloss);
 
   const [reachX, reachY] = radialReach(uvX, uvY);
   let smearR = 0;
@@ -313,10 +335,10 @@ describe("wet-look CPU evidence", () => {
         const uvY = (y + 0.5) / size;
         const worldX = -CROP_M / 2 + uvX * CROP_M;
         const worldY = -CROP_M / 2 + uvY * CROP_M;
-        const wet = puddleMask(
+        const wet = puddleField(
           PUDDLE_COVERAGE,
-          valueNoise(worldX / PUDDLE_SCALE_M, worldY / PUDDLE_SCALE_M)
-        );
+          valueNoise(worldX / PUDDLE_SCALE_M, (worldY * PUDDLE_STRETCH_Y) / PUDDLE_SCALE_M)
+        )[0];
         if (wet > 0) {
           const smeared = shade(pxPerMetre, x, y);
           const unsmeared = shade(pxPerMetre, x, y, 0);
@@ -350,6 +372,54 @@ describe("wet-look CPU evidence", () => {
   }, 15_000);
 
   it("makes a zero coverage field exactly dry", () => {
-    expect(puddleMask(0, 0.99)).toBe(0);
+    const [puddle, rim] = puddleField(0, 0.99);
+    expect(puddle).toBe(0);
+    expect(rim).toBe(0);
+  });
+
+  it("draws a sharp waterline with a damp collar just outside it", () => {
+    const threshold = 1 - PUDDLE_COVERAGE;
+    const [dryStart, rimDryStart] = puddleField(PUDDLE_COVERAGE, threshold - PUDDLE_EDGE_WET);
+    expect(dryStart).toBe(0);
+    expect(rimDryStart).toBe(0);
+
+    const [, rimMid] = puddleField(PUDDLE_COVERAGE, threshold - PUDDLE_EDGE_WET / 2);
+    expect(rimMid).toBeGreaterThan(0);
+
+    const [water, rimWater] = puddleField(PUDDLE_COVERAGE, threshold + PUDDLE_EDGE_DRY);
+    expect(water).toBeCloseTo(1, 6);
+    expect(rimWater).toBe(0);
+  });
+
+  it("keeps the waterline asymmetric: saturated sooner on the dry-out side", () => {
+    const threshold = 1 - PUDDLE_COVERAGE;
+    // The old symmetric edge only completed at threshold + 0.08; the new one completes at
+    // threshold + PUDDLE_EDGE_DRY...
+    const [pastEdge] = puddleField(PUDDLE_COVERAGE, threshold + PUDDLE_EDGE_DRY);
+    expect(pastEdge).toBe(1);
+    // ...while the wet-in side rises across a wider band, smoothing island shapes.
+    const [halfWetIn] = puddleField(PUDDLE_COVERAGE, threshold - PUDDLE_EDGE_WET / 2);
+    expect(halfWetIn).toBeGreaterThan(0);
+    expect(halfWetIn).toBeLessThan(1);
+  });
+
+  it("elongates the field along world Y via the anisotropic sample domain", () => {
+    let differs = 0;
+    for (let y = 0; y < 32; y += 1) {
+      for (let x = 0; x < 32; x += 1) {
+        const wx = ((x + 0.5) / 32) * CROP_M;
+        const wy = ((y + 0.5) / 32) * CROP_M;
+        const stretched = puddleField(
+          PUDDLE_COVERAGE,
+          valueNoise(wx / PUDDLE_SCALE_M, (wy * PUDDLE_STRETCH_Y) / PUDDLE_SCALE_M)
+        )[0];
+        const square = puddleField(
+          PUDDLE_COVERAGE,
+          valueNoise(wx / PUDDLE_SCALE_M, wy / PUDDLE_SCALE_M)
+        )[0];
+        if (stretched !== square) differs += 1;
+      }
+    }
+    expect(differs).toBeGreaterThan(0);
   });
 });

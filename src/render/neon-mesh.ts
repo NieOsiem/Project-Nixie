@@ -2,6 +2,7 @@ import { GLOW_MARGIN_M } from "../core/gen/neon.js";
 import { ATTRIBUTE_OFFSETS, VERTEX_STRIDE_BYTES, type MeshBuffers } from "../core/geom/mesh.js";
 import { EMISSIVE_MAX } from "../core/palette.js";
 import type { CameraUniforms } from "./city-mesh.js";
+import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import type { PaletteTexture } from "./palette-texture.js";
 import { NEON_FRAG, NEON_VERT } from "./shaders/neon.js";
 
@@ -43,6 +44,8 @@ export class NeonMesh {
       uLeanStrength: 1,
       uDepthFar: 20000,
       uEmissiveMax: EMISSIVE_MAX,
+      uNeonGain: DEFAULT_LOOK_DIALS.neonGain,
+      uPoolGain: DEFAULT_LOOK_DIALS.poolGain,
       uGlowMarginM: GLOW_MARGIN_M,
       uPalette: palette.texture
     });
@@ -65,6 +68,13 @@ export class NeonMesh {
     u.uCamHeight = c.cameraHeightPx;
     u.uLeanStrength = c.leanStrength;
     u.uDepthFar = c.depthFar;
+  }
+
+  setDials(d: LookDials): void {
+    // debugNoEmissive kills the additive pass too — the form test wants a fully unlit city.
+    const gate = 1 - Math.min(d.debugNoEmissive, 1);
+    this.display.shader.uniforms.uNeonGain = d.neonGain * gate;
+    this.display.shader.uniforms.uPoolGain = d.poolGain * gate;
   }
 
   /** Leaves the palette texture alone — it is shared with every other mesh. */

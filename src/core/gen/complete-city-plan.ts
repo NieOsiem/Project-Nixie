@@ -847,6 +847,153 @@ function landmarkMassRects(site: Ring, definition: LandmarkGrammarDefinition, se
   return output;
 }
 
+/** Kind expanded into four L-shaped corner masses by the polygonal shape branch. */
+const MEGAFRAME_KIND = "megaframe";
+
+/**
+ * Regular n-gon centred in, and bbox-fitted to, an oriented box. The rotation is part of
+ * the shape (applied before the frame rotation), so one seeded rotation per column keeps
+ * stacked polygonal setbacks edge-aligned.
+ */
+function polygonRingInBox(boxCentre: Vec2, boxWidth: number, boxHeight: number, angle: number, sides: number, rotation: number): Ring {
+  const unit: Vec2[] = [];
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let k = 0; k < sides; k++) {
+    const vertexAngle = rotation + (k * 2 * Math.PI) / sides;
+    const x = Math.cos(vertexAngle);
+    const y = Math.sin(vertexAngle);
+    unit.push({ x, y });
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  const scale = Math.min(boxWidth / (maxX - minX), boxHeight / (maxY - minY));
+  const centreX = (minX + maxX) / 2;
+  const centreY = (minY + maxY) / 2;
+  // Translate into absolute position first, then rotate about the box centre —
+  // rotatePoint pivots around its origin, so feeding it a centroid-relative offset
+  // would fling the ring to the wrong side of the map.
+  return unit.map((point) => {
+    const placed = { x: boxCentre.x + (point.x - centreX) * scale, y: boxCentre.y + (point.y - centreY) * scale };
+    return angle === 0 ? placed : rotatePoint(placed, boxCentre, angle);
+  });
+}
+
+/** Shrink a ring toward its centroid until it sits inside the container, or null. Mirrors fitRectInside. */
+function fitRingInside(ring: Ring, container: MultiPolygon): Ring | null {
+  const initialArea = Math.abs(ringArea(ring));
+  if (initialArea <= GEOMETRY_EPSILON) return null;
+  const centre = ringCentroid(ring);
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const factor = Math.pow(0.92, attempt);
+    const scaled = ring.map((point) => ({ x: centre.x + (point.x - centre.x) * factor, y: centre.y + (point.y - centre.y) * factor }));
+    // WHY: the boolean pipeline snaps to 1 mm, so a freshly built polygonal ring always
+    // differs from its snapped cut by slivers; containment must use the project's
+    // snap-noise gate, never an exact-area ratio.
+    if (isSnapNoise(difference(ringAsMulti(scaled), [container]))) return scaled;
+  }
+  return null;
+}
+/**
+ * Four L-shaped corner rings tiling a rectangular frame around an open courtyard hole.
+ * Corners meet edge-to-edge at the arm midlines, so the four simple hexagons neither
+ * overlap nor leave gaps; the hole stays uncovered ground inside the site.
+ */
+function frameCornerRings(width: number, height: number, thickness: number): Ring[] {
+  const halfWidth = width / 2;
+  const halfHeight = height / 2;
+  const t = Math.min(thickness, halfWidth * 0.8, halfHeight * 0.8);
+  const point = (x: number, y: number): Vec2 => ({ x, y });
+  return [
+    [point(-halfWidth, -halfHeight), point(0, -halfHeight), point(0, -halfHeight + t), point(-halfWidth + t, -halfHeight + t), point(-halfWidth + t, 0), point(-halfWidth, 0)],
+    [point(0, -halfHeight), point(halfWidth, -halfHeight), point(halfWidth, 0), point(halfWidth - t, 0), point(halfWidth - t, -halfHeight + t), point(0, -halfHeight + t)],
+    [point(halfWidth, 0), point(halfWidth, halfHeight), point(0, halfHeight), point(0, halfHeight - t), point(halfWidth - t, halfHeight - t), point(halfWidth - t, 0)],
+    [point(-halfWidth + t, 0), point(-halfWidth + t, halfHeight - t), point(0, halfHeight - t), point(0, halfHeight), point(-halfWidth, halfHeight), point(-halfWidth, 0)]
+  ];
+}
+
+/**
+ * Polygonal counterpart of `landmarkMassRects`, used only by grammars whose templates
+ * declare polygonSides or the megaframe kind; column layout, chain stacking and seed
+ * paths mirror the rect branch so both share one placement grammar.
+ */
+function landmarkMassPolygons(site: Ring, definition: LandmarkGrammarDefinition, seed: string, region: MultiPolygon): RawMass[] {
+  const frame = largestPiece(region) ?? site;
+  const angle = longestEdgeAngle(frame);
+  const centre = ringCentroid(frame);
+  const bounds = ringBounds(frame.map((point) => rotatePoint(point, centre, -angle)));
+  const chains: LandmarkMassTemplate[][] = [];
+  let current: LandmarkMassTemplate[] = [];
+  for (const template of definition.massTemplates) {
+    if (template.elevationFactor > 0) {
+      current.push(template);
+    } else {
+      if (current.length > 0) chains.push(current);
+      current = [template];
+    }
+  }
+  if (current.length > 0) chains.push(current);
+
+  const output: RawMass[] = [];
+  const columnCount = chains.length;
+  let totalWidth = 0;
+  for (const chain of chains) {
+    const ground = chain[0]!;
+    totalWidth += Math.min(ground.widthFactor, 0.8 / Math.max(1, columnCount));
+  }
+  const gap = 0.03;
+  const usable = Math.min(1, 1 - gap * Math.max(0, columnCount - 1));
+  const scale = Math.min(1, usable / Math.max(GEOMETRY_EPSILON, totalWidth));
+  let cursor = 0;
+  for (let column = 0; column < columnCount; column++) {
+    const chain = chains[column]!;
+    const ground = chain[0]!;
+    const width = Math.min(ground.widthFactor, 0.8 / Math.max(1, columnCount)) * scale;
+    const depth = Math.min(ground.depthFactor, ground.kind === MEGAFRAME_KIND ? 0.9 : 0.7);
+    const slotOffsetX = (cursor + width / 2 - 0.5) * bounds.width;
+    if (chain.length === 1 && ground.kind === MEGAFRAME_KIND) {
+      // One megaframe template expands into four corner masses; each corner draws its
+      // own height from the template band so the frame reads crenellated, not flat.
+      const frameWidth = bounds.width * width;
+      const frameDepth = bounds.height * depth;
+      // Corner rings are built around the local origin; move them to the column slot
+      // first, then rotate the whole frame back into world space like localRect does.
+      const slotCentre = { x: bounds.x + bounds.width / 2 + slotOffsetX, y: bounds.y + bounds.height / 2 };
+      const worldCorners = frameCornerRings(frameWidth, frameDepth, Math.min(frameWidth, frameDepth) * 0.3).map((ring) =>
+        ring.map((point) => rotatePoint({ x: slotCentre.x + point.x, y: slotCentre.y + point.y }, centre, angle))
+      );
+      for (let corner = 0; corner < worldCorners.length; corner++) {
+        const heightM = range(`${seed}/shape/frame-height/${column}/${corner}`, ground.heightMinM, ground.heightMaxM);
+        const fitted = fitRingInside(worldCorners[corner]!, region);
+        if (!fitted) continue;
+        output.push({ footprint: fitted, elevationM: 0, heightM, kind: "megaframe-corner" });
+      }
+      cursor += width + gap;
+      continue;
+    }
+    const rotation = hashUnit(`${seed}/shape/rotation/${column}`) * Math.PI * 2;
+    let elevationM = 0;
+    for (let index = 0; index < chain.length; index++) {
+      const template = chain[index]!;
+      const w = bounds.width * width * (index === 0 ? 1 : Math.max(0.25, template.widthFactor / ground.widthFactor));
+      const h = bounds.height * depth * (index === 0 ? 1 : Math.max(0.25, template.depthFactor / ground.depthFactor));
+      const heightM = range(`${seed}/height/${column}/${index}`, template.heightMinM, template.heightMaxM);
+      const boxCentre = rotatePoint({ x: bounds.x + bounds.width / 2 + slotOffsetX, y: bounds.y + bounds.height / 2 }, centre, angle);
+      const ring = polygonRingInBox(boxCentre, w, h, angle, template.polygonSides ?? 6, rotation);
+      const fitted = fitRingInside(ring, region);
+      if (!fitted) continue;
+      output.push({ footprint: fitted, elevationM, heightM, kind: template.kind });
+      elevationM += heightM;
+    }
+    cursor += width + gap;
+  }
+  return output;
+}
+
 const EMPTY_COMPATIBILITY_TAGS: ReadonlySet<string> = new Set();
 
 function districtCompatibilityTags(districtId: string | null, districtById: Map<string, DistrictSource>): ReadonlySet<string> {
@@ -1999,7 +2146,12 @@ function materializeLandmarkMasses(
     const definition = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)!;
     const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
     const bank = parcelBank(district, banks);
-    landmark.rawMasses = landmarkMassRects(landmark.sitePolygon, definition, landmark.seed, regions.get(landmark.id) ?? ringAsMulti(landmark.sitePolygon));
+    // Grammars with polygonal templates (or the megaframe kind) emit ring footprints;
+    // every other grammar keeps the rect branch and its exact original streams.
+    const massRegion = regions.get(landmark.id) ?? ringAsMulti(landmark.sitePolygon);
+    landmark.rawMasses = definition.massTemplates.some((template) => template.polygonSides !== undefined || template.kind === MEGAFRAME_KIND)
+      ? landmarkMassPolygons(landmark.sitePolygon, definition, landmark.seed, massRegion)
+      : landmarkMassRects(landmark.sitePolygon, definition, landmark.seed, massRegion);
     landmark.masses = landmark.rawMasses.map((raw, index) => {
       const massSeed = `${landmark.seed}/mass/${index}`;
       // WHY: landmark appearance changes must not move geometry or IDs.

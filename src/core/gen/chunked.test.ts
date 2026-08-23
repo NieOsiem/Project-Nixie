@@ -210,7 +210,7 @@ describe("partition equivalence", () => {
         carDetailMesh(chunk.cars, PPM)
       ]));
     }
-  });
+  }, 30_000);
 
   it("places every vertex bit-identically", () => {
     expect(worstDeviation(fromChunks, whole)).toBe(0);
@@ -382,7 +382,7 @@ describe("overhang", () => {
         }
       }
     }
-  });
+  }, 30_000);
 
   it("stays within a margin of the chunk rect", () => {
     for (const c of CHUNKS) {

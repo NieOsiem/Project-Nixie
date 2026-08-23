@@ -9,7 +9,6 @@
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 import { glslFloat } from "./weather.js";
 
-const THRESHOLD = 0.40;
 /** Half-width of the quadratic knee below the threshold. Softens the cut-in. */
 const KNEE = 0.20;
 
@@ -27,8 +26,29 @@ const BLACK_FLOOR = 0.004;
 
 /** Ground height shared with the weather splash mask. */
 const WET_GROUND_HEIGHT_M = 2.5;
-/** Noise edge in normalized field units; this is the damp margin around a puddle island. */
-const PUDDLE_EDGE = 0.08;
+/**
+ * Puddle waterline half-widths in normalized field units (CRITIQUE.md #5). The wet-in side is
+ * deliberately wide so island silhouettes rise smoothly instead of reading as camouflage
+ * blotches; the dry-out side is narrow so the waterline still reads as an edge.
+ */
+const PUDDLE_EDGE_WET = 0.18;
+const PUDDLE_EDGE_DRY = 0.04;
+/** Peak strength of the damp-rim darkening between dry ground and standing water. */
+const PUDDLE_RIM_DARKEN = 0.65;
+/**
+ * Anisotropy of the puddle noise domain: islands run ~35% longer along world Y so they read as
+ * drainage-aligned standing water rather than round blobs. Same hash field, same determinism.
+ */
+const PUDDLE_STRETCH_Y = 1.35;
+/**
+ * Wet-darkening channel balance (CRITIQUE.md #14): reds and greens sink harder than blue, so a
+ * darkened surface cools and saturates instead of merely scaling down.
+ */
+const WET_DARKEN_TINT_R = 0.9;
+const WET_DARKEN_TINT_G = 0.97;
+const WET_DARKEN_TINT_B = 1.06;
+/** Bounded multiplicative gloss lift on lit wet surfaces (was an unguarded +35%). */
+const GLOSS_LIFT = 0.5;
 /** Constant-bound radial taps keep the smear a cheap composite term. */
 const SMEAR_TAPS = 12;
 /** Keep the old 0.65^4 endpoint while sampling the same profile at a denser spatial cadence. */
@@ -68,6 +88,7 @@ void main() {
  * The four taps sit on source texel corners, so bilinear filtering makes each one a 2×2
  * average and the four together cover the full 4×4 block a destination texel stands for.
  * A single tap would miss fifteen of those sixteen texels and flicker as the camera moves.
+ * The cut-in luma rides the live `uBloomThreshold` dial instead of a baked constant.
  */
 export const THRESHOLD_FRAG = `
 precision highp float;
@@ -75,6 +96,7 @@ precision highp float;
 uniform sampler2D uScene;
 uniform vec2 uSrcTexel;
 uniform vec2 uSceneUvScale;
+uniform float uBloomThreshold;
 
 varying vec2 vUv;
 
@@ -89,9 +111,9 @@ void main() {
     texture2D(uScene, clamp(uv + uSrcTexel * vec2( 1.0,  1.0), edge, limit)).rgb);
 
   float l = dot(c, ${LUMA});
-  float soft = clamp(l - ${THRESHOLD.toFixed(3)} + ${KNEE.toFixed(3)}, 0.0, ${(2 * KNEE).toFixed(3)});
+  float soft = clamp(l - uBloomThreshold + ${KNEE.toFixed(3)}, 0.0, ${(2 * KNEE).toFixed(3)});
   soft = soft * soft / ${(4 * KNEE).toFixed(3)};
-  float w = max(soft, l - ${THRESHOLD.toFixed(3)}) / max(l, 0.0001);
+  float w = max(soft, l - uBloomThreshold) / max(l, 0.0001);
 
   gl_FragColor = vec4(c * w, 1.0);
 }
@@ -220,6 +242,7 @@ uniform sampler2D uAo;
 uniform float uNarrowStrength;
 uniform float uWideStrength;
 uniform float uStreakStrength;
+uniform float uShadowStrength;
 uniform float uAoStrength;
 uniform float uAoHeightM;
 uniform float uFogStrength;
@@ -236,6 +259,8 @@ uniform float uWetDarken;
 uniform float uWetGloss;
 uniform float uRadialSmear;
 uniform float uSmearStrength;
+uniform float uBlackLift;
+uniform float uDebugGrayscale;
 uniform vec2 uPivotUv;
 uniform vec2 uWorldOriginM;
 uniform vec2 uWorldSizeM;
@@ -251,7 +276,12 @@ uniform vec2 uAoUvScale;
 varying vec2 vUv;
 
 const float WET_GROUND_HEIGHT_M = ${glslFloat(WET_GROUND_HEIGHT_M)};
-const float PUDDLE_EDGE = ${glslFloat(PUDDLE_EDGE)};
+const float PUDDLE_EDGE_WET = ${glslFloat(PUDDLE_EDGE_WET)};
+const float PUDDLE_EDGE_DRY = ${glslFloat(PUDDLE_EDGE_DRY)};
+const float PUDDLE_RIM_DARKEN = ${glslFloat(PUDDLE_RIM_DARKEN)};
+const vec3 WET_DARKEN_TINT = vec3(${glslFloat(WET_DARKEN_TINT_R)}, ${glslFloat(WET_DARKEN_TINT_G)}, ${glslFloat(WET_DARKEN_TINT_B)});
+const float GLOSS_LIFT = ${glslFloat(GLOSS_LIFT)};
+const float PUDDLE_STRETCH_Y = ${glslFloat(PUDDLE_STRETCH_Y)};
 
 float hash21(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -284,20 +314,31 @@ void main() {
   // while the decoded height keeps the wet look on flat roads and low caps only.
   float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;
   vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;
-  float puddleNoise = valueNoise(worldM / max(uPuddleScaleM, 0.001));
+  // Anisotropic sample domain: islands elongate along world Y so they read as drainage-aligned
+  // standing water rather than round blobs. Same hash field, so determinism is untouched.
+  float puddleNoise = valueNoise(
+    vec2(worldM.x, worldM.y * PUDDLE_STRETCH_Y) / max(uPuddleScaleM, 0.001));
   float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);
-  float puddle = smoothstep(
-    puddleThreshold - PUDDLE_EDGE,
-    puddleThreshold + PUDDLE_EDGE,
-    puddleNoise) * step(0.0001, uPuddleCoverage);
+  // Asymmetric waterline: wide smooth wet-in, narrow crisp dry-out. Coverage zero stays exactly
+  // dry through the explicit step gate, whatever the smoothstep tails do as noise approaches 1.
+  float wetIn = puddleThreshold - PUDDLE_EDGE_WET;
+  float puddle = smoothstep(wetIn, puddleThreshold + PUDDLE_EDGE_DRY, puddleNoise)
+    * step(0.0001, uPuddleCoverage);
+  // Damp collar hugging the outside of the waterline: fully risen before the water saturates,
+  // gone inside it. Ground-gated so walls never grow rim halos.
+  float rim = smoothstep(wetIn, puddleThreshold, puddleNoise)
+    * (1.0 - puddle) * step(0.0001, uPuddleCoverage) * ground;
   float wet = clamp(uWetStrength, 0.0, 1.0) * ground * puddle;
 
-  // Darken first to make headroom, then lift only lit puddles. The mix is bounded so highlights
-  // that already hit the tone-map ceiling do not turn into an invisible additive spike.
-  c *= mix(1.0, clamp(uWetDarken, 0.0, 1.0), wet);
+  // Darken first to make headroom, then lift only lit puddles. Wet darkening is saturated and
+  // slightly cool (WET_DARKEN_TINT) rather than a flat scale-down; the rim shares it at partial
+  // strength and the mask clamps to 1 so the two stack without over-darkening. The mix stays
+  // bounded so highlights near the tone-map ceiling cannot become an additive spike.
+  c *= mix(vec3(1.0), clamp(uWetDarken, 0.0, 1.0) * WET_DARKEN_TINT,
+    clamp(wet + PUDDLE_RIM_DARKEN * rim, 0.0, 1.0));
   float light = clamp(dot(c, ${LUMA}), 0.0, 1.0);
-  float gloss = wet * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.03, 0.72, light);
-  c = mix(c, c * (1.0 + ${glslFloat(0.35)}), gloss);
+  float gloss = wet * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.02, 0.60, light);
+  c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), gloss);
 
   // The projection leans geometry away from the pivot. A mirror image therefore samples away
   // from the pivot too; the reach is exactly zero at the pivot and grows radially with uRadialSmear.
@@ -334,16 +375,25 @@ void main() {
   vec3 smearTarget = min(c + smearLift * ${glslFloat(0.35)}, vec3(1.0));
   c = mix(c, smearTarget, smearAmount);
 
+  float buildingCoverage = texture2D(uBuildingMask, vUv * uMaskUvScale).a;
   float castShadow = texture2D(uShadow, vUv * uShadowUvScale).r
-    * (1.0 - texture2D(uBuildingMask, vUv * uMaskUvScale).a);
-  c *= 1.0 - 0.22 * castShadow;
+    * (1.0 - buildingCoverage);
+  c *= 1.0 - uShadowStrength * castShadow;
 
   float ao = texture2D(uAo, vUv * uAoUvScale).r;
   float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);
-  c *= 1.0 - uAoStrength * ao * lowness * covered;
+  float lowSurface = lowness * covered;
+  // The broad AO remains gentle, while its dense core becomes a tight contact term. The
+  // full-resolution silhouette removes roofs and walls from that core: only the exposed side
+  // of footprint edges and enclosed gaps receive the extra darkening. This reuses the one
+  // blurred quarter-resolution AO sample; no target, pass, derivative or time term is added.
+  float contactAo = smoothstep(0.30, 0.70, ao) * (1.0 - buildingCoverage);
+  c *= 1.0 - uAoStrength * ao * lowSurface;
+  c *= 1.0 - uAoStrength * 0.35 * contactAo * lowSurface;
   // Cool neon-night grade: the reference city sits on an indigo base — red damped, blue
   // lifted, a whisper of violet in the floor. Neon hues pass through the chroma stage after.
-  c = c * vec3(0.94, 0.91, 1.10) + vec3(0.008, 0.005, 0.022);
+  // The floor term scales with the uBlackLift dial — below 1 deepens blacks toward true black.
+  c = c * vec3(0.94, 0.91, 1.10) + vec3(0.008, 0.005, 0.022) * uBlackLift;
 
   // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
   // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
@@ -365,6 +415,9 @@ void main() {
 
   float m = max(max(c.r, c.g), c.b);
   c *= 1.0 / (1.0 + max(m - 1.0, 0.0));
+  // Form-readability probe: presenting the graded frame as pure luma checks that architecture
+  // keeps its form without emissives (CRITIQUE.md #4/#14).
+  c = mix(c, vec3(dot(c, ${LUMA})), clamp(uDebugGrayscale, 0.0, 1.0));
   gl_FragColor = vec4(c, 1.0);
 }
 `;

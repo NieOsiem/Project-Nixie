@@ -20,11 +20,30 @@ import { hash2 } from "./hash.js";
  */
 export const GLOW_MARGIN_M = 2;
 
-// Fixed 30 m pools overlapped across adjacent lots; panel-scaled pools with a 10 m cap keep additive glow local.
-export const MAX_POOL_RADIUS_M = 10;
-export const MIN_POOL_RADIUS_M = 2;
-const POOL_RADIUS_FACTOR = 0.8;
-export const POOL_RATE = 0.5;
+// CRITIQUE #13: fewer but stronger environmental lights. Minor signs keep modest local
+// pools (MIN_POOL_RADIUS_M..SMALL_POOL_MAX_RADIUS_M); major panels — billboards, banners,
+// crowns — scale their radius with the panel's own reach up to MAX_POOL_RADIUS_M, so a
+// handful of large sources visibly light the streetscape instead of many faint blobs.
+export const MAX_POOL_RADIUS_M = 20;
+export const MIN_POOL_RADIUS_M = 4;
+const SMALL_POOL_MAX_RADIUS_M = 7;
+const MAJOR_POOL_MIN_RADIUS_M = 8;
+const MINOR_POOL_RADIUS_FACTOR = 1.5;
+const MAJOR_POOL_RADIUS_FACTOR = 1.75;
+// Minors pool at a fraction of their configured density. Majors scale too, but never
+// drop below their own small floor: they are the rare, load-bearing light sources.
+const MINOR_POOL_RATE_MULT = 0.16;
+const MAJOR_POOL_RATE_MULT = 0.6;
+const MAJOR_POOL_MIN_RATE = 0.15;
+export const POOL_RATE = 0.4;
+// A corner billboard may shove its pool centre toward the street by a seeded slice of
+// the radius (fraction drawn from POOL_STREET_OFFSET_MIN_FRACTION..+SPAN). Salt 23 is
+// new and independent of every existing stream.
+const POOL_STREET_OFFSET_SALT = 23;
+const POOL_STREET_OFFSET_MIN_FRACTION = 0.25;
+const POOL_STREET_OFFSET_SPAN = 0.35;
+// Relative cross-product threshold for "the footprint genuinely turns at this vertex".
+const CORNER_TURN_EPSILON = 1e-3;
 
 const FACADE_RATE = 0.75;
 const FACADE_MIN_BUILDING_M = 6;
@@ -60,11 +79,13 @@ const BANNER_TOP_HIGH = 0.9;
  */
 export const SIGN_BAND_TOP_M = 12;
 const SIZE_RAMP_FULL_M = 60;
-
-export const POOL_MAX_SIGN_HEIGHT_M = 15;
+/** Highest sign bottom that may still throw a ground pool when its panel is a major one. */
+export const POOL_MAX_SIGN_HEIGHT_M = 22;
 const POOL_MAX_SIGN_BOTTOM_M = 8;
 const POOL_HEIGHT_M = 0.03;
-const POOL_STRENGTH = 0.14;
+// Contrast, not uniform brightening: small pools dim slightly, major panels light hard.
+const POOL_STRENGTH = 0.12;
+const MAJOR_POOL_STRENGTH = 0.3;
 
 const STRENGTH_SPREAD = 0.6;
 const FACADE_STRENGTH = 0.7;
@@ -130,6 +151,10 @@ interface NeonQuad {
   material: number;
   strength: number;
   radial: number;
+  /** Facade panels only; tiers the ground pool's size, rate and strength. */
+  kind?: SignKind;
+  /** Unit outward normal of the mounting edge; set on corner-facing billboards only. */
+  streetNormal?: { x: number; y: number };
 }
 
 /** Independent draws from one building's 0..1 seed. `hash2` wants integers. */
@@ -243,6 +268,42 @@ function edgeCandidates(ring: Ring, minWidthM: number, pixelsPerMetre: number): 
     if (Math.hypot(b.x - a.x, b.y - a.y) >= need) out.push(i);
   }
   return out;
+}
+
+/**
+ * Outward unit normal of edge `edgeIdx` when the boundary genuinely turns at one of its
+ * endpoints — a street corner a billboard's pool can spill across. Null on straight runs,
+ * where light thrown outward would only climb the neighbouring wall.
+ */
+function streetSideNormal(ring: Ring, edgeIdx: number): { x: number; y: number } | null {
+  const n = ring.length;
+  const p = ring[(edgeIdx - 1 + n) % n]!;
+  const a = ring[edgeIdx]!;
+  const b = ring[(edgeIdx + 1) % n]!;
+  const q = ring[(edgeIdx + 2) % n]!;
+
+  const abX = b.x - a.x;
+  const abY = b.y - a.y;
+  const lenAb = Math.hypot(abX, abY);
+  if (lenAb === 0) return null;
+  // Collinear vertices are just a long wall; a real corner bends the boundary.
+  const turnsAtA =
+    Math.abs((a.x - p.x) * abY - (a.y - p.y) * abX) >
+    CORNER_TURN_EPSILON * Math.hypot(a.x - p.x, a.y - p.y) * lenAb;
+  const turnsAtB =
+    Math.abs(abX * (q.y - b.y) - abY * (q.x - b.x)) >
+    CORNER_TURN_EPSILON * lenAb * Math.hypot(q.x - b.x, q.y - b.y);
+  if (!turnsAtA && !turnsAtB) return null;
+
+  // Shoelace sign picks which side of the edge is outside the lot.
+  let area2 = 0;
+  for (let i = 0; i < n; i++) {
+    const c = ring[i]!;
+    const d = ring[(i + 1) % n]!;
+    area2 += c.x * d.y - d.x * c.y;
+  }
+  const s = area2 >= 0 ? 1 : -1;
+  return { x: (s * abY) / lenAb, y: (-s * abX) / lenAb };
 }
 
 function chooseSignKind(
@@ -390,7 +451,9 @@ function facadeSign(
     halfHeightM: heightM / 2,
     material: neonMaterial(spec, 8),
     strength: panelStrength(profile, spec),
-    radial: 0
+    radial: 0,
+    kind,
+    streetNormal: kind === "billboard" ? (streetSideNormal(ring, edgeIdx) ?? undefined) : undefined
   };
 }
 
@@ -497,33 +560,57 @@ function groundPool(
   profile: SemanticProfile,
   pixelsPerMetre: number
 ): NeonQuad | null {
-  // Keyed off the panel's bottom: genuine ground-reaching signs only. High signs never emit pools.
+  // CRITIQUE #13 tiering: major panels (billboard, banner, crown) are the few sources
+  // allowed to dominate a block face — bigger reach, harder light — and they may hang
+  // mid-tower yet still throw their pool down to the street. Everything else stays modest.
+  const kind = sign.kind ?? "sign";
+  const major = kind === "billboard" || kind === "banner" || kind === "crown";
+
+  // Keyed off the panel's bottom: genuine ground-reaching signs only.
   const bottomH = Math.min(...sign.corners.map((c) => c.h));
-  if (bottomH > POOL_MAX_SIGN_BOTTOM_M || bottomH > POOL_MAX_SIGN_HEIGHT_M) return null;
+  if (bottomH > (major ? POOL_MAX_SIGN_HEIGHT_M : POOL_MAX_SIGN_BOTTOM_M)) return null;
 
   const defaultPoolRate =
     profile === "market_entertainment"
-      ? 0.55
+      ? 0.45
       : profile === "corporate_civic"
-        ? 0.35
+        ? 0.3
         : profile === "residential"
-          ? 0.25
+          ? 0.2
           : profile === "industrial_utility"
-            ? 0.2
+            ? 0.15
             : profile === "derelict_old_city"
-              ? 0.3
+              ? 0.25
               : POOL_RATE;
 
-  const poolRate =
+  const configuredRate =
     spec.poolRate === undefined || !Number.isFinite(spec.poolRate)
       ? defaultPoolRate
       : Math.max(0, Math.min(1, spec.poolRate));
+  // Fewer, stronger: minors thin to a fraction of their configured density; majors keep
+  // a scaled share but never below MAJOR_POOL_MIN_RATE.
+  const poolRate = Math.min(
+    1,
+    major
+      ? Math.max(configuredRate * MAJOR_POOL_RATE_MULT, MAJOR_POOL_MIN_RATE)
+      : configuredRate * MINOR_POOL_RATE_MULT
+  );
 
   if (roll(spec.seed, 13) >= poolRate) return null;
 
-  const cx = sign.corners.reduce((sum, c) => sum + c.x, 0) / sign.corners.length;
-  const cy = sign.corners.reduce((sum, c) => sum + c.y, 0) / sign.corners.length;
-  const radiusM = poolRadiusM(sign);
+  let cx = sign.corners.reduce((sum, c) => sum + c.x, 0) / sign.corners.length;
+  let cy = sign.corners.reduce((sum, c) => sum + c.y, 0) / sign.corners.length;
+  const radiusM = poolRadiusM(sign, major);
+  if (sign.streetNormal !== undefined) {
+    // Spill across the intersection: shift the centre toward the street by a seeded
+    // slice of the radius (drawn after the rate roll; salt 23 is new and independent).
+    const offsetFraction =
+      POOL_STREET_OFFSET_MIN_FRACTION +
+      POOL_STREET_OFFSET_SPAN * roll(spec.seed, POOL_STREET_OFFSET_SALT);
+    cx += sign.streetNormal.x * radiusM * offsetFraction;
+    cy += sign.streetNormal.y * radiusM * offsetFraction;
+  }
+
   const r = radiusM * pixelsPerMetre;
   return {
     corners: [
@@ -535,14 +622,18 @@ function groundPool(
     halfWidthM: radiusM,
     halfHeightM: radiusM,
     material: sign.material,
-    strength: sign.strength * POOL_STRENGTH,
+    strength: sign.strength * (major ? MAJOR_POOL_STRENGTH : POOL_STRENGTH),
     radial: 1
   };
 }
 
-function poolRadiusM(sign: NeonQuad): number {
+function poolRadiusM(sign: NeonQuad, major: boolean): number {
   const halfDiagM = Math.hypot(sign.halfWidthM, sign.halfHeightM);
-  return Math.min(MAX_POOL_RADIUS_M, Math.max(MIN_POOL_RADIUS_M, POOL_RADIUS_FACTOR * halfDiagM));
+  const reachM = (major ? MAJOR_POOL_RADIUS_FACTOR : MINOR_POOL_RADIUS_FACTOR) * halfDiagM;
+  return Math.min(
+    major ? MAX_POOL_RADIUS_M : SMALL_POOL_MAX_RADIUS_M,
+    Math.max(major ? MAJOR_POOL_MIN_RADIUS_M : MIN_POOL_RADIUS_M, reachM)
+  );
 }
 
 /** A mass with neon disabled emits no geometry, so its renderer pass remains empty. */

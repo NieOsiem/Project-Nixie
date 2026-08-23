@@ -1,5 +1,6 @@
 import {
   describeBuildingMassing,
+  supportsRoofStructures,
   wallShade,
   withPositiveArea,
   type BuildingMassing,
@@ -41,6 +42,24 @@ export type ArchitecturalTypology =
 
 const roll = (seed: number, salt: number): number =>
   hash2(Math.round(seed * 0x3fffffff), salt);
+
+const fnv1a = (text: string): number => {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return hash >>> 0;
+};
+
+/**
+ * Deterministic unit roll on the v2 rooftop namespace. Every family owns its own path so
+ * these streams never alias existing numeric salts or each other; geometry decisions use
+ * `geo/...` slots and appearance (materials, accents) uses `mat/...` slots.
+ */
+const rooftopRoll = (spec: BuildingSpec, family: string, slot: string): number =>
+  fnv1a(`${Math.round(spec.seed * 0x3fffffff)}/rooftops/v2/${family}/${slot}`) / 0x100000000;
+
+/** District material for a slot in the building's own bank (planting, contrast roofs...). */
+const bankSlotMaterial = (spec: BuildingSpec, slot: number): number =>
+  Math.floor(spec.wallMaterial / BANK_SIZE) * BANK_SIZE + slot;
 
 /**
  * Classifies a building into its architectural typology based on facadeProfile,
@@ -680,6 +699,681 @@ function utilityPrisms(
   return prisms;
 }
 
+// ---------------------------------------------------------------------------
+// v2 rooftop feature families (CRITIQUE #7).
+//
+// One prism-only vocabulary of rooftop sets, selected per architectural typology so
+// corporate roofs stay clean, residential roofs cluttered-small, industrial heavy,
+// market chaotic and derelict improvised. Every family draws randomness from its own
+// `rooftops/v2/<family>` namespace (never the legacy numeric salts) and every footprint
+// is corner-checked against the deck, so determinism and containment hold by construction.
+// ---------------------------------------------------------------------------
+
+type RoofFamilyId =
+  | "access"
+  | "antenna"
+  | "billboard"
+  | "garden"
+  | "generator"
+  | "hvac"
+  | "pad"
+  | "satdish"
+  | "skylight"
+  | "stacks"
+  | "tank"
+  | "vents";
+
+interface RoofContext {
+  spec: BuildingSpec;
+  accent: number;
+  pixelsPerMetre: number;
+  roof: BuildingVolume;
+  footprint: Ring;
+  frame: RoofFrame;
+}
+
+interface RoofRect {
+  centreU: number;
+  centreV: number;
+  halfU: number;
+  halfV: number;
+}
+
+/** Families low enough to also serve as rate-gated utility-tier extras (≤5 m above deck). */
+const LOW_PROFILE_FAMILIES: Readonly<Partial<Record<RoofFamilyId, true>>> = {
+  access: true,
+  hvac: true,
+  satdish: true,
+  skylight: true,
+  vents: true
+};
+
+/**
+ * Candidate menu per typology. Kept sorted by id so hashing never depends on authoring
+ * order; "standard" deliberately stays empty — the legacy bounded utility boxes remain
+ * its generic fallback look.
+ */
+const ROOFTOP_FAMILY_PLAN: Readonly<Record<ArchitecturalTypology, readonly RoofFamilyId[]>> = {
+  corporate: ["access", "antenna", "garden", "hvac", "pad", "satdish"],
+  residential: ["access", "garden", "hvac", "tank", "vents"],
+  industrial: ["generator", "hvac", "skylight", "stacks", "tank"],
+  market: ["access", "billboard", "generator", "hvac", "satdish", "skylight"],
+  civic: ["antenna", "garden", "satdish"],
+  derelict: ["antenna", "stacks", "tank", "vents"],
+  standard: []
+};
+
+const framePoint = (frame: RoofFrame, uM: number, vM: number, pixelsPerMetre: number): Vec2 => {
+  const along = uM * pixelsPerMetre;
+  const across = vM * pixelsPerMetre;
+  return {
+    x: frame.centre.x + frame.ux * along - frame.uy * across,
+    y: frame.centre.y + frame.uy * along + frame.ux * across
+  };
+};
+
+function localBoxRing(
+  ctx: RoofContext,
+  centreU: number,
+  centreV: number,
+  halfU: number,
+  halfV: number
+): Ring | null {
+  if (halfU <= 0 || halfV <= 0) return null;
+  const corner = (su: number, sv: number): Vec2 =>
+    framePoint(ctx.frame, centreU + su * halfU, centreV + sv * halfV, ctx.pixelsPerMetre);
+  const box = withPositiveArea([corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)]);
+  if (box.length !== 4) return null;
+  return box.every((p) => pointInRing(p, ctx.footprint)) ? box : null;
+}
+
+/** Angled variant used for satellite dishes; same containment contract. */
+function rotatedBoxRing(
+  ctx: RoofContext,
+  centreU: number,
+  centreV: number,
+  halfU: number,
+  halfV: number,
+  angle: number
+): Ring | null {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const corner = (su: number, sv: number): Vec2 =>
+    framePoint(
+      ctx.frame,
+      centreU + su * halfU * cos - sv * halfV * sin,
+      centreV + su * halfU * sin + sv * halfV * cos,
+      ctx.pixelsPerMetre
+    );
+  const box = withPositiveArea([corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)]);
+  if (box.length !== 4) return null;
+  return box.every((p) => pointInRing(p, ctx.footprint)) ? box : null;
+}
+
+/** Rolls a contained spot for one unit, optionally keeping clear of already-placed ones. */
+function placeRoofUnit(
+  ctx: RoofContext,
+  family: string,
+  unitKey: string | number,
+  halfU: number,
+  halfV: number,
+  attempts = 6,
+  avoid: readonly RoofRect[] = [],
+  gap = 0.5
+): RoofRect | null {
+  if (halfU < 0.16 || halfV < 0.16) return null;
+  const rangeU = Math.max(0, ctx.frame.extentU - halfU - 0.7);
+  const rangeV = Math.max(0, ctx.frame.extentV - halfV - 0.7);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const rect: RoofRect = {
+      centreU: (rooftopRoll(ctx.spec, family, `geo/u/${unitKey}/${attempt}`) * 2 - 1) * rangeU,
+      centreV: (rooftopRoll(ctx.spec, family, `geo/v/${unitKey}/${attempt}`) * 2 - 1) * rangeV,
+      halfU,
+      halfV
+    };
+    if (
+      localBoxRing(ctx, rect.centreU, rect.centreV, halfU, halfV) !== null &&
+      avoid.every(
+        (other) =>
+          Math.abs(other.centreU - rect.centreU) >= other.halfU + halfU + gap ||
+          Math.abs(other.centreV - rect.centreV) >= other.halfV + halfV + gap
+      )
+    ) {
+      return rect;
+    }
+  }
+  return null;
+}
+
+/** Snaps a unit against the parapet on one deterministic edge (bulkheads hug the rim). */
+function placeNearParapet(
+  ctx: RoofContext,
+  family: string,
+  halfU: number,
+  halfV: number
+): RoofRect | null {
+  const edge = Math.min(3, Math.floor(rooftopRoll(ctx.spec, family, "geo/edge") * 4));
+  const t = rooftopRoll(ctx.spec, family, "geo/t") * 2 - 1;
+  const insetU = Math.max(0, ctx.frame.extentU - halfU - 0.9);
+  const insetV = Math.max(0, ctx.frame.extentV - halfV - 0.9);
+  const candidates: RoofRect[] = [
+    { centreU: t * insetU, centreV: insetV, halfU, halfV },
+    { centreU: t * insetU, centreV: -insetV, halfU, halfV },
+    { centreU: insetU, centreV: t * insetV, halfU, halfV },
+    { centreU: -insetU, centreV: t * insetV, halfU, halfV }
+  ];
+  const candidate = candidates[edge]!;
+  return localBoxRing(ctx, candidate.centreU, candidate.centreV, halfU, halfV) !== null
+    ? candidate
+    : null;
+}
+
+const addPrism = (
+  prisms: DetailPrism[],
+  ctx: RoofContext,
+  ring: Ring,
+  baseOffsetM: number,
+  heightM: number,
+  material: number,
+  seedSlot: string
+): void => {
+  prisms.push({
+    footprint: ring,
+    baseHeight: ctx.roof.topHeight + baseOffsetM,
+    topHeight: ctx.roof.topHeight + baseOffsetM + heightM,
+    material,
+    seed: rooftopRoll(ctx.spec, "seed", seedSlot)
+  });
+};
+
+/** Rows of 2-6 low AC/chiller boxes in a spaced grid, some carrying fan cubes. */
+function hvacBankFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const count = 2 + Math.floor(rooftopRoll(ctx.spec, "hvac", "geo/count") * 4.99);
+  const cols = Math.min(count, 3);
+  const rows = Math.ceil(count / cols);
+  const unitU = 0.85 + rooftopRoll(ctx.spec, "hvac", "geo/unit-u") * 0.5;
+  const unitV = 0.7 + rooftopRoll(ctx.spec, "hvac", "geo/unit-v") * 0.45;
+  const gap = 0.55;
+  const anchor = placeRoofUnit(
+    ctx,
+    "hvac",
+    "bank",
+    (cols * unitU * 2 + (cols - 1) * gap) / 2,
+    (rows * unitV * 2 + (rows - 1) * gap) / 2,
+    8
+  );
+  if (anchor === null) return prisms;
+  for (let i = 0; i < count; i++) {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const cu = anchor.centreU + (col - (cols - 1) / 2) * (unitU * 2 + gap);
+    const cv = anchor.centreV + (row - (rows - 1) / 2) * (unitV * 2 + gap);
+    const ring = localBoxRing(ctx, cu, cv, unitU, unitV);
+    if (ring === null) continue;
+    const height = 0.9 + rooftopRoll(ctx.spec, "hvac", `geo/h/${i}`) * 1.0;
+    addPrism(prisms, ctx, ring, 0.04, height, ctx.spec.roofMaterial, `hvac/unit/${i}`);
+    if (rooftopRoll(ctx.spec, "hvac", `mat/fan/${i}`) < 0.45) {
+      addPrism(
+        prisms,
+        ctx,
+        scaledRing(ring, 0.52),
+        0.04 + height,
+        0.45 + rooftopRoll(ctx.spec, "hvac", `geo/fan/${i}`) * 0.35,
+        ctx.spec.wallMaterial,
+        `hvac/fan/${i}`
+      );
+    }
+  }
+  return prisms;
+}
+
+/** Loose ring/grid of 3-8 small vent stacks around a cluster centre. */
+function ventClusterFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const count = 3 + Math.floor(rooftopRoll(ctx.spec, "vents", "geo/count") * 5.99);
+  const radiusU = 1.1 + rooftopRoll(ctx.spec, "vents", "geo/radius-u") * 1.3;
+  const radiusV = 1.1 + rooftopRoll(ctx.spec, "vents", "geo/radius-v") * 1.3;
+  const anchor = placeRoofUnit(ctx, "vents", "cluster", radiusU, radiusV, 8);
+  if (anchor === null) return prisms;
+  const twist = rooftopRoll(ctx.spec, "vents", "geo/twist") * Math.PI * 2;
+  for (let i = 0; i < count; i++) {
+    const angle = twist + (i / count) * Math.PI * 2;
+    const pull = 0.3 + rooftopRoll(ctx.spec, "vents", `geo/pull/${i}`) * 0.7;
+    const half = 0.2 + rooftopRoll(ctx.spec, "vents", `geo/size/${i}`) * 0.2;
+    const ring = localBoxRing(
+      ctx,
+      anchor.centreU + Math.cos(angle) * radiusU * pull,
+      anchor.centreV + Math.sin(angle) * radiusV * pull,
+      half,
+      half
+    );
+    if (ring === null) continue;
+    const core = i % 3 === 0;
+    const height = core
+      ? 1.0 + rooftopRoll(ctx.spec, "vents", `geo/h/${i}`) * 0.8
+      : 0.45 + rooftopRoll(ctx.spec, "vents", `geo/h/${i}`) * 0.6;
+    addPrism(prisms, ctx, ring, 0.04, height, ctx.spec.wallMaterial, `vents/${i}`);
+  }
+  return prisms;
+}
+
+/** 1-3 tall thin exhaust flues on collars; improvised scrap variants when derelict. */
+function exhaustStackFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const count = 1 + Math.floor(rooftopRoll(ctx.spec, "stacks", "geo/count") * 2.99);
+  const improvised = resolveArchitecturalTypology(ctx.spec) === "derelict";
+  for (let i = 0; i < count; i++) {
+    const half = 0.3 + rooftopRoll(ctx.spec, "stacks", `geo/size/${i}`) * 0.24;
+    const spot = placeRoofUnit(ctx, "stacks", i, half * 1.9, half * 1.9, 7);
+    if (spot === null) continue;
+    const collar = localBoxRing(ctx, spot.centreU, spot.centreV, half * 1.9, half * 1.9);
+    if (collar !== null) {
+      addPrism(
+        prisms,
+        ctx,
+        collar,
+        0.04,
+        0.7,
+        improvised && i % 2 === 1 ? ctx.spec.roofMaterial : ctx.spec.wallMaterial,
+        `stacks/collar/${i}`
+      );
+    }
+    const flue = localBoxRing(ctx, spot.centreU, spot.centreV, half, half);
+    if (flue !== null) {
+      const height =
+        (improvised ? 3.2 : 4.2) + rooftopRoll(ctx.spec, "stacks", `geo/h/${i}`) * (improvised ? 2.6 : 4.0);
+      addPrism(
+        prisms,
+        ctx,
+        flue,
+        0.74,
+        height,
+        improvised && i % 2 === 0 ? ctx.spec.roofMaterial : ctx.spec.wallMaterial,
+        `stacks/flue/${i}`
+      );
+    }
+  }
+  return prisms;
+}
+
+/** Medium genset box paired with a low wide fuel tank and a thin exhaust pipe. */
+function generatorSetFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const tankHalfU = 2.0 + rooftopRoll(ctx.spec, "generator", "geo/tank-u") * 1.0;
+  const tankHalfV = 0.75 + rooftopRoll(ctx.spec, "generator", "geo/tank-v") * 0.35;
+  const tank = placeRoofUnit(ctx, "generator", "tank", tankHalfU, tankHalfV, 8);
+  if (tank === null) return prisms;
+  const tankRing = localBoxRing(ctx, tank.centreU, tank.centreV, tank.halfU, tank.halfV);
+  if (tankRing !== null) {
+    addPrism(
+      prisms,
+      ctx,
+      tankRing,
+      0.04,
+      0.75 + rooftopRoll(ctx.spec, "generator", "geo/tank-h") * 0.35,
+      ctx.spec.roofMaterial,
+      "generator/tank"
+    );
+  }
+  const genset = placeRoofUnit(
+    ctx,
+    "generator",
+    "genset",
+    1.4 + rooftopRoll(ctx.spec, "generator", "geo/gen-u") * 0.6,
+    0.95 + rooftopRoll(ctx.spec, "generator", "geo/gen-v") * 0.4,
+    8,
+    [tank],
+    0.6
+  );
+  if (genset === null) return prisms;
+  const genHeight = 1.6 + rooftopRoll(ctx.spec, "generator", "geo/gen-h") * 0.6;
+  const genRing = localBoxRing(ctx, genset.centreU, genset.centreV, genset.halfU, genset.halfV);
+  if (genRing === null) return prisms;
+  addPrism(prisms, ctx, genRing, 0.04, genHeight, ctx.spec.wallMaterial, "generator/genset");
+  const pipe = localBoxRing(
+    ctx,
+    genset.centreU + genset.halfU * 0.55,
+    genset.centreV - genset.halfV * 0.55,
+    0.15,
+    0.15
+  );
+  if (pipe !== null) {
+    addPrism(
+      prisms,
+      ctx,
+      pipe,
+      0.04 + genHeight,
+      1.1 + rooftopRoll(ctx.spec, "generator", "geo/pipe-h") * 0.7,
+      ctx.spec.roofMaterial,
+      "generator/pipe"
+    );
+  }
+  return prisms;
+}
+
+/** Ground-cluster squat tanks with lids (the stilted variant lives in the residential roof). */
+function tankClusterFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const count = 2 + Math.floor(rooftopRoll(ctx.spec, "tank", "geo/count") * 1.99);
+  const improvised = resolveArchitecturalTypology(ctx.spec) === "derelict";
+  const placed: RoofRect[] = [];
+  for (let i = 0; i < count; i++) {
+    const half = 1.05 + rooftopRoll(ctx.spec, "tank", `geo/size/${i}`) * 0.7;
+    const spot = placeRoofUnit(ctx, "tank", i, half, half, 7, placed, 0.55);
+    if (spot === null) continue;
+    const ring = localBoxRing(ctx, spot.centreU, spot.centreV, half, half);
+    if (ring === null) continue;
+    placed.push(spot);
+    const height = 1.25 + rooftopRoll(ctx.spec, "tank", `geo/h/${i}`) * 0.9;
+    const barrelMaterial = improvised && i % 2 === 1 ? ctx.spec.roofMaterial : ctx.spec.wallMaterial;
+    addPrism(prisms, ctx, ring, 0.04, height, barrelMaterial, `tank/barrel/${i}`);
+    addPrism(
+      prisms,
+      ctx,
+      scaledRing(ring, 0.84),
+      0.04 + height,
+      0.22,
+      barrelMaterial === ctx.spec.wallMaterial ? ctx.spec.roofMaterial : ctx.spec.wallMaterial,
+      `tank/lid/${i}`
+    );
+  }
+  return prisms;
+}
+
+/** 2-5 thin masts of varying height clustered near an anchor, rare beacon on the tallest. */
+function antennaClusterFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const count = 2 + Math.floor(rooftopRoll(ctx.spec, "antenna", "geo/count") * 3.99);
+  const anchor = placeRoofUnit(ctx, "antenna", "anchor", 1.1, 1.1, 8);
+  if (anchor === null) return prisms;
+  const baseRing = localBoxRing(ctx, anchor.centreU, anchor.centreV, 0.6, 0.6);
+  if (baseRing !== null) {
+    addPrism(prisms, ctx, baseRing, 0.04, 0.9, ctx.spec.wallMaterial, "antenna/base");
+  }
+  let tallestHeight = 0;
+  let tallestCu = 0;
+  let tallestCv = 0;
+  let hasMast = false;
+  for (let i = 0; i < count; i++) {
+    const cu = anchor.centreU + (rooftopRoll(ctx.spec, "antenna", `geo/off-u/${i}`) * 2 - 1);
+    const cv = anchor.centreV + (rooftopRoll(ctx.spec, "antenna", `geo/off-v/${i}`) * 2 - 1);
+    const half = 0.08 + rooftopRoll(ctx.spec, "antenna", `geo/size/${i}`) * 0.1;
+    const ring = localBoxRing(ctx, cu, cv, half, half);
+    if (ring === null) continue;
+    const height = 2.4 + rooftopRoll(ctx.spec, "antenna", `geo/h/${i}`) * 4.4;
+    addPrism(prisms, ctx, ring, 0.04, height, ctx.spec.roofMaterial, `antenna/mast/${i}`);
+    if (height > tallestHeight) {
+      tallestHeight = height;
+      tallestCu = cu;
+      tallestCv = cv;
+      hasMast = true;
+    }
+  }
+  if (hasMast && ctx.spec.neonEnabled !== false && rooftopRoll(ctx.spec, "antenna", "mat/beacon") < 0.35) {
+    const beacon = localBoxRing(ctx, tallestCu, tallestCv, 0.07, 0.07);
+    if (beacon !== null) {
+      addPrism(prisms, ctx, beacon, 0.04 + tallestHeight, 0.28, ctx.accent, "antenna/beacon");
+    }
+  }
+  return prisms;
+}
+
+/** Pedestalled dish aimed at a deterministic angle, with feed arm. */
+function satelliteDishFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const pad = placeRoofUnit(ctx, "satdish", "pad", 1.05, 1.05, 8);
+  if (pad === null) return prisms;
+  const pedestal = localBoxRing(ctx, pad.centreU, pad.centreV, 0.55, 0.55);
+  if (pedestal === null) return prisms;
+  addPrism(prisms, ctx, pedestal, 0.04, 0.5, ctx.spec.wallMaterial, "satdish/pedestal");
+  const angle = rooftopRoll(ctx.spec, "satdish", "geo/tilt") * Math.PI;
+  const half = 0.65 + rooftopRoll(ctx.spec, "satdish", "geo/size") * 0.3;
+  const ring =
+    rotatedBoxRing(
+      ctx,
+      pad.centreU + Math.cos(angle) * 0.28,
+      pad.centreV + Math.sin(angle) * 0.28,
+      half,
+      half * 0.72,
+      angle
+    ) ?? localBoxRing(ctx, pad.centreU, pad.centreV, half, half * 0.72);
+  if (ring === null) return prisms;
+  const dishHeight = 0.45 + rooftopRoll(ctx.spec, "satdish", "geo/dish-h") * 0.3;
+  addPrism(prisms, ctx, ring, 0.54, dishHeight, ctx.spec.roofMaterial, "satdish/dish");
+  const arm = localBoxRing(ctx, pad.centreU, pad.centreV, 0.12, 0.12);
+  if (arm !== null) {
+    addPrism(prisms, ctx, arm, 0.54 + dishHeight, 0.3, ctx.spec.wallMaterial, "satdish/arm");
+  }
+  return prisms;
+}
+
+/** Long low glazed ridges running across the deck (market sheds, industrial sawtooth kin). */
+function skylightRunFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const ridges = 1 + Math.floor(rooftopRoll(ctx.spec, "skylight", "geo/count") * 2.99);
+  const lenHalf = Math.min(ctx.frame.extentU * 0.36, 2.4 + rooftopRoll(ctx.spec, "skylight", "geo/len") * 2.4);
+  const depthHalf = Math.min(1.0, ctx.frame.extentV / (ridges * 2.4));
+  if (lenHalf < 0.8 || depthHalf < 0.35) return prisms;
+  for (let r = 0; r < ridges; r++) {
+    const cv = (r - (ridges - 1) / 2) * ((ctx.frame.extentV * 0.66) / Math.max(1, ridges));
+    const cu = (rooftopRoll(ctx.spec, "skylight", `geo/off/${r}`) * 2 - 1) *
+      Math.max(0, ctx.frame.extentU - lenHalf - 1.0);
+    const ring = localBoxRing(ctx, cu, cv, lenHalf, depthHalf);
+    if (ring === null) continue;
+    addPrism(
+      prisms,
+      ctx,
+      ring,
+      0.04,
+      0.38 + rooftopRoll(ctx.spec, "skylight", `geo/h/${r}`) * 0.3,
+      ctx.spec.wallMaterial,
+      `skylight/${r}`
+    );
+  }
+  return prisms;
+}
+
+/** Stairwell/elevator bulkhead hugging the parapet, occasional roof vent on top. */
+function accessBulkheadFamily(ctx: RoofContext): DetailPrism[] {
+  const prisms: DetailPrism[] = [];
+  const spot = placeNearParapet(
+    ctx,
+    "access",
+    1.25 + rooftopRoll(ctx.spec, "access", "geo/hu") * 0.6,
+    1.0 + rooftopRoll(ctx.spec, "access", "geo/hv") * 0.5
+  );
+  if (spot === null) return prisms;
+  const ring = localBoxRing(ctx, spot.centreU, spot.centreV, spot.halfU, spot.halfV);
+  if (ring === null) return prisms;
+  const height = 2.2 + rooftopRoll(ctx.spec, "access", "geo/h") * 0.6;
+  addPrism(prisms, ctx, ring, 0.04, height, ctx.spec.wallMaterial, "access/bulkhead");
+  if (rooftopRoll(ctx.spec, "access", "geo/vent") < 0.5) {
+    addPrism(
+      prisms,
+      ctx,
+      scaledRing(ring, 0.42),
+      0.04 + height,
+      0.5,
+      ctx.spec.roofMaterial,
+      "access/vent"
+    );
+  }
+  return prisms;
+}
+
+/** Rare flat landing pad with contrast markings; big towers only, never glowing. */
+function landingPadFamily(ctx: RoofContext): DetailPrism[] {
+  if (Math.min(ctx.frame.extentU, ctx.frame.extentV) < 11) return [];
+  if (ctx.spec.height < 70) return [];
+  if (rooftopRoll(ctx.spec, "pad", "geo/on") >= 0.25) return [];
+  const padRing = centeredRoofBox(ctx.footprint, ctx.pixelsPerMetre, 4.4, 4.4);
+  if (padRing === null) return [];
+  const prisms: DetailPrism[] = [];
+  addPrism(prisms, ctx, padRing, 0.03, 0.26, ctx.spec.roofMaterial, "pad/deck");
+  addPrism(prisms, ctx, scaledRing(padRing, 0.78), 0.31, 0.07, ctx.spec.wallMaterial, "pad/mark");
+  const stripe = localBoxRing(ctx, 0, 0, 1.6, 0.22);
+  if (stripe !== null) {
+    addPrism(prisms, ctx, stripe, 0.4, 0.06, ctx.spec.wallMaterial, "pad/stripe");
+  }
+  return prisms;
+}
+
+/** Low planter beds in the district's planting slot (ROOF_C), shrubs included. */
+function roofGardenFamily(ctx: RoofContext): DetailPrism[] {
+  if (rooftopRoll(ctx.spec, "garden", "geo/on") >
+    (resolveArchitecturalTypology(ctx.spec) === "civic" ? 0.55 : 0.4)
+  ) {
+    return [];
+  }
+  const planting = bankSlotMaterial(ctx.spec, DISTRICT_SLOT.ROOF_C);
+  const prisms: DetailPrism[] = [];
+  const beds = 1 + Math.floor(rooftopRoll(ctx.spec, "garden", "geo/beds") * 2.99);
+  const placed: RoofRect[] = [];
+  for (let i = 0; i < beds; i++) {
+    const spot = placeRoofUnit(
+      ctx,
+      "garden",
+      i,
+      1.1 + rooftopRoll(ctx.spec, "garden", `geo/u/${i}`) * 1.2,
+      0.7 + rooftopRoll(ctx.spec, "garden", `geo/v/${i}`) * 0.6,
+      7,
+      placed,
+      0.7
+    );
+    if (spot === null) continue;
+    const ring = localBoxRing(ctx, spot.centreU, spot.centreV, spot.halfU, spot.halfV);
+    if (ring === null) continue;
+    placed.push(spot);
+    addPrism(prisms, ctx, ring, 0.04, 0.32, planting, `garden/bed/${i}`);
+    if (rooftopRoll(ctx.spec, "garden", `geo/shrub/${i}`) < 0.6) {
+      addPrism(prisms, ctx, scaledRing(ring, 0.4), 0.36, 0.28, planting, `garden/shrub/${i}`);
+    }
+  }
+  return prisms;
+}
+
+/** Post-supported billboard rig — the second market sign style beside the wall-mounted one. */
+function billboardFrameFamily(ctx: RoofContext): DetailPrism[] {
+  const spanHalf = 2.4 + rooftopRoll(ctx.spec, "billboard", "geo/span") * 1.2;
+  const spot = placeRoofUnit(ctx, "billboard", "rig", spanHalf + 0.5, 1.3, 8);
+  if (spot === null) return [];
+  const leftPost = localBoxRing(ctx, spot.centreU - spanHalf * 0.8, spot.centreV, 0.22, 0.22);
+  const rightPost = localBoxRing(ctx, spot.centreU + spanHalf * 0.8, spot.centreV, 0.22, 0.22);
+  if (leftPost === null || rightPost === null) return [];
+  const prisms: DetailPrism[] = [];
+  const postHeight = 2.4 + rooftopRoll(ctx.spec, "billboard", "geo/post-h") * 1.6;
+  addPrism(prisms, ctx, leftPost, 0.04, postHeight, ctx.spec.roofMaterial, "billboard/post-l");
+  addPrism(prisms, ctx, rightPost, 0.04, postHeight, ctx.spec.roofMaterial, "billboard/post-r");
+  const panelHalfV = 0.32 + rooftopRoll(ctx.spec, "billboard", "geo/panel-v") * 0.18;
+  const panel = localBoxRing(ctx, spot.centreU, spot.centreV, spanHalf, panelHalfV);
+  if (panel === null) return prisms;
+  const panelHeight = 1.0 + rooftopRoll(ctx.spec, "billboard", "geo/panel-h") * 0.6;
+  addPrism(prisms, ctx, panel, 0.04 + postHeight, panelHeight, ctx.spec.wallMaterial, "billboard/panel");
+  if (ctx.spec.neonEnabled !== false) {
+    addPrism(
+      prisms,
+      ctx,
+      scaledRing(panel, 1.14),
+      0.04 + postHeight + panelHeight - 0.3,
+      0.3,
+      ctx.accent,
+      "billboard/border"
+    );
+  }
+  return prisms;
+}
+
+const FAMILY_BUILDERS: Readonly<Record<RoofFamilyId, (ctx: RoofContext) => DetailPrism[]>> = {
+  access: accessBulkheadFamily,
+  antenna: antennaClusterFamily,
+  billboard: billboardFrameFamily,
+  garden: roofGardenFamily,
+  generator: generatorSetFamily,
+  hvac: hvacBankFamily,
+  pad: landingPadFamily,
+  satdish: satelliteDishFamily,
+  skylight: skylightRunFamily,
+  stacks: exhaustStackFamily,
+  tank: tankClusterFamily,
+  vents: ventClusterFamily
+};
+
+/** How many always-on sets a typology ships with: clean corporate, crowded residential... */
+function familyPickCount(typology: ArchitecturalTypology, spec: BuildingSpec): number {
+  switch (typology) {
+    case "corporate":
+      return rooftopRoll(spec, "plan", "count/corporate") < 0.62 ? 1 : 0;
+    case "residential":
+      return 1 + (rooftopRoll(spec, "plan", "count/residential") < 0.5 ? 1 : 0);
+    case "industrial":
+      return 2;
+    case "market":
+      return 1 + (rooftopRoll(spec, "plan", "count/market") < 0.55 ? 1 : 0);
+    case "civic":
+      return rooftopRoll(spec, "plan", "count/civic") < 0.7 ? 1 : 0;
+    case "derelict":
+      return 1 + (rooftopRoll(spec, "plan", "count/derelict") < 0.35 ? 1 : 0);
+    default:
+      return 0;
+  }
+}
+
+/** Draws `count` distinct ids from an already-sorted pool without replacement. */
+function pickFamilies(spec: BuildingSpec, menu: readonly RoofFamilyId[], count: number): RoofFamilyId[] {
+  const pool = [...menu].sort();
+  const picked: RoofFamilyId[] = [];
+  for (let i = 0; i < count && pool.length > 0; i++) {
+    const rollValue = rooftopRoll(spec, "plan", `pick/${pool.length}/${i}`);
+    picked.push(pool.splice(Math.min(pool.length - 1, Math.floor(rollValue * pool.length)), 1)[0]!);
+  }
+  return picked;
+}
+
+/**
+ * The v2 variety stream: typology-aware rooftop sets, plus one extra low-profile set
+ * bought by the grammar's rooftop-utility rate. Appended after every existing stream so
+ * legacy draw order is untouched.
+ */
+function rooftopFamilyLayer(
+  spec: BuildingSpec,
+  massing: BuildingMassing,
+  pixelsPerMetre: number,
+  accent: number
+): DetailPrism[] {
+  const roof = massing.volumes.at(-1)!;
+  const footprint = withPositiveArea(roof.footprint);
+  // WHY: extrude flags non-rectangular decks as structure-free (negative ROOF shade);
+  // keep painted and physical rooftops in agreement by honouring that flag here too.
+  if (!supportsRoofStructures(footprint)) return [];
+  const frame = roofFrame(footprint, pixelsPerMetre);
+  if (frame === null) return [];
+
+  const typology = resolveArchitecturalTypology(spec);
+  const menu = ROOFTOP_FAMILY_PLAN[typology];
+  if (menu.length === 0) return [];
+
+  const ctx: RoofContext = { spec, accent, pixelsPerMetre, roof, footprint, frame };
+  const prisms: DetailPrism[] = [];
+  const runFamily = (family: RoofFamilyId): void => {
+    prisms.push(...FAMILY_BUILDERS[family](ctx));
+  };
+
+  const used = pickFamilies(spec, menu, familyPickCount(typology, spec));
+  for (const family of used) runFamily(family);
+
+  const rate = spec.rooftopUtilityRate;
+  if (typeof rate === "number" && Number.isFinite(rate) && rate > 0 &&
+    rooftopRoll(spec, "gate", "bonus") < Math.min(1, rate)
+  ) {
+    const remaining = menu.filter(
+      (family) => LOW_PROFILE_FAMILIES[family] === true && !used.includes(family)
+    );
+    for (const family of pickFamilies(spec, remaining, 1)) runFamily(family);
+  }
+  return prisms;
+}
+
 function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPrism[] {
   if (
     spec.height < BUILDING_DETAIL_MIN_HEIGHT_M ||
@@ -1141,6 +1835,9 @@ function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPr
 
   // 5. Rooftop utility prisms
   prisms.push(...utilityPrisms(spec, massing, pixelsPerMetre, accent));
+
+  // 6. v2 typology-aware rooftop feature families (appended: legacy draw order untouched).
+  prisms.push(...rooftopFamilyLayer(spec, massing, pixelsPerMetre, accent));
   return prisms;
 }
 

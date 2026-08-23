@@ -99,6 +99,10 @@ varying float vGlyphPxPerM;
 varying float vSeed;
 
 uniform float uGlowMarginM;
+// CRITIQUE C1 live dials: uNeonGain scales every additive quad; uPoolGain scales the ground
+// pools only, so environmental bounce tunes apart from the signage itself.
+uniform float uNeonGain;
+uniform float uPoolGain;
 
 // Coarse enough that the ¼-res bloom blur cannot smear the blocks across the gaps.
 const float GLYPH_PERIOD_M = 1.6;
@@ -116,7 +120,7 @@ void main() {
   if (vRadial > 0.5) {
     // Quadratic, not cubic: the quad is sized for the glow's full reach and a cubic put
     // 88% of the falloff in the inner half, so the street outside it stayed unlit.
-    g = pow(max(0.0, 1.0 - length(vLocal)), 2.0);
+    g = pow(max(0.0, 1.0 - length(vLocal)), 2.0) * uNeonGain * uPoolGain;
   } else {
     vec2 d = abs(vLocal);
 
@@ -156,7 +160,7 @@ void main() {
     // featureless blob. Only what stays under the clamp can carry structure, so the gaps do.
     // Keep spill * gap below ~0.47 or the gaps clip too and the blob comes back.
     float spill = 1.0 - smoothstep(0.0, 1.0, max(d.x, d.y));
-    g = spill * 0.24 + lit * 0.85;
+    g = (spill * 0.24 + lit * 0.85) * uNeonGain;
   }
 
   // Alpha 0, not g: BLEND_MODES.ADD is blendFunc(ONE, ONE), so alpha accumulates too and

@@ -239,7 +239,12 @@ function emptySurfaces(): CitySurfacePartitions {
     markings: [],
     laneMarkings: [],
     crossings: [],
-    kerbs: []
+    kerbs: [],
+    gutters: [],
+    curbHighlights: [],
+    drains: [],
+    repairs: [],
+    repairHighlights: []
   };
 }
 
@@ -255,7 +260,12 @@ function clipSurfaces(surfaces: CitySurfacePartitions, clip: Rect): CitySurfaceP
     markings: intersection(surfaces.markings, box),
     laneMarkings: intersection(surfaces.laneMarkings, box),
     crossings: intersection(surfaces.crossings, box),
-    kerbs: intersection(surfaces.kerbs, box)
+    kerbs: intersection(surfaces.kerbs, box),
+    gutters: intersection(surfaces.gutters, box),
+    curbHighlights: intersection(surfaces.curbHighlights, box),
+    drains: intersection(surfaces.drains, box),
+    repairs: intersection(surfaces.repairs, box),
+    repairHighlights: intersection(surfaces.repairHighlights, box)
   };
 }
 
@@ -271,7 +281,12 @@ function toPixelsSurfaces(surfaces: CitySurfacePartitions, origin: Vec2, pixelsP
     markings: convert(surfaces.markings),
     laneMarkings: convert(surfaces.laneMarkings),
     crossings: convert(surfaces.crossings),
-    kerbs: convert(surfaces.kerbs)
+    kerbs: convert(surfaces.kerbs),
+    gutters: convert(surfaces.gutters),
+    curbHighlights: convert(surfaces.curbHighlights),
+    drains: convert(surfaces.drains),
+    repairs: convert(surfaces.repairs),
+    repairHighlights: convert(surfaces.repairHighlights)
   };
 }
 
@@ -874,6 +889,11 @@ export function buildCompleteCityChunk(
     flatMesh(clipped.vehicleCarriageway, 0, MATERIAL.ROAD, 1),
     flatMesh(clipped.vehicleSidewalk, 0, MATERIAL.SIDEWALK, 1),
     flatMesh(clipped.nonVehicleRoute, 0, MATERIAL.NON_VEHICLE_ROUTE, 1),
+    flatMesh(clipped.gutters, 0.021, MATERIAL.ROAD, 0.62),
+    flatMesh(clipped.repairs, 0.022, MATERIAL.ROAD, 0.82),
+    flatMesh(clipped.repairHighlights, 0.023, MATERIAL.ROAD, 1.12),
+    flatMesh(clipped.drains, 0.03, MATERIAL.GROUND, 0.52),
+    flatMesh(clipped.curbHighlights, 0.04, MATERIAL.KERB, 1.08),
     flatMesh(clipped.laneMarkings, 0.05, MATERIAL.LANE_MARK, 1),
     flatMesh(clipped.crossings, 0.05, MATERIAL.CROSSING, 1),
     flatMesh(clipped.kerbs, 0.05, MATERIAL.KERB, 1)
@@ -947,8 +967,7 @@ export function buildCompleteCityChunk(
     vehicleTriangleCount: surfaceParts[2]!.triangleCount,
     sidewalkTriangleCount: surfaceParts[3]!.triangleCount,
     nonVehicleTriangleCount: surfaceParts[4]!.triangleCount,
-    markingTriangleCount:
-      surfaceParts[5]!.triangleCount + surfaceParts[6]!.triangleCount + surfaceParts[7]!.triangleCount,
+    markingTriangleCount: surfaceParts.slice(5).reduce((sum, part) => sum + part.triangleCount, 0),
     openSpaceTriangleCount: openSpaceTriangles
   };
 }

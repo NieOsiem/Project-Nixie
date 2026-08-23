@@ -4,6 +4,12 @@ import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 /** Seed buckets a facade hash may resolve to. Far above the ~1e-7 interpolation jitter. */
 export const SEED_STEPS = 4096;
+/** Deterministic lit-window population: district-compatible, cool-neutral, contrast. */
+export const FACADE_WINDOW_COLOR_SHARES = Object.freeze({
+  district: 0.68,
+  neutral: 0.20,
+  contrast: 0.12
+});
 
 /**
  * Fake-3D extrusion.
@@ -38,11 +44,15 @@ uniform float uLeanStrength;
 uniform float uDepthFar;
 uniform float uEmissiveMax;
 uniform sampler2D uPalette;
+uniform float uBodyExposure;
+uniform float uEmissiveGain;
+uniform float uDebugNoEmissive;
 
 varying vec3 vBase;
 varying vec3 vEmissive;
 varying vec3 vAccent;
 varying vec3 vAmbient;
+varying float vEmissiveGate;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -75,18 +85,23 @@ void main() {
   float accentU = (bank + accentSlot + 0.5) / ${PALETTE_SIZE}.0;
   vec4 accent = texture2DLod(uPalette, vec2(accentU, 0.75), 0.0);
 
-  // Exposure on the material bodies only. The reference is a mid-key image lit by a large soft
-  // sky, not a black frame with lights in it; the palette bases alone land ~5x under that once
-  // shade and canyon have multiplied them down. Emissives are deliberately not gained — that
-  // would just move the bloom threshold, and this must not change what glows.
-  vBase = base.rgb * 1.7;
-  vEmissive = emissive.rgb * (emissive.a * uEmissiveMax);
-  vAccent = accent.rgb * (accent.a * uEmissiveMax) * 0.36;
+  // Exposure on the material bodies only (the bodyExposure dial). The reference is a mid-key image
+  // lit by a large soft sky, not a black frame with lights in it; the palette bases alone land
+  // well under that once shade and canyon have multiplied them down.
+  vBase = base.rgb * uBodyExposure;
+  // One live gain over every emissive contribution (windows, shopfronts, sign strips, parapets)
+  // plus the form-readability gate: debugNoEmissive = 1 zeroes all of it while the matte body
+  // above stays intact (CRITIQUE C1/C4).
+  float emissiveGate = uEmissiveGain * (1.0 - min(uDebugNoEmissive, 1.0));
+  vEmissive = emissive.rgb * (emissive.a * uEmissiveMax) * emissiveGate;
+  vAccent = accent.rgb * (accent.a * uEmissiveMax) * 0.36 * emissiveGate;
+  vEmissiveGate = emissiveGate;
   // District-hued ambient reflected spill: each material's own emissive tint, scaled down
   // and capped, added uniformly in the fragment shader so every wall and roof picks up the
   // district colour even where no light fixture exists. The cap keeps the added radiance
   // under the bloom knee; walls/roofs store strengths <= 0.07, so this lands ~0.02-0.07.
-  vAmbient = min(emissive.rgb * (emissive.a * uEmissiveMax) * 0.55, vec3(0.070));
+  // It is emissive-derived light, so it rides the same gate.
+  vAmbient = min(emissive.rgb * (emissive.a * uEmissiveMax) * 0.55, vec3(0.070)) * emissiveGate;
   vShade = aShade;
   vKind = aKind;
   vHeight = aHeight;
@@ -127,6 +142,7 @@ varying vec3 vBase;
 varying vec3 vEmissive;
 varying vec3 vAccent;
 varying vec3 vAmbient;
+varying float vEmissiveGate;
 varying float vShade;
 varying float vKind;
 varying float vHeight;
@@ -139,6 +155,7 @@ varying float vUpPxPerMetre;
 
 uniform float uScreenPxPerMetre;
 uniform float uDetailQuality;
+uniform float uSkyLift;
 
 const float FLOOR_M = 3.4;
 const float GROUND_BAND_M = 4.2;
@@ -241,7 +258,9 @@ vec3 facade() {
 
   float coping = smoothstep(vTop - 0.8 - wUp, vTop - 0.8 + wUp, h);
   float parapetShadow = slab(h, vTop - 2.1, vTop - 0.9, wUp);
-  float parapetGlow = step(0.62, hash11(seed + 3.41));
+  // CRITIQUE C4: lit coping drops from 38% of buildings to a ~15% minority, and the glow it
+  // earns is faint — the band is structure, not a light fixture.
+  float parapetGlow = step(0.85, hash11(seed + 3.41));
 
   // Low-rise shed: corrugated panels, a dark door, a thin window slit.
   if (architecture < 0.5) {
@@ -263,7 +282,7 @@ vec3 facade() {
     vec3 body = vBase * (vShade * canyon * sectionTone * grime);
     body = body * (1.0 + 0.55 * coping - 0.42 * parapetShadow);
     return body
-      + vEmissive * (0.10 + 0.8 * coping * parapetGlow)
+      + vEmissive * (0.04 + 0.40 * coping * parapetGlow)
       + vAccent * (0.85 * litBand);
   }
 
@@ -305,8 +324,12 @@ vec3 facade() {
   float litThreshold = mix(0.18, 0.5, hash11(seed + section * 5.23 + 6.11));
   float lit = step(litThreshold, hash21(vec2(cellX + seed * 53.7, cellY + seed * 91.3)));
   float glassTone = mix(0.4, 0.8, hash21(vec2(cellX + seed * 12.1, cellY + seed * 33.7)));
-  // Random neon windows are reduced to rare accents, not pervasive saturated washes.
-  float neonWin = step(0.92, hash21(vec2(cellX + seed * 61.1, cellY + seed * 73.9)));
+  // Three deterministic colour populations keep each district legible without making a
+  // facade monochrome: 68% district-compatible, 20% cool-neutral and 12% contrast accent.
+  float windowHue = hash21(vec2(cellX + seed * 47.9, cellY + seed * 23.3));
+  float neutralWindow = step(${FACADE_WINDOW_COLOR_SHARES.district}, windowHue)
+    * (1.0 - step(${FACADE_WINDOW_COLOR_SHARES.district + FACADE_WINDOW_COLOR_SHARES.neutral}, windowHue));
+  float contrastWindow = step(${FACADE_WINDOW_COLOR_SHARES.district + FACADE_WINDOW_COLOR_SHARES.neutral}, windowHue);
 
   float win = winH * winV * upper * mechWindows;
   float glass = glassH * glassV * upper * mechWindows;
@@ -315,15 +338,12 @@ vec3 facade() {
   float sheen = smoothstep(0.3, 0.7, fract((vU - above * 0.4) / 34.0));
   vec3 glassC = vec3(0.08, 0.13, 0.21) * (vShade * (0.7 + 0.3 * glassTone)
     * (0.7 + 0.3 * (1.0 - fract(above / FLOOR_M)) + 0.5 * sheen) * (1.0 - recessShadow));
-  // Lit glass: dominant cool interior light — a bright white-cyan core carrying the district
-  // hue, a ~25% warm minority — plus rare neonWin saturations. Tone keeps pre-grade luma in
-  // the 0.5-0.95 band so lit towers clear the 0.40 bloom gate.
-  float litHue = hash21(vec2(cellX + seed * 47.9, cellY + seed * 23.3));
   vec3 districtHue = normalize(vEmissive + vec3(0.12));
-  vec3 coolC = vec3(0.72, 0.92, 1.0) * 0.75 + districtHue * 0.22;
-  vec3 warmC = vec3(1.0, 0.84, 0.66) * 0.85;
-  vec3 litC = mix(mix(coolC, warmC, step(0.75, litHue)),
-    vAccent * 2.4 + districtHue * 0.2, neonWin * 0.7) * mix(0.75, 1.0, glassTone);
+  vec3 districtC = mix(vec3(0.72, 0.92, 1.0) * 0.72, districtHue * 1.05, 0.64);
+  vec3 neutralC = vec3(0.78, 0.90, 1.0) * 0.82;
+  vec3 contrastC = normalize(vAccent + vec3(0.05)) * 1.05;
+  vec3 litC = mix(mix(districtC, neutralC, neutralWindow), contrastC, contrastWindow)
+    * mix(0.75, 1.0, glassTone);
   vec3 frameC = vBase * (vShade * 0.5);
 
   // Ground-floor storefront: darker base, glowing glass bays and an emissive sign strip so
@@ -341,7 +361,7 @@ vec3 facade() {
   float spandrel = slab(fy, 0.0, 0.1, wUp / FLOOR_M) + slab(fy, 0.9, 1.0, wUp / FLOOR_M);
   float articulation = sectionTone * grime * (1.0 - 0.12 * spandrel) * (1.0 - joint);
   vec3 bodyC = vBase * (vShade * canyon * articulation * mechTone * (1.0 - 0.3 * recess));
-  vec3 windowC = mix(frameC, mix(glassC, litC, lit * 0.8), glass);
+  vec3 windowC = mix(frameC, mix(glassC, litC * vEmissiveGate, lit * 0.8), glass);
   vec3 upperC = mix(bodyC, windowC, win);
   vec3 parapetC = bodyC * (1.0 + 0.55 * coping - 0.42 * parapetShadow);
 
@@ -351,13 +371,13 @@ vec3 facade() {
     float vent = slab(bay, 0.2, 0.8, wAlong / BAY_M) * slab(fy, 0.2, 0.8, wUp / FLOOR_M) * lit;
     vec3 ribC = vBase * (vShade * canyon * sectionTone * grime * (1.0 - 0.28 * rib) * mechTone);
     ribC = mix(ribC, parapetC, coping + parapetShadow);
-    return ribC + vAccent * (0.9 * vent * upper) + vEmissive * (0.10 + 0.8 * coping * parapetGlow);
+    return ribC + vAccent * (0.9 * vent * upper) + vEmissive * (0.04 + 0.40 * coping * parapetGlow);
   }
 
   vec3 col = mix(upperC, parapetC, coping + parapetShadow);
   col = mix(col, shopGlass, 1.0 - upper);
   col = mix(col, vBase * (vShade * 0.55), louver);
-  col += vEmissive * (0.10 + 0.8 * coping * parapetGlow);
+  col += vEmissive * (0.04 + 0.40 * coping * parapetGlow);
   col += vAccent * (0.95 * lit * glass * 0.6 + 0.85 * shop * signOn * shopTone + 1.05 * signStrip * signOn * shopTone);
   col += vEmissive * ((0.85 * signStrip + 0.30 * shop) * signOn * shopTone);
   if (feature > 0.5) {
@@ -425,9 +445,9 @@ vec3 roof() {
     - seam * 0.085 - patch * 0.07;
 
   if (uDetailQuality < 0.5) {
-    return vBase * (0.96 + familyTone + wear * 0.5) + vEmissive * 0.05;
+    return vBase * (0.96 + familyTone + wear * 0.5) + vEmissive * 0.02;
   }
-  return vBase * material + vEmissive * 0.05;
+  return vBase * material + vEmissive * 0.02;
 }
 
 vec3 clutter() {
@@ -436,8 +456,8 @@ vec3 clutter() {
   vec3 sideColour = vBase * vShade + vEmissive;
   // Cap lighter than the roof it sits on and the lip darker, not the reverse: a raised box
   // catches more sky than the deck.
-  vec3 capColour = vBase * 1.2 + vEmissive * 0.10;
-  vec3 rimColour = vBase * 0.72 + vEmissive * 0.05;
+  vec3 capColour = vBase * 1.2 + vEmissive * 0.04;
+  vec3 rimColour = vBase * 0.72 + vEmissive * 0.02;
   return mix(sideColour, mix(capColour, rimColour, edge), cap);
 }
 
@@ -477,7 +497,7 @@ void main() {
   // Sky ambient lift: the reference look reads bodies near mid luminance while roads stay
   // dark, so scale the albedo up by exposure above street level — hue-preserving, and it
   // fades to nothing at the ground so asphalt never lifts into a grey wash.
-  colour += vBase * (0.12 * smoothstep(-2.0, 22.0, vHeight));
+  colour += vBase * (uSkyLift * smoothstep(-2.0, 22.0, vHeight));
   float sceneAlpha = SCENE_ALPHA_FLOOR
     + (1.0 - SCENE_ALPHA_FLOOR) * clamp(vHeight / SCENE_HEIGHT_NORM_M, 0.0, 1.0);
   gl_FragColor = vec4(colour, sceneAlpha);

@@ -8,6 +8,9 @@ describe("neon shaders", () => {
     expect(NEON_VERT).toContain("vRadial = aShade;");
     expect(NEON_FRAG).toContain("if (vRadial > 0.5)");
     expect(NEON_FRAG).toContain("pow(max(0.0, 1.0 - length(vLocal)), 2.0)");
+    expect(NEON_FRAG).toContain("* uNeonGain * uPoolGain;");
+    // decl + WHY comment + pool use + panel use
+    expect(NEON_FRAG.match(/uNeonGain/g)).toHaveLength(4);
   });
 
   it("biases a facade panel far less than a pool, so a hidden wall stays hidden", () => {
@@ -48,7 +51,7 @@ describe("neon shaders", () => {
     // post.ts ends in c *= 1/(1 + max(m-1, 0)), which for m >= 1 is an exact clamp to 1.0,
     // not a shoulder. Everything at or above the clamp renders identically, so the panel's
     // structure can only live in what stays below it. If a gap clips, the panel is a blob.
-    const mix = NEON_FRAG.match(/g = spill \* ([\d.]+) \+ lit \* ([\d.]+);/);
+    const mix = NEON_FRAG.match(/g = \(spill \* ([\d.]+) \+ lit \* ([\d.]+)\) \* uNeonGain;/);
     expect(mix).not.toBeNull();
     const [gapCoefficient, litCoefficient] = [Number(mix![1]), Number(mix![2])];
 

@@ -102,7 +102,11 @@ const chunk = (id: string, triangleCount = 1) => ({
   mesh: mesh(triangleCount),
   detail: mesh(0),
   neon: mesh(0),
-  surfaces: { water: [], exposedLand: [], vehicleCarriageway: [], vehicleSidewalk: [], nonVehicleRoute: [], markings: [], laneMarkings: [], crossings: [], kerbs: [] },
+  surfaces: {
+    water: [], exposedLand: [], vehicleCarriageway: [], vehicleSidewalk: [],
+    nonVehicleRoute: [], markings: [], laneMarkings: [], crossings: [], kerbs: [],
+    gutters: [], curbHighlights: [], drains: [], repairs: [], repairHighlights: []
+  },
   buildingIds: [],
   landmarkIds: [],
   connectors: [],

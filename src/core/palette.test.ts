@@ -247,17 +247,17 @@ describe("shipped palettes", () => {
   it("separates Neon Sprawl bodies, wall light, and strong architectural accents", () => {
     const [wallA, wallB, wallC, , , , neonA, neonB] = DEFAULT_DISTRICT_PALETTE.materials;
     expect(wallA).toMatchObject({
-      base: { r: 0.240, g: 0.190, b: 0.340 },
+      base: { r: 0.168, g: 0.133, b: 0.238 },
       emissive: { r: 0.42, g: 0.30, b: 0.62 },
       emissiveStrength: 0.07
     });
     expect(wallB).toMatchObject({
-      base: { r: 0.110, g: 0.280, b: 0.300 },
+      base: { r: 0.077, g: 0.196, b: 0.210 },
       emissive: { r: 0.20, g: 0.60, b: 0.62 },
       emissiveStrength: 0.06
     });
     expect(wallC).toMatchObject({
-      base: { r: 0.310, g: 0.140, b: 0.270 },
+      base: { r: 0.217, g: 0.098, b: 0.189 },
       emissive: { r: 0.62, g: 0.22, b: 0.48 },
       emissiveStrength: 0.07
     });
@@ -293,19 +293,23 @@ describe("shipped palettes", () => {
     const lLaneMark = luma(laneMark);
     const lCrossing = luma(crossing);
 
-    // Monotonic dark-to-light progression
+    // Monotonic dark-to-light progression. CRITIQUE C12 pulled the paint down a tier: the
+    // kerb now reads darker than a service route, and lane paint sits just under sidewalk
+    // concrete instead of glowing above it.
     expect(lWater).toBeLessThan(lGround);
     expect(lGround).toBeLessThan(lRoad);
-    expect(lRoad).toBeLessThan(lRoute);
-    expect(lRoute).toBeLessThan(lKerb);
-    expect(lKerb).toBeLessThan(lSidewalk);
-    expect(lSidewalk).toBeLessThan(lLaneMark);
-    expect(lLaneMark).toBeLessThan(lCrossing);
+    expect(lRoad).toBeLessThan(lKerb);
+    expect(lKerb).toBeLessThan(lRoute);
+    expect(lRoute).toBeLessThan(lLaneMark);
+    expect(lLaneMark).toBeLessThan(lSidewalk);
+    expect(lSidewalk).toBeLessThan(lCrossing);
 
     // Minimum slot separation to prevent mud
     expect(lRoad - lGround).toBeGreaterThanOrEqual(0.015);
+    expect(lKerb - lRoad).toBeGreaterThanOrEqual(0.01);
     expect(lSidewalk - lRoad).toBeGreaterThanOrEqual(0.05);
-    expect(lLaneMark - lSidewalk).toBeGreaterThanOrEqual(0.04);
+    expect(lLaneMark - lRoad).toBeGreaterThanOrEqual(0.04);
+    expect(lCrossing - lLaneMark).toBeGreaterThanOrEqual(0.02);
 
     // Bounded luminance bands
     expect(lGround).toBeGreaterThanOrEqual(0.06);
@@ -314,7 +318,9 @@ describe("shipped palettes", () => {
     expect(lRoad).toBeLessThanOrEqual(0.10);
     expect(lSidewalk).toBeGreaterThanOrEqual(0.135);
     expect(lSidewalk).toBeLessThanOrEqual(0.17);
-    expect(lLaneMark).toBeGreaterThanOrEqual(0.18);
+    expect(lLaneMark).toBeGreaterThanOrEqual(0.12);
+    expect(lLaneMark).toBeLessThanOrEqual(0.16);
+    expect(lCrossing).toBeLessThanOrEqual(0.18);
   });
 
   it("finds presets by name and nothing else", () => {
@@ -362,13 +368,13 @@ describe("built-in district palettes", () => {
     for (const palette of ALL_PALETTES) {
       for (const slot of WALL_SLOTS) {
         const l = luma(palette.materials[slot]!);
-        expect(l, `${palette.name} wall slot ${slot} luma`).toBeGreaterThanOrEqual(0.16);
-        expect(l, `${palette.name} wall slot ${slot} luma`).toBeLessThanOrEqual(0.30);
+        expect(l, `${palette.name} wall slot ${slot} luma`).toBeGreaterThanOrEqual(0.11);
+        expect(l, `${palette.name} wall slot ${slot} luma`).toBeLessThanOrEqual(0.22);
       }
       for (const slot of ROOF_SLOTS) {
         const l = luma(palette.materials[slot]!);
-        expect(l, `${palette.name} roof slot ${slot} luma`).toBeGreaterThanOrEqual(0.12);
-        expect(l, `${palette.name} roof slot ${slot} luma`).toBeLessThanOrEqual(0.24);
+        expect(l, `${palette.name} roof slot ${slot} luma`).toBeGreaterThanOrEqual(0.09);
+        expect(l, `${palette.name} roof slot ${slot} luma`).toBeLessThanOrEqual(0.17);
       }
     }
   });
@@ -466,6 +472,22 @@ describe("built-in district palettes", () => {
     }
     const signatures = DISTRICT_PALETTE_IDS.map((id) => JSON.stringify(builtinPalette(id).materials));
     expect(new Set(signatures).size).toBe(signatures.length);
+  });
+  it("keeps a recognizable dominant body hue in every built-in district bank", () => {
+    for (const id of DISTRICT_PALETTE_IDS) {
+      const walls = builtinPalette(id).materials.slice(DISTRICT_SLOT.WALL_A, DISTRICT_SLOT.ROOF_A);
+      const dominantChannels = walls.map((material) => {
+        const channels = [material.base.r, material.base.g, material.base.b];
+        return channels.indexOf(Math.max(...channels));
+      });
+      const dominantCount = Math.max(
+        ...[0, 1, 2].map((channel) => dominantChannels.filter((candidate) => candidate === channel).length)
+      );
+      expect(dominantCount, `${id} wall family dominant hue`).toBeGreaterThanOrEqual(2);
+      for (const wall of walls) {
+        expect(luma(wall), `${id} matte wall value`).toBeLessThanOrEqual(0.22);
+      }
+    }
   });
 
   it("keeps ground-sampled wall and roof slots under the whole-ground bloom threshold", () => {

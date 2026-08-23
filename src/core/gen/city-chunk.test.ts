@@ -49,7 +49,12 @@ function combine(chunks: CitySurfacePartitions[]): CitySurfacePartitions {
     markings: chunks.flatMap((chunk) => chunk.markings),
     laneMarkings: chunks.flatMap((chunk) => chunk.laneMarkings),
     crossings: chunks.flatMap((chunk) => chunk.crossings),
-    kerbs: chunks.flatMap((chunk) => chunk.kerbs)
+    kerbs: chunks.flatMap((chunk) => chunk.kerbs),
+    gutters: chunks.flatMap((chunk) => chunk.gutters),
+    curbHighlights: chunks.flatMap((chunk) => chunk.curbHighlights),
+    drains: chunks.flatMap((chunk) => chunk.drains),
+    repairs: chunks.flatMap((chunk) => chunk.repairs),
+    repairHighlights: chunks.flatMap((chunk) => chunk.repairHighlights)
   };
 }
 

@@ -17,6 +17,8 @@ export interface LookDials {
   fogTintR: number;
   fogTintG: number;
   fogTintB: number;
+  /** Strength of directional shadows cast from the roof-shadow target onto exposed surfaces. */
+  shadowStrength: number;
   aoStrength: number;
   aoHeightM: number;
   streakStrength: number;
@@ -41,6 +43,24 @@ export interface LookDials {
   hazeBandM: number;
   hazeDrift: number;
   hazeInscatter: number;
+  /** City body exposure multiplier on `vBase` (replaces the hardcoded ×1.7). */
+  bodyExposure: number;
+  /** Sky ambient lift coefficient on facades (replaces the hardcoded 0.12). */
+  skyLift: number;
+  /** Global multiplier on city-mesh emissive contributions (windows, shopfronts, parapets). */
+  emissiveGain: number;
+  /** Global multiplier on additive neon quads (panels, banners, ground pools). */
+  neonGain: number;
+  /** Extra multiplier for neon ground pools only — the environmental-light dial. */
+  poolGain: number;
+  /** 1 zeroes every city-mesh emissive contribution (form-readability test from CRITIQUE.md). */
+  debugNoEmissive: number;
+  /** Bloom threshold luma (replaces the hardcoded 0.40). */
+  bloomThreshold: number;
+  /** Scalar on the composite's additive grade lift; below 1 deepens blacks. */
+  blackLift: number;
+  /** 1 presents the composite in grayscale (form-readability test from CRITIQUE.md). */
+  debugGrayscale: number;
 }
 
 /**
@@ -55,16 +75,17 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   fogTintR: 0.075,
   fogTintG: 0.055,
   fogTintB: 0.13,
-  aoStrength: 0.30,
-  aoHeightM: 18,
+  shadowStrength: 0.30,
+  aoStrength: 0.42,
+  aoHeightM: 24,
   streakStrength: 1.5,
-  wetStrength: 0.7,
-  puddleCoverage: 0.45,
-  puddleScaleM: 4,
-  wetDarken: 0.78,
-  wetGloss: 0.75,
-  smearStrength: 1,
-  smearHeightM: 50,
+  wetStrength: 0.85,
+  puddleCoverage: 0.32,
+  puddleScaleM: 7,
+  wetDarken: 0.64,
+  wetGloss: 1,
+  smearStrength: 1.5,
+  smearHeightM: 70,
   rainDrops: 0.55,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s
   // fall, so this apparent speed stands in for the fall we cannot see.
@@ -92,7 +113,16 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   hazeStrength: 0.12,
   hazeBandM: 46,
   hazeDrift: 0.7,
-  hazeInscatter: 0.35
+  hazeInscatter: 0.45,
+  bodyExposure: 1.7,
+  skyLift: 0.12,
+  emissiveGain: 1,
+  neonGain: 1,
+  poolGain: 1,
+  debugNoEmissive: 0,
+  bloomThreshold: 0.4,
+  blackLift: 1,
+  debugGrayscale: 0
 };
 
 /**
@@ -118,7 +148,7 @@ export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
   [WEATHER.DRIZZLE]: {
     strength: 1,
     dials: {
-      wetStrength: 0.25,
+      wetStrength: 0.35,
       rainDrops: 0.45,
       rainSpeedMPS: 25,
       rainStreakDuty: 0.25,
@@ -129,7 +159,7 @@ export const WEATHER_PRESETS: Record<Weather, WeatherPreset> = {
   [WEATHER.RAIN]: {
     strength: 1,
     dials: {
-      wetStrength: 0.7,
+      wetStrength: 0.85,
       rainDrops: 0.55,
       rainSpeedMPS: 35,
       rainStreakDuty: 0.35,

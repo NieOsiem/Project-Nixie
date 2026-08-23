@@ -21,6 +21,11 @@ export interface CitySurfacePartitions {
   laneMarkings: MultiPolygon;
   crossings: MultiPolygon;
   kerbs: MultiPolygon;
+  gutters: MultiPolygon;
+  curbHighlights: MultiPolygon;
+  drains: MultiPolygon;
+  repairs: MultiPolygon;
+  repairHighlights: MultiPolygon;
 }
 
 export interface CityChunkBuild {
@@ -152,19 +157,33 @@ function routeParts(network: CompiledRouteNetwork): {
   };
 }
 
-function markingPartsByMaterial(network: CompiledRouteNetwork): { laneMarkings: MultiPolygon; crossings: MultiPolygon; kerbs: MultiPolygon; markings: MultiPolygon } {
+function markingPartsByMaterial(network: CompiledRouteNetwork): Omit<
+  CitySurfacePartitions,
+  "water" | "exposedLand" | "vehicleCarriageway" | "vehicleSidewalk" | "nonVehicleRoute"
+> {
   const markings = buildCityMarkings(network);
   return {
-    laneMarkings: markings.laneMarkings,
-    crossings: markings.crossings,
-    kerbs: markings.kerbs,
-    markings: union([markings.laneMarkings, markings.crossings, markings.kerbs])
+    ...markings,
+    markings: union([
+      markings.laneMarkings,
+      markings.crossings,
+      markings.kerbs,
+      markings.gutters,
+      markings.curbHighlights,
+      markings.drains,
+      markings.repairs,
+      markings.repairHighlights
+    ])
   };
 }
 
 function clipSurfaces(surfaces: CitySurfacePartitions, clip: Rect): CitySurfacePartitions {
   if (emptyRect(clip)) {
-    return { water: [], exposedLand: [], vehicleCarriageway: [], vehicleSidewalk: [], nonVehicleRoute: [], markings: [], laneMarkings: [], crossings: [], kerbs: [] };
+    return {
+      water: [], exposedLand: [], vehicleCarriageway: [], vehicleSidewalk: [],
+      nonVehicleRoute: [], markings: [], laneMarkings: [], crossings: [], kerbs: [],
+      gutters: [], curbHighlights: [], drains: [], repairs: [], repairHighlights: []
+    };
   }
   const box = ringAsMulti(rectRing(clip));
   return {
@@ -176,7 +195,12 @@ function clipSurfaces(surfaces: CitySurfacePartitions, clip: Rect): CitySurfaceP
     markings: intersection(surfaces.markings, box),
     laneMarkings: intersection(surfaces.laneMarkings, box),
     crossings: intersection(surfaces.crossings, box),
-    kerbs: intersection(surfaces.kerbs, box)
+    kerbs: intersection(surfaces.kerbs, box),
+    gutters: intersection(surfaces.gutters, box),
+    curbHighlights: intersection(surfaces.curbHighlights, box),
+    drains: intersection(surfaces.drains, box),
+    repairs: intersection(surfaces.repairs, box),
+    repairHighlights: intersection(surfaces.repairHighlights, box)
   };
 }
 
@@ -191,7 +215,12 @@ function toPixels(surfaces: CitySurfacePartitions, source: CitySource, pixelsPer
     markings: convert(surfaces.markings),
     laneMarkings: convert(surfaces.laneMarkings),
     crossings: convert(surfaces.crossings),
-    kerbs: convert(surfaces.kerbs)
+    kerbs: convert(surfaces.kerbs),
+    gutters: convert(surfaces.gutters),
+    curbHighlights: convert(surfaces.curbHighlights),
+    drains: convert(surfaces.drains),
+    repairs: convert(surfaces.repairs),
+    repairHighlights: convert(surfaces.repairHighlights)
   };
 }
 
@@ -203,6 +232,11 @@ function buildMeshes(surfaces: CitySurfacePartitions, source: CitySource, ppm: n
     flatMesh(px.vehicleCarriageway, 0, MATERIAL.ROAD, 1),
     flatMesh(px.vehicleSidewalk, 0, MATERIAL.SIDEWALK, 1),
     flatMesh(px.nonVehicleRoute, 0, MATERIAL.NON_VEHICLE_ROUTE, 1),
+    flatMesh(px.gutters, 0.021, MATERIAL.ROAD, 0.62),
+    flatMesh(px.repairs, 0.022, MATERIAL.ROAD, 0.82),
+    flatMesh(px.repairHighlights, 0.023, MATERIAL.ROAD, 1.12),
+    flatMesh(px.drains, 0.03, MATERIAL.GROUND, 0.52),
+    flatMesh(px.curbHighlights, 0.04, MATERIAL.KERB, 1.08),
     flatMesh(px.laneMarkings, 0.05, MATERIAL.LANE_MARK, 1),
     flatMesh(px.crossings, 0.05, MATERIAL.CROSSING, 1),
     flatMesh(px.kerbs, 0.05, MATERIAL.KERB, 1)
@@ -234,7 +268,12 @@ function fullSurfaces(source: CitySource, sceneBoundsM: Rect, network: CompiledR
         markings: intersection(markings.markings, terrain.land),
         laneMarkings: intersection(markings.laneMarkings, terrain.land),
         crossings: intersection(markings.crossings, terrain.land),
-        kerbs: intersection(markings.kerbs, terrain.land)
+        kerbs: intersection(markings.kerbs, terrain.land),
+        gutters: intersection(markings.gutters, terrain.land),
+        curbHighlights: intersection(markings.curbHighlights, terrain.land),
+        drains: intersection(markings.drains, terrain.land),
+        repairs: intersection(markings.repairs, terrain.land),
+        repairHighlights: intersection(markings.repairHighlights, terrain.land)
       };
     })()
   };
@@ -269,7 +308,7 @@ export function buildCityChunk(
     vehicleTriangleCount: counts[2]!,
     sidewalkTriangleCount: counts[3]!,
     nonVehicleTriangleCount: counts[4]!,
-    markingTriangleCount: counts[5]! + counts[6]! + counts[7]!
+    markingTriangleCount: counts.slice(5).reduce((sum, count) => sum + count, 0)
   };
 }
 

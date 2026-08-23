@@ -168,11 +168,11 @@ const ringFourPlan = (): CompleteCityPlan => sharedPlan("ringSource(4)", () => b
 const ringSixteenPlan = (): CompleteCityPlan => sharedPlan("ringSource(16)", () => buildCompleteCityPlan(ringSource(16)));
 
 describe("buildCompleteCityPlan", () => {
-  it.concurrent("produces a validating complete plan over all 16 districts with all four landmarks", () => {
+  it.concurrent("produces a validating complete plan over all 16 districts with every curated landmark", () => {
     const source = ringSource(16);
     const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    expect(plan.diagnostics.landmarkCount).toBe(4);
+    expect(plan.diagnostics.landmarkCount).toBe(LANDMARK_GRAMMAR_IDS.length);
     expect(plan.diagnostics.landmarkSkipped).toEqual([]);
     expect(new Set(plan.landmarks.map((landmark) => landmark.landmarkGrammarId))).toEqual(new Set(LANDMARK_GRAMMAR_IDS));
     const parcelDistricts = new Set(plan.parcels.map((parcel) => parcel.districtId));
@@ -532,11 +532,11 @@ describe("buildCompleteCityPlan", () => {
   it.concurrent("honors pre-reserved major landmark sites verbatim", () => {
     const source = ringSource(16);
     const reserved = reserveMajorLandmarkSites(source);
-    expect(reserved.length).toBe(4);
+    expect(reserved.length).toBe(LANDMARK_GRAMMAR_IDS.length);
     expect(reserveMajorLandmarkSites(source)).toEqual(reserved);
     const plan = buildCompleteCityPlan(source, 1, 0, reserved);
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    expect(plan.diagnostics.landmarkCount).toBe(4);
+    expect(plan.diagnostics.landmarkCount).toBe(LANDMARK_GRAMMAR_IDS.length);
     expect(plan.diagnostics.landmarkFailures).toEqual([]);
     for (const reservation of reserved) {
       const landmark = plan.landmarks.find((candidate) => candidate.landmarkGrammarId === reservation.grammarId)!;
@@ -601,7 +601,7 @@ describe("buildCompleteCityPlan", () => {
     const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const reserved = reserveMajorLandmarkSites(source);
-    expect(reserved.length).toBe(4);
+    expect(reserved.length).toBe(LANDMARK_GRAMMAR_IDS.length);
     const keptLineages = new Set(plan.landmarks.map((landmark) => landmark.placementLineage));
     const covering = union([
       ...plan.parcels.map((parcel) => ringAsMulti(parcel.polygon)),
@@ -647,16 +647,31 @@ describe("buildCompleteCityPlan", () => {
   it("skips landmarks with no compatible district and falls back to compatible block-inscribed sites", () => {
     const plan = buildCompleteCityPlan(crossSource());
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    // No district in the plain cross carries any landmark grammar tag, so every grammar
-    // is skipped explicitly instead of being mis-associated.
-    expect(plan.diagnostics.landmarkCount).toBe(0);
-    expect([...plan.diagnostics.landmarkSkipped].sort()).toEqual([...LANDMARK_GRAMMAR_IDS].sort());
+    // The plain cross only carries fine-grain/market/residential tags, so the seven
+    // grammars needing formal/industrial/waterfront/campus/irregular tags are skipped
+    // explicitly instead of being mis-associated; the residential/market grammars
+    // (megaframe-block, arcology-terraces, transit-hall) still fall back inside.
+    expect(plan.diagnostics.landmarkCount).toBe(3);
+    expect(plan.diagnostics.landmarkSkipped).toEqual([
+      "hero-tower-plaza",
+      "civic-corporate-compound",
+      "infrastructure-utility-site",
+      "monument-open-space",
+      "circular-beacon-tower",
+      "tri-spire",
+      "comms-mast-field"
+    ]);
     // With compatible districts the same city falls back to legal block-inscribed sites.
     const fallbackPlan = buildCompleteCityPlan(compatibleCross());
     expect(validateCompleteCityPlan(fallbackPlan)).toEqual([]);
-    expect(fallbackPlan.diagnostics.landmarkCount).toBe(3);
+    expect(fallbackPlan.diagnostics.landmarkCount).toBe(6);
     expect(fallbackPlan.landmarks.every((landmark) => landmark.placementLineage.startsWith("fallback:"))).toBe(true);
-    expect(fallbackPlan.diagnostics.landmarkSkipped).toEqual(["monument-open-space"]);
+    expect(fallbackPlan.diagnostics.landmarkSkipped).toEqual([
+      "monument-open-space",
+      "megaframe-block",
+      "arcology-terraces",
+      "transit-hall"
+    ]);
     for (const landmark of fallbackPlan.landmarks) {
       expect(overlapMulti(landmark.sitePolygon, fallbackPlan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
     }

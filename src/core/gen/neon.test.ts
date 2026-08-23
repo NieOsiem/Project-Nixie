@@ -8,6 +8,7 @@ import {
   BANNER_MIN_BUILDING_M,
   MAX_POOL_RADIUS_M,
   MIN_POOL_RADIUS_M,
+  POOL_MAX_SIGN_HEIGHT_M,
   SIGN_BAND_TOP_M,
   neonMesh
 } from "./neon.js";
@@ -170,8 +171,9 @@ describe("neonMesh", () => {
     }
   });
 
-  it("contains all quad vertices within building footprint bounds plus glow margin", () => {
-    const slack = MAX_POOL_RADIUS_M * PPM;
+    // Radius plus a fully offset centre: a corner billboard may shove its pool up to
+    // 0.6 extra radii toward the street (POOL_STREET_OFFSET_MIN_FRACTION + SPAN).
+    const slack = MAX_POOL_RADIUS_M * 1.6 * PPM;
     const epsilon = 1e-3;
     for (const spec of cityOf(150)) {
       const m = neonMesh([spec], PPM);
@@ -233,11 +235,12 @@ describe("neonMesh", () => {
         // High crown signs near the top of the building
         if (q.centerM > spec.height * 0.6 && spec.height >= 20) {
           highCrowns++;
-          // High crown signs MUST NEVER emit ground pools
+          // Crowns are major panels under CRITIQUE #13: they may throw a ground pool
+          // while their bottom stays under the raised major cap; deeper signs stay
+          // pool-free.
           if (quads[i + 1]?.radial === 1) {
             expect(quads[i + 1]!.bottomM).toBeLessThan(1);
-            // Verify this pool does not belong to a high sign
-            expect(q.bottomM).toBeLessThanOrEqual(8);
+            expect(q.bottomM).toBeLessThanOrEqual(POOL_MAX_SIGN_HEIGHT_M);
           }
         } else if (q.centerM <= SIGN_BAND_TOP_M) {
           entryBands++;
@@ -298,15 +301,18 @@ describe("neonMesh", () => {
     expect(maxStrength - minStrength).toBeGreaterThan(0.2);
   });
 
-  it("only attaches ground glow pools to low signs with bounded radii", () => {
+  it("attaches fewer, tiered ground pools: modest minors and large majors", () => {
     const specs = cityOf(600);
     const m = neonMesh(specs, PPM);
     let pools = 0;
+    let largePools = 0;
 
     for (let q = 0; q < m.vertexCount; q += 4) {
       const pool = vertexAt(m, q);
       if (pool.radial !== 1) continue;
       pools++;
+      // Beyond the pre-C13 flat cap: only major signage may reach this far.
+      if (pool.halfWidthM > 10) largePools++;
 
       const sign = vertexAt(m, q - 4);
       expect(sign.radial).toBe(0);
@@ -318,7 +324,9 @@ describe("neonMesh", () => {
       expect(pool.halfWidthM).toBeLessThanOrEqual(MAX_POOL_RADIUS_M);
     }
 
-    expect(pools).toBeGreaterThan(10);
+    // CRITIQUE #13 thinned the mass of small pools well below the old count.
+    expect(pools).toBeGreaterThan(8);
+    expect(largePools).toBeGreaterThan(0);
   });
 
   it("keeps facade signs below the outer tier top of detailed towers", () => {
@@ -336,4 +344,3 @@ describe("neonMesh", () => {
     }
     expect(facades).toBeGreaterThan(10);
   });
-});
