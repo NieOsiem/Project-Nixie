@@ -1666,6 +1666,53 @@ function implicatedRouteIds(problems: readonly string[], source: RoadSource): Se
   return new Set(source.edges.filter((edge) => edgeIds.has(edge.id)).map((edge) => edge.routeId));
 }
 
+/**
+ * `clipSegment` can leave the last edge of a planned corridor terminating directly at
+ * a reserved site's clearance boundary. Drop only that terminal edge. Do not iterate:
+ * recursively pruning the exposed parent erases useful approach streets and collapses
+ * parcel density around landmarks.
+ */
+function pruneReservedSiteStubs(source: RoadSource, reservedSites: readonly Ring[]): RoadSource {
+  if (reservedSites.length === 0) return source;
+  const positionByNode = new Map(source.nodes.map((node) => [node.id, { x: node.x, y: node.y } as Vec2]));
+  const degree = new Map<string, number>();
+  for (const edge of source.edges) {
+    degree.set(edge.a, (degree.get(edge.a) ?? 0) + 1);
+    degree.set(edge.b, (degree.get(edge.b) ?? 0) + 1);
+  }
+  const drop = new Set<string>();
+  for (const edge of source.edges) {
+    const limit = clearanceOf(edge.classId) + 2;
+    for (const end of [edge.a, edge.b] as const) {
+      if (degree.get(end) !== 1) continue;
+      const point = positionByNode.get(end)!;
+      if (reservedSites.some((ring) => distToRing(point, ring) <= limit)) {
+        drop.add(edge.id);
+        break;
+      }
+    }
+  }
+  if (drop.size === 0) return source;
+  return compactRoadSource({
+    nodes: source.nodes,
+    routes: source.routes,
+    edges: source.edges.filter((edge) => !drop.has(edge.id))
+  });
+}
+
+function distToRing(point: Vec2, ring: Ring): number {
+  let nearest = Infinity;
+  for (let index = 0; index < ring.length; index++) {
+    const c = ring[index]!;
+    const d = ring[(index + 1) % ring.length]!;
+    const abx = d.x - c.x;
+    const aby = d.y - c.y;
+    const t = Math.max(0, Math.min(1, ((point.x - c.x) * abx + (point.y - c.y) * aby) / (abx * abx + aby * aby || 1)));
+    nearest = Math.min(nearest, Math.hypot(point.x - (c.x + abx * t), point.y - (c.y + aby * t)));
+  }
+  return nearest;
+}
+
 /** Generated roads should be valid by construction. When the canonical compiler still finds a
  * curve contact on a large map, preserve the graph first: straighten only implicated routes, then
  * (if necessary) all remaining multi-edge routes. Only genuine straight-edge conflicts may remove
@@ -2030,7 +2077,9 @@ export function generateInitialRoadNetwork(input: RoadGenerationInput): Generate
     edges: dedupedEdges
   };
   const roleByRouteId = new Map(routeIds.map((id, index) => [id, state.lines[index]!.role] as const));
-  const stabilized = stabilizeGeneratedSource(roads, roleByRouteId, idSeed);
+  // Prune severed site stubs BEFORE the topology fallback: removing edges shifts compiled
+  // curves, and the stabilizer must see the final graph to repair any fresh contacts.
+  const stabilized = stabilizeGeneratedSource(pruneReservedSiteStubs(roads, reservedSites), roleByRouteId, idSeed);
   const finalRoads = stabilized.source;
   const sourceProblems = validateRoadSource(finalRoads);
   if (sourceProblems.length > 0) throw new Error(`Generated road source is invalid: ${sourceProblems.join(" ")}`);

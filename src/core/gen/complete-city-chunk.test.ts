@@ -102,6 +102,7 @@ const mass = (
   archetype: "rectangle",
   elevationM,
   heightM,
+  frontage: null,
   roofline: "flat",
   facadeProfile: "office-grid",
   massing: "residential-slab",
@@ -619,6 +620,40 @@ describe("buildCompleteCityChunk", () => {
     expect(seedsOf(worn, KIND.ROOF)).not.toEqual(seedsOf(base, KIND.ROOF));
   });
 
+
+  it("propagates one planned frontage into detail without changing mass geometry", () => {
+    const frontagedPlan: CompleteCityPlan = {
+      ...PLAN,
+      buildings: PLAN.buildings.map((building) =>
+        building.id !== "building-a"
+          ? building
+          : {
+              ...building,
+              masses: building.masses.map((buildingMass) => ({
+                ...buildingMass,
+                frontage: { angleRad: 0, outward: { x: 0, y: -1 } }
+              }))
+            }
+      )
+    };
+    const plain = buildCompleteCityChunk(SOURCE, PLAN, { cx: 0, cy: 0 }, SCENE, PPM);
+    const frontaged = buildCompleteCityChunk(
+      SOURCE,
+      frontagedPlan,
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    const entryTriangles = frontaged.detail.triangleCount - plain.detail.triangleCount;
+
+    expect([...frontaged.mesh.vertices]).toEqual([...plain.mesh.vertices]);
+    expect([...frontaged.mesh.indices]).toEqual([...plain.mesh.indices]);
+    // The ground podium is coarse-policy, but is admitted to DETAIL solely for one portal.
+    // Its elevated tower shares the plan frontage and must not receive another group.
+    expect(entryTriangles).toBeGreaterThanOrEqual(50);
+    expect(entryTriangles).toBeLessThanOrEqual(70);
+    expect(entryTriangles % 10).toBe(0);
+  });
   it("keeps neon zero for a detail-enabled, neon-disabled mass despite signageRate 1", () => {
     const onlyTower = (towerOver: Partial<BuildingMassPlan>): CompleteCityPlan => ({
       ...PLAN,

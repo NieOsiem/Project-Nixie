@@ -915,8 +915,8 @@ describe("CityRenderer bloom", () => {
     r.update(camera);
 
     let uniforms = (lastCall().content as StubMesh).shader.uniforms;
-    expect(uniforms.uSmearStrength).toBe(1);
-    expect(uniforms.uRadialSmear).toBeCloseTo((50 / (900 - 50)) * dollyLeanStrength(1));
+    expect(uniforms.uSmearStrength).toBe(1.5);
+    expect(uniforms.uRadialSmear).toBeCloseTo((70 / (900 - 70)) * dollyLeanStrength(1));
 
     const before = renderCalls;
     r.lookDials.smearStrength = 0.25;

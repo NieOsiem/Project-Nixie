@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
-import { rectRing, ringArea, type MultiPolygon, type Ring } from "../geom/types.js";
+import { rectRing, ringArea, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
+import { ROUTE_CLASS_REGISTRY } from "./city.js";
 import { rectangleLand } from "./terrain.js";
 import { generateInitialRoadNetwork, type GeneratedRoadNetwork } from "./road-generator.js";
 import { compileRouteNetwork } from "../graph/compiler.js";
@@ -12,6 +13,19 @@ const multiArea = (multi: MultiPolygon): number =>
 
 const occupancyOverlap = (roads: GeneratedRoadNetwork["roads"], site: Ring): number =>
   multiArea(intersection(ringAsMulti(site), compiledRouteOccupancy(compileRouteNetwork(roads)).all));
+
+function distToRing(point: Vec2, ring: Ring): number {
+  let nearest = Infinity;
+  for (let index = 0; index < ring.length; index++) {
+    const c = ring[index]!;
+    const d = ring[(index + 1) % ring.length]!;
+    const abx = d.x - c.x;
+    const aby = d.y - c.y;
+    const t = Math.max(0, Math.min(1, ((point.x - c.x) * abx + (point.y - c.y) * aby) / (abx * abx + aby * aby || 1)));
+    nearest = Math.min(nearest, Math.hypot(point.x - (c.x + abx * t), point.y - (c.y + aby * t)));
+  }
+  return nearest;
+}
 
 describe("initial road generation", () => {
   const mask = rectangleLand({ x: 0, y: 0, width: 400, height: 300 });
@@ -41,6 +55,21 @@ describe("initial road generation", () => {
       expect(generated.roads.edges.length).toBeGreaterThan(0);
       for (const site of sites) expect(occupancyOverlap(generated.roads, site)).toBeLessThanOrEqual(1e-6);
       expect(validateRouteTopology(generated.roads, compileRouteNetwork(generated.roads)).ok).toBe(true);
+      const nodeById = new Map(generated.roads.nodes.map((node) => [node.id, node]));
+      const degree = new Map<string, number>();
+      for (const edge of generated.roads.edges) {
+        degree.set(edge.a, (degree.get(edge.a) ?? 0) + 1);
+        degree.set(edge.b, (degree.get(edge.b) ?? 0) + 1);
+      }
+      for (const edge of generated.roads.edges) {
+        const routeClass = ROUTE_CLASS_REGISTRY.get(edge.classId)!;
+        const clearance = routeClass.widthM / 2 + routeClass.sidewalkM + 2;
+        for (const looseId of [edge.a, edge.b] as const) {
+          if (degree.get(looseId) !== 1) continue;
+          const loose = nodeById.get(looseId)!;
+          expect(Math.min(...sites.map((site) => distToRing(loose, site)))).toBeGreaterThan(clearance);
+        }
+      }
     }
   });
 

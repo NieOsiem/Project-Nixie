@@ -18,14 +18,46 @@ const minMassMinorAtMinimum = (entry: (typeof BUILDING_GRAMMARS)[number]): numbe
 };
 
 describe("building grammar registry", () => {
-  it("ships at least 24 stable grammars across all seven archetypes and all eight uses", () => {
-    expect(BUILDING_GRAMMAR_IDS.length).toBeGreaterThanOrEqual(24);
+  it("ships 40 stable grammars across all twelve archetypes and all eight uses", () => {
+    expect(BUILDING_GRAMMAR_IDS).toHaveLength(40);
     expect(new Set(BUILDING_GRAMMAR_IDS).size).toBe(BUILDING_GRAMMAR_IDS.length);
     expect(BUILDING_GRAMMARS.map((entry) => entry.id)).toEqual(BUILDING_GRAMMAR_IDS);
     expect(new Set(BUILDING_GRAMMARS.map((entry) => entry.archetype))).toEqual(new Set(FOOTPRINT_ARCHETYPE_IDS));
     const uses = new Set(BUILDING_GRAMMARS.flatMap((entry) => entry.compatibleUses));
     expect([...uses].sort()).toEqual([...BUILDING_USE_IDS].sort());
     expect(validateBuildingRegistry()).toEqual({ ok: true, problems: [] });
+  });
+
+  it("registers exactly the five C8 silhouette families and ten reachable grammars", () => {
+    expect(FOOTPRINT_ARCHETYPE_IDS.slice(-5)).toEqual(["chamfered", "stepped", "offset-tower", "bridge", "cantilever"]);
+    const ids = [
+      "corporate-chamfered-tower",
+      "civic-chamfered-hall",
+      "corporate-setback-tower",
+      "civic-stepped-institute",
+      "commercial-offset-tower",
+      "entertainment-offset-stack",
+      "industrial-skybridge-works",
+      "market-bridge-complex",
+      "logistics-cantilever-works",
+      "entertainment-cantilever-stack"
+    ] as const;
+    expect(ids).toHaveLength(10);
+    expect(ids.map((id) => BUILDING_GRAMMAR_REGISTRY.get(id)?.archetype)).toEqual([
+      "chamfered",
+      "chamfered",
+      "stepped",
+      "stepped",
+      "offset-tower",
+      "offset-tower",
+      "bridge",
+      "bridge",
+      "cantilever",
+      "cantilever"
+    ]);
+    for (const id of ids) {
+      expect(DISTRICT_TYPES.some((district) => district.buildingGrammarWeights[id] > 0), id).toBe(true);
+    }
   });
 
   it("declares valid limits, profiles, rates, and normalized material slots for every grammar", () => {
@@ -54,6 +86,7 @@ describe("building grammar registry", () => {
     for (const district of DISTRICT_TYPES) {
       const active = BUILDING_GRAMMAR_IDS.filter((id) => (district.buildingGrammarWeights[id] ?? 0) > 0);
       expect(active.length, district.id).toBeGreaterThanOrEqual(4);
+      expect(active.reduce((sum, id) => sum + district.buildingGrammarWeights[id], 0), district.id).toBeCloseTo(1, 9);
       for (const id of active) reachable.add(id);
     }
     expect([...reachable].sort()).toEqual([...BUILDING_GRAMMAR_IDS].sort());
@@ -112,8 +145,11 @@ describe("building grammar registry", () => {
   it("pins the deliberate tower outliers that escape block height coherence", () => {
     expect([...TOWER_BUILDING_GRAMMAR_IDS].sort()).toEqual([
       "civic-tower-plinth",
+      "commercial-offset-tower",
       "commercial-twin-tower-podium",
       "corporate-atrium-block",
+      "corporate-chamfered-tower",
+      "corporate-setback-tower",
       "corporate-tower-podium",
       "entertainment-signage-podium"
     ]);

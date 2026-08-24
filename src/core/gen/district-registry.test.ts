@@ -97,4 +97,17 @@ describe("district planning registry", () => {
       .reduce((sum, id) => sum + (definition.buildingGrammarWeights[id] ?? 0), 0);
     expect(tallWeight).toBeGreaterThan(0.8);
   });
+
+  it("uses silhouette vocabularies as the dominant architectural signal by district family", () => {
+    const weight = (districtId: (typeof DISTRICT_TYPE_IDS)[number], ids: readonly (typeof BUILDING_GRAMMAR_IDS)[number][]): number => {
+      const district = DISTRICT_TYPE_REGISTRY.get(districtId)!;
+      return ids.reduce((sum, id) => sum + district.buildingGrammarWeights[id], 0);
+    };
+    expect(weight("corporate-core", ["corporate-setback-tower", "corporate-chamfered-tower", "commercial-offset-tower"])).toBeGreaterThan(0.65);
+    expect(weight("heavy-industrial", ["industrial-skybridge-works", "logistics-cantilever-works", "industrial-loading-court", "service-court-works"])).toBeGreaterThan(0.75);
+    expect(weight("residential-megablocks", ["megablock-ring", "dense-perimeter-block", "residential-court", "residential-wing"])).toBeGreaterThan(0.85);
+    expect(weight("entertainment-strip", ["entertainment-offset-stack", "entertainment-cantilever-stack", "entertainment-signage-podium"])).toBeGreaterThanOrEqual(0.6);
+    expect(weight("civic-institutional", ["civic-stepped-institute", "civic-chamfered-hall", "civic-entry-court"])).toBeGreaterThan(0.6);
+    expect(weight("derelict-reclamation", ["derelict-reclamation-cluster", "service-court-works", "old-city-courtyard"])).toBeGreaterThanOrEqual(0.6);
+  });
 });

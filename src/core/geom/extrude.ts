@@ -2,6 +2,14 @@ import { KIND, MeshBuilder, type MeshBuffers } from "./mesh.js";
 import { triangulate } from "./tessellate.js";
 import { ringArea, ringCentroid, type Ring, type Vec2 } from "./types.js";
 
+/** Street orientation carried from the metre-space plan into pixel-space mesh generation. */
+export interface BuildingFrontageSpec {
+  /** World-space tangent along the road-facing wall. */
+  angleRad: number;
+  /** Unit world-space normal pointing from the mass toward the road. */
+  outward: Vec2;
+}
+
 export interface BuildingSpec {
   /** Footprint in world pixels. Winding is normalised internally. */
   footprint: Ring;
@@ -13,6 +21,12 @@ export interface BuildingSpec {
   wallMaterial: number;
   /** 0..1 building hash. Picks the facade style and seeds its per-cell hashes. */
   seed: number;
+  /** Road-facing orientation; uniform metre-to-pixel scaling leaves it unchanged. */
+  frontage?: BuildingFrontageSpec | null;
+  /** Exactly one eligible ground mass per building owns the primary entrance group. */
+  primaryFrontage?: boolean;
+  /** This coarse-policy mass is present in the detail pass solely to carry its entrance. */
+  facadeEntryOnly?: boolean;
   /** WHY: opt-in keeps ad-hoc specs such as cars on their existing simple extrusion. */
   detailedMassing?: boolean;
   /** District-selected silhouette family. Omitted specs retain the existing podium/tower form. */

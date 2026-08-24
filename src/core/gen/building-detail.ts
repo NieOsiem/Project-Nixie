@@ -1374,16 +1374,421 @@ function rooftopFamilyLayer(
   return prisms;
 }
 
-function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPrism[] {
+interface FrontageEdge {
+  a: Vec2;
+  b: Vec2;
+  lengthM: number;
+}
+
+const FACADE_ENTRY_MAX_PROJECTION_M = 1.8;
+const FACADE_ENTRY_SIDE_MARGIN_M = 0.5;
+const FACADE_ENTRY_ALIGNMENT_COS = Math.cos((35 * Math.PI) / 180);
+
+/** All entrance decisions live in their own stable namespace, separate from rooftop salts. */
+const facadeEntryRoll = (spec: BuildingSpec, slot: string): number =>
+  fnv1a(`${Math.round(spec.seed * 0x3fffffff)}/facade-entry/v1/${slot}`) / 0x100000000;
+
+const facadeEntryNeonMaterial = (spec: BuildingSpec, slot: string): number => {
+  if (spec.neonEnabled === false) return spec.wallMaterial;
+  const bank = Math.floor(spec.wallMaterial / BANK_SIZE) * BANK_SIZE;
+  const weights = spec.neonWeights ?? [0.5, 0.5];
+  return bank +
+    (facadeEntryRoll(spec, `mat/${slot}`) < weights[0]!
+      ? DISTRICT_SLOT.NEON_A
+      : DISTRICT_SLOT.NEON_B);
+};
+
+/**
+ * Pick only a wall parallel to the planned road tangent, then choose the wall furthest
+ * toward the road. A long back wall is never used as a fallback when no aligned wall exists.
+ */
+function roadFacingEdge(spec: BuildingSpec, pixelsPerMetre: number): FrontageEdge | null {
+  const frontage = spec.frontage;
   if (
-    spec.height < BUILDING_DETAIL_MIN_HEIGHT_M ||
+    frontage === null ||
+    frontage === undefined ||
+    !Number.isFinite(frontage.angleRad) ||
+    !Number.isFinite(frontage.outward.x) ||
+    !Number.isFinite(frontage.outward.y)
+  ) {
+    return null;
+  }
+  const normalLength = Math.hypot(frontage.outward.x, frontage.outward.y);
+  if (normalLength <= 0) return null;
+  const nx = frontage.outward.x / normalLength;
+  const ny = frontage.outward.y / normalLength;
+  const tx = Math.cos(frontage.angleRad);
+  const ty = Math.sin(frontage.angleRad);
+  let selected: FrontageEdge | null = null;
+  let selectedScore = -Infinity;
+  const footprint = withPositiveArea(spec.footprint);
+  for (let i = 0; i < footprint.length; i++) {
+    const a = footprint[i]!;
+    const b = footprint[(i + 1) % footprint.length]!;
+    const lengthPx = Math.hypot(b.x - a.x, b.y - a.y);
+    if (lengthPx <= 0) continue;
+    const ux = (b.x - a.x) / lengthPx;
+    const uy = (b.y - a.y) / lengthPx;
+    if (Math.abs(ux * tx + uy * ty) < FACADE_ENTRY_ALIGNMENT_COS) continue;
+    const score = ((a.x + b.x) * 0.5) * nx + ((a.y + b.y) * 0.5) * ny;
+    if (score > selectedScore) {
+      selected = { a, b, lengthM: lengthPx / pixelsPerMetre };
+      selectedScore = score;
+    }
+  }
+  return selected;
+}
+
+/** Rectangle measured along the selected wall and outward toward the road, never inward. */
+function frontageBox(
+  edge: FrontageEdge,
+  outward: Vec2,
+  startM: number,
+  endM: number,
+  nearM: number,
+  farM: number,
+  pixelsPerMetre: number
+): Ring {
+  const lengthPx = edge.lengthM * pixelsPerMetre;
+  const ux = (edge.b.x - edge.a.x) / lengthPx;
+  const uy = (edge.b.y - edge.a.y) / lengthPx;
+  const normalLength = Math.hypot(outward.x, outward.y);
+  const nx = outward.x / normalLength;
+  const ny = outward.y / normalLength;
+  const point = (alongM: number, outM: number): Vec2 => ({
+    x: edge.a.x + (ux * alongM + nx * outM) * pixelsPerMetre,
+    y: edge.a.y + (uy * alongM + ny * outM) * pixelsPerMetre
+  });
+  return withPositiveArea([
+    point(startM, nearM),
+    point(endM, nearM),
+    point(endM, farM),
+    point(startM, farM)
+  ]);
+}
+
+/**
+ * Ground-level, street-facing entrance vocabulary. Every prism lies on the outward side
+ * of the selected facade, projects at most 1.8 m, and ends below this mass's roof.
+ */
+export function facadeEntryPrisms(
+  spec: BuildingSpec,
+  pixelsPerMetre: number
+): DetailPrism[] {
+  const base = spec.baseHeight ?? 0;
+  if (
+    spec.primaryFrontage !== true ||
+    base > 0.5 ||
+    spec.height <= 0 ||
     spec.footprint.length < 3 ||
     pixelsPerMetre <= 0
   ) {
     return [];
   }
+  const edge = roadFacingEdge(spec, pixelsPerMetre);
+  if (edge === null) return [];
 
+  const typology = resolveArchitecturalTypology(spec);
+  const outward = spec.frontage!.outward;
+  const topLimit = base + spec.height - 0.15;
+  const dark = bankSlotMaterial(spec, DISTRICT_SLOT.WALL_C);
+  const trim = spec.roofMaterial;
+  const light = facadeEntryNeonMaterial(spec, typology);
   const prisms: DetailPrism[] = [];
+  let prismIndex = 0;
+  const add = (
+    startM: number,
+    endM: number,
+    nearM: number,
+    farM: number,
+    bottom: number,
+    top: number,
+    material: number,
+    role: string
+  ): void => {
+    if (
+      endM <= startM ||
+      nearM < 0 ||
+      farM <= nearM ||
+      farM > FACADE_ENTRY_MAX_PROJECTION_M + 1e-6 ||
+      top <= bottom ||
+      bottom < base ||
+      top > topLimit
+    ) {
+      return;
+    }
+    prisms.push({
+      footprint: frontageBox(edge, outward, startM, endM, nearM, farM, pixelsPerMetre),
+      baseHeight: bottom,
+      topHeight: top,
+      material,
+      seed: facadeEntryRoll(spec, `prism/${role}/${prismIndex++}`)
+    });
+  };
+  const place = (widthM: number): number | null => {
+    const spare = edge.lengthM - widthM - FACADE_ENTRY_SIDE_MARGIN_M * 2;
+    if (spare < 0) return null;
+    return FACADE_ENTRY_SIDE_MARGIN_M + facadeEntryRoll(spec, "geo/position") * spare;
+  };
+  const commonPortal = (
+    widthM: number,
+    minHeightM: number,
+    targetHeightM: number,
+    canopyProjectionM: number,
+    glowingTransom: boolean
+  ): { start: number; end: number; doorTop: number } | null => {
+    const postWidth = Math.min(0.22, Math.max(0.14, widthM * 0.07));
+    const startWithPosts = place(widthM + postWidth * 2);
+    if (startWithPosts === null || topLimit - base < minHeightM + 0.28) return null;
+    const start = startWithPosts + postWidth;
+    const end = start + widthM;
+    const doorTop = Math.min(base + targetHeightM, topLimit - 0.24);
+    if (doorTop < base + minHeightM) return null;
+    add(start, end, 0.03, 0.06, base + 0.03, doorTop, dark, "portal");
+    add(start - postWidth, start, 0.025, 0.2, base, doorTop + 0.08, trim, "post-left");
+    add(end, end + postWidth, 0.025, 0.2, base, doorTop + 0.08, trim, "post-right");
+    const canopyTop = Math.min(topLimit, doorTop + 0.24);
+    add(
+      start - postWidth,
+      end + postWidth,
+      0.025,
+      Math.min(FACADE_ENTRY_MAX_PROJECTION_M, canopyProjectionM),
+      canopyTop - 0.16,
+      canopyTop,
+      trim,
+      "canopy"
+    );
+    if (glowingTransom) {
+      add(start + 0.12, end - 0.12, 0.061, 0.1, doorTop - 0.44, doorTop - 0.08, light, "light");
+      // A shallow threshold spill reads from the module's top-down camera without turning
+      // the whole pavement into emissive material. It stays under the canopy and within
+      // the facade-entry projection budget.
+      add(
+        start + 0.08,
+        end - 0.08,
+        0.1,
+        Math.min(0.75, Math.max(0.35, canopyProjectionM * 0.55)),
+        base + 0.01,
+        base + 0.05,
+        light,
+        "threshold-spill"
+      );
+    }
+    return { start, end, doorTop };
+  };
+
+  switch (typology) {
+    case "corporate":
+    case "civic": {
+      const minWidth = typology === "civic" ? 3 : 2.5;
+      const width = Math.min(
+        minWidth + facadeEntryRoll(spec, "geo/portal-width") * (5 - minWidth),
+        edge.lengthM - FACADE_ENTRY_SIDE_MARGIN_M * 2 - 0.44
+      );
+      if (width < minWidth) return [];
+      const portal = commonPortal(
+        width,
+        2.7,
+        2.8 + facadeEntryRoll(spec, "geo/portal-height") * 0.4,
+        1.2 + facadeEntryRoll(spec, "geo/canopy-depth") * 0.6,
+        true
+      );
+      if (
+        portal !== null &&
+        facadeEntryRoll(spec, "geo/security-vestibule") < (typology === "civic" ? 0.22 : 0.14)
+      ) {
+        const rail = 0.1;
+        const vestibuleDepth = 0.72;
+        add(portal.start, portal.start + rail, 0.2, vestibuleDepth, base, base + 1.15, trim, "vestibule-left");
+        add(portal.end - rail, portal.end, 0.2, vestibuleDepth, base, base + 1.15, trim, "vestibule-right");
+      }
+      break;
+    }
+
+    case "residential": {
+      const width = Math.min(
+        1.5 + facadeEntryRoll(spec, "geo/portal-width") * 1,
+        edge.lengthM - FACADE_ENTRY_SIDE_MARGIN_M * 2 - 0.44
+      );
+      if (width < 1.5) return [];
+      const portal = commonPortal(
+        width,
+        2.2,
+        2.25 + facadeEntryRoll(spec, "geo/portal-height") * 0.45,
+        0.8 + facadeEntryRoll(spec, "geo/canopy-depth") * 0.3,
+        true
+      );
+      if (portal !== null) {
+        add(portal.start - 0.12, portal.end + 0.12, 0.08, 0.7, base, base + 0.16, trim, "stoop");
+      }
+      break;
+    }
+
+    case "industrial": {
+      const serviceWidth = 1.2 + facadeEntryRoll(spec, "geo/service-width") * 0.4;
+      const gap = 0.55;
+      const maxGarage = edge.lengthM -
+        FACADE_ENTRY_SIDE_MARGIN_M * 2 -
+        serviceWidth -
+        gap -
+        0.2;
+      const garageWidth = Math.min(
+        4 + facadeEntryRoll(spec, "geo/garage-width") * 3,
+        maxGarage
+      );
+      if (garageWidth < 4 || topLimit - base < 3.78) return [];
+      const totalWidth = garageWidth + gap + serviceWidth;
+      const startWithPost = place(totalWidth + 0.2);
+      if (startWithPost === null) return [];
+      const start = startWithPost + 0.2;
+      const garageEnd = start + garageWidth;
+      const serviceStart = garageEnd + gap;
+      const serviceEnd = serviceStart + serviceWidth;
+      const garageTop = Math.min(
+        base + 3.5 + facadeEntryRoll(spec, "geo/garage-height") * 1.5,
+        topLimit - 0.24
+      );
+      if (garageTop < base + 3.5) return [];
+      const serviceTop = Math.min(base + 2.5, garageTop - 0.25);
+      add(start, garageEnd, 0.03, 0.06, base + 0.04, garageTop, dark, "garage");
+      const segments = 4 + Math.floor(facadeEntryRoll(spec, "geo/segments") * 3);
+      for (let segment = 1; segment < segments; segment++) {
+        const y = base + ((garageTop - base) * segment) / segments;
+        add(start + 0.08, garageEnd - 0.08, 0.061, 0.09, y - 0.035, y + 0.035, trim, `garage-seam-${segment}`);
+      }
+      add(serviceStart, serviceEnd, 0.03, 0.06, base + 0.04, serviceTop, dark, "service-door");
+      add(start - 0.2, start, 0.025, 0.22, base, garageTop + 0.08, trim, "garage-post-left");
+      add(garageEnd, garageEnd + 0.2, 0.025, 0.22, base, garageTop + 0.08, trim, "garage-post-right");
+      const awningTop = Math.min(topLimit, garageTop + 0.24);
+      add(
+        start - 0.2,
+        garageEnd + 0.2,
+        0.025,
+        1 + facadeEntryRoll(spec, "geo/awning-depth") * 0.6,
+        awningTop - 0.18,
+        awningTop,
+        trim,
+        "dock-awning"
+      );
+      add(
+        serviceStart,
+        serviceEnd,
+        0.061,
+        0.12,
+        serviceTop - 0.18,
+        serviceTop - 0.06,
+        light,
+        "service-light"
+      );
+      break;
+    }
+
+    case "market": {
+      const paneCount = 2 + Math.floor(facadeEntryRoll(spec, "geo/pane-count") * 3);
+      const minWidth = paneCount * 1.35;
+      const width = Math.min(
+        paneCount * (1.65 + facadeEntryRoll(spec, "geo/pane-width") * 0.35),
+        edge.lengthM - FACADE_ENTRY_SIDE_MARGIN_M * 2 - 0.32
+      );
+      if (width < minWidth || topLimit - base < 2.78) return [];
+      const startWithPosts = place(width + 0.32);
+      if (startWithPosts === null) return [];
+      const start = startWithPosts + 0.16;
+      const end = start + width;
+      const paneTop = Math.min(
+        base + 2.5 + facadeEntryRoll(spec, "geo/pane-height") * 0.5,
+        topLimit - 0.24
+      );
+      const gap = 0.08;
+      const paneWidth = width / paneCount;
+      for (let pane = 0; pane < paneCount; pane++) {
+        add(
+          start + pane * paneWidth + gap,
+          start + (pane + 1) * paneWidth - gap,
+          0.03,
+          0.06,
+          base + 0.05,
+          paneTop,
+          dark,
+          `shopfront-${pane}`
+        );
+      }
+      for (let mullion = 1; mullion < paneCount; mullion++) {
+        const x = start + mullion * paneWidth;
+        add(x - 0.055, x + 0.055, 0.025, 0.15, base, paneTop + 0.08, trim, `mullion-${mullion}`);
+      }
+      add(start - 0.16, start, 0.025, 0.18, base, paneTop + 0.08, trim, "post-left");
+      add(end, end + 0.16, 0.025, 0.18, base, paneTop + 0.08, trim, "post-right");
+      const awningTop = Math.min(topLimit, paneTop + 0.24);
+      add(
+        start - 0.16,
+        end + 0.16,
+        0.025,
+        0.9 + facadeEntryRoll(spec, "geo/awning-depth") * 0.5,
+        awningTop - 0.18,
+        awningTop,
+        trim,
+        "awning"
+      );
+      add(start + 0.15, end - 0.15, 0.061, 0.11, paneTop - 0.24, paneTop - 0.08, light, "header");
+      break;
+    }
+
+    case "derelict": {
+      const width = Math.min(
+        1.2 + facadeEntryRoll(spec, "geo/portal-width") * 0.6,
+        edge.lengthM - FACADE_ENTRY_SIDE_MARGIN_M * 2 - 0.44
+      );
+      if (width < 1.2) return [];
+      const portal = commonPortal(
+        width,
+        2.2,
+        2.2 + facadeEntryRoll(spec, "geo/portal-height") * 0.35,
+        0.8 + facadeEntryRoll(spec, "geo/hood-depth") * 0.25,
+        false
+      );
+      if (portal !== null) {
+        const shutterBands = 3 + Math.floor(facadeEntryRoll(spec, "geo/shutter-bands") * 3);
+        for (let band = 1; band < shutterBands; band++) {
+          const y = base + ((portal.doorTop - base) * band) / shutterBands;
+          add(portal.start + 0.04, portal.end - 0.04, 0.061, 0.09, y - 0.03, y + 0.03, trim, `shutter-${band}`);
+        }
+      }
+      break;
+    }
+
+    case "standard":
+    default: {
+      const width = Math.min(
+        1.8 + facadeEntryRoll(spec, "geo/portal-width") * 0.6,
+        edge.lengthM - FACADE_ENTRY_SIDE_MARGIN_M * 2 - 0.44
+      );
+      if (width < 1.8) return [];
+      commonPortal(
+        width,
+        2.3,
+        2.4 + facadeEntryRoll(spec, "geo/portal-height") * 0.45,
+        0.9 + facadeEntryRoll(spec, "geo/canopy-depth") * 0.35,
+        true
+      );
+      break;
+    }
+  }
+  return prisms;
+}
+
+function prismsForBuilding(spec: BuildingSpec, pixelsPerMetre: number): DetailPrism[] {
+  const entryPrisms = facadeEntryPrisms(spec, pixelsPerMetre);
+  if (
+    spec.facadeEntryOnly === true ||
+    spec.height < BUILDING_DETAIL_MIN_HEIGHT_M ||
+    spec.footprint.length < 3 ||
+    pixelsPerMetre <= 0
+  ) {
+    return entryPrisms;
+  }
+
+  const prisms: DetailPrism[] = [...entryPrisms];
   const massing = describeBuildingMassing(spec, pixelsPerMetre);
   const accent = neonMaterial(spec, 901);
   const typology = resolveArchitecturalTypology(spec);

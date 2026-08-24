@@ -6,8 +6,10 @@ import { BANK_SIZE, DISTRICT_SLOT } from "../palette.js";
 import {
   BUILDING_DETAIL_MIN_HEIGHT_M,
   buildingDetailMesh,
+  facadeEntryPrisms,
   prismMesh,
-  resolveArchitecturalTypology
+  resolveArchitecturalTypology,
+  type DetailPrism
 } from "./building-detail.js";
 
 const PPM = 25;
@@ -20,6 +22,25 @@ const spec = (over: Partial<BuildingSpec> = {}): BuildingSpec => ({
   seed: 0.42,
   detailedMassing: true,
   ...over
+});
+
+const frontedSpec = (over: Partial<BuildingSpec> = {}): BuildingSpec =>
+  spec({
+    detailedMassing: false,
+    frontage: { angleRad: 0, outward: { x: 0, y: -1 } },
+    primaryFrontage: true,
+    facadeEntryOnly: true,
+    neonEnabled: true,
+    ...over
+  });
+
+const prismBounds = (prisms: DetailPrism[]) => ({
+  minX: Math.min(...prisms.flatMap((prism) => prism.footprint.map((point) => point.x))),
+  maxX: Math.max(...prisms.flatMap((prism) => prism.footprint.map((point) => point.x))),
+  minY: Math.min(...prisms.flatMap((prism) => prism.footprint.map((point) => point.y))),
+  maxY: Math.max(...prisms.flatMap((prism) => prism.footprint.map((point) => point.y))),
+  minHeight: Math.min(...prisms.map((prism) => prism.baseHeight)),
+  maxHeight: Math.max(...prisms.map((prism) => prism.topHeight))
 });
 
 const vertexAt = (mesh: MeshBuffers, index: number) => {
@@ -279,6 +300,140 @@ describe("buildingDetailMesh", () => {
           expect(v.y).toBeLessThanOrEqual(bounds.maxY + 1e-2);
         }
       }
+    }
+  });
+
+  it("selects the furthest aligned road wall and builds only on its outward side", () => {
+    const building = frontedSpec({
+      facadeProfile: "office-grid",
+      frontage: { angleRad: 0, outward: { x: 0, y: 1 } }
+    });
+    const prisms = facadeEntryPrisms(building, PPM);
+    const bounds = prismBounds(prisms);
+
+    expect(prisms.length).toBeGreaterThanOrEqual(5);
+    expect(bounds.minY).toBeGreaterThanOrEqual(18 * PPM);
+    expect(bounds.maxY).toBeLessThanOrEqual((18 + 1.8) * PPM + 1e-3);
+    expect(bounds.minX).toBeGreaterThanOrEqual(0.5 * PPM - 1e-3);
+    expect(bounds.maxX).toBeLessThanOrEqual(23.5 * PPM + 1e-3);
+    expect(bounds.minHeight).toBeGreaterThanOrEqual(0);
+    expect(bounds.maxHeight).toBeLessThan(building.height);
+  });
+
+  it("keeps facade entries deterministic and metre-scaled across scene regrids", () => {
+    const building = frontedSpec({ facadeProfile: "residential-balcony" });
+    const first = facadeEntryPrisms(building, PPM);
+    const second = facadeEntryPrisms(building, PPM);
+    expect(second).toEqual(first);
+
+    const finePpm = PPM * 2;
+    const fine = facadeEntryPrisms(
+      frontedSpec({
+        facadeProfile: "residential-balcony",
+        footprint: rectRing({ x: 0, y: 0, width: 24 * finePpm, height: 18 * finePpm })
+      }),
+      finePpm
+    );
+    expect(fine.length).toBe(first.length);
+    for (let prismIndex = 0; prismIndex < first.length; prismIndex++) {
+      const coarsePrism = first[prismIndex]!;
+      const finePrism = fine[prismIndex]!;
+      expect(finePrism.baseHeight).toBeCloseTo(coarsePrism.baseHeight, 6);
+      expect(finePrism.topHeight).toBeCloseTo(coarsePrism.topHeight, 6);
+      for (let pointIndex = 0; pointIndex < coarsePrism.footprint.length; pointIndex++) {
+        expect(finePrism.footprint[pointIndex]!.x / finePpm)
+          .toBeCloseTo(coarsePrism.footprint[pointIndex]!.x / PPM, 6);
+        expect(finePrism.footprint[pointIndex]!.y / finePpm)
+          .toBeCloseTo(coarsePrism.footprint[pointIndex]!.y / PPM, 6);
+      }
+    }
+  });
+
+  it("uses typology-specific entry dimensions, materials, and geometry families", () => {
+    const corporate = facadeEntryPrisms(frontedSpec({ facadeProfile: "office-grid" }), PPM);
+    const residential = facadeEntryPrisms(frontedSpec({ facadeProfile: "residential-balcony" }), PPM);
+    const industrial = facadeEntryPrisms(frontedSpec({ facadeProfile: "industrial-panel" }), PPM);
+    const market = facadeEntryPrisms(frontedSpec({ facadeProfile: "shopfront" }), PPM);
+    const derelict = facadeEntryPrisms(frontedSpec({ facadeProfile: "derelict-shack" }), PPM);
+    const signature = (prisms: DetailPrism[]): string =>
+      prisms.map((prism) => {
+        const widthM =
+          (Math.max(...prism.footprint.map((point) => point.x)) -
+            Math.min(...prism.footprint.map((point) => point.x))) /
+          PPM;
+        return `${widthM.toFixed(3)}:${prism.baseHeight.toFixed(3)}:${prism.topHeight.toFixed(3)}:${prism.material}`;
+      }).join("|");
+
+    expect(new Set([corporate, residential, industrial, market, derelict].map(signature)).size).toBe(5);
+    const industrialMaxWidthM =
+      (prismBounds(industrial).maxX - prismBounds(industrial).minX) / PPM;
+    const residentialMaxWidthM =
+      (prismBounds(residential).maxX - prismBounds(residential).minX) / PPM;
+    expect(industrialMaxWidthM).toBeGreaterThanOrEqual(5.9);
+    expect(residentialMaxWidthM).toBeLessThan(3.2);
+    const dark = BANK_SIZE * 2 + DISTRICT_SLOT.WALL_C;
+    const widthsForDarkPanels = (prisms: DetailPrism[]): number[] =>
+      prisms
+        .filter((prism) => prism.material === dark)
+        .map((prism) =>
+          (Math.max(...prism.footprint.map((point) => point.x)) -
+            Math.min(...prism.footprint.map((point) => point.x))) /
+          PPM
+        );
+    const industrialDoorWidthM = Math.max(...widthsForDarkPanels(industrial));
+    const residentialDoorWidthM = Math.max(...widthsForDarkPanels(residential));
+    expect(industrialDoorWidthM).toBeGreaterThanOrEqual(4);
+    expect(industrialDoorWidthM).toBeLessThanOrEqual(7);
+    expect(residentialDoorWidthM).toBeGreaterThanOrEqual(1.5);
+    expect(residentialDoorWidthM).toBeLessThanOrEqual(2.5);
+    expect(widthsForDarkPanels(market).length).toBeGreaterThanOrEqual(2);
+    expect(widthsForDarkPanels(market).length).toBeLessThanOrEqual(4);
+
+    const neonA = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_A;
+    const neonB = BANK_SIZE * 2 + DISTRICT_SLOT.NEON_B;
+    expect(market.some((prism) => prism.material === neonA || prism.material === neonB)).toBe(true);
+    for (const family of [corporate, residential, industrial, market, derelict]) {
+      const bounds = prismBounds(family);
+      expect(bounds.minY).toBeGreaterThanOrEqual(-1.8 * PPM - 1e-3);
+      expect(bounds.maxY).toBeLessThanOrEqual(0);
+      expect(bounds.minHeight).toBeGreaterThanOrEqual(0);
+      expect(bounds.maxHeight).toBeLessThan(52);
+    }
+    expect(derelict.some((prism) => prism.material === neonA || prism.material === neonB)).toBe(false);
+  });
+
+  it("suppresses null, elevated, unaligned, short-edge, and non-primary entries", () => {
+    expect(facadeEntryPrisms(frontedSpec({ frontage: null }), PPM)).toEqual([]);
+    expect(facadeEntryPrisms(frontedSpec({ baseHeight: 0.51 }), PPM)).toEqual([]);
+    expect(facadeEntryPrisms(frontedSpec({ primaryFrontage: false }), PPM)).toEqual([]);
+    expect(
+      facadeEntryPrisms(
+        frontedSpec({ frontage: { angleRad: Math.PI / 4, outward: { x: 0, y: -1 } } }),
+        PPM
+      )
+    ).toEqual([]);
+    expect(
+      facadeEntryPrisms(
+        frontedSpec({
+          facadeProfile: "office-grid",
+          footprint: rectRing({ x: 0, y: 0, width: 3.8 * PPM, height: 12 * PPM })
+        }),
+        PPM
+      )
+    ).toEqual([]);
+  });
+
+  it("emits one primary entry when several masses share a building frontage", () => {
+    const primary = frontedSpec({ height: 8, seed: 0.31 });
+    const secondary = frontedSpec({ height: 8, seed: 0.73, primaryFrontage: false });
+    const one = buildingDetailMesh([primary], PPM);
+    const stacked = buildingDetailMesh([primary, secondary], PPM);
+
+    expect(stacked.vertices).toEqual(one.vertices);
+    expect(stacked.indices).toEqual(one.indices);
+    expect(one.vertexCount).toBeGreaterThan(0);
+    for (let vertexIndex = 0; vertexIndex < one.vertexCount; vertexIndex++) {
+      expect(vertexAt(one, vertexIndex).kind).toBe(KIND.DETAIL);
     }
   });
 });

@@ -437,7 +437,14 @@ function openSpaceDetailMesh(
  * The plan already decomposed each building into disjoint masses (podium, tower, ...),
  * so every mass is one simple extruded volume sitting on its own elevation.
  */
-function massSpec(mass: PlanMass, origin: Vec2, pixelsPerMetre: number): BuildingSpec {
+function massSpec(
+  mass: PlanMass,
+  origin: Vec2,
+  pixelsPerMetre: number,
+  primaryFrontage = false,
+  facadeEntryOnly = false
+): BuildingSpec {
+  const frontage = "frontage" in mass ? mass.frontage : null;
   return {
     footprint: toPixelsRing(mass.footprint, origin, pixelsPerMetre),
     height: mass.heightM,
@@ -445,6 +452,9 @@ function massSpec(mass: PlanMass, origin: Vec2, pixelsPerMetre: number): Buildin
     roofMaterial: mass.roofMaterial,
     wallMaterial: mass.wallMaterial,
     seed: mass.facadeSeed,
+    frontage,
+    primaryFrontage,
+    facadeEntryOnly,
     detailedMassing: false,
     facadeRate: mass.signageRate,
     neonWeights: mass.neonSlots,
@@ -454,6 +464,22 @@ function massSpec(mass: PlanMass, origin: Vec2, pixelsPerMetre: number): Buildin
     rooftopUtilityRate: mass.rooftopUtilityRate,
     neonEnabled: mass.neonEnabled
   };
+}
+
+/** Stable ownership prevents stacked wings (and reordered mass arrays) from each adding a door. */
+function primaryFrontageMassId(building: BuildingPlan): string | null {
+  let primary: BuildingMassPlan | null = null;
+  for (const mass of building.masses) {
+    if (mass.frontage === null || mass.elevationM > 0.5) continue;
+    if (
+      primary === null ||
+      mass.index < primary.index ||
+      (mass.index === primary.index && mass.id < primary.id)
+    ) {
+      primary = mass;
+    }
+  }
+  return primary?.id ?? null;
 }
 
 
@@ -848,9 +874,12 @@ export function buildCompleteCityChunk(
     if (ownsCentroid(boundsM, ringCentroid(landmark.sitePolygon))) ownedLandmarks.push(landmark);
   }
 
-  const buildingSpecs = ownedBuildings.flatMap((building) =>
-    building.masses.map((mass) => massSpec(mass, origin, pixelsPerMetre))
-  );
+  const buildingSpecs = ownedBuildings.flatMap((building) => {
+    const primaryId = primaryFrontageMassId(building);
+    return building.masses.map((mass) =>
+      massSpec(mass, origin, pixelsPerMetre, mass.id === primaryId)
+    );
+  });
   const landmarkSpecs = ownedLandmarks.flatMap((landmark) =>
     landmark.masses.map((mass) => massSpec(mass, origin, pixelsPerMetre))
   );
@@ -866,10 +895,11 @@ export function buildCompleteCityChunk(
       .filter((landmark) => (LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)?.geometryPolicy.coarse ?? "volumes") === "silhouette")
       .map((landmark) => landmark.id)
   );
-  const coarseBuildingSpecs = ownedBuildings.flatMap((building) =>
-    (silhouetteBuildings.has(building.id) ? building.masses.slice(0, 1) : building.masses)
-      .map((mass) => massSpec(mass, origin, pixelsPerMetre))
-  );
+  const coarseBuildingSpecs = ownedBuildings.flatMap((building) => {
+    const primaryId = primaryFrontageMassId(building);
+    return (silhouetteBuildings.has(building.id) ? building.masses.slice(0, 1) : building.masses)
+      .map((mass) => massSpec(mass, origin, pixelsPerMetre, mass.id === primaryId));
+  });
   const coarseLandmarkSpecs = ownedLandmarks.flatMap((landmark) =>
     (silhouetteLandmarks.has(landmark.id) ? landmark.masses.slice(0, 1) : landmark.masses)
       .map((mass) => massSpec(mass, origin, pixelsPerMetre))
@@ -877,7 +907,12 @@ export function buildCompleteCityChunk(
   const silhouetteVolumeSpecs = [
     ...ownedBuildings
       .filter((building) => silhouetteBuildings.has(building.id))
-      .flatMap((building) => building.masses.slice(1).map((mass) => massSpec(mass, origin, pixelsPerMetre))),
+      .flatMap((building) => {
+        const primaryId = primaryFrontageMassId(building);
+        return building.masses.slice(1).map((mass) =>
+          massSpec(mass, origin, pixelsPerMetre, mass.id === primaryId)
+        );
+      }),
     ...ownedLandmarks
       .filter((landmark) => silhouetteLandmarks.has(landmark.id))
       .flatMap((landmark) => landmark.masses.slice(1).map((mass) => massSpec(mass, origin, pixelsPerMetre)))
@@ -905,11 +940,24 @@ export function buildCompleteCityChunk(
     ...coarseLandmarkSpecs.map((spec) => extrudeBuilding(spec, pixelsPerMetre)),
     clutterMesh(buildingSpecs, pixelsPerMetre)
   ]);
-  const detailBuildingSpecs = ownedBuildings.flatMap((building) =>
-    building.masses
-      .filter((mass) => mass.detailPolicy === "detail" || mass.detailPolicy === "both")
-      .map((mass) => massSpec(mass, origin, pixelsPerMetre))
-  );
+  const detailBuildingSpecs = ownedBuildings.flatMap((building) => {
+    const primaryId = primaryFrontageMassId(building);
+    return building.masses
+      .filter((mass) =>
+        mass.detailPolicy === "detail" ||
+        mass.detailPolicy === "both" ||
+        mass.id === primaryId
+      )
+      .map((mass) =>
+        massSpec(
+          mass,
+          origin,
+          pixelsPerMetre,
+          mass.id === primaryId,
+          mass.detailPolicy === "coarse"
+        )
+      );
+  });
   const detailLandmarkSpecs = ownedLandmarks.flatMap((landmark) =>
     landmark.masses
       .filter((mass) => mass.detailPolicy === "detail" || mass.detailPolicy === "both")

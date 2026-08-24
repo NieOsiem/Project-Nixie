@@ -586,6 +586,13 @@ export interface OpenSpacePlan {
   material: number;
 }
 
+export interface BuildingFrontagePlan {
+  /** World-space tangent along the road-facing wall. */
+  angleRad: number;
+  /** Unit world-space normal pointing from the mass toward the road. */
+  outward: Vec2;
+}
+
 export interface BuildingMassPlan {
   id: string;
   buildingId: string;
@@ -594,6 +601,7 @@ export interface BuildingMassPlan {
   archetype: FootprintArchetypeId;
   elevationM: number;
   heightM: number;
+  frontage: BuildingFrontagePlan | null;
   roofline: string;
   facadeProfile: string;
   massing: string;
@@ -1513,7 +1521,175 @@ function archetypeMasses(
   };
   const mergePieces = (rings: readonly Ring[]): Ring | null => largestHoleFreePiece(union(rings.map((ring) => ringAsMulti(ring))));
   const archetype = definition.archetype;
+  // New silhouette families are isolated under a versioned salt namespace. Existing
+  // archetypes retain their exact seed paths and draw order.
+  if (archetype === "chamfered") {
+    const v3 = `${seed}/massing/v3`;
+    const worldPolygon = (points: readonly Vec2[]): Ring => {
+      const localRing = points.map((point) => ({ x: bounds.x + point.x, y: bounds.y + point.y }));
+      return angle === 0 ? localRing : localRing.map((point) => rotatePoint(point, centre, angle));
+    };
+    const chamfer = (x: number, y: number, width: number, depth: number, amount: number, sixCorners: boolean): Ring => {
+      const c = Math.min(amount, width * 0.22, depth * 0.22);
+      if (sixCorners) {
+        return worldPolygon([
+          { x: x + c, y },
+          { x: x + width, y },
+          { x: x + width, y: y + depth - c },
+          { x: x + width - c, y: y + depth },
+          { x, y: y + depth },
+          { x, y: y + c }
+        ]);
+      }
+      return worldPolygon([
+        { x: x + c, y },
+        { x: x + width - c, y },
+        { x: x + width, y: y + c },
+        { x: x + width, y: y + depth - c },
+        { x: x + width - c, y: y + depth },
+        { x: x + c, y: y + depth },
+        { x, y: y + depth - c },
+        { x, y: y + c }
+      ]);
+    };
+    const count = definition.massing.minMasses +
+      Math.floor(hashUnit(`${v3}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+    const sixCorners = hashUnit(`${v3}/chamfered/corners`) < 0.35;
+    const base = fitRectInside(chamfer(baseX, baseY, mainW, mainH, Math.min(mainW, mainH) * 0.14, sixCorners), container);
+    if (!base) return [];
+    const masses: RawMass[] = [];
+    const tierHeight = heightM / count;
+    const baseContainer = ringAsMulti(base);
+    for (let index = 0; index < count; index++) {
+      const scale = 1 - index * 0.13;
+      const width = mainW * scale;
+      const depth = mainH * scale;
+      const driftX = index === 0 ? 0 : (hashUnit(`${v3}/chamfered/drift-x/${index}`) - 0.5) * (mainW - width) * 0.5;
+      const driftY = index === 0 ? 0 : (hashUnit(`${v3}/chamfered/drift-y/${index}`) - 0.5) * (mainH - depth) * 0.5;
+      const ring = index === 0
+        ? base
+        : fitRectInside(chamfer(baseX + (mainW - width) / 2 + driftX, baseY + (mainH - depth) / 2 + driftY, width, depth, Math.min(width, depth) * 0.14, sixCorners), baseContainer);
+      if (!ring) return [];
+      masses.push({ footprint: ring, elevationM: tierHeight * index, heightM: tierHeight, kind: index === 0 ? "chamfered-base" : "chamfered-tier" });
+    }
+    return masses;
+  }
+
+  if (archetype === "stepped") {
+    const v3 = `${seed}/massing/v3`;
+    const count = definition.massing.minMasses +
+      Math.floor(hashUnit(`${v3}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+    const tierHeight = heightM / count;
+    const base = put(localRect(bounds, angle, centre, baseX, baseY, mainW, mainH), "stepped-base", 0, tierHeight);
+    if (!base) return [];
+    const masses: RawMass[] = [base];
+    const baseContainer = ringAsMulti(base.footprint);
+    for (let index = 1; index < count; index++) {
+      const scale = 1 - index * 0.1;
+      const width = mainW * scale;
+      const depth = mainH * scale;
+      const maxDriftX = (mainW - width) * 0.45;
+      const maxDriftY = (mainH - depth) * 0.45;
+      const driftX = (hashUnit(`${v3}/stepped/drift-x/${index}`) - 0.5) * 2 * maxDriftX;
+      const driftY = (hashUnit(`${v3}/stepped/drift-y/${index}`) - 0.5) * 2 * maxDriftY;
+      const ring = fitRectInside(
+        localRect(bounds, angle, centre, baseX + (mainW - width) / 2 + driftX, baseY + (mainH - depth) / 2 + driftY, width, depth),
+        baseContainer
+      );
+      if (!ring) return [];
+      masses.push({ footprint: ring, elevationM: tierHeight * index, heightM: tierHeight, kind: "setback-tier" });
+    }
+    return masses;
+  }
+
+  if (archetype === "offset-tower") {
+    const v3 = `${seed}/massing/v3`;
+    const massCount = definition.massing.minMasses +
+      Math.floor(hashUnit(`${v3}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+    const withWing = massCount >= 3;
+    const podiumWidth = mainW * (withWing ? 0.72 : 1);
+    const podiumX = baseX + (withWing && hashUnit(`${v3}/offset-tower/podium-side`) >= 0.5 ? mainW - podiumWidth : 0);
+    const podiumHeight = heightM * range(`${v3}/offset-tower/podium-height`, 0.24, 0.34);
+    const podium = put(localRect(bounds, angle, centre, podiumX, baseY, podiumWidth, mainH), "podium", 0, podiumHeight);
+    if (!podium) return [];
+    const towerW = podiumWidth * 0.52;
+    const towerH = mainH * 0.54;
+    const roomX = podiumWidth - towerW;
+    const roomY = mainH - towerH;
+    const towerX = podiumX + roomX * range(`${v3}/offset-tower/x`, 0.08, 0.38);
+    const towerY = baseY + roomY * range(`${v3}/offset-tower/y`, 0.08, 0.38);
+    const tower = fitRectInside(localRect(bounds, angle, centre, towerX, towerY, towerW, towerH), ringAsMulti(podium.footprint));
+    if (!tower) return [];
+    const masses: RawMass[] = [
+      podium,
+      { footprint: tower, elevationM: podiumHeight, heightM: heightM - podiumHeight, kind: "offset-tower" }
+    ];
+    if (withWing) {
+      const wingW = mainW * 0.26;
+      const wingX = podiumX === baseX ? baseX + mainW - wingW : baseX;
+      const wing = put(localRect(bounds, angle, centre, wingX, baseY + mainH * 0.18, wingW, mainH * 0.64), "service-wing", 0, podiumHeight * 1.4);
+      if (!wing) return [];
+      masses.push(wing);
+    }
+    return masses;
+  }
+
+  if (archetype === "bridge") {
+    const v3 = `${seed}/massing/v3`;
+    const supportW = mainW * 0.3;
+    const supportHeight = heightM;
+    const left = put(localRect(bounds, angle, centre, baseX, baseY, supportW, mainH), "bridge-support", 0, supportHeight);
+    const right = put(localRect(bounds, angle, centre, baseX + mainW - supportW, baseY, supportW, mainH), "bridge-support", 0, supportHeight);
+    if (!left || !right) return [];
+    const connectorHeight = Math.min(12, Math.max(6, heightM * 0.18));
+    const connectorElevation = Math.min(heightM - connectorHeight, heightM * range(`${v3}/bridge/elevation`, 0.48, 0.68));
+    const connectorDepth = mainH * 0.4;
+    // The connector spans only the clear gap between the supports. Its end faces
+    // coincide with the supports' inner faces, giving a continuous bridge without
+    // wasting overlapping 3D volume.
+    const connector = put(
+      localRect(bounds, angle, centre, baseX + supportW, baseY + (mainH - connectorDepth) / 2, mainW - supportW * 2, connectorDepth),
+      "skybridge",
+      connectorElevation,
+      connectorHeight
+    );
+    if (!connector) return [];
+    return [left, right, connector];
+  }
+
+  if (archetype === "cantilever") {
+    const v3 = `${seed}/massing/v3`;
+    const massCount = definition.massing.minMasses +
+      Math.floor(hashUnit(`${v3}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+    const withMechanicalFloor = massCount >= 3;
+    const baseHeight = heightM * range(`${v3}/cantilever/base-height`, 0.28, 0.36);
+    const baseW = mainW * 0.64;
+    const baseH = mainH * 0.62;
+    const base = put(localRect(bounds, angle, centre, baseX + (mainW - baseW) / 2, baseY + (mainH - baseH) / 2, baseW, baseH), "cantilever-base", 0, baseHeight);
+    if (!base) return [];
+    const upperW = mainW * 0.82;
+    const upperH = mainH * 0.72;
+    const shiftX = (hashUnit(`${v3}/cantilever/x`) < 0.5 ? -1 : 1) * (mainW - upperW) * 0.42;
+    const shiftY = (hashUnit(`${v3}/cantilever/y`) < 0.5 ? -1 : 1) * (mainH - upperH) * 0.42;
+    const upper = put(
+      localRect(bounds, angle, centre, baseX + (mainW - upperW) / 2 + shiftX, baseY + (mainH - upperH) / 2 + shiftY, upperW, upperH),
+      "cantilever-slab",
+      withMechanicalFloor ? baseHeight + heightM * 0.1 : baseHeight,
+      heightM - baseHeight - (withMechanicalFloor ? heightM * 0.1 : 0)
+    );
+    if (!upper) return [];
+    if (!withMechanicalFloor) return [base, upper];
+    const mechanical = put(
+      localRect(bounds, angle, centre, baseX + mainW * 0.14, baseY + mainH * 0.11, mainW * 0.72, mainH * 0.78),
+      "widened-mechanical-floor",
+      baseHeight,
+      heightM * 0.1
+    );
+    if (!mechanical) return [];
+    return [base, mechanical, upper];
+  }
   const declaredCount = definition.massing.minMasses + Math.floor(hashUnit(`${seed}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+
 
   if (archetype === "rectangle") {
     const masses: RawMass[] = [];
@@ -1751,6 +1927,18 @@ export function planParcelBuilding(
   }
   const bank = parcelBank(district, banks);
   const buildingId = stableId("building", `${parcel.id}|${grammarId}|${rawMasses.map((mass) => pointKey(mass.footprint[0]!)).join("+")}`);
+  let frontagePlan: BuildingFrontagePlan | null = null;
+  if (frontage !== null) {
+    const cosine = Math.cos(parcel.frontageAngleRad);
+    const sine = Math.sin(parcel.frontageAngleRad);
+    const outward = frontage.axis === "u"
+      ? { x: frontage.sign * cosine, y: frontage.sign * sine }
+      : { x: -frontage.sign * sine, y: frontage.sign * cosine };
+    frontagePlan = {
+      angleRad: frontage.angleRad ?? (frontage.axis === "v" ? parcel.frontageAngleRad : parcel.frontageAngleRad + Math.PI / 2),
+      outward
+    };
+  }
   const masses: BuildingMassPlan[] = rawMasses.map((raw, index) => {
     const massSeed = `${geometrySeed}/mass/${index}`;
     // WHY: appearance rerolls must not move geometry, IDs, or associations.
@@ -1767,6 +1955,7 @@ export function planParcelBuilding(
       archetype: grammar.archetype,
       elevationM: raw.elevationM,
       heightM: raw.heightM,
+      frontage: frontagePlan,
       roofline,
       facadeProfile,
       massing: raw.kind,
@@ -2452,12 +2641,32 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
       }
       if (parcel && validRing(mass.footprint) && !ringContained(mass.footprint, parcel.polygon)) problems.push(`Building "${building.id}" mass ${mass.index} is not contained in its parcel.`);
       if (typeof mass.neonEnabled !== "boolean") problems.push(`Building "${building.id}" mass ${mass.index} has an invalid neon flag.`);
+      const frontageDescriptor: unknown = mass.frontage;
+      if (frontageDescriptor === undefined) {
+        problems.push(`Building "${building.id}" mass ${mass.index} is missing its frontage descriptor.`);
+      } else if (frontageDescriptor !== null) {
+        const candidate = isRecord(frontageDescriptor) ? frontageDescriptor : null;
+        const outward = candidate !== null && isRecord(candidate.outward) ? candidate.outward : null;
+        const angleRad = candidate !== null && typeof candidate.angleRad === "number" ? candidate.angleRad : NaN;
+        const outwardX = outward !== null && typeof outward.x === "number" ? outward.x : NaN;
+        const outwardY = outward !== null && typeof outward.y === "number" ? outward.y : NaN;
+        const length = Math.hypot(outwardX, outwardY);
+        if (!Number.isFinite(angleRad) || !Number.isFinite(length) || Math.abs(length - 1) > GEOMETRY_EPSILON) {
+          problems.push(`Building "${building.id}" mass ${mass.index} has an invalid frontage descriptor.`);
+        }
+      }
+      const firstFrontage = building.masses[0]?.frontage ?? null;
+      if (JSON.stringify(mass.frontage) !== JSON.stringify(firstFrontage)) {
+        problems.push(`Building "${building.id}" masses do not share one frontage descriptor.`);
+      }
     }
     for (let left = 0; left < building.masses.length; left++) {
       for (let right = left + 1; right < building.masses.length; right++) {
         const a = building.masses[left]!;
         const b = building.masses[right]!;
-        // WHY: stacked volumes may share footprint only when their elevation spans do not overlap.
+        // Stacked volumes may share footprint only when their elevation spans do not
+        // overlap. This invariant is universal: bridge connectors meet their supports
+        // face-to-face rather than penetrating them.
         const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
         if (spansOverlap && ringOverlaps(a.footprint, b.footprint)) {
           problems.push(`Building "${building.id}" masses ${left} and ${right} overlap.`);
