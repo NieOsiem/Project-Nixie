@@ -2,6 +2,11 @@ export interface LeanCurvePoint {
   zoom: number;
   strength: number;
 }
+/**
+ * Below the user-calibrated overview zoom, lean strength falls with zoom so facade
+ * height cannot keep growing relative to shrinking building footprints.
+ */
+export const LEAN_ZOOM_OUT_CUTOFF = 0.05053900390751178;
 
 export const DOLLY_LEAN_POINTS: readonly LeanCurvePoint[] = [
   { zoom: 0.03, strength: 0.15 },
@@ -77,4 +82,10 @@ export function dollyLeanStrength(zoom: number): number {
     (-2 * t3 + 3 * t2) * ys[i + 1]! +
     (t3 - t2) * width * tangents[i + 1]!
   );
+}
+
+export function capOverviewLeanStrength(zoom: number, leanStrength: number): number {
+  return zoom < LEAN_ZOOM_OUT_CUTOFF
+    ? leanStrength * zoom / LEAN_ZOOM_OUT_CUTOFF
+    : leanStrength;
 }

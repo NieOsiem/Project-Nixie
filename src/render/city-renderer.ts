@@ -8,7 +8,10 @@ import {
 } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
-import { dollyLeanStrength } from "../core/lean-curve.js";
+import {
+  capOverviewLeanStrength,
+  dollyLeanStrength
+} from "../core/lean-curve.js";
 import { BloomChain } from "./bloom.js";
 import { DEFAULT_LOOK_DIALS, type LookDials } from "./look-dials.js";
 import {
@@ -253,10 +256,11 @@ export class CityRenderer {
   leanCalibrationPoint(): LeanCalibrationPoint {
     const camera = this.#lastCamera;
     if (camera === null) throw new Error("The city has not rendered a camera frame yet.");
-    const leanStrength =
+    const selectedLeanStrength =
       this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
         ? (this.#leanOverride ?? this.#automaticLeanStrength)
         : 1;
+    const leanStrength = capOverviewLeanStrength(this.#cameraZoom, selectedLeanStrength);
     return {
       zoom: this.#cameraZoom,
       leanStrength,
@@ -446,10 +450,12 @@ export class CityRenderer {
     this.#pivotUv[1] = camera.stageY / camera.screenHeight;
     const zoom = camera.scale > 0 ? camera.scale : 1;
     const automaticLeanStrength = dollyLeanStrength(zoom);
-    const leanStrength =
+    const selectedLeanStrength =
       this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
         ? (this.#leanOverride ?? automaticLeanStrength)
         : 1;
+    // Preserve the calibrated overview's apparent facade-height/building-width ratio.
+    const leanStrength = capOverviewLeanStrength(zoom, selectedLeanStrength);
     const cameraHeightPx = this.#cameraHeightMetres * this.#pixelsPerMetre;
     this.#cameraZoom = zoom;
     this.#automaticLeanStrength = automaticLeanStrength;

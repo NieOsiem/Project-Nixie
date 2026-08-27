@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { DOLLY_LEAN_POINTS, dollyLeanStrength } from "./lean-curve.js";
+import {
+  DOLLY_LEAN_POINTS,
+  LEAN_ZOOM_OUT_CUTOFF,
+  capOverviewLeanStrength,
+  dollyLeanStrength
+} from "./lean-curve.js";
 
 describe("dollyLeanStrength", () => {
   it.each(DOLLY_LEAN_POINTS)("passes through $zoom -> $strength", ({ zoom, strength }) => {
@@ -37,9 +42,15 @@ describe("dollyLeanStrength", () => {
     expect(dollyLeanStrength(0.7290772227456292)).toBeCloseTo(3.351410554125601, 12);
   });
 
-  it("continues without a top cap and holds the lowest sampled value below range", () => {
+  it("holds the lowest sampled value below range and continues without a top cap", () => {
     expect(dollyLeanStrength(0.01)).toBeCloseTo(0.15, 12);
     expect(dollyLeanStrength(8)).toBeGreaterThan(32);
+  });
+
+  it("caps perceived facade height below the calibrated overview zoom", () => {
+    expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF, 1)).toBe(1);
+    expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF / 2, 1)).toBe(0.5);
+    expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF / 4, 3)).toBe(0.75);
   });
 
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid zoom %s", (zoom) => {

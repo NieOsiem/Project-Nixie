@@ -3,7 +3,7 @@ import { CAMERA_ZOOM_MODE } from "../constants.js";
 import { visibleWorldRect, type CameraState } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
-import { dollyLeanStrength } from "../core/lean-curve.js";
+import { LEAN_ZOOM_OUT_CUTOFF, dollyLeanStrength } from "../core/lean-curve.js";
 import { WHOLE_CITY_CHUNK_ID } from "./chunk-culling.js";
 import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
 import { FRAME_QUALITY } from "./frame-quality.js";
@@ -1293,6 +1293,20 @@ describe("CityRenderer culling", () => {
     });
     r.destroy();
   });
+  it("caps apparent facade height below the calibrated overview zoom in every mode", () => {
+    const r = make();
+    const farZoom = LEAN_ZOOM_OUT_CUTOFF / 2;
+    r.update(cam({ scale: farZoom }));
+    expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBeCloseTo(
+      dollyLeanStrength(farZoom) / 2
+    );
+
+    r.cameraZoomMode = CAMERA_ZOOM_MODE.FIXED;
+    r.update(cam({ scale: farZoom }));
+    expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBeCloseTo(0.5);
+    r.destroy();
+  });
+
 
   it("applies and reports an uncapped calibration override", () => {
     const r = make();
