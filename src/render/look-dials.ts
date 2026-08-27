@@ -21,6 +21,12 @@ export interface LookDials {
   shadowStrength: number;
   aoStrength: number;
   aoHeightM: number;
+  /** Tight matte darkening immediately outside building footprints and in narrow gaps. */
+  contactAoStrength: number;
+  /** Selected low-frequency colored bounce from major neon onto low nearby surfaces. */
+  lightSpillStrength: number;
+  /** World-space reach of the existing wide-bloom samples used for local colored bounce. */
+  lightSpillRadius: number;
   streakStrength: number;
   wetStrength: number;
   puddleCoverage: number;
@@ -28,6 +34,8 @@ export interface LookDials {
   wetDarken: number;
   wetGloss: number;
   smearStrength: number;
+  /** Sharp colored wide-bloom reflection visible only inside standing-water masks. */
+  puddleReflectionStrength: number;
   smearHeightM: number;
   rainDrops: number;
   rainSpeedMPS: number;
@@ -78,6 +86,9 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   shadowStrength: 0.30,
   aoStrength: 0.42,
   aoHeightM: 24,
+  contactAoStrength: 0.62,
+  lightSpillStrength: 1.35,
+  lightSpillRadius: 17,
   streakStrength: 1.5,
   wetStrength: 0.85,
   puddleCoverage: 0.32,
@@ -85,6 +96,7 @@ export const DEFAULT_LOOK_DIALS: LookDials = {
   wetDarken: 0.64,
   wetGloss: 1,
   smearStrength: 1.5,
+  puddleReflectionStrength: 1.6,
   smearHeightM: 70,
   rainDrops: 0.55,
   // Stylised, not meteorological: a top-down camera projects almost none of a raindrop's 9 m/s

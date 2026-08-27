@@ -116,6 +116,9 @@ describe("composite shader", () => {
       "uniform float uShadowStrength;",
       "uniform float uAoStrength;",
       "uniform float uAoHeightM;",
+      "uniform float uContactAoStrength;",
+      "uniform float uLightSpillStrength;",
+      "uniform float uLightSpillRadius;",
       "uniform float uFogStrength;",
       "uniform float uFogDensity;",
       "uniform float uFogHeightM;",
@@ -124,6 +127,7 @@ describe("composite shader", () => {
       "uniform float uFogTintG;",
       "uniform float uFogTintB;",
       "uniform float uBlackLift;",
+      "uniform float uPuddleReflectionStrength;",
       "uniform float uDebugGrayscale;"
     ]) {
       expect(COMPOSITE_FRAG).toContain(uniform);
@@ -142,57 +146,116 @@ describe("composite shader", () => {
     );
   });
 
-  it("multiplies AO down on low covered surfaces and tightens contact outside silhouettes", () => {
+  it("uses four quarter-res neighbours for a tight dial-driven contact ring", () => {
     expect(COMPOSITE_FRAG).toContain("float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);");
     expect(COMPOSITE_FRAG).toContain("float lowSurface = lowness * covered;");
+    expect(COMPOSITE_FRAG).toContain("float aoEdge = max(");
+    expect(COMPOSITE_FRAG).toContain("float contactBand = smoothstep(0.42, 0.72, ao)");
     expect(COMPOSITE_FRAG).toContain(
-      "float contactAo = smoothstep(0.30, 0.70, ao) * (1.0 - buildingCoverage);"
+      "float contactAo = max(smoothstep(0.035, 0.16, aoEdge), contactBand)"
     );
     expect(COMPOSITE_FRAG).toContain("c *= 1.0 - uAoStrength * ao * lowSurface;");
     expect(COMPOSITE_FRAG).toContain(
-      "c *= 1.0 - uAoStrength * 0.35 * contactAo * lowSurface;"
+      "c *= 1.0 - clamp(uContactAoStrength, 0.0, 1.0) * contactAo * lowSurface;"
     );
-    expect(COMPOSITE_FRAG.match(/texture2D\(uAo/g)).toHaveLength(1);
+    expect(COMPOSITE_FRAG.match(/texture2D\(uAo/g)).toHaveLength(5);
   });
 
-  it("builds a covered low-ground mask and anchors puddles in world space", () => {
+  it("places a world-space multi-scale puddle union from road, curb, and drainage cues", () => {
     expect(COMPOSITE_FRAG).toContain("uniform vec2 uWorldOriginM;");
     expect(COMPOSITE_FRAG).toContain("uniform vec2 uWorldSizeM;");
     expect(COMPOSITE_FRAG).toContain("vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;");
-    expect(COMPOSITE_FRAG).toContain("float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;");
     expect(COMPOSITE_FRAG).toContain(
-      "float puddleNoise = valueNoise(\n    vec2(worldM.x, worldM.y * PUDDLE_STRETCH_Y) / max(uPuddleScaleM, 0.001));"
+      "float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;"
     );
-    expect(COMPOSITE_FRAG).toContain("float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);");
-    expect(COMPOSITE_FRAG).toContain("float wetIn = puddleThreshold - PUDDLE_EDGE_WET;");
+    expect(COMPOSITE_FRAG.match(/texture2D\(uScene/g)).toHaveLength(5);
+    expect(COMPOSITE_FRAG).toContain("float roadEdge = smoothstep(0.025, 0.12, max(");
+    expect(COMPOSITE_FRAG).toContain("float broadRoad = (leftRoad + rightRoad + upRoad + downRoad) * 0.25;");
+    expect(COMPOSITE_FRAG).toContain("float drainageBand = 1.0 - smoothstep(");
+    expect(COMPOSITE_FRAG).toContain("float tinyField =");
+    expect(COMPOSITE_FRAG).toContain("float mediumField =");
+    expect(COMPOSITE_FRAG).toContain("float hugeField =");
     expect(COMPOSITE_FRAG).toContain(
-      "float puddle = smoothstep(wetIn, puddleThreshold + PUDDLE_EDGE_DRY, puddleNoise)"
+      "float puddleNoise = max(tinyField - 0.08, max(mediumField, hugeField - 0.04))"
     );
-    expect(COMPOSITE_FRAG).toContain(
-      "float rim = smoothstep(wetIn, puddleThreshold, puddleNoise)"
-    );
-    expect(COMPOSITE_FRAG).toContain("* step(0.0001, uPuddleCoverage);");
+    expect(COMPOSITE_FRAG).toContain("* roadMask * coverageGate;");
+    expect(COMPOSITE_FRAG).toContain("float coverageGate = step(0.0001, uPuddleCoverage);");
   });
 
-  it("darkens before the cast shadow and applies only a bounded light-aware gloss", () => {
-    const wetDarken = COMPOSITE_FRAG.indexOf(
-      "c *= mix(vec3(1.0), clamp(uWetDarken, 0.0, 1.0) * WET_DARKEN_TINT,"
+  it("orders damp road, matte occlusion, sharp reflection, spill, then the locked grade", () => {
+    const wetDarken = COMPOSITE_FRAG.indexOf("c *= mix(vec3(1.0), darkTarget, darkMask);");
+    const broadGloss = COMPOSITE_FRAG.indexOf(
+      "c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), broadGloss);"
     );
-    const rimMask = COMPOSITE_FRAG.indexOf("clamp(wet + PUDDLE_RIM_DARKEN * rim, 0.0, 1.0));");
-    const gloss = COMPOSITE_FRAG.indexOf("c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), gloss);");
+    const reflectionInputs = COMPOSITE_FRAG.indexOf("float reflectionAmount =");
     const shadow = COMPOSITE_FRAG.indexOf("float castShadow =");
-    expect(wetDarken).toBeGreaterThan(-1);
-    expect(rimMask).toBeGreaterThan(wetDarken);
-    expect(gloss).toBeGreaterThan(rimMask);
-    expect(shadow).toBeGreaterThan(gloss);
     const ao = COMPOSITE_FRAG.indexOf("float ao =");
-    const depth = COMPOSITE_FRAG.indexOf("c *= 1.0 - 0.1 * smoothstep");
+    const generalAo = COMPOSITE_FRAG.indexOf("c *= 1.0 - uAoStrength * ao * lowSurface;");
+    const contactAo = COMPOSITE_FRAG.indexOf(
+      "c *= 1.0 - clamp(uContactAoStrength, 0.0, 1.0) * contactAo * lowSurface;"
+    );
+    const reflection = COMPOSITE_FRAG.indexOf("c = mix(c, reflectionTarget,");
+    const spill = COMPOSITE_FRAG.indexOf("c = mix(c, spillTarget,");
+    const grade = COMPOSITE_FRAG.indexOf("c = c * vec3(0.94, 0.91, 1.10)");
     const fog = COMPOSITE_FRAG.indexOf("c = mix(c, haze, clamp(fog, 0.0, 1.0));");
+    expect(wetDarken).toBeGreaterThan(-1);
+    expect(broadGloss).toBeGreaterThan(wetDarken);
+    expect(reflectionInputs).toBeGreaterThan(broadGloss);
+    expect(shadow).toBeGreaterThan(reflectionInputs);
     expect(ao).toBeGreaterThan(shadow);
-    expect(depth).toBeGreaterThan(ao);
-    expect(fog).toBeGreaterThan(depth);
-    expect(COMPOSITE_FRAG).toContain("float light = clamp(dot(c, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);");
+    expect(generalAo).toBeGreaterThan(ao);
+    expect(contactAo).toBeGreaterThan(generalAo);
+    expect(reflection).toBeGreaterThan(contactAo);
+    expect(spill).toBeGreaterThan(reflection);
+    expect(grade).toBeGreaterThan(spill);
+    expect(fog).toBeGreaterThan(grade);
     expect(COMPOSITE_FRAG).not.toMatch(/c\s*\+=/);
+  });
+
+  it("uses local colored wide bloom for sharp puddle reflection and the fan only for diffuse spill", () => {
+    expect(COMPOSITE_FRAG.match(/texture2D\(uBloomWide/g)).toHaveLength(6);
+    expect(COMPOSITE_FRAG).toContain(
+      "vec3 fanBloom = (wideBloom + fanForward + fanBack + fanLeft + fanRight) * 0.2;"
+    );
+    expect(COMPOSITE_FRAG).toContain("vec3 reflectionBloom = wideBloom;");
+    expect(COMPOSITE_FRAG).not.toContain("reflectionBloom = max(");
+    expect(COMPOSITE_FRAG).toContain("float reflectionChroma =");
+    expect(COMPOSITE_FRAG).toContain("float reflectionAmount = wet * smoothstep(0.48, 0.90, puddle)");
+    expect(COMPOSITE_FRAG).toContain(
+      "float reflectionSelect = smoothstep(0.020, 0.120, reflectionLuma)"
+    );
+    expect(COMPOSITE_FRAG).toContain("* smoothstep(0.010, 0.080, reflectionChroma);");
+    expect(COMPOSITE_FRAG).toContain(
+      "* min(reflectionLuma * uWideStrength * 1.8, 0.60);"
+    );
+    expect(COMPOSITE_FRAG).toContain("float spillChroma =");
+    expect(COMPOSITE_FRAG).toContain(
+      "float spillSelect = smoothstep(0.020, 0.120, spillLuma)"
+    );
+    expect(COMPOSITE_FRAG).toContain("* smoothstep(0.010, 0.080, spillChroma);");
+    expect(COMPOSITE_FRAG).toContain(
+      "c + spillHue * min(spillLuma * uWideStrength * 1.8, 0.54),"
+    );
+    expect(COMPOSITE_FRAG).toContain("float spillHeight = 1.0 - smoothstep(2.0, 16.0, heightM);");
+    expect(COMPOSITE_FRAG).toContain("float surfaceHeightEdge = max(");
+    expect(COMPOSITE_FRAG).toContain(
+      "float lowWall = smoothstep(0.0015, 0.020, surfaceHeightEdge)"
+    );
+    expect(COMPOSITE_FRAG).toContain("float spillSurface = max(ground, lowWall) * covered;");
+    expect(COMPOSITE_FRAG).toContain(
+      "float spillOcclusion = 1.0 - clamp(ao * 0.72 + contactAo * 0.90, 0.0, 1.0);"
+    );
+  });
+
+  it("rejects white local sources at the shared chroma gate", () => {
+    const smoothstep = (lo: number, hi: number, value: number): number => {
+      const t = Math.min(Math.max((value - lo) / (hi - lo), 0), 1);
+      return t * t * (3 - 2 * t);
+    };
+    const selected = (luma: number, chroma: number): number =>
+      smoothstep(0.020, 0.120, luma) * smoothstep(0.010, 0.080, chroma);
+    expect(selected(1, 0)).toBe(0);
+    expect(selected(0.12, 0.08)).toBe(1);
   });
 
   it("smears only wide bloom away from the pivot, masked by the wet field", () => {
@@ -293,6 +356,9 @@ describe("look dials", () => {
       shadowStrength: 0.30,
       aoStrength: 0.42,
       aoHeightM: 24,
+      contactAoStrength: 0.62,
+      lightSpillStrength: 1.35,
+      lightSpillRadius: 17,
       streakStrength: 1.5,
       wetStrength: 0.85,
       puddleCoverage: 0.32,
@@ -300,6 +366,7 @@ describe("look dials", () => {
       wetDarken: 0.64,
       wetGloss: 1,
       smearStrength: 1.5,
+      puddleReflectionStrength: 1.6,
       smearHeightM: 70,
       rainDrops: 0.55,
       rainSpeedMPS: 35,

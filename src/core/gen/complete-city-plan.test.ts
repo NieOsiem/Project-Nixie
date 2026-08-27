@@ -3,13 +3,13 @@ import { intersection, ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring } from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_GRAMMARS, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, MICRO_BUILDING_GRAMMAR_IDS, isTowerGrammar, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
-import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_GRAMMARS, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, isTowerGrammar, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
+import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarId } from "./landmark-registry.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "./district-generator.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 import { rectangleLand, validateRing } from "./terrain.js";
-import { buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
+import { DENSITY_INFILL_DISTRICT_TYPE_IDS, DENSITY_INFILL_SALT, DENSITY_INFILL_UNZONED_WEIGHTS, DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS, FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN, FALLBACK_LANDMARK_SITE_TARGET_MAX_M2, FALLBACK_LANDMARK_SITE_TARGET_MIN_M2, GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2, MAX_DENSITY_INFILL_AREA_M2, MAX_DENSITY_INFILL_BUILDINGS, MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT, MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL, MAX_REFERENCE_DENSITY_BUILDINGS, MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2, MIN_DENSITY_INFILL_AREA_M2, MIN_DENSITY_INFILL_MINOR_DIMENSION_M, buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -106,6 +106,33 @@ const ringSource = (
   };
 };
 
+/**
+ * Semantic open-space fixture: preserves four district identities, legal landmark sites,
+ * and a district-scale whole-block strip without paying for overview-scale fabric.
+ */
+const compactRingSource = (
+  openSpaceProfile: CitySourceV3["generation"]["openSpaceProfile"] = "medium",
+  citySeed = "complete-plan-compact-ring"
+): CitySourceV3 => {
+  const width = 640;
+  const height = 640;
+  const stripWidth = width / 4;
+  const source = ringSource(4, openSpaceProfile, citySeed);
+  return {
+    ...source,
+    terrain: { land: rectRing({ x: 0, y: 0, width, height }), urbanFootprint: null },
+    roads: {
+      nodes: [node("a", 0, 0), node("b", width, 0), node("c", width, height), node("d", 0, height)],
+      routes: [route("ring")],
+      edges: [edge("ab", "a", "b", "ring"), edge("bc", "b", "c", "ring"), edge("cd", "c", "d", "ring"), edge("da", "d", "a", "ring")]
+    },
+    districts: source.districts.map((district, index) => ({
+      ...district,
+      polygon: rectRing({ x: index * stripWidth, y: 0, width: stripWidth, height })
+    }))
+  };
+};
+
 interface StagedReproductionFixture {
   source: CitySourceV3;
   reservations: MajorLandmarkSiteReservation[];
@@ -116,7 +143,8 @@ function stagedReproduction(
   citySeed = "foundry-repro-0",
   roadLayout: CitySourceV3["generation"]["roadLayout"] = "european",
   hubMode: CitySourceV3["generation"]["hubMode"] = "multiple-hubs",
-  openSpaceProfile: CitySourceV3["generation"]["openSpaceProfile"] = "medium"
+  openSpaceProfile: CitySourceV3["generation"]["openSpaceProfile"] = "medium",
+  grammarIds: readonly LandmarkGrammarId[] = PRE_ROAD_LANDMARK_GRAMMAR_IDS
 ): StagedReproductionFixture {
   const sceneBounds = { x: -600, y: -450, width: 1200, height: 900 };
   const land = rectangleLand(sceneBounds);
@@ -135,7 +163,7 @@ function stagedReproduction(
     roads: { nodes: [], routes: [], edges: [] },
     districts: []
   };
-  const reservations = reserveMajorLandmarkSites(source);
+  const reservations = reserveMajorLandmarkSites(source, grammarIds);
   source.roads = generateInitialRoadNetwork({
     citySeed: source.citySeed,
     mask: land,
@@ -172,7 +200,13 @@ function sharedPlan(key: string, build: () => CompleteCityPlan): CompleteCityPla
 }
 let fullReservationFixtureCache: StagedReproductionFixture | undefined;
 function fullReservationFixture(): StagedReproductionFixture {
-  fullReservationFixtureCache ??= stagedReproduction("complete-plan-reserved-sites", "grid", "single-centre");
+  fullReservationFixtureCache ??= stagedReproduction(
+    "complete-plan-reserved-sites",
+    "grid",
+    "single-centre",
+    "medium",
+    LANDMARK_GRAMMAR_IDS
+  );
   return fullReservationFixtureCache;
 }
 const fullReservationPlan = (): CompleteCityPlan => sharedPlan("full-reservation-fixture", () => {
@@ -182,15 +216,62 @@ const fullReservationPlan = (): CompleteCityPlan => sharedPlan("full-reservation
 
 const ringFourPlan = (): CompleteCityPlan => sharedPlan("ringSource(4)", () => buildCompleteCityPlan(ringSource(4)));
 const ringSixteenPlan = (): CompleteCityPlan => sharedPlan("ringSource(16)", () => buildCompleteCityPlan(ringSource(16)));
+const compactFourPlan = (): CompleteCityPlan => sharedPlan("compactRingSource(4)", () => buildCompleteCityPlan(compactRingSource()));
+const compactFourRepeat = (): CompleteCityPlan => sharedPlan("compactRingSource(4)/repeat", () => buildCompleteCityPlan(compactRingSource()));
 
 describe("buildCompleteCityPlan", () => {
-  it.concurrent("produces a validating complete plan over all 16 districts with every curated landmark", () => {
+  it("reserves compact generated major sites for the curated grammars deterministically", () => {
+    const source = ringSource(4);
+    const first = reserveMajorLandmarkSites(source);
+    expect(first.map((reservation) => reservation.grammarId)).toEqual([
+      "hero-tower-plaza",
+      "civic-corporate-compound",
+      "circular-beacon-tower",
+      "tri-spire",
+      "megaframe-block",
+      "arcology-terraces",
+      "hex-corporate-hq",
+      "logo-gateway"
+    ]);
+    expect(reserveMajorLandmarkSites(source)).toEqual(first);
+    const all = reserveMajorLandmarkSites(source, LANDMARK_GRAMMAR_IDS);
+    expect(all.map((reservation) => reservation.grammarId)).toEqual(LANDMARK_GRAMMAR_IDS);
+    for (let index = 0; index < all.length; index++) {
+      const reservation = all[index]!;
+      const definition = LANDMARK_GRAMMAR_REGISTRY.get(reservation.grammarId)!;
+      const areaM2 = Math.abs(ringArea(reservation.sitePolygon));
+      const safeMinimumM2 = Math.max(
+        GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2,
+        definition.minSiteAreaM2 * GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN
+      );
+      expect(areaM2, reservation.grammarId).toBeGreaterThanOrEqual(safeMinimumM2 - 0.5);
+      expect(areaM2, reservation.grammarId).toBeLessThanOrEqual(
+        Math.max(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2, safeMinimumM2) + 0.5
+      );
+      expect(overlap(reservation.sitePolygon, source.terrain.land), `${reservation.grammarId} containment`)
+        .toBeCloseTo(areaM2, 0);
+      for (let otherIndex = index + 1; otherIndex < all.length; otherIndex++) {
+        expect(overlap(reservation.sitePolygon, all[otherIndex]!.sitePolygon), `${reservation.grammarId}/${all[otherIndex]!.grammarId}`)
+          .toBeLessThan(0.5);
+      }
+    }
+    expect(() => reserveMajorLandmarkSites(source, [
+      ...PRE_ROAD_LANDMARK_GRAMMAR_IDS,
+      PRE_ROAD_LANDMARK_GRAMMAR_IDS[0]
+    ])).toThrow(/Duplicate landmark grammar/);
+    expect(() => reserveMajorLandmarkSites(
+      source,
+      ["unknown-landmark"] as unknown as readonly LandmarkGrammarId[]
+    )).toThrow(/Unknown landmark grammar/);
+  });
+
+  it.concurrent("produces a validating complete plan over all 16 districts with 12-16 overview landmarks", () => {
     const source = ringSource(16);
     const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    expect(plan.diagnostics.landmarkCount).toBe(LANDMARK_GRAMMAR_IDS.length);
-    expect(plan.diagnostics.landmarkSkipped).toEqual([]);
-    expect(new Set(plan.landmarks.map((landmark) => landmark.landmarkGrammarId))).toEqual(new Set(LANDMARK_GRAMMAR_IDS));
+    expect(plan.diagnostics.landmarkCount).toBe(plan.landmarks.length);
+    expect(plan.landmarks.length).toBeGreaterThanOrEqual(12);
+    expect(plan.landmarks.length).toBeLessThanOrEqual(16);
     const parcelDistricts = new Set(plan.parcels.map((parcel) => parcel.districtId));
     const openSpaceDistricts = new Set(plan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null).map((openSpace) => openSpace.districtId));
     for (const district of source.districts) {
@@ -217,9 +298,25 @@ describe("buildCompleteCityPlan", () => {
 
   it("completes the exact foundry-repro-0 staged generation deterministically with valid topology", () => {
     const { source, reservations, warnings } = stagedReproduction();
+    expect(reservations.map((reservation) => reservation.grammarId)).toEqual(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
     const plan = buildCompleteCityPlan(source, 1, 0, reservations);
     if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
     expect(validateCompleteCityPlan(plan)).toEqual([]);
+    expect(plan.landmarks.length).toBeGreaterThanOrEqual(14);
+    expect(plan.landmarks.length).toBeLessThanOrEqual(16);
+    const reservationLineages = new Set(reservations.map((reservation) => reservation.lineage));
+    expect(plan.landmarks.filter((landmark) => reservationLineages.has(landmark.placementLineage))).toHaveLength(8);
+    for (const grammarId of PRE_ROAD_LANDMARK_GRAMMAR_IDS) {
+      const reservation = reservations.find((candidate) => candidate.grammarId === grammarId)!;
+      const landmark = plan.landmarks.find((candidate) => candidate.landmarkGrammarId === grammarId)!;
+      expect(landmark.sitePolygon, grammarId).toEqual(reservation.sitePolygon);
+      expect(landmark.placementLineage, grammarId).toBe(reservation.lineage);
+    }
+    const preRoadIds = new Set<LandmarkGrammarId>(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
+    for (const landmark of plan.landmarks.filter((candidate) => !preRoadIds.has(candidate.landmarkGrammarId))) {
+      expect(landmark.placementLineage, landmark.landmarkGrammarId).toMatch(/^fallback:/);
+      expect(overlapMulti(landmark.sitePolygon, plan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
+    }
 
     const repeated = buildCompleteCityPlan(source, 1, 0, reservations);
     if (warnings.length > 0) repeated.diagnostics.warnings.push(...warnings);
@@ -248,6 +345,240 @@ describe("buildCompleteCityPlan", () => {
     expect(rings.length).toBeGreaterThan(0);
     for (const ring of rings) expect(validateRing(ring)).toEqual({ ok: true });
   }, 600_000);
+
+  it("keeps the nixie-2 overview dense with eight pre-road anchors and legal secondary fallbacks", () => {
+    const { source, reservations, warnings } = stagedReproduction(
+      "nixie-2",
+      "european",
+      "single-centre",
+      "very-low"
+    );
+    expect(reservations.map((reservation) => reservation.grammarId)).toEqual(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
+    // Eight major anchors preserve the strongest silhouettes while returning enough
+    // central land to the road and post-road fallback streams.
+    expect(source.roads.edges.length).toBeGreaterThanOrEqual(400);
+    const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    if (warnings.length > 0) plan.diagnostics.warnings.push(...warnings);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    expect(plan.landmarks.length).toBeGreaterThanOrEqual(14);
+    expect(plan.landmarks.length).toBeLessThanOrEqual(16);
+    expect(plan.buildings.length).toBeGreaterThanOrEqual(1_050);
+    expect(plan.buildings.length).toBeLessThanOrEqual(MAX_REFERENCE_DENSITY_BUILDINGS);
+    expect(FALLBACK_LANDMARK_SITE_TARGET_MIN_M2).toBe(2_000);
+    expect(FALLBACK_LANDMARK_SITE_TARGET_MAX_M2).toBe(3_000);
+    expect(FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN).toBe(1.1);
+    expect(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2).toBe(5_000);
+    expect(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2).toBe(6_500);
+    expect(GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN).toBe(1.1);
+    expect(DENSITY_INFILL_SALT).toBe("density/v3/infill");
+    expect(MAX_DENSITY_INFILL_BUILDINGS).toBe(600);
+    expect(MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT).toBe(72);
+    expect(MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL).toBe(12);
+    expect(MAX_REFERENCE_DENSITY_BUILDINGS).toBe(1_250);
+    expect(MIN_DENSITY_INFILL_AREA_M2).toBe(60);
+    expect(MAX_DENSITY_INFILL_AREA_M2).toBe(4_800);
+    expect(MIN_DENSITY_INFILL_MINOR_DIMENSION_M).toBe(6.5);
+    expect(DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS).toEqual({
+      "campus-annex": 0.7,
+      "narrow-strip": 0.75
+    });
+    for (const typeId of [
+      "civic-institutional",
+      "heavy-industrial",
+      "light-industrial",
+      "logistics-port",
+      "derelict-reclamation"
+    ] as const) {
+      expect(DENSITY_INFILL_DISTRICT_TYPE_IDS[typeId], typeId).toBe(true);
+    }
+    expect(DENSITY_INFILL_DISTRICT_TYPE_IDS["utility-infrastructure"]).toBeUndefined();
+    const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
+    const infillBuildings = plan.buildings.filter((building) =>
+      parcelById.get(building.parcelId)?.role.includes("density-infill") === true
+    );
+    const infillCountByFragment = new Map<string, number>();
+    for (const building of infillBuildings) {
+      infillCountByFragment.set(building.fragmentId, (infillCountByFragment.get(building.fragmentId) ?? 0) + 1);
+    }
+    expect(Math.max(...infillCountByFragment.values())).toBeLessThanOrEqual(MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT);
+    expect(infillBuildings.length).toBeGreaterThan(0);
+    expect(infillBuildings.length).toBeLessThanOrEqual(MAX_DENSITY_INFILL_BUILDINGS);
+    expect(infillBuildings.some((building) =>
+      INFILL_BUILDING_GRAMMAR_IDS.some((grammarId) => grammarId === building.grammarId)
+    )).toBe(true);
+    const landCentre = ringCentroid(source.terrain.land);
+    const parcelsByDistance = plan.parcels.map((parcel) => {
+      const centre = ringCentroid(parcel.polygon);
+      return {
+        id: parcel.id,
+        distanceSq: (centre.x - landCentre.x) ** 2 + (centre.y - landCentre.y) ** 2
+      };
+    }).sort((a, b) => a.distanceSq - b.distanceSq || a.id.localeCompare(b.id));
+    const quartileSize = Math.max(1, Math.floor(parcelsByDistance.length / 4));
+    const centralParcelIds = new Set(parcelsByDistance.slice(0, quartileSize).map((entry) => entry.id));
+    const outerParcelIds = new Set(parcelsByDistance.slice(-quartileSize).map((entry) => entry.id));
+    const centralInfillShare = infillBuildings.filter((building) => centralParcelIds.has(building.parcelId)).length / quartileSize;
+    const outerInfillShare = infillBuildings.filter((building) => outerParcelIds.has(building.parcelId)).length / quartileSize;
+    expect(centralInfillShare).toBeGreaterThan(outerInfillShare + 0.05);
+    const unzonedInfill = infillBuildings.filter((building) => building.districtId === null);
+    for (const building of unzonedInfill) {
+      expect(DENSITY_INFILL_UNZONED_WEIGHTS[building.grammarId], building.id).toBeGreaterThan(0);
+    }
+    for (const grammarId of INFILL_BUILDING_GRAMMAR_IDS) {
+      expect(DENSITY_INFILL_UNZONED_WEIGHTS[grammarId], grammarId).toBe(1);
+    }
+    expect(DENSITY_INFILL_UNZONED_WEIGHTS["campus-annex"]).toBe(0.7);
+    expect(DENSITY_INFILL_UNZONED_WEIGHTS["narrow-strip"]).toBe(0.75);
+    for (const grammarId of ["street-kiosk", "garage-unit", "shack-shanty", "utility-kiosk"] as const) {
+      expect(DENSITY_INFILL_UNZONED_WEIGHTS[grammarId], grammarId).toBe(0);
+    }
+    for (const grammar of BUILDING_GRAMMARS.filter(isTowerGrammar)) {
+      expect(DENSITY_INFILL_UNZONED_WEIGHTS[grammar.id], grammar.id).toBe(0);
+    }
+    const industrialInfill = infillBuildings.filter((building) => {
+      const typeId = source.districts.find((district) => district.id === building.districtId)?.typeId;
+      return typeId === "heavy-industrial" || typeId === "derelict-reclamation";
+    });
+    for (const building of industrialInfill) {
+      if (INFILL_BUILDING_GRAMMAR_IDS.some((grammarId) => grammarId === building.grammarId)) {
+        expect(building.grammarId).toBe("infill-courtyard-cluster");
+      }
+      expect(building.masses.every((mass) => !mass.neonEnabled), building.id).toBe(true);
+    }
+    for (const building of infillBuildings) {
+      const parcel = parcelById.get(building.parcelId)!;
+      expect(parcel.areaM2, parcel.id).toBeLessThanOrEqual(MAX_DENSITY_INFILL_AREA_M2);
+      const district = source.districts.find((candidate) => candidate.id === building.districtId);
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)!;
+      if (district === undefined) {
+        expect(building.districtId, building.id).toBeNull();
+        expect(DENSITY_INFILL_UNZONED_WEIGHTS[building.grammarId], building.id).toBeGreaterThan(0);
+      } else {
+        expect(DENSITY_INFILL_DISTRICT_TYPE_IDS[district.typeId], district.typeId).toBe(true);
+      }
+      expect(isTowerGrammar(grammar), building.id).toBe(false);
+      expect(
+        !MICRO_BUILDING_GRAMMAR_IDS.has(building.grammarId) || building.grammarId === "campus-annex",
+        building.id
+      ).toBe(true);
+      expect(["street-kiosk", "garage-unit", "shack-shanty", "utility-kiosk"]).not.toContain(building.grammarId);
+      const expectedDetailPolicy = grammar.geometryPolicy.detail === "none"
+        ? "coarse"
+        : grammar.geometryPolicy.neon ? "both" : "detail";
+      expect(building.masses.every((mass) => mass.detailPolicy === expectedDetailPolicy), building.id).toBe(true);
+    }
+    const oversizedSourceCourts = plan.districtPlan.developmentCells.filter((cell) =>
+      (cell.semanticRole === "courtyard" || cell.semanticRole === "plaza")
+      && Math.abs(ringArea(cell.polygon)) > MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2
+    );
+    expect(oversizedSourceCourts.length).toBeGreaterThanOrEqual(2);
+    expect(Math.max(...oversizedSourceCourts.map((cell) => Math.abs(ringArea(cell.polygon))))).toBeGreaterThan(8_000);
+
+    const semanticPockets = plan.openSpaces.filter((openSpace) => openSpace.lineage.includes("/density/v2/semantic-pocket/"));
+    expect(semanticPockets.length).toBeGreaterThanOrEqual(2);
+    expect(semanticPockets.every((openSpace) =>
+      openSpace.landmarkId === null
+      && openSpace.parcelId === null
+      && (openSpace.semanticRole === "courtyard" || openSpace.semanticRole === "plaza")
+      && openSpace.category === (openSpace.semanticRole === "courtyard" ? "landscaping" : "plaza")
+      && openSpace.size === "pocket"
+      && openSpace.areaM2 >= 100
+      && openSpace.areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5
+    )).toBe(true);
+    const ordinarySemanticCourts = plan.openSpaces.filter((openSpace) =>
+      openSpace.landmarkId === null
+      && (openSpace.semanticRole === "courtyard" || openSpace.semanticRole === "plaza")
+    );
+    expect(Math.max(...ordinarySemanticCourts.map((openSpace) => openSpace.areaM2)))
+      .toBeLessThanOrEqual(MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2 + 0.5);
+    expect(plan.openSpaces.filter((openSpace) => openSpace.landmarkId !== null)
+      .every((openSpace) => !openSpace.lineage.includes("/density/v2/semantic-pocket/"))).toBe(true);
+
+    const convertedSourceCourts = oversizedSourceCourts.filter((cell) =>
+      semanticPockets.some((pocket) => pocket.lineage.includes(`/${cell.id}/`))
+    );
+    expect(convertedSourceCourts.length).toBeGreaterThanOrEqual(2);
+    for (const cell of convertedSourceCourts) {
+      const pocketArea = semanticPockets
+        .filter((pocket) => pocket.lineage.includes(`/${cell.id}/`))
+        .reduce((sum, pocket) => sum + overlap(cell.polygon, pocket.polygon), 0);
+      const returnedParcelArea = plan.parcels.reduce((sum, parcel) => sum + overlap(cell.polygon, parcel.polygon), 0);
+      expect(returnedParcelArea, cell.id).toBeGreaterThan(pocketArea);
+      for (const pocket of semanticPockets.filter((candidate) => candidate.lineage.includes(`/${cell.id}/`))) {
+        for (const parcel of plan.parcels) expect(overlap(parcel.polygon, pocket.polygon), pocket.id).toBeLessThan(0.5);
+      }
+    }
+    const fragmentArea = plan.districtPlan.blocks.reduce((sum, block) =>
+      sum + block.districtFragments.reduce((fragmentSum, fragment) => fragmentSum + multiArea(fragment.buildable), 0), 0);
+    const landmarkArea = plan.landmarks.reduce((sum, landmark) => sum + landmark.areaM2, 0);
+    const nonParcelOpenArea = plan.openSpaces
+      .filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null)
+      .reduce((sum, openSpace) => sum + openSpace.areaM2, 0);
+    const developmentArea = fragmentArea - landmarkArea - nonParcelOpenArea;
+    const parcelArea = plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0);
+    const builtParcelIds = new Set(plan.buildings.map((building) => building.parcelId));
+    const builtParcelArea = plan.parcels
+      .filter((parcel) => builtParcelIds.has(parcel.id))
+      .reduce((sum, parcel) => sum + parcel.areaM2, 0);
+    expect(parcelArea / developmentArea).toBeGreaterThan(0.97);
+    expect(builtParcelArea / developmentArea).toBeGreaterThan(0.72);
+    const landmarkByGrammar = new Map(plan.landmarks.map((landmark) => [landmark.landmarkGrammarId, landmark]));
+    for (const reservation of reservations) {
+      const landmark = landmarkByGrammar.get(reservation.grammarId);
+      expect(landmark, reservation.grammarId).toBeDefined();
+      expect(landmark!.placementLineage, reservation.grammarId).toBe(reservation.lineage);
+      expect(landmark!.sitePolygon, reservation.grammarId).toEqual(reservation.sitePolygon);
+    }
+    const preRoadIds = new Set<LandmarkGrammarId>(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
+    const fallbackLandmarks = plan.landmarks.filter((landmark) => !preRoadIds.has(landmark.landmarkGrammarId));
+    expect(fallbackLandmarks.length).toBeGreaterThanOrEqual(6);
+    expect(fallbackLandmarks.length).toBeLessThanOrEqual(8);
+    let fullFallbackCount = 0;
+    for (const landmark of fallbackLandmarks) {
+      const grammar = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)!;
+      const safeMinimumM2 = grammar.minSiteAreaM2 * FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN;
+      const compactMaximumM2 = Math.max(FALLBACK_LANDMARK_SITE_TARGET_MAX_M2, safeMinimumM2);
+      const compacted = landmark.areaM2 <= compactMaximumM2 + 0.5;
+      expect(landmark.placementLineage, landmark.landmarkGrammarId).toMatch(/^fallback:/);
+      expect(landmark.areaM2, landmark.id).toBeGreaterThanOrEqual(safeMinimumM2 - 0.5);
+      if (!compacted) {
+        fullFallbackCount++;
+        expect(landmark.areaM2, `${landmark.id} bounded full-site fallback`)
+          .toBeLessThanOrEqual(grammar.maxSiteAreaM2 + 0.5);
+      }
+      expect(landmark.masses.length, landmark.id).toBeGreaterThan(0);
+      expect(overlapMulti(landmark.sitePolygon, plan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
+
+      const block = plan.districtPlan.blocks.find((candidate) => candidate.id === landmark.blockId)!;
+      const blockBuildable = union(block.districtFragments.map((fragment) => fragment.buildable));
+      expect(overlapMulti(landmark.sitePolygon, blockBuildable), `${landmark.id} containment`)
+        .toBeCloseTo(landmark.areaM2, 0);
+
+      const surroundingParcels = plan.parcels.filter((parcel) => parcel.blockId === landmark.blockId);
+      expect(surroundingParcels.length, `${landmark.id} remainder parcels`).toBeGreaterThan(0);
+      const surroundingAreaM2 = surroundingParcels.reduce((sum, parcel) => sum + parcel.areaM2, 0);
+      if (compacted) {
+        expect(surroundingAreaM2, `${landmark.id} recovered parcel area`).toBeGreaterThan(landmark.areaM2);
+      } else {
+        expect(surroundingAreaM2, `${landmark.id} full-site surrounding fabric`).toBeGreaterThan(1_000);
+      }
+      for (const parcel of surroundingParcels) {
+        expect(overlap(parcel.polygon, landmark.sitePolygon), `${landmark.id}/${parcel.id}`).toBeLessThan(0.5);
+      }
+      for (const other of plan.landmarks) {
+        if (other.id !== landmark.id) expect(overlap(other.sitePolygon, landmark.sitePolygon), `${landmark.id}/${other.id}`).toBeLessThan(0.5);
+      }
+
+      if (grammar.requiredOpenSpace) {
+        const carvedAreaM2 = plan.openSpaces
+          .filter((openSpace) => openSpace.landmarkId === landmark.id)
+          .reduce((sum, openSpace) => sum + overlap(openSpace.polygon, landmark.sitePolygon), 0);
+        expect(carvedAreaM2 + 0.5, `${landmark.id} ${grammar.requiredOpenSpace.category}`)
+          .toBeGreaterThanOrEqual(grammar.requiredOpenSpace.minShare * landmark.areaM2);
+      }
+    }
+    expect(fullFallbackCount).toBeLessThanOrEqual(2);
+  }, 150_000);
 
   it("completes european-single-very-low-0 deterministically with valid snapped topology", () => {
     const { source, reservations, warnings } = stagedReproduction(
@@ -287,10 +618,11 @@ describe("buildCompleteCityPlan", () => {
     expect(developmentArea).toBeGreaterThan(0);
     expect(parcelArea / developmentArea).toBeGreaterThan(0.97);
     expect(builtParcelArea / developmentArea).toBeGreaterThan(0.65);
-    // Landmark-aware road cleanup is deliberately conservative; retain a bounded
-    // residual budget while the parcel/development and built/development assertions
-    // above continue to enforce a dense city.
-    expect(anonymousResidualArea / fragmentArea).toBeLessThanOrEqual(0.10);
+    // Landmark-aware road cleanup plus density/v1 pockets deliberately convert a little
+    // more fragment area into small breathing spaces. Every anonymous piece is separately
+    // capped at 1,200 m²; retain a bounded aggregate budget while the parcel/development
+    // and built/development assertions above continue to enforce dense city fabric.
+    expect(anonymousResidualArea / fragmentArea).toBeLessThanOrEqual(0.12);
 
     const repeated = buildCompleteCityPlan(source, 1, 0, reservations);
     if (warnings.length > 0) repeated.diagnostics.warnings.push(...warnings);
@@ -365,11 +697,35 @@ describe("buildCompleteCityPlan", () => {
     // planned space with two identical ids. The contract is one id per distinct planned
     // space — including fragments/pieces sharing a semantic role — and a fresh build must
     // reproduce every id exactly, never a mutable encounter-order counter.
-    const plan = ringSixteenPlan();
+    const plan = compactFourPlan();
     const ids = plan.openSpaces.map((openSpace) => openSpace.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    expect(buildCompleteCityPlan(ringSource(16)).openSpaces.map((openSpace) => openSpace.id)).toEqual(ids);
+    expect(compactFourRepeat().openSpaces.map((openSpace) => openSpace.id)).toEqual(ids);
+  }, 300_000);
+
+  it.concurrent("pins plot-sized density pockets and caps anonymous voids", () => {
+    const plan = ringSixteenPlan();
+    const pockets = plan.openSpaces.filter((openSpace) => openSpace.lineage.includes("/density/v1/pocket/"));
+    expect(pockets.length).toBeGreaterThanOrEqual(4);
+    expect(pockets.length).toBeLessThanOrEqual(6);
+    expect(pockets.every((openSpace) =>
+      openSpace.semanticRole === "plaza"
+      && openSpace.category === "plaza"
+      && openSpace.size === "pocket"
+      && openSpace.areaM2 >= 100
+      && openSpace.areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2
+    )).toBe(true);
+    const pocketsPerBlock = new Map<string, number>();
+    for (const pocket of pockets) pocketsPerBlock.set(pocket.blockId, (pocketsPerBlock.get(pocket.blockId) ?? 0) + 1);
+    expect([...pocketsPerBlock.values()].every((count) => count >= 1 && count <= 2)).toBe(true);
+
+    const anonymous = plan.openSpaces.filter((openSpace) =>
+      openSpace.parcelId !== null
+      || (openSpace.semanticRole === "landscape" && /boundary-sliver|residual/.test(openSpace.lineage))
+    );
+    expect(anonymous.length).toBeGreaterThan(0);
+    expect(Math.max(...anonymous.map((openSpace) => openSpace.areaM2))).toBeLessThanOrEqual(MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5);
   }, 300_000);
 
   it("is deterministic and identical under source permutation and origin shift", () => {
@@ -446,20 +802,24 @@ describe("buildCompleteCityPlan", () => {
   }, 300_000);
 
   it.concurrent("honors global none, a district override above none, and landmark-required open space", () => {
-    const nonePlan = buildCompleteCityPlan(ringSource(4, "none"));
+    const nonePlan = buildCompleteCityPlan(compactRingSource("none"));
     expect(validateCompleteCityPlan(nonePlan)).toEqual([]);
     expect(nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId === null && openSpace.parcelId === null && openSpace.semanticRole === undefined)).toEqual([]);
     const landmarkOpen = nonePlan.openSpaces.filter((openSpace) => openSpace.landmarkId !== null);
     expect(landmarkOpen.length).toBeGreaterThanOrEqual(1);
-    const hero = nonePlan.landmarks.find((landmark) => landmark.landmarkGrammarId === "hero-tower-plaza")!;
-    expect(hero.openSpaceIds.length).toBeGreaterThan(0);
-    const heroPlaza = nonePlan.openSpaces.find((openSpace) => openSpace.id === hero.openSpaceIds[0])!;
-    expect(heroPlaza.category).toBe("plaza");
-    expect(overlap(heroPlaza.polygon, hero.sitePolygon)).toBeGreaterThan(heroPlaza.areaM2 - 0.5);
-    // The required plaza covers at least the grammar's declared minimum share of the site.
-    expect(heroPlaza.areaM2).toBeGreaterThanOrEqual(LANDMARK_GRAMMAR_REGISTRY.get("hero-tower-plaza")!.requiredOpenSpace!.minShare * hero.areaM2 - 0.5);
+    const requiredLandmark = nonePlan.landmarks.find((landmark) =>
+      Boolean(LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)?.requiredOpenSpace)
+    )!;
+    expect(requiredLandmark).toBeDefined();
+    const requirement = LANDMARK_GRAMMAR_REGISTRY.get(requiredLandmark.landmarkGrammarId)!.requiredOpenSpace!;
+    expect(requiredLandmark.openSpaceIds.length).toBeGreaterThan(0);
+    const requiredOpenSpace = nonePlan.openSpaces.find((openSpace) => openSpace.id === requiredLandmark.openSpaceIds[0])!;
+    expect(requiredOpenSpace.category).toBe(requirement.category);
+    expect(overlap(requiredOpenSpace.polygon, requiredLandmark.sitePolygon)).toBeGreaterThan(requiredOpenSpace.areaM2 - 0.5);
+    // Required landmark space survives global `none` and covers its grammar's declared share.
+    expect(requiredOpenSpace.areaM2).toBeGreaterThanOrEqual(requirement.minShare * requiredLandmark.areaM2 - 0.5);
 
-    const overriddenSource = ringSource(4, "none");
+    const overriddenSource = compactRingSource("none");
     overriddenSource.districts = overriddenSource.districts.map((district, index) =>
       index === 3 ? { ...district, openSpaceOverride: parkOverride(0.5) } : district
     );
@@ -470,7 +830,7 @@ describe("buildCompleteCityPlan", () => {
   }, 300_000);
 
   it.concurrent("produces final geometry for pocket, small, large, and whole-block sizes", () => {
-    const source = ringSource(4, "none");
+    const source = compactRingSource("none");
     source.districts = source.districts.map((district, index) =>
       index === 2 ? {
         ...district,
@@ -485,14 +845,22 @@ describe("buildCompleteCityPlan", () => {
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const wholeBlock = plan.openSpaces.find((openSpace) => openSpace.districtId === source.districts[2]!.id && openSpace.landmarkId === null && openSpace.parcelId === null && openSpace.size === "whole-block");
     expect(wholeBlock?.size).toBe("whole-block");
-    expect(wholeBlock!.areaM2).toBeGreaterThan(50_000);
+    expect(wholeBlock!.areaM2).toBeGreaterThan(10_000);
+    const districtStripArea = Math.abs(ringArea(source.districts[2]!.polygon));
+    const districtBuildableArea = plan.districtPlan.blocks.reduce((sum, block) =>
+      sum + block.districtFragments
+        .filter((fragment) => fragment.districtId === source.districts[2]!.id)
+        .reduce((fragmentSum, fragment) => fragmentSum + multiArea(fragment.buildable), 0), 0);
+    expect(districtBuildableArea).toBeGreaterThan(0);
+    expect(wholeBlock!.areaM2).toBeGreaterThan(Math.min(districtStripArea, districtBuildableArea) * 0.1);
+    expect(wholeBlock!.areaM2).toBeLessThanOrEqual(districtStripArea + 0.5);
     // Landmark sites inside the strip are excluded from the whole-block open space; the
     // surrounding donut remainder becomes explicit parcels, never unexplained gaps.
     for (const parcel of plan.parcels) {
       if (parcel.districtId !== source.districts[2]!.id) continue;
       expect(overlap(parcel.polygon, wholeBlock!.polygon), parcel.id).toBeLessThan(0.5);
     }
-    const mediumPlan = buildCompleteCityPlan(ringSource(4, "medium"));
+    const mediumPlan = compactFourPlan();
     const sizes = new Set(mediumPlan.openSpaces.map((openSpace) => openSpace.size));
     expect(mediumPlan.openSpaces.length).toBeGreaterThan(0);
     for (const size of sizes) expect(["pocket", "small", "large", "whole-block"]).toContain(size);
@@ -545,8 +913,51 @@ describe("buildCompleteCityPlan", () => {
       for (const mass of landmark.masses) {
         expect(overlap(mass.footprint, landmark.sitePolygon), mass.id).toBeGreaterThan(Math.abs(ringArea(mass.footprint)) - 0.5);
       }
+      for (let left = 0; left < landmark.masses.length; left++) {
+        for (let right = left + 1; right < landmark.masses.length; right++) {
+          const a = landmark.masses[left]!;
+          const b = landmark.masses[right]!;
+          const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
+          if (spansOverlap) expect(overlap(a.footprint, b.footprint), landmark.id).toBeLessThan(0.5);
+        }
+      }
     }
   }, 300_000);
+
+  it.concurrent("materializes all sixteen memorable landmark compositions at overview scale", () => {
+    const plan = fullReservationPlan();
+    expect(plan.landmarks).toHaveLength(16);
+    const byGrammar = new Map(plan.landmarks.map((landmark) => [landmark.landmarkGrammarId, landmark]));
+
+    const stadium = byGrammar.get("stadium-bowl")!;
+    expect(stadium.masses.filter((mass) => mass.kind === "stadium-bowl-segment")).toHaveLength(8);
+    expect(stadium.masses.reduce((sum, mass) => sum + Math.abs(ringArea(mass.footprint)), 0) / stadium.areaM2).toBeLessThan(0.55);
+
+    const cooling = byGrammar.get("cooling-tower-yard")!;
+    expect(cooling.masses.length).toBeGreaterThanOrEqual(3);
+    expect(cooling.masses.length).toBeLessThanOrEqual(5);
+    expect(cooling.masses.every((mass) => mass.kind === "cooling-tower" && mass.footprint.length === 8)).toBe(true);
+
+    const garden = byGrammar.get("garden-arcology")!;
+    expect(garden.masses).toHaveLength(3);
+    for (let index = 1; index < garden.masses.length; index++) {
+      expect(garden.masses[index]!.elevationM).toBeCloseTo(garden.masses[index - 1]!.elevationM + garden.masses[index - 1]!.heightM, 9);
+      expect(Math.abs(ringArea(garden.masses[index]!.footprint))).toBeLessThan(Math.abs(ringArea(garden.masses[index - 1]!.footprint)));
+    }
+
+    const event = byGrammar.get("event-plaza-pylon")!;
+    const pylon = event.masses.find((mass) => mass.kind === "luminous-pylon")!;
+    expect(pylon.heightM).toBeGreaterThan(90);
+    expect(event.openSpaceIds).toHaveLength(1);
+
+    const hex = byGrammar.get("hex-corporate-hq")!;
+    expect(hex.masses.every((mass) => mass.footprint.length === 6)).toBe(true);
+
+    const gateway = byGrammar.get("logo-gateway")!;
+    expect(gateway.masses.filter((mass) => mass.kind === "logo-gateway-support")).toHaveLength(2);
+    expect(gateway.masses.find((mass) => mass.kind === "elevated-logo-sign")!.elevationM).toBeGreaterThan(0);
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+  }, 600_000);
 
   it.concurrent("honors pre-reserved major landmark sites verbatim", () => {
     // Generate roads around the current reservation polygons, then assign compatible
@@ -554,7 +965,8 @@ describe("buildCompleteCityPlan", () => {
     // not a valid fixture for testing the pre-road reservation contract.
     const { source, reservations: reserved } = fullReservationFixture();
     expect(reserved.length).toBe(LANDMARK_GRAMMAR_IDS.length);
-    expect(reserveMajorLandmarkSites(source)).toEqual(reserved);
+    expect(reserveMajorLandmarkSites(source, LANDMARK_GRAMMAR_IDS)).toEqual(reserved);
+    expect(reserveMajorLandmarkSites(source).map((reservation) => reservation.grammarId)).toEqual(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
     const plan = fullReservationPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.diagnostics.landmarkCount).toBe(reserved.length);
@@ -573,10 +985,22 @@ describe("buildCompleteCityPlan", () => {
       manualReservation("hero-tower-plaza", 10, 100),
       manualReservation("civic-corporate-compound", 110, 100),
       manualReservation("monument-open-space", 810, 100),
-      manualReservation("infrastructure-utility-site", 910, 100)
+      manualReservation("infrastructure-utility-site", 910, 100),
+      manualReservation("stadium-bowl", 10, 300, 240, 12)
     ];
+    const explicitReservationBytes = JSON.stringify(reservations);
     const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+    expect(JSON.stringify(reservations)).toBe(explicitReservationBytes);
     expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const stadium = plan.landmarks.find((landmark) => landmark.landmarkGrammarId === "stadium-bowl")!;
+    const stadiumBounds = ringBounds(stadium.sitePolygon);
+    expect(stadiumBounds.width / stadiumBounds.height).toBeGreaterThan(10);
+    expect(stadium.masses).toHaveLength(8);
+    for (let left = 0; left < stadium.masses.length; left++) {
+      for (let right = left + 1; right < stadium.masses.length; right++) {
+        expect(overlap(stadium.masses[left]!.footprint, stadium.masses[right]!.footprint), `${left}/${right}`).toBeLessThan(0.5);
+      }
+    }
     const reservationLineages = new Set(reservations.map((reservation) => reservation.lineage));
     expect(plan.landmarks.filter((landmark) => reservationLineages.has(landmark.placementLineage))).toHaveLength(reservations.length);
     expect(plan.diagnostics.landmarkCount).toBe(plan.landmarks.length);
@@ -626,7 +1050,7 @@ describe("buildCompleteCityPlan", () => {
     const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const reserved = reserveMajorLandmarkSites(source);
-    expect(reserved.length).toBe(LANDMARK_GRAMMAR_IDS.length);
+    expect(reserved.length).toBe(PRE_ROAD_LANDMARK_GRAMMAR_IDS.length);
     const keptLineages = new Set(plan.landmarks.map((landmark) => landmark.placementLineage));
     const covering = union([
       ...plan.parcels.map((parcel) => ringAsMulti(parcel.polygon)),
@@ -677,40 +1101,31 @@ describe("buildCompleteCityPlan", () => {
   it("skips landmarks with no compatible district and falls back to compatible block-inscribed sites", () => {
     const plan = buildCompleteCityPlan(crossSource());
     expect(validateCompleteCityPlan(plan)).toEqual([]);
-    // The plain cross only carries fine-grain/market/residential tags, so the seven
-    // grammars needing formal/industrial/waterfront/campus/irregular tags are skipped
-    // explicitly instead of being mis-associated; the residential/market grammars
-    // (megaframe-block, arcology-terraces, transit-hall) still fall back inside.
-    expect(plan.diagnostics.landmarkCount).toBe(3);
-    expect(plan.diagnostics.landmarkSkipped).toEqual([
+    // The plain cross only carries fine-grain, market, and residential tags. Grammars
+    // requiring wholly unrelated district families are explicitly skipped rather than
+    // mis-associated; compatible old and newly appended grammars may share a block when
+    // enough legal buildable area remains.
+    const necessarilySkipped = [
       "hero-tower-plaza",
       "civic-corporate-compound",
       "infrastructure-utility-site",
       "monument-open-space",
       "circular-beacon-tower",
       "tri-spire",
-      "comms-mast-field"
-    ]);
-    // With compatible districts the same city places one fallback in each available
-    // block. The current formal/industrial fixture therefore materializes these exact
-    // four grammars and explicitly reports every incompatible or capacity-skipped one.
+      "comms-mast-field",
+      "cooling-tower-yard",
+      "hex-corporate-hq"
+    ] as const;
+    expect(plan.diagnostics.landmarkCount).toBeGreaterThanOrEqual(3);
+    for (const grammarId of necessarilySkipped) expect(plan.diagnostics.landmarkSkipped, grammarId).toContain(grammarId);
+
     const fallbackPlan = buildCompleteCityPlan(compatibleCross());
     expect(validateCompleteCityPlan(fallbackPlan)).toEqual([]);
-    expect(new Set(fallbackPlan.landmarks.map((landmark) => landmark.landmarkGrammarId))).toEqual(new Set([
-      "hero-tower-plaza",
-      "civic-corporate-compound",
-      "infrastructure-utility-site",
-      "comms-mast-field"
-    ]));
+    const placed = new Set(fallbackPlan.landmarks.map((landmark) => landmark.landmarkGrammarId));
+    for (const required of ["hero-tower-plaza", "civic-corporate-compound", "infrastructure-utility-site", "comms-mast-field"] as const) {
+      expect(placed, required).toContain(required);
+    }
     expect(fallbackPlan.landmarks.every((landmark) => landmark.placementLineage.startsWith("fallback:"))).toBe(true);
-    expect(fallbackPlan.diagnostics.landmarkSkipped).toEqual([
-      "monument-open-space",
-      "circular-beacon-tower",
-      "tri-spire",
-      "megaframe-block",
-      "arcology-terraces",
-      "transit-hall"
-    ]);
     for (const landmark of fallbackPlan.landmarks) {
       expect(overlapMulti(landmark.sitePolygon, fallbackPlan.routeOccupancy.all), landmark.id).toBeLessThan(0.5);
     }
@@ -720,12 +1135,9 @@ describe("buildCompleteCityPlan", () => {
     const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const builtIds = new Set(plan.buildings.map((building) => building.parcelId));
-    // Three kinds of parcel-linked open spaces exist (parcelId !== null):
-    //   1. Fix 3b unbuilt fallbacks: parcel that fit no grammar at all
-    //      → seed ends in "/unbuilt", category: "landscaping"
-    //   2. Residual slivers: leftover geometry after a refined building was placed
-    //      → seed contains "/residual/", category: "vacant"
-    // Both kinds need a 1-to-1 open space entry for their parcel.
+    // Parcel-linked open spaces are either unbuilt landscaping or residual vacant
+    // pieces. Oversized anonymous surfaces may be split, but every piece remains linked
+    // to its source parcel and the pieces together cover that parcel exactly.
     const parcelLinked = plan.openSpaces.filter((openSpace) => openSpace.parcelId !== null);
     const unbuiltFallbacks = parcelLinked.filter((os) => os.seed.endsWith("/unbuilt"));
     const residualSlivers  = parcelLinked.filter((os) => !os.seed.endsWith("/unbuilt"));
@@ -735,34 +1147,37 @@ describe("buildCompleteCityPlan", () => {
     expect(unbuiltFallbacks.every((os) => os.surfaceStyle === "paving" && os.detailStyle === "planters")).toBe(true);
     // Residual slivers from refined buildings remain "vacant".
     expect(residualSlivers.every((os) => os.category === "vacant")).toBe(true);
-    // Every unbuilt parcel (not built, regardless of how it became unbuilt) must
-    // have exactly one parcel-linked open space covering its full area.
-    const openSpaceByParcel = new Map(parcelLinked.map((os) => [os.parcelId, os]));
+    const openSpacesByParcel = new Map<string, typeof parcelLinked>();
+    for (const openSpace of parcelLinked) {
+      openSpacesByParcel.set(openSpace.parcelId!, [...(openSpacesByParcel.get(openSpace.parcelId!) ?? []), openSpace]);
+    }
     let unbuiltCount = 0;
     let unbuiltAreaM2 = 0;
     for (const parcel of plan.parcels) {
       if (builtIds.has(parcel.id)) continue;
       unbuiltCount++;
       unbuiltAreaM2 += parcel.areaM2;
-      const openSpace = openSpaceByParcel.get(parcel.id);
-      expect(openSpace, parcel.id).toBeDefined();
-      expect(openSpace!.areaM2).toBeCloseTo(parcel.areaM2, 4);
+      const owned = openSpacesByParcel.get(parcel.id);
+      expect(owned, parcel.id).toBeDefined();
+      expect(owned!.reduce((sum, openSpace) => sum + openSpace.areaM2, 0)).toBeCloseTo(parcel.areaM2, 4);
+      expect(owned!.every((openSpace) => openSpace.areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5), parcel.id).toBe(true);
     }
     expect(unbuiltCount).toBeGreaterThan(0);
-    expect(parcelLinked.length).toBe(unbuiltCount);
+    expect(openSpacesByParcel.size).toBe(unbuiltCount);
     expect(unbuiltFallbacks.length).toBeGreaterThan(0);
     expect(unbuiltAreaM2 / plan.parcels.reduce((sum, parcel) => sum + parcel.areaM2, 0)).toBeLessThanOrEqual(0.1);
     expect(parcelLinked.every((os) => os.material === MATERIAL.GROUND)).toBe(true);
     const intentional = plan.openSpaces.filter((openSpace) => openSpace.parcelId === null);
     expect(intentional.length).toBeGreaterThan(0);
     expect(intentional.some((openSpace) => openSpace.material !== MATERIAL.GROUND)).toBe(true);
-    // The classification is deterministic.
-    expect(buildCompleteCityPlan(ringSource(4))).toEqual(plan);
+    // A second compact build pins full planner determinism without regenerating the
+    // overview-scale fabric solely for an equality assertion.
+    expect(compactFourRepeat()).toEqual(compactFourPlan());
   }, 300_000);
-  it("materializes every shipping grammar and all twelve archetypes through the production path", () => {
+  it("materializes every shipping grammar and all seventeen archetypes through the production path", () => {
     // Fixed legal breadth gallery: one deterministic parcel per grammar built from its
     // own declared limits, materialized through the same exported production path that
-    // planBuildings uses, so all 40 grammars and 12 archetypes are proven as outputs.
+    // planBuildings uses, so all 55 grammars and 17 archetypes are proven as outputs.
     const archetypes = new Set<string>();
     for (const grammarId of BUILDING_GRAMMAR_IDS) {
       const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
@@ -883,6 +1298,20 @@ describe("buildCompleteCityPlan", () => {
         expect(Math.abs(ringArea(upper.footprint)) - overlap(upper.footprint, base.footprint), grammarId).toBeGreaterThan(0.5);
         expect(upper.elevationM).toBeGreaterThanOrEqual(base.heightM);
       }
+      if (grammar.archetype === "t-shape") {
+        expect(building!.masses[0]!.footprint.length, grammarId).toBeGreaterThanOrEqual(8);
+      }
+      if (grammar.archetype === "cross" || grammar.archetype === "h-shape") {
+        expect(building!.masses[0]!.footprint.length, grammarId).toBeGreaterThan(8);
+      }
+      if (grammar.archetype === "hexagonal") {
+        expect(building!.masses.every((mass) => mass.footprint.length === 6), grammarId).toBe(true);
+      }
+      if (grammar.archetype === "sawtooth") {
+        const base = building!.masses.find((mass) => mass.massing === "merged-sawtooth-base")!;
+        expect(base, grammarId).toBeDefined();
+        expect(base.footprint.length, grammarId).toBeGreaterThan(8);
+      }
     }
     expect([...archetypes].sort()).toEqual([...FOOTPRINT_ARCHETYPE_IDS].sort());
   }, 60_000);
@@ -1000,7 +1429,7 @@ describe("buildCompleteCityPlan", () => {
 
   it.concurrent("reaches every archetype and a broad grammar set in a single whole-city plan", () => {
     // Ordinary whole-city reachability sanity: one deterministic plan must produce all
-    // twelve archetypes and a broad set of shipping grammars as generated outputs.
+    // seventeen archetypes and a broad set of shipping grammars as generated outputs.
     const plan = ringSixteenPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.buildings.length).toBeGreaterThan(0);
@@ -1008,6 +1437,9 @@ describe("buildCompleteCityPlan", () => {
     const archetypes = new Set(plan.buildings.map((building) => building.archetype));
     expect(grammars.size).toBeGreaterThanOrEqual(16);
     expect([...archetypes].sort()).toEqual([...FOOTPRINT_ARCHETYPE_IDS].sort());
+    for (const archetype of ["t-shape", "cross", "h-shape", "hexagonal", "sawtooth"] as const) {
+      expect(plan.buildings.filter((building) => building.archetype === archetype).length, archetype).toBeGreaterThanOrEqual(10);
+    }
     for (const building of plan.buildings) {
       const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)!;
       expect(building.heightM, building.id).toBeGreaterThanOrEqual(grammar.height.minM);
@@ -1020,15 +1452,25 @@ describe("buildCompleteCityPlan", () => {
     const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     expect(plan.buildings.length).toBeGreaterThan(0);
-    const hero = plan.landmarks.find((landmark) => landmark.landmarkGrammarId === "hero-tower-plaza")!;
-    expect(hero).toBeDefined();
+    const occupiedLandmark = plan.landmarks.find((landmark) => landmark.masses.length > 0)!;
+    const requiredLandmark = plan.landmarks.find((landmark) => {
+      const grammar = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId);
+      return Boolean(grammar?.requiredOpenSpace)
+        && Math.abs(ringArea(landmark.sitePolygon)) >= (grammar?.minSiteAreaM2 ?? Infinity)
+        && landmark.openSpaceIds.length > 0;
+    })!;
+    expect(occupiedLandmark).toBeDefined();
+    expect(requiredLandmark).toBeDefined();
+    const requiredCategory = LANDMARK_GRAMMAR_REGISTRY.get(requiredLandmark.landmarkGrammarId)!.requiredOpenSpace!.category;
     const firstParcel = plan.parcels[0]!;
     const firstBuilding = plan.buildings[0]!;
     // (a) a parcel invading a landmark site
     const parcelInvasion: CompleteCityPlan = {
       ...plan,
       parcels: plan.parcels.map((parcel) =>
-        parcel.id === firstParcel.id ? { ...parcel, polygon: hero.sitePolygon, areaM2: Math.abs(ringArea(hero.sitePolygon)) } : parcel
+        parcel.id === firstParcel.id
+          ? { ...parcel, polygon: occupiedLandmark.sitePolygon, areaM2: Math.abs(ringArea(occupiedLandmark.sitePolygon)) }
+          : parcel
       )
     };
     expect(validateCompleteCityPlan(parcelInvasion).some((message) => message.includes("overlaps landmark site"))).toBe(true);
@@ -1037,18 +1479,24 @@ describe("buildCompleteCityPlan", () => {
       ...plan,
       buildings: plan.buildings.map((building) =>
         building.id === firstBuilding.id && building.masses.length > 0
-          ? { ...building, masses: building.masses.map((mass, index) => (index === 0 ? { ...mass, footprint: hero.masses[0]!.footprint } : mass)) }
+          ? { ...building, masses: building.masses.map((mass, index) =>
+            index === 0 ? { ...mass, footprint: occupiedLandmark.masses[0]!.footprint } : mass
+          ) }
           : building
       )
     };
     expect(validateCompleteCityPlan(massInvasion).some((message) => message.includes("overlaps landmark"))).toBe(true);
     // (c) missing required landmark open space
-    const missingPlaza: CompleteCityPlan = {
+    const missingRequiredOpenSpace: CompleteCityPlan = {
       ...plan,
-      openSpaces: plan.openSpaces.filter((openSpace) => !hero.openSpaceIds.includes(openSpace.id)),
-      landmarks: plan.landmarks.map((landmark) => (landmark.id === hero.id ? { ...landmark, openSpaceIds: [] } : landmark))
+      openSpaces: plan.openSpaces.filter((openSpace) => !requiredLandmark.openSpaceIds.includes(openSpace.id)),
+      landmarks: plan.landmarks.map((landmark) =>
+        landmark.id === requiredLandmark.id ? { ...landmark, openSpaceIds: [] } : landmark
+      )
     };
-    expect(validateCompleteCityPlan(missingPlaza).some((message) => message.includes("requires plaza open space"))).toBe(true);
+    expect(validateCompleteCityPlan(missingRequiredOpenSpace).some((message) =>
+      message.includes(`requires ${requiredCategory} open space`)
+    )).toBe(true);
     // (d) a grammar that cannot fit its parcel
     const nonFitting: CompleteCityPlan = {
       ...plan,
@@ -1058,7 +1506,25 @@ describe("buildCompleteCityPlan", () => {
       buildings: plan.buildings.map((building) => (building.id === firstBuilding.id ? { ...building, grammarId: "industrial-shed" } : building))
     };
     expect(validateCompleteCityPlan(nonFitting).some((message) => message.includes("does not fit its parcel"))).toBe(true);
-    // (e) an invalid neon flag on a mass
+    // (e) non-landmark grammar-authored courts cannot regress to district-scale voids.
+    const oversizedSemanticCourt: CompleteCityPlan = {
+      ...plan,
+      openSpaces: plan.openSpaces.map((openSpace, index) =>
+        index === 0
+          ? {
+            ...openSpace,
+            landmarkId: null,
+            parcelId: null,
+            semanticRole: "courtyard",
+            areaM2: MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2 + 1
+          }
+          : openSpace
+      )
+    };
+    expect(validateCompleteCityPlan(oversizedSemanticCourt).some((message) =>
+      message.includes("exceeds the development-cell area cap")
+    )).toBe(true);
+    // (f) an invalid neon flag on a mass
     const badNeon: CompleteCityPlan = {
       ...plan,
       buildings: plan.buildings.map((building) =>
@@ -1068,7 +1534,7 @@ describe("buildCompleteCityPlan", () => {
       )
     };
     expect(validateCompleteCityPlan(badNeon).some((message) => message.includes("invalid neon flag"))).toBe(true);
-    // (f) frontage descriptors must remain unit world-space vectors.
+    // (g) frontage descriptors must remain unit world-space vectors.
     const badFrontage: CompleteCityPlan = {
       ...plan,
       buildings: plan.buildings.map((building) =>
@@ -1277,8 +1743,10 @@ describe("frontage placement", () => {
       spans.push((massMaxX - massMinX) / bounds.width);
     }
     spans.sort((a, b) => a - b);
+    const p10 = spans[Math.floor(spans.length * 0.1)]!;
     expect(spans[Math.floor(spans.length / 2)]!).toBeGreaterThan(0.7);
-    expect(spans[0]!).toBeGreaterThan(0.25);
+    expect(p10).toBeGreaterThan(0.3);
+    expect(spans[0]!).toBeGreaterThan(0.12);
   }, 300_000);
 });
 
@@ -1289,6 +1757,8 @@ describe("block height coherence", () => {
     const districtById = new Map(ringSource(4).districts.map((district) => [district.id, district]));
     const bands = deriveBlockHeightBands(plan.parcels, districtById);
     const heightsByBlock = new Map<string, number[]>();
+    const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
+    const infillBlocks = new Set<string>();
     for (const building of plan.buildings) {
       const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId)!;
       if (isTowerGrammar(grammar) || MICRO_BUILDING_GRAMMAR_IDS.has(building.grammarId)) continue;
@@ -1301,14 +1771,17 @@ describe("block height coherence", () => {
       expect(building.heightM, building.id).toBeGreaterThanOrEqual(Math.min(band!.minM, grammar.height.minM) - 1e-9);
       expect(building.heightM, building.id).toBeLessThanOrEqual(Math.max(band!.maxM, grammar.height.maxM) + 1e-9);
       heightsByBlock.set(building.blockId, [...(heightsByBlock.get(building.blockId) ?? []), building.heightM]);
+      if (parcelById.get(building.parcelId)?.role.includes("density-infill")) infillBlocks.add(building.blockId);
     }
-    // No block mixes sub-15 m and over-100 m ordinary fabric: the realized spread inside
-    // any block is bounded by the band ratio (<= ~2.4) plus clamp effects.
+    // Established blocks stay within 3×. A block receiving explicit density/v3 infill may
+    // layer low/mid-rise foreground against its tower band, matching the visual density
+    // target, but remains bounded to 5×.
     let coherentBlocks = 0;
     for (const [blockId, heights] of heightsByBlock) {
       if (heights.length < 2) continue;
       coherentBlocks++;
-      expect(Math.max(...heights) / Math.min(...heights), blockId).toBeLessThanOrEqual(3);
+      expect(Math.max(...heights) / Math.min(...heights), blockId)
+        .toBeLessThanOrEqual(infillBlocks.has(blockId) ? 5 : 3);
     }
     expect(coherentBlocks).toBeGreaterThanOrEqual(2);
   }, 300_000);

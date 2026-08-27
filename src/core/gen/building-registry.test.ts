@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMARS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, MICRO_BUILDING_GRAMMAR_IDS, TOWER_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, validateBuildingRegistry, type BuildingGrammarId } from "./building-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMARS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, TOWER_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, validateBuildingRegistry, type BuildingGrammarId } from "./building-registry.js";
 import { DISTRICT_TYPES } from "./district-registry.js";
 
 /**
@@ -18,8 +18,8 @@ const minMassMinorAtMinimum = (entry: (typeof BUILDING_GRAMMARS)[number]): numbe
 };
 
 describe("building grammar registry", () => {
-  it("ships 40 stable grammars across all twelve archetypes and all eight uses", () => {
-    expect(BUILDING_GRAMMAR_IDS).toHaveLength(40);
+  it("ships 55 stable grammars across all seventeen archetypes and all eight uses", () => {
+    expect(BUILDING_GRAMMAR_IDS).toHaveLength(55);
     expect(new Set(BUILDING_GRAMMAR_IDS).size).toBe(BUILDING_GRAMMAR_IDS.length);
     expect(BUILDING_GRAMMARS.map((entry) => entry.id)).toEqual(BUILDING_GRAMMAR_IDS);
     expect(new Set(BUILDING_GRAMMARS.map((entry) => entry.archetype))).toEqual(new Set(FOOTPRINT_ARCHETYPE_IDS));
@@ -28,8 +28,32 @@ describe("building grammar registry", () => {
     expect(validateBuildingRegistry()).toEqual({ ok: true, problems: [] });
   });
 
-  it("registers exactly the five C8 silhouette families and ten reachable grammars", () => {
-    expect(FOOTPRINT_ARCHETYPE_IDS.slice(-5)).toEqual(["chamfered", "stepped", "offset-tower", "bridge", "cantilever"]);
+  it("ships five broad low/mid-rise infill grammars without collapsing to one silhouette", () => {
+    expect(INFILL_BUILDING_GRAMMAR_IDS).toEqual([
+      "infill-rowhouse",
+      "infill-corner-block",
+      "infill-mixed-t",
+      "infill-residential-h",
+      "infill-courtyard-cluster"
+    ]);
+    const grammars = INFILL_BUILDING_GRAMMAR_IDS.map((id) => BUILDING_GRAMMAR_REGISTRY.get(id)!);
+    expect(grammars.map((entry) => entry.archetype)).toEqual(["rectangle", "l-shape", "t-shape", "h-shape", "compound"]);
+    for (const grammar of grammars) {
+      expect(grammar.siteLimits.minAreaM2, grammar.id).toBeGreaterThanOrEqual(100);
+      expect(grammar.siteLimits.maxAreaM2, grammar.id).toBe(4_800);
+      expect(grammar.height.maxM, grammar.id).toBeLessThanOrEqual(35);
+      expect(grammar.height.skylineBias, grammar.id).toBeLessThan(0.2);
+      expect(MICRO_BUILDING_GRAMMAR_IDS.has(grammar.id), grammar.id).toBe(false);
+      expect(TOWER_BUILDING_GRAMMAR_IDS.has(grammar.id), grammar.id).toBe(false);
+    }
+    const industrialCluster = BUILDING_GRAMMAR_REGISTRY.get("infill-courtyard-cluster")!;
+    expect(industrialCluster.compatibilityTags).toContain("industrial");
+    expect(industrialCluster.compatibleUses).toContain("industrial");
+    expect(industrialCluster.geometryPolicy.neon).toBe(false);
+  });
+
+  it("keeps the five massing/v3 silhouette families and their ten reachable grammars", () => {
+    expect(FOOTPRINT_ARCHETYPE_IDS.slice(-10, -5)).toEqual(["chamfered", "stepped", "offset-tower", "bridge", "cantilever"]);
     const ids = [
       "corporate-chamfered-tower",
       "civic-chamfered-hall",
@@ -60,6 +84,28 @@ describe("building grammar registry", () => {
     }
   });
 
+  it("registers five massing/v4 overview families through ten production grammars", () => {
+    expect(FOOTPRINT_ARCHETYPE_IDS.slice(-5)).toEqual(["t-shape", "cross", "h-shape", "hexagonal", "sawtooth"]);
+    const ids = [
+      "commercial-t-headquarters",
+      "residential-t-court",
+      "civic-cross-tower",
+      "market-cross-complex",
+      "residential-h-block",
+      "campus-h-institute",
+      "corporate-hex-tower",
+      "waterfront-hex-pavilion",
+      "industrial-sawtooth-works",
+      "logistics-comb-depot"
+    ] as const;
+    expect(ids.map((id) => BUILDING_GRAMMAR_REGISTRY.get(id)?.archetype)).toEqual([
+      "t-shape", "t-shape", "cross", "cross", "h-shape", "h-shape", "hexagonal", "hexagonal", "sawtooth", "sawtooth"
+    ]);
+    for (const id of ids) {
+      expect(DISTRICT_TYPES.some((district) => district.buildingGrammarWeights[id] > 0), id).toBe(true);
+    }
+  });
+
   it("declares valid limits, profiles, rates, and normalized material slots for every grammar", () => {
     for (const entry of BUILDING_GRAMMARS) {
       expect(entry.siteLimits.minWidthM, entry.id).toBeGreaterThan(0);
@@ -81,13 +127,20 @@ describe("building grammar registry", () => {
     }
   });
 
-  it("keeps every grammar reachable from at least one shipping district and every district at four or more grammars", () => {
+  it("keeps every grammar reachable from a shipping district or the bounded infill path", () => {
     const reachable = new Set<string>();
     for (const district of DISTRICT_TYPES) {
       const active = BUILDING_GRAMMAR_IDS.filter((id) => (district.buildingGrammarWeights[id] ?? 0) > 0);
       expect(active.length, district.id).toBeGreaterThanOrEqual(4);
       expect(active.reduce((sum, id) => sum + district.buildingGrammarWeights[id], 0), district.id).toBeCloseTo(1, 9);
       for (const id of active) reachable.add(id);
+    }
+    for (const id of INFILL_BUILDING_GRAMMAR_IDS) {
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(id)!;
+      expect(DISTRICT_TYPES.some((district) =>
+        grammar.compatibilityTags.some((tag) => district.compatibilityTags.includes(tag))
+      ), id).toBe(true);
+      reachable.add(id);
     }
     expect([...reachable].sort()).toEqual([...BUILDING_GRAMMAR_IDS].sort());
   });
@@ -144,11 +197,13 @@ describe("building grammar registry", () => {
 
   it("pins the deliberate tower outliers that escape block height coherence", () => {
     expect([...TOWER_BUILDING_GRAMMAR_IDS].sort()).toEqual([
+      "civic-cross-tower",
       "civic-tower-plinth",
       "commercial-offset-tower",
       "commercial-twin-tower-podium",
       "corporate-atrium-block",
       "corporate-chamfered-tower",
+      "corporate-hex-tower",
       "corporate-setback-tower",
       "corporate-tower-podium",
       "entertainment-signage-podium"

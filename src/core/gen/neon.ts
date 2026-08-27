@@ -92,6 +92,12 @@ const FACADE_STRENGTH = 0.7;
 
 /** Brightest a panel can be, before the palette's own emissive strength. */
 export const MAX_PANEL_STRENGTH = FACADE_STRENGTH + STRENGTH_SPREAD;
+/**
+ * Panel importance is packed into aSeed above the complete 0..MAX_PANEL_STRENGTH base-strength
+ * range. The vertex shader decodes it, preserving the old minor-panel bytes and glyph seed.
+ */
+export const PANEL_IMPORTANCE_STRIDE = 2;
+export const MAX_PANEL_IMPORTANCE = 3;
 
 /** Local quad coords, one per corner: (-1,-1) (1,-1) (1,1) (-1,1). */
 const LOCAL_U = [-1, 1, 1, -1];
@@ -153,6 +159,8 @@ interface NeonQuad {
   radial: number;
   /** Facade panels only; tiers the ground pool's size, rate and strength. */
   kind?: SignKind;
+  /** Facade-only core tier packed into aSeed; zero leaves minor panels byte-identical. */
+  importance?: number;
   /** Unit outward normal of the mounting edge; set on corner-facing billboards only. */
   streetNormal?: { x: number; y: number };
 }
@@ -418,6 +426,14 @@ function facadeSign(
   const rawWidthM = MIN_WIDTH_M[kind] + size * (MAX_WIDTH_M[kind] - MIN_WIDTH_M[kind]);
   const widthM = Math.min(rawWidthM, Math.max(MIN_WIDTH_M[kind], lenM - 2 * GLOW_MARGIN_M));
   const heightM = panelHeightM(kind, spec, facadeHeight, size);
+  const importance =
+    kind === "crown"
+      ? MAX_PANEL_IMPORTANCE
+      : kind === "billboard" || kind === "banner"
+        ? widthM * heightM >= 54
+          ? 2
+          : 1
+        : 0;
   const halfWM = widthM / 2 + GLOW_MARGIN_M;
   const halfHM = heightM / 2 + GLOW_MARGIN_M;
 
@@ -453,6 +469,7 @@ function facadeSign(
     strength: panelStrength(profile, spec),
     radial: 0,
     kind,
+    importance,
     streetNormal: kind === "billboard" ? (streetSideNormal(ring, edgeIdx) ?? undefined) : undefined
   };
 }
@@ -654,6 +671,9 @@ export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): Mes
   const builder = new MeshBuilder(quads.length * 4, quads.length * 2);
   for (const quad of quads) {
     const base = builder.vertexCount;
+    const encodedStrength =
+      quad.strength +
+      (quad.radial < 0.5 ? (quad.importance ?? 0) * PANEL_IMPORTANCE_STRIDE : 0);
     for (let i = 0; i < 4; i++) {
       const c = quad.corners[i]!;
       builder.vertex(
@@ -665,7 +685,7 @@ export function neonMesh(buildings: BuildingSpec[], pixelsPerMetre: number): Mes
         KIND.NEON,
         LOCAL_U[i]!,
         LOCAL_V[i]!,
-        quad.strength,
+        encodedStrength,
         quad.halfWidthM,
         quad.halfHeightM
       );

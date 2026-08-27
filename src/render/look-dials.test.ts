@@ -85,4 +85,10 @@ describe("weather presets", () => {
     expect(Number.isFinite(DEFAULT_LOOK_DIALS.smearHeightM)).toBe(true);
     expect(DEFAULT_LOOK_DIALS.smearHeightM).toBe(70);
   });
+
+  it("defaults selected local light to a visible world-space reach", () => {
+    expect(DEFAULT_LOOK_DIALS.lightSpillStrength).toBe(1.35);
+    expect(DEFAULT_LOOK_DIALS.lightSpillRadius).toBe(17);
+    expect(DEFAULT_LOOK_DIALS.puddleReflectionStrength).toBe(1.6);
+  });
 });

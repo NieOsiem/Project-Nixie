@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CITY_FRAG,
   CITY_VERT,
+  FACADE_SIGN_COLOR_SHARES,
   FACADE_WINDOW_COLOR_SHARES,
   SEED_STEPS
 } from "./city.js";
@@ -9,11 +10,12 @@ import { NEON_FRAG } from "./neon.js";
 import { SCENE_ALPHA_FLOOR, SCENE_HEIGHT_NORM_M } from "./scene-alpha.js";
 
 describe("city fragment shader", () => {
-  it("keeps architectural emission outside the wall canyon falloff", () => {
+  it("keeps architectural emission outside the wall canyon falloff without flattening window tiers", () => {
     expect(CITY_FRAG).toContain(
       "vBase * (vShade * canyon * articulation * mechTone * (1.0 - 0.3 * recess))"
     );
-    expect(CITY_FRAG).toContain("col += vAccent * (0.95 * lit * glass * 0.6");
+    expect(CITY_FRAG).not.toContain("vAccent * (0.95 * lit * glass");
+    expect(CITY_FRAG).toContain("col += signC * ((1.35 * signStrip + 0.48 * shop)");
   });
 
   it("uses five facade families, per-window cells and three-to-six-floor sections", () => {
@@ -44,7 +46,7 @@ describe("city fragment shader", () => {
     expect(CITY_FRAG).toMatch(/float on = step\(0\.22,/);
     expect(CITY_FRAG).toContain("vec3(0.08, 0.13, 0.21)");
     expect(CITY_FRAG).toContain("glassC + vEmissive * 0.35, shop * 0.85");
-    expect(CITY_FRAG).toContain("(0.85 * signStrip + 0.30 * shop) * signOn * shopTone");
+    expect(CITY_FRAG).toContain("(1.35 * signStrip + 0.48 * shop) * signOn * shopTone");
   });
 
   it("pins deterministic lit-window hashes to 68/20/12 colour populations", () => {
@@ -65,6 +67,39 @@ describe("city fragment shader", () => {
     expect(counts.district / 40_000).toBeCloseTo(0.68, 2);
     expect(counts.neutral / 40_000).toBeCloseTo(0.20, 2);
     expect(counts.contrast / 40_000).toBeCloseTo(0.12, 2);
+  });
+
+  it("pins storefront signs to a separately salted 64/22/14 colour population", () => {
+    expect(FACADE_SIGN_COLOR_SHARES).toEqual({ district: 0.64, neutral: 0.22, contrast: 0.14 });
+    expect(Object.values(FACADE_SIGN_COLOR_SHARES).reduce((sum, share) => sum + share, 0)).toBe(1);
+    expect(CITY_FRAG).toContain("floor(vU / (BAY_M * 1.7)) + seed * 67.1");
+    expect(CITY_FRAG).toContain("seed * 11.7 + 4.0");
+    expect(CITY_FRAG).toContain(`step(${FACADE_SIGN_COLOR_SHARES.district}, signHue)`);
+    expect(CITY_FRAG).toContain(
+      `step(${FACADE_SIGN_COLOR_SHARES.district + FACADE_SIGN_COLOR_SHARES.neutral}, signHue)`
+    );
+    expect(CITY_FRAG).toContain(
+      "vec3 signC = mix(mix(districtC, neutralC, neutralSign), contrastC, contrastSign);"
+    );
+
+    const counts = { district: 0, neutral: 0, contrast: 0 };
+    const fract = (value: number): number => value - Math.floor(value);
+    for (let index = 0; index < 40_000; index++) {
+      const signBay = index % 200;
+      const seed = Math.round(fract(Math.sin(index * 12.9898) * 43758.5453) * SEED_STEPS) / SEED_STEPS;
+      const hue = fract(
+        Math.sin(
+          (signBay + seed * 67.1) * 127.1
+          + (seed * 11.7 + 4.0) * 311.7
+        ) * 43758.5453
+      );
+      if (hue < FACADE_SIGN_COLOR_SHARES.district) counts.district++;
+      else if (hue < FACADE_SIGN_COLOR_SHARES.district + FACADE_SIGN_COLOR_SHARES.neutral) counts.neutral++;
+      else counts.contrast++;
+    }
+    expect(counts.district / 40_000).toBeCloseTo(0.64, 2);
+    expect(counts.neutral / 40_000).toBeCloseTo(0.22, 2);
+    expect(counts.contrast / 40_000).toBeCloseTo(0.14, 2);
   });
 
   it("samples a strong district accent independently of the body material", () => {

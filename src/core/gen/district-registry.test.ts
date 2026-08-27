@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds } from "../geom/types.js";
 import { BLOCK_GRAMMAR_IDS, DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, validateDistrictRegistry } from "./district-registry.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY } from "./building-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, MICRO_BUILDING_GRAMMAR_IDS } from "./building-registry.js";
 import { districtBreadthGallery, planDistrictFragmentWithGrammar, type DistrictBlockFragment } from "./district-plan.js";
 import { validateRing } from "./terrain.js";
 
@@ -103,11 +103,23 @@ describe("district planning registry", () => {
       const district = DISTRICT_TYPE_REGISTRY.get(districtId)!;
       return ids.reduce((sum, id) => sum + district.buildingGrammarWeights[id], 0);
     };
-    expect(weight("corporate-core", ["corporate-setback-tower", "corporate-chamfered-tower", "commercial-offset-tower"])).toBeGreaterThan(0.65);
-    expect(weight("heavy-industrial", ["industrial-skybridge-works", "logistics-cantilever-works", "industrial-loading-court", "service-court-works"])).toBeGreaterThan(0.75);
-    expect(weight("residential-megablocks", ["megablock-ring", "dense-perimeter-block", "residential-court", "residential-wing"])).toBeGreaterThan(0.85);
-    expect(weight("entertainment-strip", ["entertainment-offset-stack", "entertainment-cantilever-stack", "entertainment-signage-podium"])).toBeGreaterThanOrEqual(0.6);
-    expect(weight("civic-institutional", ["civic-stepped-institute", "civic-chamfered-hall", "civic-entry-court"])).toBeGreaterThan(0.6);
-    expect(weight("derelict-reclamation", ["derelict-reclamation-cluster", "service-court-works", "old-city-courtyard"])).toBeGreaterThanOrEqual(0.6);
+    expect(weight("corporate-core", ["corporate-setback-tower", "corporate-chamfered-tower", "commercial-offset-tower", "commercial-t-headquarters", "civic-cross-tower", "corporate-hex-tower"])).toBeGreaterThan(0.65);
+    expect(weight("heavy-industrial", ["industrial-skybridge-works", "logistics-cantilever-works", "industrial-loading-court", "service-court-works", "industrial-sawtooth-works", "logistics-comb-depot"])).toBeGreaterThan(0.75);
+    expect(weight("residential-megablocks", ["megablock-ring", "dense-perimeter-block", "residential-court", "residential-wing", "residential-t-court", "residential-h-block", "campus-h-institute"])).toBeGreaterThan(0.85);
+    expect(weight("entertainment-strip", ["entertainment-offset-stack", "entertainment-cantilever-stack", "entertainment-signage-podium", "market-cross-complex"])).toBeGreaterThanOrEqual(0.7);
+    expect(weight("civic-institutional", ["civic-stepped-institute", "civic-chamfered-hall", "civic-entry-court", "civic-cross-tower", "campus-h-institute", "commercial-t-headquarters"])).toBeGreaterThan(0.7);
+    expect(weight("derelict-reclamation", ["derelict-reclamation-cluster", "service-court-works", "old-city-courtyard", "industrial-sawtooth-works", "logistics-cantilever-works"])).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it("caps rectangle and trapezoid dominance in every shipping district", () => {
+    for (const district of DISTRICT_TYPES) {
+      const nonMicro = BUILDING_GRAMMAR_IDS.filter((id) => !MICRO_BUILDING_GRAMMAR_IDS.has(id));
+      const total = nonMicro.reduce((sum, id) => sum + district.buildingGrammarWeights[id], 0);
+      const rectangular = nonMicro.reduce((sum, id) => {
+        const archetype = BUILDING_GRAMMAR_REGISTRY.get(id)!.archetype;
+        return sum + (archetype === "rectangle" || archetype === "trapezoid" ? district.buildingGrammarWeights[id] : 0);
+      }, 0);
+      expect(rectangular / total, district.id).toBeLessThanOrEqual(0.35);
+    }
   });
 });

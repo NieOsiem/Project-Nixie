@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMARS, LANDMARK_GRAMMAR_REGISTRY, validateLandmarkRegistry } from "./landmark-registry.js";
+import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMARS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, validateLandmarkRegistry } from "./landmark-registry.js";
 import { DISTRICT_TYPES } from "./district-registry.js";
 
 describe("landmark grammar registry", () => {
-  it("ships exactly the ten curated landmark grammars with valid distinct signatures", () => {
+  it("ships exactly sixteen curated landmark grammars with valid distinct signatures", () => {
     expect(LANDMARK_GRAMMAR_IDS).toEqual([
       "hero-tower-plaza",
       "civic-corporate-compound",
@@ -14,10 +14,31 @@ describe("landmark grammar registry", () => {
       "megaframe-block",
       "comms-mast-field",
       "arcology-terraces",
-      "transit-hall"
+      "transit-hall",
+      "stadium-bowl",
+      "cooling-tower-yard",
+      "garden-arcology",
+      "event-plaza-pylon",
+      "hex-corporate-hq",
+      "logo-gateway"
     ]);
     expect(LANDMARK_GRAMMARS.map((entry) => entry.id)).toEqual(LANDMARK_GRAMMAR_IDS);
     expect(validateLandmarkRegistry()).toEqual({ ok: true, problems: [] });
+  });
+
+  it("pins eight unique overview-critical grammars for pre-road reservation", () => {
+    expect(PRE_ROAD_LANDMARK_GRAMMAR_IDS).toEqual([
+      "hero-tower-plaza",
+      "civic-corporate-compound",
+      "circular-beacon-tower",
+      "tri-spire",
+      "megaframe-block",
+      "arcology-terraces",
+      "hex-corporate-hq",
+      "logo-gateway"
+    ]);
+    expect(new Set(PRE_ROAD_LANDMARK_GRAMMAR_IDS).size).toBe(8);
+    expect(PRE_ROAD_LANDMARK_GRAMMAR_IDS.every((id) => LANDMARK_GRAMMAR_REGISTRY.has(id))).toBe(true);
   });
 
   it("requires an approach plaza for the hero tower and valid templates everywhere", () => {
@@ -37,7 +58,7 @@ describe("landmark grammar registry", () => {
     }
   });
 
-  it("declares site area limits that keep all ten grammars placeable on a large fixture", () => {
+  it("declares site area limits that keep all sixteen grammars placeable on a large fixture", () => {
     const largest = Math.max(...LANDMARK_GRAMMARS.map((entry) => entry.minSiteAreaM2));
     expect(largest).toBeLessThanOrEqual(5000);
   });
@@ -50,7 +71,7 @@ describe("landmark grammar registry", () => {
     }
   });
 
-  it("declares polygonal mass shapes only through valid side counts and the megaframe kind", () => {
+  it("declares valid polygonal shapes, including true hexagonal and octagonal landmarks", () => {
     const beacon = LANDMARK_GRAMMAR_REGISTRY.get("circular-beacon-tower")!;
     expect(beacon.massTemplates.some((template) => (template.polygonSides ?? 0) >= 10)).toBe(true);
     const spire = LANDMARK_GRAMMAR_REGISTRY.get("tri-spire")!;
@@ -59,10 +80,14 @@ describe("landmark grammar registry", () => {
     expect(frame.massTemplates).toHaveLength(1);
     expect(frame.massTemplates[0]!.kind).toBe("megaframe");
     expect(frame.massTemplates[0]!.polygonSides).toBeUndefined();
+    const cooling = LANDMARK_GRAMMAR_REGISTRY.get("cooling-tower-yard")!;
+    expect(cooling.massTemplates[0]!.polygonSides).toBe(8);
+    const hex = LANDMARK_GRAMMAR_REGISTRY.get("hex-corporate-hq")!;
+    expect(hex.massTemplates.every((template) => template.polygonSides === 6)).toBe(true);
     // Rect grammars must never mix in polygonal templates: one branch owns each grammar.
     for (const entry of LANDMARK_GRAMMARS) {
       const polygonal = entry.massTemplates.some((template) => template.polygonSides !== undefined || template.kind === "megaframe");
-      if (!["circular-beacon-tower", "tri-spire", "megaframe-block"].includes(entry.id)) {
+      if (!["circular-beacon-tower", "tri-spire", "megaframe-block", "cooling-tower-yard", "hex-corporate-hq"].includes(entry.id)) {
         expect(polygonal, entry.id).toBe(false);
       }
     }

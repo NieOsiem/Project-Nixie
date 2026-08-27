@@ -27,7 +27,8 @@ import {
   presetByName,
   zoneBank,
   type DistrictPalette,
-  type Material
+  type Material,
+  type RGB
 } from "./palette.js";
 
 const mat = (over: Partial<Material> = {}): Material => ({
@@ -364,6 +365,29 @@ describe("built-in district palettes", () => {
   const luma = (m: Material): number =>
     0.299 * m.base.r + 0.587 * m.base.g + 0.114 * m.base.b;
 
+  const rgbHue = ({ r, g, b }: RGB): number => {
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    if (delta === 0) return 0;
+    const sector =
+      max === r
+        ? ((g - b) / delta) % 6
+        : max === g
+          ? (b - r) / delta + 2
+          : (r - g) / delta + 4;
+    return (sector * 60 + 360) % 360;
+  };
+  const hueDistance = (a: RGB, b: RGB): number => {
+    const difference = Math.abs(rgbHue(a) - rgbHue(b));
+    return Math.min(difference, 360 - difference);
+  };
+  const averageBase = (palette: DistrictPalette, slots: number[]): RGB => ({
+    r: slots.reduce((sum, slot) => sum + palette.materials[slot]!.base.r, 0) / slots.length,
+    g: slots.reduce((sum, slot) => sum + palette.materials[slot]!.base.g, 0) / slots.length,
+    b: slots.reduce((sum, slot) => sum + palette.materials[slot]!.base.b, 0) / slots.length
+  });
+
   it("keeps wall albedo in the saturated midtone band and roof albedo darker below it", () => {
     for (const palette of ALL_PALETTES) {
       for (const slot of WALL_SLOTS) {
@@ -438,16 +462,15 @@ describe("built-in district palettes", () => {
     expect(neonB.emissiveStrength).toBeGreaterThanOrEqual(1.5);
   });
 
-  it("differentiates primary and secondary neon hues across all districts", () => {
+  it("gives every primary and secondary neon a deliberate contrasting hue", () => {
     for (const id of DISTRICT_PALETTE_IDS) {
       const palette = builtinPalette(id);
       const a = palette.materials[DISTRICT_SLOT.NEON_A]!;
       const b = palette.materials[DISTRICT_SLOT.NEON_B]!;
-      const dr = Math.abs(a.emissive.r - b.emissive.r);
-      const dg = Math.abs(a.emissive.g - b.emissive.g);
-      const db = Math.abs(a.emissive.b - b.emissive.b);
-      const hueDiff = dr + dg + db;
-      expect(hueDiff, `${id} neon A/B hue distinction`).toBeGreaterThanOrEqual(0.3);
+      expect(
+        hueDistance(a.emissive, b.emissive),
+        `${id} neon A/B hue distinction`
+      ).toBeGreaterThanOrEqual(70);
     }
   });
 
@@ -487,6 +510,44 @@ describe("built-in district palettes", () => {
       for (const wall of walls) {
         expect(luma(wall), `${id} matte wall value`).toBeLessThanOrEqual(0.22);
       }
+    }
+  });
+
+  it("pins four dominant, one neutral and one contrasting body tier in every district", () => {
+    for (const id of DISTRICT_PALETTE_IDS) {
+      // The port's sea-teal crane is its contrast wall; every other bank reserves WALL_C.
+      const dominantSlots =
+        id === "logistics-port"
+          ? [DISTRICT_SLOT.WALL_A, DISTRICT_SLOT.WALL_C, DISTRICT_SLOT.ROOF_A, DISTRICT_SLOT.ROOF_B]
+          : [DISTRICT_SLOT.WALL_A, DISTRICT_SLOT.WALL_B, DISTRICT_SLOT.ROOF_A, DISTRICT_SLOT.ROOF_B];
+      const contrastSlot =
+        id === "logistics-port" ? DISTRICT_SLOT.WALL_B : DISTRICT_SLOT.WALL_C;
+      const neutralSlot = DISTRICT_SLOT.ROOF_C;
+      const palette = builtinPalette(id);
+      const dominant = averageBase(palette, dominantSlots);
+      const contrast = palette.materials[contrastSlot]!;
+      const neutral = palette.materials[neutralSlot]!;
+      const neutralChroma =
+        Math.max(neutral.base.r, neutral.base.g, neutral.base.b)
+        - Math.min(neutral.base.r, neutral.base.g, neutral.base.b);
+      const contrastChroma =
+        Math.max(contrast.base.r, contrast.base.g, contrast.base.b)
+        - Math.min(contrast.base.r, contrast.base.g, contrast.base.b);
+
+      expect(dominantSlots.length / GROUND_SLOTS.length, `${id} dominant body share`).toBeCloseTo(2 / 3, 5);
+      for (const slot of dominantSlots) {
+        expect(
+          hueDistance(palette.materials[slot]!.base, dominant),
+          `${id} dominant slot ${slot} hue cohesion`
+        ).toBeLessThanOrEqual(25);
+      }
+      expect(neutralChroma, `${id} neutral tier chroma`).toBeLessThanOrEqual(0.02);
+      expect(neutral.emissiveStrength, `${id} neutral roof emission`).toBeLessThanOrEqual(0.015);
+      expect(contrastChroma, `${id} contrast tier chroma`).toBeGreaterThanOrEqual(0.065);
+      expect(
+        hueDistance(contrast.base, dominant),
+        `${id} dominant/contrast hue separation`
+      ).toBeGreaterThanOrEqual(90);
     }
   });
 

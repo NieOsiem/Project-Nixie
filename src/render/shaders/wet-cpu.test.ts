@@ -2,7 +2,7 @@ import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
-/** Keep this port deliberately small: it mirrors the static 4a field and 4b smear terms. */
+/** CPU port of the shader's stationary road, wet material, matte occlusion and reflection path. */
 const OUTPUT_DIR = "/tmp/project-nixie-wet-cpu";
 const CROP_M = 8;
 const PUDDLE_SCALE_M = 4;
@@ -10,10 +10,15 @@ const PUDDLE_COVERAGE = 0.45;
 const WET_STRENGTH = 0.7;
 const WET_DARKEN = 0.78;
 const WET_GLOSS = 0.6;
+const PUDDLE_REFLECTION_STRENGTH = 1.6;
 const PUDDLE_EDGE_WET = 0.18;
 const PUDDLE_EDGE_DRY = 0.04;
 const PUDDLE_RIM_DARKEN = 0.65;
-const PUDDLE_STRETCH_Y = 1.35;
+const ROAD_SAMPLE_M = 2;
+const TINY_PUDDLE_SCALE = 0.24;
+const HUGE_PUDDLE_SCALE = 4.5;
+const HUGE_ASPECT_MIN = 2.8;
+const HUGE_ASPECT_SPAN = 2.7;
 const GLOSS_LIFT = 0.5;
 const WET_DARKEN_TINT_R = 0.9;
 const WET_DARKEN_TINT_G = 0.97;
@@ -26,6 +31,16 @@ const SMEAR_PROFILE_STEPS = 4;
 const SMEAR_DECAY = 0.65;
 const EDGE_WIDE_TEXEL = 1 / 64;
 const WIDE_STRENGTH = 0.55;
+const LIGHT_SPILL_RADIUS_M = 17;
+const SELECT_LUMA_LOW = 0.020;
+const SELECT_LUMA_HIGH = 0.120;
+const SELECT_CHROMA_LOW = 0.010;
+const SELECT_CHROMA_HIGH = 0.080;
+const LOCAL_LIGHT_GAIN = 1.8;
+const REFLECTION_LIFT_CAP = 0.60;
+const SHADOW_STRENGTH = 0.30;
+const AO_STRENGTH = 0.42;
+const CONTACT_AO_STRENGTH = 0.62;
 const EDGE_SOURCE_X = 1.03;
 const EDGE_SOURCE_RADIUS = 0.06;
 
@@ -75,20 +90,198 @@ function puddleField(coverage: number, noise: number): [number, number] {
   const rim = mul(smoothstep(wetIn, threshold, noise), sub(1, puddle));
   return [puddle, rim];
 }
+type Colour = [number, number, number];
+type WideBloomSampler = (uvX: number, uvY: number) => Colour;
+
+function worldFromView(
+  originX: number,
+  originY: number,
+  widthM: number,
+  heightM: number,
+  uvX: number,
+  uvY: number
+): [number, number] {
+  return [add(originX, mul(uvX, widthM)), add(originY, mul(uvY, heightM))];
+}
+type PuddleSample = {
+  puddle: number;
+  rim: number;
+  roadMask: number;
+  tinyField: number;
+  mediumField: number;
+  hugeField: number;
+};
+
+function luma(colour: Colour): number {
+  return add(add(mul(colour[0], 0.299), mul(colour[1], 0.587)), mul(colour[2], 0.114));
+}
+
+function sceneColour(worldX: number, worldY: number): Colour {
+  const grain = mul(0.018, valueNoise(div(worldX, 5), div(worldY, 5)));
+  if (Math.abs(worldY) < 2.25) {
+    const base = add(0.095, grain);
+    return [mul(base, 0.88), mul(base, 0.82), mul(base, 1.18)];
+  }
+  const base = add(0.25, grain);
+  return [mul(base, 1.02), base, mul(base, 1.01)];
+}
+
+type MatteOcclusion = {
+  castShadow: number;
+  ao: number;
+  contactAo: number;
+};
+
+/**
+ * Representative stationary shadow/AO target values for the CPU evidence crop. The sampled
+ * values are synthetic, but their three multipliers and their order are the composite shader's.
+ */
+function matteOcclusion(worldX: number, worldY: number): MatteOcclusion {
+  const roadBand = sub(1, smoothstep(1.8, 2.3, Math.abs(worldY)));
+  const castShadow = mul(
+    mul(smoothstep(-3, -1, worldX), sub(1, smoothstep(1, 3, worldX))),
+    roadBand
+  );
+  const ao = mul(0.38, smoothstep(1.2, 2.25, Math.abs(worldY)));
+  const contactAo = mul(
+    smoothstep(1.65, 2, Math.abs(worldY)),
+    sub(1, smoothstep(2, 2.25, Math.abs(worldY)))
+  );
+  return { castShadow, ao, contactAo };
+}
+
+function roadCue(colour: Colour): number {
+  const lowLuma = sub(1, smoothstep(0.12, 0.34, luma(colour)));
+  const blueViolet = smoothstep(
+    -0.025,
+    0.1,
+    sub(colour[2], Math.max(colour[0], colour[1]))
+  );
+  return mul(lowLuma, mixScalar(0.55, 1, blueViolet));
+}
+
+function puddleAt(worldX: number, worldY: number, coverage = PUDDLE_COVERAGE): PuddleSample {
+  const centre = sceneColour(worldX, worldY);
+  const left = sceneColour(worldX - ROAD_SAMPLE_M, worldY);
+  const right = sceneColour(worldX + ROAD_SAMPLE_M, worldY);
+  const up = sceneColour(worldX, worldY - ROAD_SAMPLE_M);
+  const down = sceneColour(worldX, worldY + ROAD_SAMPLE_M);
+  const centreLuma = luma(centre);
+  const roadEdge = smoothstep(
+    0.025,
+    0.12,
+    Math.max(
+      Math.abs(centreLuma - luma(left)),
+      Math.abs(centreLuma - luma(right)),
+      Math.abs(centreLuma - luma(up)),
+      Math.abs(centreLuma - luma(down))
+    )
+  );
+  const leftRoad = roadCue(left);
+  const rightRoad = roadCue(right);
+  const upRoad = roadCue(up);
+  const downRoad = roadCue(down);
+  const broadRoad = mul(add(add(leftRoad, rightRoad), add(upRoad, downRoad)), 0.25);
+  const longRoad = Math.max(Math.min(leftRoad, rightRoad), Math.min(upRoad, downRoad));
+  const junction = mul(
+    smoothstep(0.52, 0.82, broadRoad),
+    smoothstep(
+      0.3,
+      0.65,
+      Math.min(Math.max(leftRoad, rightRoad), Math.max(upRoad, downRoad))
+    )
+  );
+  const roadLikelihood = clamp(
+    add(
+      add(mul(roadCue(centre), 0.65), mul(broadRoad, 0.25)),
+      add(mul(roadEdge, 0.35), mul(longRoad, 0.15))
+    ),
+    0,
+    1
+  );
+  const roadMask = smoothstep(0.18, 0.62, roadLikelihood);
+  const drainageBand = sub(
+    1,
+    smoothstep(0.34, 0.5, Math.abs(fract(add(mul(worldX, 0.035), mul(worldY, 0.012))) - 0.5))
+  );
+  const placementBias = mul(
+    roadMask,
+    add(
+      add(mul(roadEdge, 0.12), mul(junction, 0.1)),
+      add(mul(longRoad, 0.06), mul(drainageBand, 0.08))
+    )
+  );
+
+  const puddleScale = Math.max(PUDDLE_SCALE_M, 0.001);
+  const orientationX = Math.floor(worldX / (puddleScale * HUGE_PUDDLE_SCALE));
+  const orientationY = Math.floor(worldY / (puddleScale * HUGE_PUDDLE_SCALE));
+  const angle = hash21(orientationX + 71, orientationY + 19) * Math.PI * 2;
+  const axisX = Math.cos(angle);
+  const axisY = Math.sin(angle);
+  const orientedX = add(mul(worldX, axisX), mul(worldY, axisY));
+  const orientedY = add(mul(worldX, -axisY), mul(worldY, axisX));
+  const tinyA = valueNoise(
+    (worldX + 13.7) / (puddleScale * TINY_PUDDLE_SCALE),
+    (worldY - 9.2) / (puddleScale * TINY_PUDDLE_SCALE)
+  );
+  const tinyB = valueNoise(
+    (worldX - 4.1) / (puddleScale * TINY_PUDDLE_SCALE * 0.63),
+    (worldY + 21.3) / (puddleScale * TINY_PUDDLE_SCALE * 0.63)
+  );
+  const tinyField = Math.min(Math.max(tinyA, tinyB * 0.96), Math.min(tinyA, tinyB) + 0.34);
+  const mediumA = valueNoise(orientedX / puddleScale, orientedY / puddleScale);
+  const mediumB = valueNoise(
+    (orientedX + puddleScale * 0.46) / puddleScale,
+    (orientedY - puddleScale * 0.24) / puddleScale
+  );
+  const mediumField = Math.max(mediumA, mediumB * 0.98);
+  const hugeAspect =
+    HUGE_ASPECT_MIN +
+    HUGE_ASPECT_SPAN * hash21(orientationX + 29, orientationY + 83);
+  const hugeField = valueNoise(
+    orientedX / (puddleScale * HUGE_PUDDLE_SCALE * hugeAspect),
+    orientedY / (puddleScale * HUGE_PUDDLE_SCALE)
+  );
+  const puddleNoise =
+    Math.max(tinyField - 0.08, mediumField, hugeField - 0.04) + placementBias;
+  const [rawPuddle, rawRim] = puddleField(coverage, puddleNoise);
+  return {
+    puddle: mul(rawPuddle, roadMask),
+    rim: mul(rawRim, roadMask),
+    roadMask,
+    tinyField,
+    mediumField,
+    hugeField
+  };
+}
 
 function radialReach(uvX: number, uvY: number, smear = RADIAL_SMEAR): [number, number] {
   return [mul(sub(uvX, 0.5), smear), mul(sub(uvY, 0.5), smear)];
 }
 
-function wideBloom(uvX: number, uvY: number): [number, number, number] {
+function wideBloom(uvX: number, uvY: number): Colour {
   const x = clamp(uvX, 0, 1);
   const y = clamp(uvY, 0, 1);
-  // Keep the synthetic neon off the pivot so the radial offset has a visible source to reach.
-  const worldX = sub(mul(x, CROP_M), 0.66 * CROP_M);
-  const worldY = sub(mul(y, CROP_M), 0.46 * CROP_M);
-  const radius = add(mul(worldX, worldX), mul(worldY, worldY));
-  const source = mul(0.8, Math.exp(-radius / 2));
-  return [source, mul(source, 0.7), mul(source, 0.9)];
+  const magentaX = sub(mul(x, CROP_M), 0.68 * CROP_M);
+  const magentaY = sub(mul(y, CROP_M), 0.42 * CROP_M);
+  const cyanX = sub(mul(x, CROP_M), 0.34 * CROP_M);
+  const cyanY = sub(mul(y, CROP_M), 0.56 * CROP_M);
+  const magentaRadius = add(mul(magentaX, magentaX), mul(magentaY, magentaY));
+  const cyanRadius = add(mul(cyanX, cyanX), mul(cyanY, cyanY));
+  const magenta = mul(0.8, Math.exp(-magentaRadius / 1.4));
+  const cyan = mul(0.78, Math.exp(-cyanRadius / 1.4));
+  return [
+    add(magenta, mul(cyan, 0.08)),
+    add(mul(magenta, 0.1), cyan),
+    add(mul(magenta, 0.92), mul(cyan, 0.96))
+  ];
+}
+function reflectionBloomAt(
+  uvX: number,
+  uvY: number,
+  sampleWideBloom: WideBloomSampler = wideBloom
+): Colour {
+  return sampleWideBloom(uvX, uvY);
 }
 
 function edgeCyan(uvX: number): number {
@@ -122,44 +315,73 @@ function shade(
   pxPerMetre: number,
   x: number,
   y: number,
-  smearStrength = SMEAR_STRENGTH
-): [number, number, number] {
+  smearStrength = SMEAR_STRENGTH,
+  reflectionStrength = PUDDLE_REFLECTION_STRENGTH,
+  coverage = PUDDLE_COVERAGE,
+  sampleWideBloom: WideBloomSampler = wideBloom
+): Colour {
   const size = CROP_M * pxPerMetre;
   const wideTexel = 16 / size;
   const uvX = div(add(x, 0.5), size);
   const uvY = div(add(y, 0.5), size);
   const worldX = f(-CROP_M / 2 + (x + 0.5) / pxPerMetre);
   const worldY = f(-CROP_M / 2 + (y + 0.5) / pxPerMetre);
-  const base = add(0.12, mul(0.06, valueNoise(div(worldX, 5), div(worldY, 5))));
+  const base = sceneColour(worldX, worldY);
   const radius = add(mul(worldX, worldX), mul(worldY, worldY));
-  const light = mul(0.9, Math.exp(-radius / 5));
-  let cR = add(base, light);
-  let cG = add(mul(base, 0.76), mul(light, 0.65));
-  let cB = add(mul(base, 1.12), mul(light, 0.96));
-  const puddleNoise = valueNoise(
-    div(worldX, PUDDLE_SCALE_M),
-    div(mul(worldY, PUDDLE_STRETCH_Y), PUDDLE_SCALE_M)
+  const light = mul(0.24, Math.exp(-radius / 5));
+  let cR = add(base[0], light);
+  let cG = add(base[1], mul(light, 0.72));
+  let cB = add(base[2], mul(light, 0.96));
+  const sample = puddleAt(worldX, worldY, coverage);
+  const coverageGate = coverage > 0 ? 1 : 0;
+  const roadWet = mul(mul(WET_STRENGTH, sample.roadMask), coverageGate);
+  const wet = mul(roadWet, sample.puddle);
+  const darkMask = clamp(
+    add(add(mul(roadWet, 0.18), mul(wet, 0.82)), mul(PUDDLE_RIM_DARKEN, sample.rim)),
+    0,
+    1
   );
-  const [puddle, rim] = puddleField(PUDDLE_COVERAGE, puddleNoise);
-  const wet = mul(WET_STRENGTH, puddle);
-  // Saturated cool darkening: per-channel mix toward WET_DARKEN x tint. The damp rim joins the
-  // mask at partial strength and the mask clamps at 1.
-  const wetMask = clamp(add(wet, mul(PUDDLE_RIM_DARKEN, rim)), 0, 1);
-  const darkenR = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_R), 1), wetMask));
-  const darkenG = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_G), 1), wetMask));
-  const darkenB = add(1, mul(sub(mul(WET_DARKEN, WET_DARKEN_TINT_B), 1), wetMask));
-  cR = mul(cR, darkenR);
-  cG = mul(cG, darkenG);
-  cB = mul(cB, darkenB);
-  const lit = clamp(add(add(mul(cR, 0.299), mul(cG, 0.587)), mul(cB, 0.114)), 0, 1);
-  const gloss = mul(mul(wet, WET_GLOSS), smoothstep(0.02, 0.6, lit));
-  // Bounded lift: mirrors min(c * (1 + GLOSS_LIFT), vec3(1.0)) in the shader.
+  const puddleDarkTier = mixScalar(1, 0.42, sample.puddle);
+  const darkenR = mul(mul(WET_DARKEN, WET_DARKEN_TINT_R), puddleDarkTier);
+  const darkenG = mul(mul(WET_DARKEN, WET_DARKEN_TINT_G), puddleDarkTier);
+  const darkenB = mul(mul(WET_DARKEN, WET_DARKEN_TINT_B), puddleDarkTier);
+  cR = mul(cR, mixScalar(1, darkenR, darkMask));
+  cG = mul(cG, mixScalar(1, darkenG, darkMask));
+  cB = mul(cB, mixScalar(1, darkenB, darkMask));
+  const lit = clamp(luma([cR, cG, cB]), 0, 1);
+  const broadGloss = mul(
+    mul(mul(roadWet, sub(1, mul(sample.puddle, 0.7))), WET_GLOSS),
+    mul(smoothstep(0.02, 0.6, lit), 0.28)
+  );
   const liftR = Math.min(mul(cR, add(1, GLOSS_LIFT)), 1);
   const liftG = Math.min(mul(cG, add(1, GLOSS_LIFT)), 1);
   const liftB = Math.min(mul(cB, add(1, GLOSS_LIFT)), 1);
-  cR = mixScalar(cR, liftR, gloss);
-  cG = mixScalar(cG, liftG, gloss);
-  cB = mixScalar(cB, liftB, gloss);
+  cR = mixScalar(cR, liftR, broadGloss);
+  cG = mixScalar(cG, liftG, broadGloss);
+  cB = mixScalar(cB, liftB, broadGloss);
+
+  // The sharp source is the wide bloom already present at this puddle pixel. The shader's four
+  // remote fan taps remain diffuse-spill inputs only and cannot be selected for reflection.
+  const reflection = reflectionBloomAt(uvX, uvY, sampleWideBloom);
+  const reflectionLuma = luma(reflection);
+  const reflectionChroma =
+    Math.max(...reflection) - Math.min(...reflection);
+  const reflectionSelect = mul(
+    smoothstep(SELECT_LUMA_LOW, SELECT_LUMA_HIGH, reflectionLuma),
+    smoothstep(SELECT_CHROMA_LOW, SELECT_CHROMA_HIGH, reflectionChroma)
+  );
+  const reflectionAmount = mul(
+    mul(
+      mul(wet, smoothstep(0.48, 0.9, sample.puddle)),
+      clamp(reflectionStrength, 0, 2)
+    ),
+    reflectionSelect
+  );
+  const reflectionLight = Math.min(
+    mul(mul(reflectionLuma, WIDE_STRENGTH), LOCAL_LIGHT_GAIN),
+    REFLECTION_LIFT_CAP
+  );
+  const reflectionDenom = Math.max(reflectionLuma, 0.001);
 
   const [reachX, reachY] = radialReach(uvX, uvY);
   let smearR = 0;
@@ -177,11 +399,11 @@ function shade(
         * (1 - smoothstep(1 - wideTexel, 1, rawX));
       const fadeY = smoothstep(0, wideTexel, rawY)
         * (1 - smoothstep(1 - wideTexel, 1, rawY));
-      const sample = wideBloom(rawX, rawY);
+      const bloom = sampleWideBloom(rawX, rawY);
       const tapWeight = mul(w, mul(fadeX, fadeY));
-      smearR = add(smearR, mul(sample[0], tapWeight));
-      smearG = add(smearG, mul(sample[1], tapWeight));
-      smearB = add(smearB, mul(sample[2], tapWeight));
+      smearR = add(smearR, mul(bloom[0], tapWeight));
+      smearG = add(smearG, mul(bloom[1], tapWeight));
+      smearB = add(smearB, mul(bloom[2], tapWeight));
     }
     smearWeight = add(smearWeight, w);
   }
@@ -189,24 +411,47 @@ function shade(
   smearG = div(smearG, Math.max(smearWeight, 0.001));
   smearB = div(smearB, Math.max(smearWeight, 0.001));
   const smearAmount = mul(wet, smearStrength);
-  const smearLuma = add(
-    add(mul(smearR, 0.299), mul(smearG, 0.587)),
-    mul(smearB, 0.114)
-  );
+  const smearLuma = luma([smearR, smearG, smearB]);
   const smearLight = clamp(mul(smearLuma, WIDE_STRENGTH), 0, 1);
   const smearDenom = Math.max(smearLuma, 0.001);
-  const smearHueR = div(smearR, smearDenom);
-  const smearHueG = div(smearG, smearDenom);
-  const smearHueB = div(smearB, smearDenom);
-  const smearLiftR = mixScalar(smearLight, mul(smearHueR, smearLight), WET_GLOSS);
-  const smearLiftG = mixScalar(smearLight, mul(smearHueG, smearLight), WET_GLOSS);
-  const smearLiftB = mixScalar(smearLight, mul(smearHueB, smearLight), WET_GLOSS);
-  const targetR = f(Math.min(add(cR, mul(smearLiftR, 0.35)), 1));
-  const targetG = f(Math.min(add(cG, mul(smearLiftG, 0.35)), 1));
-  const targetB = f(Math.min(add(cB, mul(smearLiftB, 0.35)), 1));
-  cR = mixScalar(cR, targetR, smearAmount);
-  cG = mixScalar(cG, targetG, smearAmount);
-  cB = mixScalar(cB, targetB, smearAmount);
+  const smearLiftR = mixScalar(smearLight, mul(div(smearR, smearDenom), smearLight), WET_GLOSS);
+  const smearLiftG = mixScalar(smearLight, mul(div(smearG, smearDenom), smearLight), WET_GLOSS);
+  const smearLiftB = mixScalar(smearLight, mul(div(smearB, smearDenom), smearLight), WET_GLOSS);
+  cR = mixScalar(cR, Math.min(add(cR, mul(smearLiftR, 0.35)), 1), smearAmount);
+  cG = mixScalar(cG, Math.min(add(cG, mul(smearLiftG, 0.35)), 1), smearAmount);
+  cB = mixScalar(cB, Math.min(add(cB, mul(smearLiftB, 0.35)), 1), smearAmount);
+
+  const matte = matteOcclusion(worldX, worldY);
+  const castTransmission = sub(1, mul(SHADOW_STRENGTH, matte.castShadow));
+  cR = mul(cR, castTransmission);
+  cG = mul(cG, castTransmission);
+  cB = mul(cB, castTransmission);
+  const aoTransmission = sub(1, mul(AO_STRENGTH, matte.ao));
+  cR = mul(cR, aoTransmission);
+  cG = mul(cG, aoTransmission);
+  cB = mul(cB, aoTransmission);
+  const contactTransmission = sub(1, mul(CONTACT_AO_STRENGTH, matte.contactAo));
+  cR = mul(cR, contactTransmission);
+  cG = mul(cG, contactTransmission);
+  cB = mul(cB, contactTransmission);
+
+  // Sharp water colour is applied after cast shadow, general AO and contact AO, as in the shader.
+  const reflectionMix = clamp(reflectionAmount, 0, 1);
+  cR = mixScalar(
+    cR,
+    Math.min(cR + (reflection[0] / reflectionDenom) * reflectionLight, 1),
+    reflectionMix
+  );
+  cG = mixScalar(
+    cG,
+    Math.min(cG + (reflection[1] / reflectionDenom) * reflectionLight, 1),
+    reflectionMix
+  );
+  cB = mixScalar(
+    cB,
+    Math.min(cB + (reflection[2] / reflectionDenom) * reflectionLight, 1),
+    reflectionMix
+  );
   return [clamp(cR, 0, 1), clamp(cG, 0, 1), clamp(cB, 0, 1)];
 }
 
@@ -325,6 +570,51 @@ describe("wet-look CPU evidence", () => {
     }
   });
 
+  it("ignores a bright source 17m away when local wide bloom is zero", () => {
+    const pxPerMetre = 24;
+    const size = CROP_M * pxPerMetre;
+    let point: [number, number] | undefined;
+    for (let y = 0; y < size && !point; y += 1) {
+      for (let x = 0; x < size * 0.65; x += 1) {
+        const worldX = -CROP_M / 2 + (x + 0.5) / pxPerMetre;
+        const worldY = -CROP_M / 2 + (y + 0.5) / pxPerMetre;
+        if (puddleAt(worldX, worldY).puddle > 0.55) {
+          point = [x, y];
+          break;
+        }
+      }
+    }
+    expect(point).toBeDefined();
+    const [x, y] = point!;
+    const localUvX = (x + 0.5) / size;
+    const localUvY = (y + 0.5) / size;
+    const remoteUvX = localUvX + LIGHT_SPILL_RADIUS_M / 64;
+    const remoteOnly: WideBloomSampler = (uvX, uvY) =>
+      Math.hypot(uvX - remoteUvX, uvY - localUvY) < 1e-6 ? [0, 0.8, 0.8] : [0, 0, 0];
+
+    expect(remoteOnly(remoteUvX, localUvY)).toEqual([0, 0.8, 0.8]);
+    expect(reflectionBloomAt(localUvX, localUvY, remoteOnly)).toEqual([0, 0, 0]);
+    const reflected = shade(
+      pxPerMetre,
+      x,
+      y,
+      0,
+      PUDDLE_REFLECTION_STRENGTH,
+      PUDDLE_COVERAGE,
+      remoteOnly
+    );
+    const matte = shade(pxPerMetre, x, y, 0, 0, PUDDLE_COVERAGE, remoteOnly);
+    expect(reflected).toEqual(matte);
+  });
+
+  it("classifies the same world point identically after pan and zoom", () => {
+    const pannedOut = worldFromView(0, -8, 32, 16, 0.375, 0.375);
+    const pannedIn = worldFromView(8, -4, 16, 8, 0.25, 0.25);
+    expect(pannedOut).toEqual([12, -2]);
+    expect(pannedIn).toEqual(pannedOut);
+    expect(puddleAt(...pannedIn)).toEqual(puddleAt(...pannedOut));
+  });
+
   it("changes a wet ground point toward the off-center bloom source", () => {
     const pxPerMetre = 50;
     const size = CROP_M * pxPerMetre;
@@ -335,10 +625,7 @@ describe("wet-look CPU evidence", () => {
         const uvY = (y + 0.5) / size;
         const worldX = -CROP_M / 2 + uvX * CROP_M;
         const worldY = -CROP_M / 2 + uvY * CROP_M;
-        const wet = puddleField(
-          PUDDLE_COVERAGE,
-          valueNoise(worldX / PUDDLE_SCALE_M, (worldY * PUDDLE_STRETCH_Y) / PUDDLE_SCALE_M)
-        )[0];
+        const wet = puddleAt(worldX, worldY).puddle;
         if (wet > 0) {
           const smeared = shade(pxPerMetre, x, y);
           const unsmeared = shade(pxPerMetre, x, y, 0);
@@ -361,6 +648,57 @@ describe("wet-look CPU evidence", () => {
     expect(difference).toBeGreaterThan(1e-5);
   });
 
+  it("keeps locally aligned cyan and magenta reflection colors distinct from the matte wet base", () => {
+    const pxPerMetre = 24;
+    const size = CROP_M * pxPerMetre;
+    let cyanDelta = 0;
+    let magentaDelta = 0;
+    for (let y = 0; y < size; y += 2) {
+      for (let x = 0; x < size; x += 2) {
+        const worldX = -CROP_M / 2 + (x + 0.5) / pxPerMetre;
+        const worldY = -CROP_M / 2 + (y + 0.5) / pxPerMetre;
+        if (puddleAt(worldX, worldY).puddle < 0.55) continue;
+        const reflected = shade(pxPerMetre, x, y, 0, PUDDLE_REFLECTION_STRENGTH);
+        const matte = shade(pxPerMetre, x, y, 0, 0);
+        const deltaR = reflected[0] - matte[0];
+        const deltaG = reflected[1] - matte[1];
+        if (deltaG > deltaR) cyanDelta = Math.max(cyanDelta, deltaG);
+        if (deltaR > deltaG) magentaDelta = Math.max(magentaDelta, deltaR);
+      }
+    }
+    expect(cyanDelta).toBeGreaterThan(1e-4);
+    expect(magentaDelta).toBeGreaterThan(1e-4);
+  });
+
+  it("lays the calibrated sharp highlight on top of matte cast shadow and AO", () => {
+    expect(LIGHT_SPILL_RADIUS_M).toBe(17);
+    expect(PUDDLE_REFLECTION_STRENGTH).toBe(1.6);
+    expect([SELECT_LUMA_LOW, SELECT_LUMA_HIGH]).toEqual([0.020, 0.120]);
+    expect([SELECT_CHROMA_LOW, SELECT_CHROMA_HIGH]).toEqual([0.010, 0.080]);
+    expect([LOCAL_LIGHT_GAIN, REFLECTION_LIFT_CAP]).toEqual([1.8, 0.60]);
+
+    const pxPerMetre = 24;
+    const size = CROP_M * pxPerMetre;
+    let shadowHighlight = 0;
+    for (let y = 0; y < size; y += 2) {
+      for (let x = 0; x < size; x += 2) {
+        const worldX = -CROP_M / 2 + (x + 0.5) / pxPerMetre;
+        const worldY = -CROP_M / 2 + (y + 0.5) / pxPerMetre;
+        if (puddleAt(worldX, worldY).puddle < 0.55) continue;
+        if (matteOcclusion(worldX, worldY).castShadow < 0.5) continue;
+        const reflected = shade(pxPerMetre, x, y, 0, PUDDLE_REFLECTION_STRENGTH);
+        const matte = shade(pxPerMetre, x, y, 0, 0);
+        shadowHighlight = Math.max(
+          shadowHighlight,
+          reflected[0] - matte[0],
+          reflected[1] - matte[1],
+          reflected[2] - matte[2]
+        );
+      }
+    }
+    expect(shadowHighlight).toBeGreaterThan(1e-4);
+  });
+
   it("renders deterministic 1:1 PNG crops at the four verification scales", () => {
     mkdirSync(OUTPUT_DIR, { recursive: true });
     for (const pxPerMetre of [3, 12, 50, 150]) {
@@ -369,12 +707,15 @@ describe("wet-look CPU evidence", () => {
       expect(statSync(path).size).toBeGreaterThan(64);
     }
     expect(renderPng(12).equals(renderPng(12))).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
-  it("makes a zero coverage field exactly dry", () => {
+  it("makes zero coverage exactly dry, including every reflection strength", () => {
     const [puddle, rim] = puddleField(0, 0.99);
     expect(puddle).toBe(0);
     expect(rim).toBe(0);
+    const dryA = shade(12, 31, 47, SMEAR_STRENGTH, 0, 0);
+    const dryB = shade(12, 31, 47, SMEAR_STRENGTH, 2, 0);
+    expect(dryA).toEqual(dryB);
   });
 
   it("draws a sharp waterline with a damp collar just outside it", () => {
@@ -403,23 +744,51 @@ describe("wet-look CPU evidence", () => {
     expect(halfWetIn).toBeLessThan(1);
   });
 
-  it("elongates the field along world Y via the anisotropic sample domain", () => {
-    let differs = 0;
-    for (let y = 0; y < 32; y += 1) {
-      for (let x = 0; x < 32; x += 1) {
-        const wx = ((x + 0.5) / 32) * CROP_M;
-        const wy = ((y + 0.5) / 32) * CROP_M;
-        const stretched = puddleField(
-          PUDDLE_COVERAGE,
-          valueNoise(wx / PUDDLE_SCALE_M, (wy * PUDDLE_STRETCH_Y) / PUDDLE_SCALE_M)
-        )[0];
-        const square = puddleField(
-          PUDDLE_COVERAGE,
-          valueNoise(wx / PUDDLE_SCALE_M, wy / PUDDLE_SCALE_M)
-        )[0];
-        if (stretched !== square) differs += 1;
+  it("biases coverage toward blue-violet carriageway and curb gradients", () => {
+    let roadWet = 0;
+    let roadSamples = 0;
+    let sidewalkWet = 0;
+    let sidewalkSamples = 0;
+    let curbWet = 0;
+    let curbSamples = 0;
+    for (let yi = 0; yi < 80; yi += 1) {
+      const worldY = -4 + (yi + 0.5) * 0.1;
+      for (let xi = 0; xi < 160; xi += 1) {
+        const worldX = -8 + (xi + 0.5) * 0.1;
+        const sample = puddleAt(worldX, worldY);
+        if (Math.abs(worldY) < 1.7) {
+          roadWet += sample.puddle;
+          roadSamples += 1;
+        } else if (Math.abs(worldY) > 3) {
+          sidewalkWet += sample.puddle;
+          sidewalkSamples += 1;
+        } else if (Math.abs(Math.abs(worldY) - 2.25) < 0.3) {
+          curbWet += sample.puddle;
+          curbSamples += 1;
+        }
       }
     }
-    expect(differs).toBeGreaterThan(0);
+    expect(roadWet / roadSamples).toBeGreaterThan(sidewalkWet / sidewalkSamples);
+    expect(curbWet / curbSamples).toBeGreaterThan(sidewalkWet / sidewalkSamples);
+  });
+
+  it("contains visible tiny, merged-medium, and huge elongated contributors", () => {
+    const winners = { tiny: 0, medium: 0, huge: 0 };
+    for (let xi = 0; xi < 2048; xi += 1) {
+      const worldX = -128 + (xi + 0.5) * 0.125;
+      for (const worldY of [-1.75, -1.25, -0.75, 0.25, 0.75, 1.25, 1.75]) {
+        const sample = puddleAt(worldX, worldY);
+        if (sample.puddle < 0.2) continue;
+        const tiny = sample.tinyField - 0.08;
+        const medium = sample.mediumField;
+        const huge = sample.hugeField - 0.04;
+        if (tiny >= medium && tiny >= huge) winners.tiny += 1;
+        else if (medium >= huge) winners.medium += 1;
+        else winners.huge += 1;
+      }
+    }
+    expect(winners.tiny).toBeGreaterThan(0);
+    expect(winners.medium).toBeGreaterThan(0);
+    expect(winners.huge).toBeGreaterThan(0);
   });
 });

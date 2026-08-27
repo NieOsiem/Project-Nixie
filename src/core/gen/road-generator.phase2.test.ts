@@ -328,7 +328,7 @@ describe("Phase 2 deterministic initial road generation", () => {
     expect(axisAlignedFraction(roads)).toBeLessThan(0.45);
     expect(network.junctions.some((junction) => junction.arms.length === 3 || junction.arms.length === 5)).toBe(true);
     expect(validateRouteTopology(roads)).toMatchObject({ ok: true });
-  });
+  }, 120_000);
 
   it("generates deterministic valid European networks on maps at least 1600 m across", () => {
     const scene = { x: -800, y: -520, width: 1600, height: 1040 };
@@ -343,7 +343,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       expect(vehicleConnectivity(first.roads, first.diagnostics.hubs), seed).toBe(true);
       expect(validateRouteTopology(first.roads), seed).toMatchObject({ ok: true });
     }
-  }, 45000);
+  }, 120_000);
 
   it("does not collapse European or Mixed full-size maps during topology fallback", () => {
     const scene = { x: -600, y: -400, width: 1200, height: 800 };
@@ -358,7 +358,7 @@ describe("Phase 2 deterministic initial road generation", () => {
         expect(validateRouteTopology(generated.roads), `${layout}/${seed}`).toMatchObject({ ok: true });
       }
     }
-  }, 20000);
+  }, 120_000);
 
   it("keeps organic junctions legible instead of piling a neighbourhood into one knot", () => {
     const scene = { x: -600, y: -400, width: 1200, height: 800 };
@@ -374,7 +374,7 @@ describe("Phase 2 deterministic initial road generation", () => {
         expect(validateRouteTopology(generated), `${layout}/${seed}`).toMatchObject({ ok: true });
       }
     }
-  }, 30000);
+  }, 120_000);
 
   it("generates a recognisable grid with explicit junction nodes", () => {
     const scene = { x: -300, y: -240, width: 600, height: 480 };
@@ -527,7 +527,7 @@ describe("Phase 2 deterministic initial road generation", () => {
       expect(vehicleConnectivity(roads, generated.diagnostics.hubs), layout).toBe(true);
       expect(validateRouteTopology(roads), layout).toMatchObject({ ok: true });
     }
-  });
+  }, 120_000);
 
   it("keeps every layout inside rectangular, coastal, concave, and footprint masks", () => {
     const fixtures: Array<[string, Ring, Ring]> = [

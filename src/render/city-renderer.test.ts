@@ -882,11 +882,21 @@ describe("CityRenderer bloom", () => {
     const r = raw();
     const camera = cam({ pivotX: 900, pivotY: 700, scale: 2 });
     const dials = r.lookDials;
+    r.update(camera);
+    expect((lastCall().content as StubMesh).shader.uniforms).toMatchObject({
+      uLightSpillStrength: 1.35,
+      uLightSpillRadius: 17,
+      uPuddleReflectionStrength: 1.6
+    });
     dials.wetStrength = 0.7;
     dials.puddleCoverage = 0.4;
     dials.puddleScaleM = 9;
     dials.wetDarken = 0.68;
     dials.wetGloss = 0.23;
+    dials.contactAoStrength = 0.58;
+    dials.lightSpillStrength = 0.81;
+    dials.lightSpillRadius = 14;
+    dials.puddleReflectionStrength = 1.1;
     r.markContentDirty();
     r.update(camera);
 
@@ -904,7 +914,11 @@ describe("CityRenderer bloom", () => {
       uPuddleCoverage: 0.4,
       uPuddleScaleM: 9,
       uWetDarken: 0.68,
-      uWetGloss: 0.23
+      uWetGloss: 0.23,
+      uContactAoStrength: 0.58,
+      uLightSpillStrength: 0.81,
+      uLightSpillRadius: 14,
+      uPuddleReflectionStrength: 1.1
     });
     r.destroy();
   });

@@ -7,9 +7,12 @@ import { hash2 } from "./hash.js";
 import {
   BANNER_MIN_BUILDING_M,
   MAX_POOL_RADIUS_M,
+  MAX_PANEL_IMPORTANCE,
+  MAX_PANEL_STRENGTH,
   MIN_POOL_RADIUS_M,
   POOL_MAX_SIGN_HEIGHT_M,
   SIGN_BAND_TOP_M,
+  PANEL_IMPORTANCE_STRIDE,
   neonMesh
 } from "./neon.js";
 
@@ -159,6 +162,33 @@ describe("neonMesh", () => {
       expect(v.strength).toBeGreaterThan(0);
       expect(v.height).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it("packs size/importance tiers only into major panel seeds", () => {
+    const m = neonMesh([...cityOf(1200), ...cityOf(600, "glass-curtain")], PPM);
+    const tiers = new Set<number>();
+    let minors = 0;
+    let majors = 0;
+    for (let q = 0; q < m.vertexCount; q += 4) {
+      const panel = vertexAt(m, q);
+      if (panel.radial !== 0) continue;
+      const tier = Math.floor(panel.strength / PANEL_IMPORTANCE_STRIDE);
+      const baseStrength = panel.strength - tier * PANEL_IMPORTANCE_STRIDE;
+      expect(tier).toBeGreaterThanOrEqual(0);
+      expect(tier).toBeLessThanOrEqual(MAX_PANEL_IMPORTANCE);
+      expect(baseStrength).toBeGreaterThan(0);
+      expect(baseStrength).toBeLessThanOrEqual(MAX_PANEL_STRENGTH);
+      if (tier === 0) minors += 1;
+      else {
+        majors += 1;
+        tiers.add(tier);
+      }
+    }
+    expect(minors).toBeGreaterThan(100);
+    expect(majors).toBeGreaterThan(10);
+    expect(tiers.has(1)).toBe(true);
+    expect(tiers.has(2)).toBe(true);
+    expect(tiers.has(MAX_PANEL_IMPORTANCE)).toBe(true);
   });
 
   it("spans local UV coordinates [-1, 1] per quad", () => {

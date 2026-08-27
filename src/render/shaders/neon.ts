@@ -1,3 +1,4 @@
+import { PANEL_IMPORTANCE_STRIDE } from "../../core/gen/neon.js";
 import { PALETTE_SIZE } from "../../core/palette.js";
 import { SEED_STEPS } from "./city.js";
 
@@ -38,6 +39,7 @@ varying vec3 vGlow;
 varying float vRadial;
 varying float vGlyphPxPerM;
 varying float vSeed;
+varying float vImportance;
 
 // WHY: a pool sits 0.03 m over the road and has to clear the 0.05 m markings too, so it
 // needs metres of bias. A facade panel does not: at 1.5 m it punched through the roof of
@@ -59,9 +61,14 @@ void main() {
 
   vLocal = vec2(aU, aTop);
   vPanelM = aRoofCentre;
-  vGlow = emissive.rgb * (emissive.a * uEmissiveMax) * aSeed;
+  // aSeed keeps old minor strengths verbatim. Major panels pack an integer importance tier
+  // above the complete base-strength range; decode before palette gain and glyph hashing.
+  float importance = floor(aSeed / ${PANEL_IMPORTANCE_STRIDE}.0);
+  float panelSeed = aSeed - importance * ${PANEL_IMPORTANCE_STRIDE}.0;
+  vGlow = emissive.rgb * (emissive.a * uEmissiveMax) * panelSeed;
   vRadial = aShade;
-  vSeed = aSeed;
+  vSeed = panelSeed;
+  vImportance = importance * (1.0 - step(0.5, aShade));
 
   // d(lean)/dh, as in city.ts: a banner's glyphs run up the facade, where a metre of
   // height covers this many screen pixels rather than uScreenPxPerMetre.
@@ -97,6 +104,7 @@ varying vec3 vGlow;
 varying float vRadial;
 varying float vGlyphPxPerM;
 varying float vSeed;
+varying float vImportance;
 
 uniform float uGlowMarginM;
 // CRITIQUE C1 live dials: uNeonGain scales every additive quad; uPoolGain scales the ground
@@ -160,7 +168,10 @@ void main() {
     // featureless blob. Only what stays under the clamp can carry structure, so the gaps do.
     // Keep spill * gap below ~0.47 or the gaps clip too and the blob comes back.
     float spill = 1.0 - smoothstep(0.0, 1.0, max(d.x, d.y));
-    g = (spill * 0.24 + lit * 0.85) * uNeonGain;
+    // Importance changes the emissive core only: minor spill/gaps remain byte-identical, while
+    // large billboards/banners and crowns cross bloom threshold without inflating every panel.
+    float coreGain = 1.0 + vImportance * 0.16;
+    g = (spill * 0.24 + lit * 0.85 * coreGain) * uNeonGain;
   }
 
   // Alpha 0, not g: BLEND_MODES.ADD is blendFunc(ONE, ONE), so alpha accumulates too and

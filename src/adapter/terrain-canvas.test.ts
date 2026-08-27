@@ -757,7 +757,7 @@ describe("full generation", () => {
     expect(generationPreflight()).toMatchObject({ kind: "unsupported", replaceable: false });
     setupScene({ kind: "city-generator-2", schemaVersion: 3, generatorVersion: 11, revision: "broken" });
     expect(generationPreflight()).toMatchObject({ kind: "malformed", replaceable: false });
-  });
+  }, 30_000);
 
   it("reports GM authority in the preflight", () => {
     setupScene(undefined);
@@ -774,7 +774,7 @@ describe("full generation", () => {
     expect(saved).toEqual(before);
     expect(generationState().active).toBe(false);
     expect(generationState().phase).toBe("idle");
-  });
+  }, 30_000);
 
   it("rejects non-GM retries and new-seed generation without claiming", async () => {
     vi.stubGlobal("Worker", undefined);

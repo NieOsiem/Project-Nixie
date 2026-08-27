@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { MAX_PANEL_STRENGTH } from "../../core/gen/neon.js";
+import {
+  MAX_PANEL_IMPORTANCE,
+  MAX_PANEL_STRENGTH,
+  PANEL_IMPORTANCE_STRIDE
+} from "../../core/gen/neon.js";
 import { DISTRICT_SLOT, PALETTE_PRESETS } from "../../core/palette.js";
 import { NEON_FRAG, NEON_VERT } from "./neon.js";
 
@@ -51,7 +55,9 @@ describe("neon shaders", () => {
     // post.ts ends in c *= 1/(1 + max(m-1, 0)), which for m >= 1 is an exact clamp to 1.0,
     // not a shoulder. Everything at or above the clamp renders identically, so the panel's
     // structure can only live in what stays below it. If a gap clips, the panel is a blob.
-    const mix = NEON_FRAG.match(/g = \(spill \* ([\d.]+) \+ lit \* ([\d.]+)\) \* uNeonGain;/);
+    const mix = NEON_FRAG.match(
+      /g = \(spill \* ([\d.]+) \+ lit \* ([\d.]+) \* coreGain\) \* uNeonGain;/
+    );
     expect(mix).not.toBeNull();
     const [gapCoefficient, litCoefficient] = [Number(mix![1]), Number(mix![2])];
 
@@ -66,6 +72,19 @@ describe("neon shaders", () => {
 
     expect(gapCoefficient * peak).toBeLessThan(0.85);
     expect((gapCoefficient + litCoefficient) * peak).toBeGreaterThan(1);
+  });
+
+  it("decodes major aSeed tiers while leaving the minor core multiplier exactly one", () => {
+    expect(NEON_VERT).toContain(
+      `float importance = floor(aSeed / ${PANEL_IMPORTANCE_STRIDE}.0);`
+    );
+    expect(NEON_VERT).toContain(
+      `float panelSeed = aSeed - importance * ${PANEL_IMPORTANCE_STRIDE}.0;`
+    );
+    expect(NEON_VERT).toContain("vGlow = emissive.rgb * (emissive.a * uEmissiveMax) * panelSeed;");
+    expect(NEON_FRAG).toContain("float coreGain = 1.0 + vImportance * 0.16;");
+    expect(1 + 0 * 0.16).toBe(1);
+    expect(1 + MAX_PANEL_IMPORTANCE * 0.16).toBeGreaterThan(1.4);
   });
 
   it("uses neither discard nor unavailable derivatives", () => {

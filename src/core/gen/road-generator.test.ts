@@ -14,15 +14,41 @@ const multiArea = (multi: MultiPolygon): number =>
 const occupancyOverlap = (roads: GeneratedRoadNetwork["roads"], site: Ring): number =>
   multiArea(intersection(ringAsMulti(site), compiledRouteOccupancy(compileRouteNetwork(roads)).all));
 
+function pointInRing(point: Vec2, ring: Ring): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i]!.x, yi = ring[i]!.y, xj = ring[j]!.x, yj = ring[j]!.y;
+    if (yi > point.y !== yj > point.y && point.x < ((xj - xi) * (point.y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function segmentCrossesRing(a: Vec2, b: Vec2, ring: Ring): boolean {
+  for (let index = 0; index < ring.length; index++) {
+    const c = ring[index]!;
+    const d = ring[(index + 1) % ring.length]!;
+    const o = (p: Vec2, q: Vec2, r: Vec2) => Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
+    const o1 = o(a, b, c), o2 = o(a, b, d), o3 = o(c, d, a), o4 = o(c, d, b);
+    if (o1 !== o2 && o3 !== o4) return true;
+  }
+  return false;
+}
+
+/** Mirrors the generator's stub predicate: does the terminal edge's axis enter the site. */
+function rayEntersRing(from: Vec2, tip: Vec2, ring: Ring): boolean {
+  const length = Math.hypot(tip.x - from.x, tip.y - from.y);
+  if (length === 0) return false;
+  const far = { x: tip.x + ((tip.x - from.x) / length) * 30, y: tip.y + ((tip.y - from.y) / length) * 30 };
+  return pointInRing(tip, ring) || pointInRing(far, ring) || segmentCrossesRing(tip, far, ring);
+}
+
 function distToRing(point: Vec2, ring: Ring): number {
   let nearest = Infinity;
   for (let index = 0; index < ring.length; index++) {
     const c = ring[index]!;
     const d = ring[(index + 1) % ring.length]!;
-    const abx = d.x - c.x;
-    const aby = d.y - c.y;
-    const t = Math.max(0, Math.min(1, ((point.x - c.x) * abx + (point.y - c.y) * aby) / (abx * abx + aby * aby || 1)));
-    nearest = Math.min(nearest, Math.hypot(point.x - (c.x + abx * t), point.y - (c.y + aby * t)));
+    const t = Math.max(0, Math.min(1, ((point.x - c.x) * (d.x - c.x) + (point.y - c.y) * (d.y - c.y)) / ((d.x - c.x) * (d.x - c.x) + (d.y - c.y) * (d.y - c.y) || 1)));
+    nearest = Math.min(nearest, Math.hypot(point.x - (c.x + (d.x - c.x) * t), point.y - (c.y + (d.y - c.y) * t)));
   }
   return nearest;
 }
@@ -63,11 +89,19 @@ describe("initial road generation", () => {
       }
       for (const edge of generated.roads.edges) {
         const routeClass = ROUTE_CLASS_REGISTRY.get(edge.classId)!;
-        const clearance = routeClass.widthM / 2 + routeClass.sidewalkM + 2;
+        // Clip landing band: corridor fitting samples every 2 m behind a 1 m clip margin, so
+        // a site-clipped terminal node lands within clearance + 3 of the boundary. Every
+        // loose end inside the band must face away from the site — a terminal edge pointing
+        // into it is exactly the wall-slam stub the pruner removes.
+        const landingBand = routeClass.widthM / 2 + routeClass.sidewalkM + 3;
         for (const looseId of [edge.a, edge.b] as const) {
           if (degree.get(looseId) !== 1) continue;
           const loose = nodeById.get(looseId)!;
-          expect(Math.min(...sites.map((site) => distToRing(loose, site)))).toBeGreaterThan(clearance);
+          for (const site of sites) {
+            if (distToRing(loose, site) > landingBand) continue;
+            const inner = nodeById.get(edge.a === looseId ? edge.b : edge.a)!;
+            expect(rayEntersRing(inner, loose, site)).toBe(false);
+          }
         }
       }
     }

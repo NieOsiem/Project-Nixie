@@ -1667,10 +1667,17 @@ function implicatedRouteIds(problems: readonly string[], source: RoadSource): Se
 }
 
 /**
- * `clipSegment` can leave the last edge of a planned corridor terminating directly at
- * a reserved site's clearance boundary. Drop only that terminal edge. Do not iterate:
- * recursively pruning the exposed parent erases useful approach streets and collapses
- * parcel density around landmarks.
+ * `clipSegment` can leave the last edge of a planned corridor terminating at a reserved
+ * site's clearance boundary: a road surface that runs flush into the monument block and
+ * stops. Drop that terminal edge. The proximity window must cover the whole clip landing
+ * band: corridor fitting samples every 2 m, so a clipped end lands anywhere in
+ * [clearance + margin, clearance + margin + 2] from the site boundary — a narrower window
+ * lets every stub whose last centreline sample fell short of the wall survive the prune.
+ * The aim test keeps the prune surgical: only a terminal edge whose axis enters the site is
+ * a clipped stub, so an organic dead end that merely sits beside a site survives. Do not
+ * iterate: the exposed parent ends at least a minimum street length further from the wall,
+ * outside the landing band, and recursively pruning it erases useful approach streets and
+ * collapses parcel density around landmarks.
  */
 function pruneReservedSiteStubs(source: RoadSource, reservedSites: readonly Ring[]): RoadSource {
   if (reservedSites.length === 0) return source;
@@ -1682,14 +1689,16 @@ function pruneReservedSiteStubs(source: RoadSource, reservedSites: readonly Ring
   }
   const drop = new Set<string>();
   for (const edge of source.edges) {
-    const limit = clearanceOf(edge.classId) + 2;
+    const limit = clearanceOf(edge.classId) + CLIP_MARGIN_M + 2;
     for (const end of [edge.a, edge.b] as const) {
-      if (degree.get(end) !== 1) continue;
+      if ((degree.get(end) ?? 0) !== 1) continue;
       const point = positionByNode.get(end)!;
-      if (reservedSites.some((ring) => distToRing(point, ring) <= limit)) {
-        drop.add(edge.id);
-        break;
-      }
+      const near = reservedSites.filter((ring) => distToRing(point, ring) <= limit);
+      if (near.length === 0) continue;
+      const inner = positionByNode.get(end === edge.a ? edge.b : edge.a)!;
+      if (!aimsIntoRings(inner, point, near)) continue;
+      drop.add(edge.id);
+      break;
     }
   }
   if (drop.size === 0) return source;
@@ -1697,6 +1706,22 @@ function pruneReservedSiteStubs(source: RoadSource, reservedSites: readonly Ring
     nodes: source.nodes,
     routes: source.routes,
     edges: source.edges.filter((edge) => !drop.has(edge.id))
+  });
+}
+
+/** True when the ray from `from` through `tip`, extended a bounded reach past `tip`, enters
+ *  one of `rings`: the terminal edge points into the nearby reserved site instead of merely
+ *  ending beside it. */
+function aimsIntoRings(from: Vec2, tip: Vec2, rings: readonly Ring[]): boolean {
+  const length = Math.hypot(tip.x - from.x, tip.y - from.y);
+  if (length <= EPS) return false;
+  const far = { x: tip.x + ((tip.x - from.x) / length) * 30, y: tip.y + ((tip.y - from.y) / length) * 30 };
+  return rings.some((ring) => {
+    if (pointInRing(tip, ring) || pointInRing(far, ring)) return true;
+    for (let index = 0; index < ring.length; index++) {
+      if (segmentIntersectionParam(tip, far, ring[index]!, ring[(index + 1) % ring.length]!)) return true;
+    }
+    return false;
   });
 }
 

@@ -167,6 +167,9 @@ export class BloomChain {
       uShadowStrength: dials.shadowStrength,
       uAoStrength: dials.aoStrength,
       uAoHeightM: dials.aoHeightM,
+      uContactAoStrength: dials.contactAoStrength,
+      uLightSpillStrength: dials.lightSpillStrength,
+      uLightSpillRadius: dials.lightSpillRadius,
       uFogStrength: dials.fogStrength,
       uFogDensity: dials.fogDensity,
       uFogHeightM: dials.fogHeightM,
@@ -182,12 +185,14 @@ export class BloomChain {
       uPuddleScaleM: dials.puddleScaleM,
       uWetDarken: dials.wetDarken,
       uWetGloss: dials.wetGloss,
+      uPuddleReflectionStrength: dials.puddleReflectionStrength,
       uRadialSmear: 0,
       uSmearStrength: dials.smearStrength,
       uBlackLift: dials.blackLift,
       uDebugGrayscale: dials.debugGrayscale,
       uPivotUv: new Float32Array([0.5, 0.5]),
       uWideTexel: this.#wideTexel,
+      uAoTexel: this.#aoTexel,
       uSceneUvScale: this.#sceneUvScale,
       uBloomUvScale: this.#bloomUvScale,
       uWideUvScale: this.#wideUvScale,
@@ -278,6 +283,9 @@ export class BloomChain {
     composite.uShadowStrength = dials.shadowStrength;
     composite.uAoStrength = dials.aoStrength;
     composite.uAoHeightM = dials.aoHeightM;
+    composite.uContactAoStrength = dials.contactAoStrength;
+    composite.uLightSpillStrength = dials.lightSpillStrength;
+    composite.uLightSpillRadius = dials.lightSpillRadius;
     composite.uFogStrength = dials.fogStrength;
     composite.uFogDensity = dials.fogDensity;
     composite.uFogHeightM = dials.fogHeightM;
@@ -297,6 +305,7 @@ export class BloomChain {
     composite.uPuddleScaleM = dials.puddleScaleM;
     composite.uWetDarken = dials.wetDarken;
     composite.uWetGloss = dials.wetGloss;
+    composite.uPuddleReflectionStrength = dials.puddleReflectionStrength;
     composite.uRadialSmear = radialSmear;
     composite.uSmearStrength = dials.smearStrength;
     composite.uBlackLift = dials.blackLift;

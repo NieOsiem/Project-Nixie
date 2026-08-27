@@ -10,6 +10,12 @@ export const FACADE_WINDOW_COLOR_SHARES = Object.freeze({
   neutral: 0.20,
   contrast: 0.12
 });
+/** Deterministic storefront/sign population, separately salted from window cells. */
+export const FACADE_SIGN_COLOR_SHARES = Object.freeze({
+  district: 0.64,
+  neutral: 0.22,
+  contrast: 0.14
+});
 
 /**
  * Fake-3D extrusion.
@@ -353,6 +359,16 @@ vec3 facade() {
   float signOn = step(0.4, hash21(vec2(floor(vU / (BAY_M * 1.7)) + seed * 29.0, 2.0)));
   float shopTone = mix(0.45, 1.0, hash21(vec2(floor(vU / (BAY_M * 1.7)) + seed * 41.0, 3.0)));
   float signStrip = slab(h, GROUND_BAND_M - 1.1, GROUND_BAND_M - 0.3, wUp) * (1.0 - upper) * 0.9;
+  // Storefront signs use their own stable bay/building salt so one sign keeps its colour
+  // while panning. The contrast tier resolves through the selected NEON_A/B accent; the
+  // neutral tier is cool-white rather than a district-wide override.
+  float signHue = hash21(vec2(
+    floor(vU / (BAY_M * 1.7)) + seed * 67.1,
+    seed * 11.7 + 4.0));
+  float neutralSign = step(${FACADE_SIGN_COLOR_SHARES.district}, signHue)
+    * (1.0 - step(${FACADE_SIGN_COLOR_SHARES.district + FACADE_SIGN_COLOR_SHARES.neutral}, signHue));
+  float contrastSign = step(${FACADE_SIGN_COLOR_SHARES.district + FACADE_SIGN_COLOR_SHARES.neutral}, signHue);
+  vec3 signC = mix(mix(districtC, neutralC, neutralSign), contrastC, contrastSign);
   vec3 baseC = vBase * (vShade * mix(0.55, 0.75, signOn) * grime);
   vec3 shopGlass = mix(baseC, glassC + vEmissive * 0.35, shop * 0.85);
 
@@ -378,11 +394,12 @@ vec3 facade() {
   col = mix(col, shopGlass, 1.0 - upper);
   col = mix(col, vBase * (vShade * 0.55), louver);
   col += vEmissive * (0.04 + 0.40 * coping * parapetGlow);
-  col += vAccent * (0.95 * lit * glass * 0.6 + 0.85 * shop * signOn * shopTone + 1.05 * signStrip * signOn * shopTone);
-  col += vEmissive * ((0.85 * signStrip + 0.30 * shop) * signOn * shopTone);
+  // Window colour is already applied through litC above. Adding the building accent again
+  // would collapse the pinned cell tiers back toward a single hue.
+  col += signC * ((1.35 * signStrip + 0.48 * shop) * signOn * shopTone) * vEmissiveGate;
   if (feature > 0.5) {
     float band = slab(fract(above / (FLOOR_M * 2.0)), 0.3, 0.7, wUp / (FLOOR_M * 2.0)) * upper * 0.5;
-    col += vAccent * band;
+    col += vBase * (0.12 * band);
   }
   return col;
 }

@@ -33,7 +33,7 @@ import {
 import type { CitySourceV2 as CitySourceV2Roads, CitySourceV3 } from "../core/gen/city.js";
 import { validateCitySourceV3 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictCompatibilityTag } from "../core/gen/district-registry.js";
-import { LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarId } from "../core/gen/landmark-registry.js";
+import { LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarId } from "../core/gen/landmark-registry.js";
 import { buildDistrictPlan } from "../core/gen/district-plan.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "../core/gen/district-generator.js";
 import { buildCompleteCityPlan, reserveMajorLandmarkSites, validateCompleteCityPlan } from "../core/gen/complete-city-plan.js";
@@ -408,6 +408,10 @@ describe("handleRequest generateCompleteCityPlan", () => {
     // from terrain+seed (roads don't matter), so replaying them on the candidate yields the
     // same plan, and the reported validation is exactly the pure validators' verdict.
     const replayReservations = reserveMajorLandmarkSites(result.candidate);
+    const preRoadIds = new Set<LandmarkGrammarId>(PRE_ROAD_LANDMARK_GRAMMAR_IDS);
+    expect(replayReservations.length).toBeLessThanOrEqual(PRE_ROAD_LANDMARK_GRAMMAR_IDS.length);
+    expect(replayReservations.every((reservation) => preRoadIds.has(reservation.grammarId))).toBe(true);
+    expect(new Set(replayReservations.map((reservation) => reservation.grammarId)).size).toBe(replayReservations.length);
     const replay = assignLandmarkCompatibleDistrictTypes(
       result.candidate.districts,
       replayReservations.map((reservation) => ({ grammarId: reservation.grammarId, sitePolygon: reservation.sitePolygon })),
@@ -418,6 +422,7 @@ describe("handleRequest generateCompleteCityPlan", () => {
     if (replay.warnings.length > 0) expectedPlan.diagnostics.warnings.push(...replay.warnings);
     expect(result.plan).toEqual(expectedPlan);
     expect(validateCompleteCityPlan(result.plan)).toEqual([]);
+    expect(result.plan.diagnostics.explicitReservationCount).toBe(replayReservations.length > 0 ? replayReservations.length : undefined);
     expect(validateCitySourceV3(result.candidate)).toEqual([]);
     expect(result.validation).toEqual([]);
     expect(result.counts.districtCount).toBe(result.candidate.districts.length);

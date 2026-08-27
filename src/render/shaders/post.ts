@@ -36,11 +36,6 @@ const PUDDLE_EDGE_DRY = 0.04;
 /** Peak strength of the damp-rim darkening between dry ground and standing water. */
 const PUDDLE_RIM_DARKEN = 0.65;
 /**
- * Anisotropy of the puddle noise domain: islands run ~35% longer along world Y so they read as
- * drainage-aligned standing water rather than round blobs. Same hash field, same determinism.
- */
-const PUDDLE_STRETCH_Y = 1.35;
-/**
  * Wet-darkening channel balance (CRITIQUE.md #14): reds and greens sink harder than blue, so a
  * darkened surface cools and saturates instead of merely scaling down.
  */
@@ -245,6 +240,9 @@ uniform float uStreakStrength;
 uniform float uShadowStrength;
 uniform float uAoStrength;
 uniform float uAoHeightM;
+uniform float uContactAoStrength;
+uniform float uLightSpillStrength;
+uniform float uLightSpillRadius;
 uniform float uFogStrength;
 uniform float uFogDensity;
 uniform float uFogHeightM;
@@ -257,6 +255,7 @@ uniform float uPuddleCoverage;
 uniform float uPuddleScaleM;
 uniform float uWetDarken;
 uniform float uWetGloss;
+uniform float uPuddleReflectionStrength;
 uniform float uRadialSmear;
 uniform float uSmearStrength;
 uniform float uBlackLift;
@@ -265,6 +264,7 @@ uniform vec2 uPivotUv;
 uniform vec2 uWorldOriginM;
 uniform vec2 uWorldSizeM;
 uniform vec2 uWideTexel;
+uniform vec2 uAoTexel;
 uniform vec2 uSceneUvScale;
 uniform vec2 uBloomUvScale;
 uniform vec2 uWideUvScale;
@@ -281,7 +281,12 @@ const float PUDDLE_EDGE_DRY = ${glslFloat(PUDDLE_EDGE_DRY)};
 const float PUDDLE_RIM_DARKEN = ${glslFloat(PUDDLE_RIM_DARKEN)};
 const vec3 WET_DARKEN_TINT = vec3(${glslFloat(WET_DARKEN_TINT_R)}, ${glslFloat(WET_DARKEN_TINT_G)}, ${glslFloat(WET_DARKEN_TINT_B)});
 const float GLOSS_LIFT = ${glslFloat(GLOSS_LIFT)};
-const float PUDDLE_STRETCH_Y = ${glslFloat(PUDDLE_STRETCH_Y)};
+const float ROAD_SAMPLE_M = ${glslFloat(2.0)};
+const float TINY_PUDDLE_SCALE = ${glslFloat(0.24)};
+const float HUGE_PUDDLE_SCALE = ${glslFloat(4.5)};
+const float HUGE_ASPECT_MIN = ${glslFloat(2.8)};
+const float HUGE_ASPECT_SPAN = ${glslFloat(2.7)};
+const float TAU = ${glslFloat(Math.PI * 2)};
 
 float hash21(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -298,6 +303,13 @@ float valueNoise(vec2 p) {
   return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
+float roadCue(vec3 colour) {
+  float luma = dot(colour, ${LUMA});
+  float lowLuma = 1.0 - smoothstep(0.12, 0.34, luma);
+  float blueViolet = smoothstep(-0.025, 0.10, colour.b - max(colour.r, colour.g));
+  return lowLuma * mix(0.55, 1.0, blueViolet);
+}
+
 void main() {
   vec4 sceneSample = texture2D(uScene, vUv * uSceneUvScale);
   float covered = step(${ALPHA_BACKGROUND}, sceneSample.a);
@@ -310,39 +322,119 @@ void main() {
     + wideBloom * uWideStrength
     + texture2D(uStreak, vUv * uStreakUvScale).rgb * uStreakStrength;
 
-  // The composite has no material channel. A world-anchored field is deliberately surface-blind,
-  // while the decoded height keeps the wet look on flat roads and low caps only.
   float ground = (1.0 - smoothstep(0.0, WET_GROUND_HEIGHT_M, heightM)) * covered;
   vec2 worldM = uWorldOriginM + vUv * uWorldSizeM;
-  // Anisotropic sample domain: islands elongate along world Y so they read as drainage-aligned
-  // standing water rather than round blobs. Same hash field, so determinism is untouched.
-  float puddleNoise = valueNoise(
-    vec2(worldM.x, worldM.y * PUDDLE_STRETCH_Y) / max(uPuddleScaleM, 0.001));
+
+  // Four pre-grade scene neighbours do double duty: their metre-space gradients find curbs and
+  // their road cues provide a broad cross-section probe for junctions and long carriageways.
+  vec2 roadUv = vec2(ROAD_SAMPLE_M) / max(uWorldSizeM, vec2(0.001));
+  vec4 sceneLeft = texture2D(uScene, clamp(vUv - vec2(roadUv.x, 0.0), vec2(0.0), vec2(1.0)) * uSceneUvScale);
+  vec4 sceneRight = texture2D(uScene, clamp(vUv + vec2(roadUv.x, 0.0), vec2(0.0), vec2(1.0)) * uSceneUvScale);
+  vec4 sceneUp = texture2D(uScene, clamp(vUv - vec2(0.0, roadUv.y), vec2(0.0), vec2(1.0)) * uSceneUvScale);
+  vec4 sceneDown = texture2D(uScene, clamp(vUv + vec2(0.0, roadUv.y), vec2(0.0), vec2(1.0)) * uSceneUvScale);
+  float sceneLuma = dot(sceneSample.rgb, ${LUMA});
+  float leftLuma = dot(sceneLeft.rgb, ${LUMA});
+  float rightLuma = dot(sceneRight.rgb, ${LUMA});
+  float upLuma = dot(sceneUp.rgb, ${LUMA});
+  float downLuma = dot(sceneDown.rgb, ${LUMA});
+  float roadEdge = smoothstep(0.025, 0.12, max(
+    max(abs(sceneLuma - leftLuma), abs(sceneLuma - rightLuma)),
+    max(abs(sceneLuma - upLuma), abs(sceneLuma - downLuma))));
+  float surfaceHeightEdge = max(
+    max(abs(sceneSample.a - sceneLeft.a), abs(sceneSample.a - sceneRight.a)),
+    max(abs(sceneSample.a - sceneUp.a), abs(sceneSample.a - sceneDown.a)));
+  float centreRoad = roadCue(sceneSample.rgb);
+  float leftRoad = roadCue(sceneLeft.rgb);
+  float rightRoad = roadCue(sceneRight.rgb);
+  float upRoad = roadCue(sceneUp.rgb);
+  float downRoad = roadCue(sceneDown.rgb);
+  float broadRoad = (leftRoad + rightRoad + upRoad + downRoad) * 0.25;
+  float longRoad = max(min(leftRoad, rightRoad), min(upRoad, downRoad));
+  float junction = smoothstep(0.52, 0.82, broadRoad)
+    * smoothstep(0.30, 0.65, min(max(leftRoad, rightRoad), max(upRoad, downRoad)));
+  float roadLikelihood = clamp(
+    centreRoad * 0.65 + broadRoad * 0.25 + roadEdge * 0.35 + longRoad * 0.15,
+    0.0, 1.0);
+  float roadMask = smoothstep(0.18, 0.62, roadLikelihood) * ground;
+
+  // A stationary drainage band breaks up otherwise even road odds. It is world-anchored, and the
+  // broad probe raises odds at junctions and along long sections without knowing road topology.
+  float drainageBand = 1.0 - smoothstep(
+    0.34, 0.50, abs(fract(dot(worldM, vec2(0.035, 0.012))) - 0.5));
+  float placementBias = roadMask
+    * (roadEdge * 0.12 + junction * 0.10 + longRoad * 0.06 + drainageBand * 0.08);
+
+  // Deterministic multi-scale union. Tiny pockets use a broken high-frequency pair, medium
+  // puddles merge two offset lobes, and the huge tier stretches along a seeded local direction.
+  float puddleScale = max(uPuddleScaleM, 0.001);
+  vec2 orientationCell = floor(worldM / (puddleScale * HUGE_PUDDLE_SCALE));
+  float angle = hash21(orientationCell + vec2(71.0, 19.0)) * TAU;
+  vec2 axis = vec2(cos(angle), sin(angle));
+  vec2 across = vec2(-axis.y, axis.x);
+  vec2 orientedM = vec2(dot(worldM, axis), dot(worldM, across));
+  float tinyA = valueNoise((worldM + vec2(13.7, -9.2)) / (puddleScale * TINY_PUDDLE_SCALE));
+  float tinyB = valueNoise((worldM + vec2(-4.1, 21.3)) / (puddleScale * TINY_PUDDLE_SCALE * 0.63));
+  float tinyField = min(max(tinyA, tinyB * 0.96), min(tinyA, tinyB) + 0.34);
+  float mediumA = valueNoise(orientedM / puddleScale);
+  float mediumB = valueNoise((orientedM + vec2(puddleScale * 0.46, -puddleScale * 0.24)) / puddleScale);
+  float mediumField = max(mediumA, mediumB * 0.98);
+  float hugeAspect = HUGE_ASPECT_MIN
+    + HUGE_ASPECT_SPAN * hash21(orientationCell + vec2(29.0, 83.0));
+  float hugeField = valueNoise(vec2(
+    orientedM.x / (puddleScale * HUGE_PUDDLE_SCALE * hugeAspect),
+    orientedM.y / (puddleScale * HUGE_PUDDLE_SCALE)));
+  float puddleNoise = max(tinyField - 0.08, max(mediumField, hugeField - 0.04))
+    + placementBias;
   float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);
-  // Asymmetric waterline: wide smooth wet-in, narrow crisp dry-out. Coverage zero stays exactly
-  // dry through the explicit step gate, whatever the smoothstep tails do as noise approaches 1.
   float wetIn = puddleThreshold - PUDDLE_EDGE_WET;
-  float puddle = smoothstep(wetIn, puddleThreshold + PUDDLE_EDGE_DRY, puddleNoise)
-    * step(0.0001, uPuddleCoverage);
-  // Damp collar hugging the outside of the waterline: fully risen before the water saturates,
-  // gone inside it. Ground-gated so walls never grow rim halos.
+  float coverageGate = step(0.0001, uPuddleCoverage);
+  float puddle = smoothstep(
+    wetIn, puddleThreshold + PUDDLE_EDGE_DRY, puddleNoise)
+    * roadMask * coverageGate;
   float rim = smoothstep(wetIn, puddleThreshold, puddleNoise)
-    * (1.0 - puddle) * step(0.0001, uPuddleCoverage) * ground;
-  float wet = clamp(uWetStrength, 0.0, 1.0) * ground * puddle;
+    * (1.0 - puddle) * roadMask * coverageGate;
+  float roadWet = clamp(uWetStrength, 0.0, 1.0) * roadMask * coverageGate;
+  float wet = roadWet * puddle;
 
-  // Darken first to make headroom, then lift only lit puddles. Wet darkening is saturated and
-  // slightly cool (WET_DARKEN_TINT) rather than a flat scale-down; the rim shares it at partial
-  // strength and the mask clamps to 1 so the two stack without over-darkening. The mix stays
-  // bounded so highlights near the tone-map ceiling cannot become an additive spike.
-  c *= mix(vec3(1.0), clamp(uWetDarken, 0.0, 1.0) * WET_DARKEN_TINT,
-    clamp(wet + PUDDLE_RIM_DARKEN * rim, 0.0, 1.0));
+  // Material tiers: damp carriageway stays broad and subdued; deep water makes more headroom for
+  // a sharper coloured reflection. The explicit coverage gate keeps the dry preset byte-identical.
+  float darkMask = clamp(roadWet * 0.18 + wet * 0.82 + PUDDLE_RIM_DARKEN * rim, 0.0, 1.0);
+  vec3 darkTarget = clamp(uWetDarken, 0.0, 1.0) * WET_DARKEN_TINT
+    * mix(1.0, 0.42, puddle);
+  c *= mix(vec3(1.0), darkTarget, darkMask);
   float light = clamp(dot(c, ${LUMA}), 0.0, 1.0);
-  float gloss = wet * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.02, 0.60, light);
-  c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), gloss);
+  float broadGloss = roadWet * (1.0 - puddle * 0.70)
+    * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.02, 0.60, light) * 0.28;
+  c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), broadGloss);
 
-  // The projection leans geometry away from the pivot. A mirror image therefore samples away
-  // from the pivot too; the reach is exactly zero at the pivot and grows radially with uRadialSmear.
-  // Wide bloom is already blurred, so geometrically weighted taps are enough for a smooth broken tail.
+  // A four-tap wide-bloom fan remains exclusively for low-frequency diffuse spill. Sharp water
+  // reflection uses the already-blurred bloom at this puddle pixel, never a remote directional max.
+  vec2 fanMetres = vec2(max(uLightSpillRadius, 0.001)) / max(uWorldSizeM, vec2(0.001));
+  vec2 radialDir = normalize(vUv - uPivotUv + vec2(0.0001));
+  vec2 fanDir = normalize(vec2(0.82, -0.37) + radialDir * uRadialSmear * 4.0);
+  vec2 fanAcross = vec2(-fanDir.y, fanDir.x);
+  vec3 fanForward = texture2D(uBloomWide,
+    clamp(vUv + fanDir * fanMetres, vec2(0.0), vec2(1.0)) * uWideUvScale).rgb;
+  vec3 fanBack = texture2D(uBloomWide,
+    clamp(vUv - fanDir * fanMetres, vec2(0.0), vec2(1.0)) * uWideUvScale).rgb;
+  vec3 fanLeft = texture2D(uBloomWide,
+    clamp(vUv + fanAcross * fanMetres * 0.42, vec2(0.0), vec2(1.0)) * uWideUvScale).rgb;
+  vec3 fanRight = texture2D(uBloomWide,
+    clamp(vUv - fanAcross * fanMetres * 0.42, vec2(0.0), vec2(1.0)) * uWideUvScale).rgb;
+  vec3 fanBloom = (wideBloom + fanForward + fanBack + fanLeft + fanRight) * 0.2;
+  vec3 reflectionBloom = wideBloom;
+  float reflectionLuma = dot(reflectionBloom, ${LUMA});
+  float reflectionChroma = max(max(reflectionBloom.r, reflectionBloom.g), reflectionBloom.b)
+    - min(min(reflectionBloom.r, reflectionBloom.g), reflectionBloom.b);
+  float reflectionSelect = smoothstep(0.020, 0.120, reflectionLuma)
+    * smoothstep(0.010, 0.080, reflectionChroma);
+  vec3 reflectionHue = reflectionBloom / max(reflectionLuma, 0.001);
+  vec3 reflectionLift = reflectionHue
+    * min(reflectionLuma * uWideStrength * 1.8, 0.60);
+  float reflectionAmount = wet * smoothstep(0.48, 0.90, puddle)
+    * clamp(uPuddleReflectionStrength, 0.0, 2.0) * reflectionSelect;
+
+  // Preserve the original radial wet smear as a longer, softer tier behind the sharp local reflection.
   float smearAmount = wet * clamp(uSmearStrength, 0.0, 1.0);
   vec2 smearReach = (vUv - uPivotUv) * uRadialSmear;
   vec3 smearSample = vec3(0.0);
@@ -362,12 +454,9 @@ void main() {
     float tapWeight = valid * edgeFade.x * edgeFade.y;
     vec2 sampleUv = clamp(rawUv, vec2(0.0), uWideUvScale);
     smearSample += texture2D(uBloomWide, sampleUv).rgb * (w * tapWeight);
-    // WHY: renormalising valid taps would cancel the fade and recreate the hard edge plateau.
     smearWeight += w;
   }
   smearSample /= max(smearWeight, 0.001);
-  // Tint a bounded dark lift toward the sampled neon hue. The explicit cap keeps wet highlights
-  // from turning into a raw additive spike before the composite tone map.
   float smearLuma = dot(smearSample, ${LUMA});
   float smearLight = clamp(smearLuma * uWideStrength, 0.0, 1.0);
   vec3 smearHue = smearSample / max(smearLuma, 0.001);
@@ -381,42 +470,63 @@ void main() {
   c *= 1.0 - uShadowStrength * castShadow;
 
   float ao = texture2D(uAo, vUv * uAoUvScale).r;
+  vec2 aoUv = vUv * uAoUvScale;
+  float aoLeft = texture2D(uAo, clamp(aoUv - vec2(uAoTexel.x, 0.0), vec2(0.0), uAoUvScale)).r;
+  float aoRight = texture2D(uAo, clamp(aoUv + vec2(uAoTexel.x, 0.0), vec2(0.0), uAoUvScale)).r;
+  float aoUp = texture2D(uAo, clamp(aoUv - vec2(0.0, uAoTexel.y), vec2(0.0), uAoUvScale)).r;
+  float aoDown = texture2D(uAo, clamp(aoUv + vec2(0.0, uAoTexel.y), vec2(0.0), uAoUvScale)).r;
+  float aoEdge = max(
+    max(abs(ao - aoLeft), abs(ao - aoRight)),
+    max(abs(ao - aoUp), abs(ao - aoDown)));
   float lowness = 1.0 - smoothstep(0.0, uAoHeightM, heightM);
   float lowSurface = lowness * covered;
-  // The broad AO remains gentle, while its dense core becomes a tight contact term. The
-  // full-resolution silhouette removes roofs and walls from that core: only the exposed side
-  // of footprint edges and enclosed gaps receive the extra darkening. This reuses the one
-  // blurred quarter-resolution AO sample; no target, pass, derivative or time term is added.
-  float contactAo = smoothstep(0.30, 0.70, ao) * (1.0 - buildingCoverage);
+  float contactBand = smoothstep(0.42, 0.72, ao) * (1.0 - smoothstep(0.84, 0.98, ao));
+  float contactAo = max(smoothstep(0.035, 0.16, aoEdge), contactBand)
+    * (1.0 - buildingCoverage);
   c *= 1.0 - uAoStrength * ao * lowSurface;
-  c *= 1.0 - uAoStrength * 0.35 * contactAo * lowSurface;
-  // Cool neon-night grade: the reference city sits on an indigo base — red damped, blue
-  // lifted, a whisper of violet in the floor. Neon hues pass through the chroma stage after.
-  // The floor term scales with the uBlackLift dial — below 1 deepens blacks toward true black.
-  c = c * vec3(0.94, 0.91, 1.10) + vec3(0.008, 0.005, 0.022) * uBlackLift;
+  c *= 1.0 - clamp(uContactAoStrength, 0.0, 1.0) * contactAo * lowSurface;
 
-  // Geometry leans away from uPivot, so screen distance from it IS depth here — this is the
-  // projection's own falloff, not a photographic vignette, which is why it keys off the pivot
-  // rather than the frame centre.
+  // Water receives the sharp local source colour after every matte occlusion term, so a puddle
+  // catches nearby light on top of the cast shadow instead of having its reflection multiplied away.
+  vec3 reflectionTarget = min(c + reflectionLift, vec3(1.0));
+  c = mix(c, reflectionTarget, clamp(reflectionAmount, 0.0, 1.0));
+
+  // Selected chromatic bloom paints only ground and low walls. White markings fail the chroma
+  // gate; roofs fail the height gate; AO and the tight contact ring stop light leaking through feet.
+  float spillLuma = dot(fanBloom, ${LUMA});
+  float spillChroma = max(max(fanBloom.r, fanBloom.g), fanBloom.b)
+    - min(min(fanBloom.r, fanBloom.g), fanBloom.b);
+  float spillSelect = smoothstep(0.020, 0.120, spillLuma)
+    * smoothstep(0.010, 0.080, spillChroma);
+  float spillHeight = 1.0 - smoothstep(2.0, 16.0, heightM);
+  float lowWall = smoothstep(0.0015, 0.020, surfaceHeightEdge)
+    * spillHeight * (1.0 - ground);
+  float spillSurface = max(ground, lowWall) * covered;
+  float spillOcclusion = 1.0 - clamp(ao * 0.72 + contactAo * 0.90, 0.0, 1.0);
+  float spillAmount = clamp(uLightSpillStrength, 0.0, 2.0)
+    * spillSelect * spillSurface * spillOcclusion;
+  vec3 spillHue = fanBloom / max(spillLuma, 0.001);
+  vec3 spillTarget = min(
+    c + spillHue * min(spillLuma * uWideStrength * 1.8, 0.54),
+    vec3(1.0));
+  c = mix(c, spillTarget, clamp(spillAmount, 0.0, 1.0));
+
+  // Global grade constants are intentionally unchanged.
+  c = c * vec3(0.94, 0.91, 1.10) + vec3(0.008, 0.005, 0.022) * uBlackLift;
   c *= 1.0 - ${DEPTH_FALLOFF} * smoothstep(0.20, 0.72, length(vUv - uPivotUv));
 
-  // Fog keys off the same radial term the depth falloff darkens with, so the two stack
-  // at the frame edge. Tune them together, never one alone.
   float radial = length(vUv - uPivotUv);
   float density = exp(-heightM / max(uFogHeightM, 0.001));
   float fog = (1.0 - exp(-uFogDensity * radial)) * density * covered * uFogStrength;
   vec3 haze = vec3(uFogTintR, uFogTintG, uFogTintB) + wideBloom * uFogInscatter;
   c = mix(c, haze, clamp(fog, 0.0, 1.0));
 
-  // Grade: body chroma adds a mild global vibrance; neon chroma boosts bright signage harder.
   float l = dot(c, ${LUMA});
   float chroma = mix(${glslFloat(BODY_CHROMA)}, ${glslFloat(NEON_CHROMA)}, smoothstep(0.18, 0.62, l));
   c = max(mix(vec3(l), c, chroma) - vec3(${BLACK_FLOOR}), vec3(0.0));
 
   float m = max(max(c.r, c.g), c.b);
   c *= 1.0 / (1.0 + max(m - 1.0, 0.0));
-  // Form-readability probe: presenting the graded frame as pure luma checks that architecture
-  // keeps its form without emissives (CRITIQUE.md #4/#14).
   c = mix(c, vec3(dot(c, ${LUMA})), clamp(uDebugGrayscale, 0.0, 1.0));
   gl_FragColor = vec4(c, 1.0);
 }

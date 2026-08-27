@@ -3,7 +3,7 @@ import type { DistrictCompatibilityTag } from "./district-registry.js";
 /**
  * Phase 4 building grammar registry.
  *
- * 39 materially distinct grammars spanning twelve footprint archetypes,
+ * 55 materially distinct grammars spanning seventeen footprint archetypes,
  * each declaring compatible district tags, site/parcel limits, footprint/setback rules,
  * height and skyline ranges, massing rules, roofline/facade/signage/rooftop/wear
  * profiles, compatible visual uses, material slot weights, and geometry policy.
@@ -24,7 +24,12 @@ export const FOOTPRINT_ARCHETYPE_IDS = [
   "stepped",
   "offset-tower",
   "bridge",
-  "cantilever"
+  "cantilever",
+  "t-shape",
+  "cross",
+  "h-shape",
+  "hexagonal",
+  "sawtooth"
 ] as const;
 
 export type FootprintArchetypeId = (typeof FOOTPRINT_ARCHETYPE_IDS)[number];
@@ -89,6 +94,23 @@ export const BUILDING_GRAMMAR_IDS = [
   // cantilever
   "logistics-cantilever-works",
   "entertainment-cantilever-stack",
+  // overview-legible massing/v4 families
+  "commercial-t-headquarters",
+  "residential-t-court",
+  "civic-cross-tower",
+  "market-cross-complex",
+  "residential-h-block",
+  "campus-h-institute",
+  "corporate-hex-tower",
+  "waterfront-hex-pavilion",
+  "industrial-sawtooth-works",
+  "logistics-comb-depot",
+  // bounded density/v3 infill (broad low/mid-rise residual grammars)
+  "infill-rowhouse",
+  "infill-corner-block",
+  "infill-mixed-t",
+  "infill-residential-h",
+  "infill-courtyard-cluster",
   // micro (fine-grain filler for parcels below the 100 m² main-grammar floor)
   "street-kiosk",
   "garage-unit",
@@ -100,6 +122,14 @@ export const BUILDING_GRAMMAR_IDS = [
 ] as const;
 
 export type BuildingGrammarId = (typeof BUILDING_GRAMMAR_IDS)[number];
+export const INFILL_BUILDING_GRAMMAR_IDS = [
+  "infill-rowhouse",
+  "infill-corner-block",
+  "infill-mixed-t",
+  "infill-residential-h",
+  "infill-courtyard-cluster"
+] as const satisfies readonly BuildingGrammarId[];
+
 
 /**
  * Micro grammars fill parcels below the main-grammar floor (~100 m²). They must never
@@ -316,6 +346,21 @@ const FRONTAGE: Readonly<Record<BuildingGrammarId, FrontagePolicy>> = Object.fre
   "market-bridge-complex": { mode: "street-wall", frontSetback: [0.2, 0.8], widthFill: 0.96, depthFill: 0.92 },
   "logistics-cantilever-works": { mode: "street-wall", frontSetback: [0.6, 1.8], widthFill: 0.94, depthFill: 0.88 },
   "entertainment-cantilever-stack": { mode: "street-wall", frontSetback: [0.2, 0.8], widthFill: 0.97, depthFill: 0.92 },
+  "commercial-t-headquarters": { mode: "setback", frontSetback: [1.5, 4], widthFill: 0.92, depthFill: 0.86 },
+  "residential-t-court": { mode: "street-wall", frontSetback: [0.5, 1.6], widthFill: 0.95, depthFill: 0.9 },
+  "civic-cross-tower": { mode: "setback", frontSetback: [2.5, 6], widthFill: 0.9, depthFill: 0.84 },
+  "market-cross-complex": { mode: "street-wall", frontSetback: [0.2, 0.8], widthFill: 0.96, depthFill: 0.92 },
+  "residential-h-block": { mode: "street-wall", frontSetback: [0.5, 1.6], widthFill: 0.95, depthFill: 0.9 },
+  "campus-h-institute": { mode: "setback", frontSetback: [2.5, 6], widthFill: 0.9, depthFill: 0.84 },
+  "corporate-hex-tower": { mode: "setback", frontSetback: [2, 5], widthFill: 0.9, depthFill: 0.84 },
+  "waterfront-hex-pavilion": { mode: "setback", frontSetback: [1.2, 3.5], widthFill: 0.92, depthFill: 0.86 },
+  "industrial-sawtooth-works": { mode: "street-wall", frontSetback: [0.4, 1.2], widthFill: 0.95, depthFill: 0.9 },
+  "logistics-comb-depot": { mode: "street-wall", frontSetback: [0.5, 1.5], widthFill: 0.94, depthFill: 0.9 },
+  "infill-rowhouse": { mode: "street-wall", frontSetback: [0.2, 0.7], widthFill: 0.96, depthFill: 0.92 },
+  "infill-corner-block": { mode: "street-wall", frontSetback: [0.2, 0.9], widthFill: 0.95, depthFill: 0.9 },
+  "infill-mixed-t": { mode: "street-wall", frontSetback: [0.3, 1], widthFill: 0.94, depthFill: 0.9 },
+  "infill-residential-h": { mode: "street-wall", frontSetback: [0.4, 1.2], widthFill: 0.94, depthFill: 0.88 },
+  "infill-courtyard-cluster": { mode: "setback", frontSetback: [0.5, 1.5], widthFill: 0.92, depthFill: 0.88 },
   "street-kiosk": { mode: "street-wall", frontSetback: [0.05, 0.3], widthFill: 0.98, depthFill: 0.95 },
   "garage-unit": { mode: "street-wall", frontSetback: [0.1, 0.5], widthFill: 0.96, depthFill: 0.9 },
   "shack-shanty": { mode: "setback", frontSetback: [0.3, 1], widthFill: 0.92, depthFill: 0.85 },
@@ -374,6 +419,26 @@ export const BUILDING_GRAMMARS: readonly BuildingGrammarDefinition[] = Object.fr
   grammar("market-bridge-complex", "Market Bridge Complex", "bridge", ["market", "fine-grain"], { minWidthM: 30, maxWidthM: 62, minDepthM: 20, maxDepthM: 50, minAreaM2: 620, maxAreaM2: 3100, minAspect: 0.6, maxAspect: 3 }, { occupancyMin: 0.74, occupancyMax: 0.94, setbackMin: 0.4, setbackMax: 1.8 }, { minM: 24, maxM: 82, skylineBias: 0.46 }, { minMasses: 3, maxMasses: 3, mainWidthFactor: 0.96, mainDepthFactor: 0.92 }, ["parapet", "curved", "shed"], ["entertainment-arcade", "shopfront", "masonry-window"], { rateMin: 0.68, rateMax: 1 }, { rateMin: 0.35, rateMax: 0.68 }, { min: 0.22, max: 0.62 }, ["entertainment", "commercial", "mixed-use"], { wall: [0.5, 0.32, 0.18], roof: [0.54, 0.28, 0.18], neon: [0.18, 0.82] }, { coarse: "volumes", detail: "facade", neon: true }),
   grammar("logistics-cantilever-works", "Logistics Cantilever Works", "cantilever", ["industrial", "waterfront"], { minWidthM: 26, maxWidthM: 68, minDepthM: 24, maxDepthM: 58, minAreaM2: 640, maxAreaM2: 3900, minAspect: 0.45, maxAspect: 2.8 }, { occupancyMin: 0.66, occupancyMax: 0.9, setbackMin: 1, setbackMax: 3.5 }, { minM: 20, maxM: 62, skylineBias: 0.2 }, { minMasses: 2, maxMasses: 3, mainWidthFactor: 0.94, mainDepthFactor: 0.88 }, ["flat", "sawtooth", "shed"], ["warehouse-ribs", "industrial-panel", "utility-louvre"], { rateMin: 0.01, rateMax: 0.1 }, { rateMin: 0.78, rateMax: 1 }, { min: 0.34, max: 0.74 }, ["logistics", "industrial", "utility"], { wall: [0.67, 0.23, 0.1], roof: [0.52, 0.31, 0.17], neon: [0.6, 0.4] }, { coarse: "volumes", detail: "rooftop", neon: false }),
   grammar("entertainment-cantilever-stack", "Entertainment Cantilever Stack", "cantilever", ["market", "fine-grain"], { minWidthM: 16, maxWidthM: 52, minDepthM: 20, maxDepthM: 52, minAreaM2: 340, maxAreaM2: 2700, minAspect: 0.38, maxAspect: 2.7 }, { occupancyMin: 0.72, occupancyMax: 0.94, setbackMin: 0.4, setbackMax: 2 }, { minM: 28, maxM: 120, skylineBias: 0.62 }, { minMasses: 2, maxMasses: 3, mainWidthFactor: 0.96, mainDepthFactor: 0.92 }, ["parapet", "curved", "crown"], ["entertainment-arcade", "shopfront", "glass-curtain"], { rateMin: 0.7, rateMax: 1 }, { rateMin: 0.42, rateMax: 0.76 }, { min: 0.16, max: 0.54 }, ["entertainment", "commercial", "mixed-use"], { wall: [0.48, 0.34, 0.18], roof: [0.52, 0.3, 0.18], neon: [0.14, 0.86] }, { coarse: "volumes", detail: "facade", neon: true }),
+  // massing/v4 overview families: each pair shares a legible footprint vocabulary but
+  // carries district-specific height, frontage, material, facade, and use behaviour.
+  grammar("commercial-t-headquarters", "Commercial T-Headquarters", "t-shape", ["formal", "fine-grain"], { minWidthM: 28, maxWidthM: 72, minDepthM: 28, maxDepthM: 64, minAreaM2: 700, maxAreaM2: 4600, minAspect: 0.45, maxAspect: 2.4 }, { occupancyMin: 0.62, occupancyMax: 0.86, setbackMin: 1.5, setbackMax: 4 }, { minM: 54, maxM: 210, skylineBias: 0.82 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.92, mainDepthFactor: 0.86 }, ["flat", "crown", "stepped"], ["glass-curtain", "office-grid", "shopfront"], { rateMin: 0.16, rateMax: 0.46 }, { rateMin: 0.42, rateMax: 0.82 }, { min: 0.03, max: 0.22 }, ["commercial", "mixed-use", "civic"], { wall: [0.68, 0.23, 0.09], roof: [0.66, 0.25, 0.09], neon: [0.58, 0.42] }, { coarse: "volumes", detail: "facade", neon: true }),
+  grammar("residential-t-court", "Residential T-Court", "t-shape", ["residential", "campus"], { minWidthM: 24, maxWidthM: 70, minDepthM: 26, maxDepthM: 58, minAreaM2: 620, maxAreaM2: 4000, minAspect: 0.42, maxAspect: 2.6 }, { occupancyMin: 0.62, occupancyMax: 0.86, setbackMin: 0.8, setbackMax: 2.5 }, { minM: 24, maxM: 112, skylineBias: 0.48 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.88 }, ["flat", "parapet", "terrace"], ["residential-balcony", "masonry-window", "office-grid"], { rateMin: 0.02, rateMax: 0.14 }, { rateMin: 0.48, rateMax: 0.9 }, { min: 0.08, max: 0.38 }, ["residential", "mixed-use"], { wall: [0.6, 0.28, 0.12], roof: [0.63, 0.26, 0.11], neon: [0.64, 0.36] }, { coarse: "volumes", detail: "facade", neon: false }),
+  grammar("civic-cross-tower", "Civic Cross Tower", "cross", ["formal", "campus"], { minWidthM: 30, maxWidthM: 72, minDepthM: 30, maxDepthM: 68, minAreaM2: 900, maxAreaM2: 4800, minAspect: 0.5, maxAspect: 2.1 }, { occupancyMin: 0.58, occupancyMax: 0.82, setbackMin: 2.5, setbackMax: 6 }, { minM: 58, maxM: 230, skylineBias: 0.88 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.9, mainDepthFactor: 0.84 }, ["crown", "flat", "domed"], ["civic-columns", "glass-curtain", "office-grid"], { rateMin: 0.04, rateMax: 0.2 }, { rateMin: 0.4, rateMax: 0.78 }, { min: 0.02, max: 0.18 }, ["civic", "commercial", "mixed-use"], { wall: [0.76, 0.18, 0.06], roof: [0.74, 0.2, 0.06], neon: [0.68, 0.32] }, { coarse: "volumes", detail: "facade", neon: true }),
+  grammar("market-cross-complex", "Market Cross Complex", "cross", ["market", "fine-grain"], { minWidthM: 22, maxWidthM: 54, minDepthM: 22, maxDepthM: 50, minAreaM2: 480, maxAreaM2: 2700, minAspect: 0.4, maxAspect: 2.5 }, { occupancyMin: 0.72, occupancyMax: 0.92, setbackMin: 0.3, setbackMax: 1.5 }, { minM: 22, maxM: 92, skylineBias: 0.5 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.96, mainDepthFactor: 0.92 }, ["parapet", "curved", "gable"], ["entertainment-arcade", "shopfront", "masonry-window"], { rateMin: 0.62, rateMax: 1 }, { rateMin: 0.34, rateMax: 0.7 }, { min: 0.2, max: 0.6 }, ["entertainment", "commercial", "mixed-use"], { wall: [0.5, 0.32, 0.18], roof: [0.54, 0.28, 0.18], neon: [0.2, 0.8] }, { coarse: "silhouette", detail: "facade", neon: true }),
+  grammar("residential-h-block", "Residential H-Block", "h-shape", ["residential", "fine-grain"], { minWidthM: 30, maxWidthM: 82, minDepthM: 28, maxDepthM: 68, minAreaM2: 840, maxAreaM2: 5500, minAspect: 0.45, maxAspect: 2.7 }, { occupancyMin: 0.62, occupancyMax: 0.88, setbackMin: 0.8, setbackMax: 2.5 }, { minM: 28, maxM: 128, skylineBias: 0.54 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.88 }, ["flat", "parapet", "stepped"], ["residential-balcony", "masonry-window", "shopfront"], { rateMin: 0.03, rateMax: 0.18 }, { rateMin: 0.48, rateMax: 0.9 }, { min: 0.08, max: 0.4 }, ["residential", "mixed-use"], { wall: [0.58, 0.3, 0.12], roof: [0.62, 0.27, 0.11], neon: [0.62, 0.38] }, { coarse: "volumes", detail: "facade", neon: false }),
+  grammar("campus-h-institute", "Campus H-Institute", "h-shape", ["campus", "formal"], { minWidthM: 30, maxWidthM: 76, minDepthM: 28, maxDepthM: 64, minAreaM2: 820, maxAreaM2: 4800, minAspect: 0.48, maxAspect: 2.4 }, { occupancyMin: 0.56, occupancyMax: 0.8, setbackMin: 2, setbackMax: 5 }, { minM: 24, maxM: 88, skylineBias: 0.42 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.9, mainDepthFactor: 0.84 }, ["flat", "domed", "terrace"], ["civic-columns", "masonry-window", "glass-curtain"], { rateMin: 0.02, rateMax: 0.14 }, { rateMin: 0.34, rateMax: 0.72 }, { min: 0.03, max: 0.24 }, ["civic", "mixed-use"], { wall: [0.76, 0.18, 0.06], roof: [0.74, 0.2, 0.06], neon: [0.76, 0.24] }, { coarse: "volumes", detail: "facade", neon: false }),
+  grammar("corporate-hex-tower", "Corporate Hex Tower", "hexagonal", ["formal", "waterfront"], { minWidthM: 26, maxWidthM: 68, minDepthM: 26, maxDepthM: 66, minAreaM2: 680, maxAreaM2: 4400, minAspect: 0.5, maxAspect: 2 }, { occupancyMin: 0.58, occupancyMax: 0.82, setbackMin: 2, setbackMax: 5 }, { minM: 74, maxM: 310, skylineBias: 0.93 }, { minMasses: 2, maxMasses: 3, mainWidthFactor: 0.9, mainDepthFactor: 0.84 }, ["crown", "flat", "stepped"], ["glass-curtain", "office-grid"], { rateMin: 0.12, rateMax: 0.36 }, { rateMin: 0.42, rateMax: 0.82 }, { min: 0.02, max: 0.16 }, ["commercial", "mixed-use", "civic"], { wall: [0.72, 0.2, 0.08], roof: [0.7, 0.22, 0.08], neon: [0.62, 0.38] }, { coarse: "volumes", detail: "facade", neon: true }),
+  grammar("waterfront-hex-pavilion", "Waterfront Hex Pavilion", "hexagonal", ["waterfront", "formal"], { minWidthM: 22, maxWidthM: 58, minDepthM: 24, maxDepthM: 54, minAreaM2: 520, maxAreaM2: 3100, minAspect: 0.42, maxAspect: 2.4 }, { occupancyMin: 0.6, occupancyMax: 0.84, setbackMin: 1.2, setbackMax: 3.5 }, { minM: 26, maxM: 106, skylineBias: 0.56 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.92, mainDepthFactor: 0.86 }, ["curved", "terrace", "crown"], ["glass-curtain", "residential-balcony", "civic-columns"], { rateMin: 0.08, rateMax: 0.32 }, { rateMin: 0.3, rateMax: 0.72 }, { min: 0.04, max: 0.26 }, ["entertainment", "commercial", "mixed-use", "civic"], { wall: [0.6, 0.27, 0.13], roof: [0.62, 0.26, 0.12], neon: [0.5, 0.5] }, { coarse: "volumes", detail: "facade", neon: true }),
+  grammar("industrial-sawtooth-works", "Industrial Sawtooth Works", "sawtooth", ["industrial", "irregular"], { minWidthM: 30, maxWidthM: 86, minDepthM: 28, maxDepthM: 72, minAreaM2: 840, maxAreaM2: 6100, minAspect: 0.42, maxAspect: 3 }, { occupancyMin: 0.68, occupancyMax: 0.9, setbackMin: 0.6, setbackMax: 2 }, { minM: 14, maxM: 44, skylineBias: 0.14 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.9 }, ["sawtooth", "shed", "flat"], ["warehouse-ribs", "industrial-panel", "utility-louvre"], { rateMin: 0.01, rateMax: 0.1 }, { rateMin: 0.72, rateMax: 1 }, { min: 0.38, max: 0.8 }, ["industrial", "logistics", "utility"], { wall: [0.67, 0.23, 0.1], roof: [0.5, 0.32, 0.18], neon: [0.6, 0.4] }, { coarse: "silhouette", detail: "rooftop", neon: false }),
+  grammar("logistics-comb-depot", "Logistics Comb Depot", "sawtooth", ["industrial", "waterfront"], { minWidthM: 36, maxWidthM: 96, minDepthM: 30, maxDepthM: 76, minAreaM2: 1080, maxAreaM2: 7200, minAspect: 0.48, maxAspect: 3.2 }, { occupancyMin: 0.66, occupancyMax: 0.9, setbackMin: 0.8, setbackMax: 2.5 }, { minM: 14, maxM: 38, skylineBias: 0.1 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.9 }, ["sawtooth", "shed", "flat"], ["warehouse-ribs", "industrial-panel", "utility-louvre"], { rateMin: 0.01, rateMax: 0.08 }, { rateMin: 0.78, rateMax: 1 }, { min: 0.34, max: 0.74 }, ["logistics", "industrial", "utility"], { wall: [0.68, 0.22, 0.1], roof: [0.52, 0.31, 0.17], neon: [0.62, 0.38] }, { coarse: "silhouette", detail: "rooftop", neon: false }),
+  // density/v3 infill: broad, low/mid-rise residual fits. These are selected only by
+  // the bounded infill pass; they deliberately span multiple silhouettes instead of
+  // falling back to wall-to-wall rectangles.
+  grammar("infill-rowhouse", "Infill Rowhouse", "rectangle", ["residential", "fine-grain", "irregular"], { minWidthM: 8, maxWidthM: 80, minDepthM: 8, maxDepthM: 60, minAreaM2: 100, maxAreaM2: 4800, minAspect: 0.14, maxAspect: 7 }, { occupancyMin: 0.72, occupancyMax: 0.9, setbackMin: 0.2, setbackMax: 0.7 }, { minM: 8, maxM: 24, skylineBias: 0.08 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.96, mainDepthFactor: 0.92 }, ["gable", "parapet", "flat"], ["masonry-window", "residential-balcony", "shopfront"], { rateMin: 0.02, rateMax: 0.18 }, { rateMin: 0.18, rateMax: 0.45 }, { min: 0.12, max: 0.5 }, ["residential", "mixed-use"], { wall: [0.58, 0.29, 0.13], roof: [0.6, 0.27, 0.13], neon: [0.7, 0.3] }, { coarse: "silhouette", detail: "facade", neon: false }),
+  grammar("infill-corner-block", "Infill Corner Block", "l-shape", ["fine-grain", "market", "waterfront"], { minWidthM: 12, maxWidthM: 80, minDepthM: 12, maxDepthM: 70, minAreaM2: 140, maxAreaM2: 4800, minAspect: 0.18, maxAspect: 5.5 }, { occupancyMin: 0.68, occupancyMax: 0.88, setbackMin: 0.2, setbackMax: 0.9 }, { minM: 10, maxM: 28, skylineBias: 0.1 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.95, mainDepthFactor: 0.9 }, ["parapet", "gable", "terrace"], ["shopfront", "masonry-window", "entertainment-arcade"], { rateMin: 0.35, rateMax: 0.65 }, { rateMin: 0.2, rateMax: 0.5 }, { min: 0.05, max: 0.25 }, ["residential", "commercial", "entertainment", "mixed-use"], { wall: [0.58, 0.28, 0.14], roof: [0.62, 0.25, 0.13], neon: [0.55, 0.45] }, { coarse: "silhouette", detail: "facade", neon: true }),
+  grammar("infill-mixed-t", "Infill Mixed T", "t-shape", ["formal", "fine-grain", "market"], { minWidthM: 14, maxWidthM: 82, minDepthM: 14, maxDepthM: 72, minAreaM2: 180, maxAreaM2: 4800, minAspect: 0.2, maxAspect: 5 }, { occupancyMin: 0.62, occupancyMax: 0.84, setbackMin: 0.3, setbackMax: 1 }, { minM: 12, maxM: 32, skylineBias: 0.12 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.9 }, ["flat", "parapet", "stepped"], ["office-grid", "shopfront", "masonry-window"], { rateMin: 0.04, rateMax: 0.24 }, { rateMin: 0.18, rateMax: 0.48 }, { min: 0.06, max: 0.38 }, ["commercial", "mixed-use", "civic"], { wall: [0.62, 0.27, 0.11], roof: [0.64, 0.25, 0.11], neon: [0.65, 0.35] }, { coarse: "silhouette", detail: "none", neon: false }),
+  grammar("infill-residential-h", "Infill Residential H", "h-shape", ["residential", "campus", "waterfront"], { minWidthM: 18, maxWidthM: 84, minDepthM: 18, maxDepthM: 72, minAreaM2: 300, maxAreaM2: 4800, minAspect: 0.24, maxAspect: 4.2 }, { occupancyMin: 0.58, occupancyMax: 0.8, setbackMin: 0.4, setbackMax: 1.2 }, { minM: 12, maxM: 35, skylineBias: 0.14 }, { minMasses: 1, maxMasses: 2, mainWidthFactor: 0.94, mainDepthFactor: 0.88 }, ["flat", "parapet", "terrace"], ["residential-balcony", "masonry-window", "office-grid"], { rateMin: 0.01, rateMax: 0.1 }, { rateMin: 0.22, rateMax: 0.52 }, { min: 0.06, max: 0.36 }, ["residential", "mixed-use"], { wall: [0.6, 0.28, 0.12], roof: [0.63, 0.26, 0.11], neon: [0.72, 0.28] }, { coarse: "silhouette", detail: "none", neon: false }),
+  grammar("infill-courtyard-cluster", "Infill Courtyard Cluster", "compound", ["formal", "campus", "industrial", "irregular", "waterfront"], { minWidthM: 16, maxWidthM: 84, minDepthM: 16, maxDepthM: 72, minAreaM2: 220, maxAreaM2: 4800, minAspect: 0.22, maxAspect: 4.5 }, { occupancyMin: 0.54, occupancyMax: 0.78, setbackMin: 0.5, setbackMax: 1.5 }, { minM: 9, maxM: 30, skylineBias: 0.08 }, { minMasses: 1, maxMasses: 4, mainWidthFactor: 0.92, mainDepthFactor: 0.88 }, ["flat", "shed", "parapet"], ["masonry-window", "civic-columns", "industrial-panel"], { rateMin: 0.18, rateMax: 0.42 }, { rateMin: 0.45, rateMax: 0.82 }, { min: 0.08, max: 0.35 }, ["residential", "civic", "industrial", "mixed-use"], { wall: [0.62, 0.25, 0.13], roof: [0.56, 0.29, 0.15], neon: [0.7, 0.3] }, { coarse: "volumes", detail: "rooftop", neon: false }),
   // Micro grammars: fill parcels between 16 m² and the 100 m² main-grammar floor. Sized so
   // buildingFitsEnvelope passes for the fine-grain/market and industrial envelopes that
   // actually produce such parcels (night-market, old-city, dense/low-rise residential,
@@ -491,7 +556,7 @@ export function validateBuildingRegistry(entries: readonly BuildingGrammarDefini
     signatures.set(signature, entry.id);
   }
   for (const id of BUILDING_GRAMMAR_IDS) if (!ids.has(id)) problems.push(`Building grammar "${id}" is unreachable.`);
-  if (BUILDING_GRAMMAR_IDS.length < 24) problems.push(`At least 24 building grammars are required, found ${BUILDING_GRAMMAR_IDS.length}.`);
+  if (BUILDING_GRAMMAR_IDS.length < 50) problems.push(`At least 50 production building grammars are required, found ${BUILDING_GRAMMAR_IDS.length}.`);
   for (const archetype of FOOTPRINT_ARCHETYPE_IDS) if (!archetypes.has(archetype)) problems.push(`Footprint archetype "${archetype}" is unreachable.`);
   for (const use of BUILDING_USE_IDS) if (!uses.has(use)) problems.push(`Building use "${use}" is unreachable.`);
   return { ok: problems.length === 0, problems };

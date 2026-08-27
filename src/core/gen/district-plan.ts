@@ -1,5 +1,5 @@
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
-import { difference, intersection, intersectMultiWithRing, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
+import { difference, intersection, intersectMultiWithRing, isSnapNoise, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
 import { triangulate } from "../geom/tessellate.js";
 import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
@@ -14,6 +14,8 @@ import { normalizeRing, validateRing } from "./terrain.js";
 
 const GEOMETRY_EPSILON = 1e-6;
 const KEY_SCALE = 1_000;
+/** Maximum land removed by all grid-safe notches that open one extracted face's holes. */
+const MAX_FACE_OPENING_AREA_M2 = 1;
 const MIN_CELL_AREA_M2 = 1;
 const MAX_CELLS_PER_FRAGMENT = 384;
 const CELL_GAP_M = 0.1;
@@ -259,6 +261,170 @@ function canonicalRing(ring: Ring): Ring {
   return [...normalized.slice(start), ...normalized.slice(0, start)];
 }
 
+/**
+ * Decomposes a snapped face walk at shared vertices without losing holes or
+ * positive-area cycles. The returned order depends only on cycle geometry.
+ */
+export function splitSimpleFaceCycles(walk: Ring): Ring[] {
+  const canonicalWalk = (candidate: Ring, positiveWinding: boolean): Ring => {
+    const snapped: Ring = [];
+    for (const point of candidate) {
+      const next = keyPoint(pointKey(point));
+      const previous = snapped[snapped.length - 1];
+      if (!previous || !samePoint(previous, next)) snapped.push(next);
+    }
+    if (snapped.length > 1 && samePoint(snapped[0]!, snapped[snapped.length - 1]!)) snapped.pop();
+    if (positiveWinding && ringArea(snapped) < 0) snapped.reverse();
+    let start = 0;
+    for (let candidateStart = 1; candidateStart < snapped.length; candidateStart++) {
+      for (let offset = 0; offset < snapped.length; offset++) {
+        const a = snapped[(candidateStart + offset) % snapped.length]!;
+        const b = snapped[(start + offset) % snapped.length]!;
+        if (a.x === b.x && a.y === b.y) continue;
+        if (a.x < b.x || (a.x === b.x && a.y < b.y)) start = candidateStart;
+        break;
+      }
+    }
+    return [...snapped.slice(start), ...snapped.slice(0, start)];
+  };
+
+  interface SignedCycle {
+    ring: Ring;
+    signedArea: number;
+    signature: string;
+  }
+
+  const source = canonicalWalk(walk, true);
+  const terminalCycles: SignedCycle[] = [];
+  const split = (candidate: Ring): void => {
+    const canonical = canonicalWalk(candidate, false);
+    const firstIndex = new Map<string, number>();
+    for (let index = 0; index < canonical.length; index++) {
+      const key = pointKey(canonical[index]!);
+      const previous = firstIndex.get(key);
+      if (previous === undefined) {
+        firstIndex.set(key, index);
+        continue;
+      }
+      split(canonical.slice(previous, index));
+      split([...canonical.slice(0, previous + 1), ...canonical.slice(index)]);
+      return;
+    }
+
+    const signedArea = ringArea(canonical);
+    if (canonical.length < 3 || Math.abs(signedArea) <= GEOMETRY_EPSILON) return;
+    const ring = canonicalRing(canonical);
+    const validation = validateRing(ring);
+    if (!validation.ok) throw new Error(`Canonical face cycle is not simple: ${validation.reason}`);
+    terminalCycles.push({ ring, signedArea, signature: ringSignature(ring) });
+  };
+  split(source);
+
+  const positives = terminalCycles.filter((cycle) => cycle.signedArea > 0)
+    .sort((a, b) => a.signature.localeCompare(b.signature));
+  const negatives = terminalCycles.filter((cycle) => cycle.signedArea < 0)
+    .sort((a, b) => a.signature.localeCompare(b.signature));
+  const holesByPositive: SignedCycle[][] = positives.map(() => []);
+  for (const hole of negatives) {
+    const containers = positives
+      .map((positive, index) => ({ positive, index }))
+      .filter(({ positive }) => hole.ring.every((point) => pointInOrOnRing(point, positive.ring)))
+      .sort((a, b) => Math.abs(a.positive.signedArea) - Math.abs(b.positive.signedArea)
+        || a.positive.signature.localeCompare(b.positive.signature));
+    const container = containers[0];
+    if (!container) throw new Error("Canonical face cycle contains a hole without an enclosing positive cycle.");
+    holesByPositive[container.index]!.push(hole);
+  }
+
+  const cycles = positives.map((positive, index) => {
+    const holes = holesByPositive[index]!.map((hole) => hole.ring);
+    return holes.length === 0 ? positive.ring : openFaceHoles(positive.ring, holes);
+  });
+  cycles.sort((a, b) => ringSignature(a).localeCompare(ringSignature(b)));
+  const sourceArea = ringArea(source);
+  const splitArea = cycles.reduce((sum, cycle) => sum + ringArea(cycle), 0);
+  const areaLoss = sourceArea - splitArea;
+  if (Math.abs(areaLoss) > MAX_FACE_OPENING_AREA_M2 * Math.max(1, negatives.length)) {
+    throw new Error("Canonical face cycle opening exceeded its area-loss bound.");
+  }
+  return cycles;
+}
+
+function openFaceHoles(outer: Ring, holes: readonly Ring[]): Ring {
+  const sourceArea = multiArea([[outer, ...holes]]);
+  let current: MultiPolygon = [[outer, ...holes]];
+  const widths = [0.002, 0.003, 0.005, 0.01];
+
+  while (current[0]!.length > 1) {
+    const currentOuter = current[0]![0]!;
+    const hole = [...current[0]!.slice(1)].sort((a, b) => ringSignature(a).localeCompare(ringSignature(b)))[0]!;
+    const candidates = new Map<string, { a: Vec2; b: Vec2; distanceSquared: number }>();
+    const addCandidate = (a: Vec2, b: Vec2): void => {
+      const key = `${pointKey(a)}>${pointKey(b)}`;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      candidates.set(key, { a, b, distanceSquared: dx * dx + dy * dy });
+    };
+    const closestOnSegment = (point: Vec2, a: Vec2, b: Vec2): Vec2 => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lengthSquared = dx * dx + dy * dy;
+      if (lengthSquared <= GEOMETRY_EPSILON * GEOMETRY_EPSILON) return a;
+      const t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared));
+      return { x: a.x + dx * t, y: a.y + dy * t };
+    };
+    for (const a of currentOuter) {
+      for (let index = 0; index < hole.length; index++) addCandidate(a, closestOnSegment(a, hole[index]!, hole[(index + 1) % hole.length]!));
+    }
+    for (const b of hole) {
+      for (let index = 0; index < currentOuter.length; index++) addCandidate(closestOnSegment(b, currentOuter[index]!, currentOuter[(index + 1) % currentOuter.length]!), b);
+    }
+    const ordered = [...candidates.entries()]
+      .sort((a, b) => a[1].distanceSquared - b[1].distanceSquared || a[0].localeCompare(b[0]))
+      .map(([, candidate]) => candidate);
+
+    let opened: MultiPolygon | null = null;
+    for (const candidate of ordered) {
+      const distance = Math.sqrt(candidate.distanceSquared);
+      for (const halfWidth of widths) {
+        let corridor: Ring;
+        if (distance <= GEOMETRY_EPSILON) {
+          corridor = rectRing({
+            x: candidate.a.x - halfWidth * 2,
+            y: candidate.a.y - halfWidth * 2,
+            width: halfWidth * 4,
+            height: halfWidth * 4
+          });
+        } else {
+          const dx = (candidate.b.x - candidate.a.x) / distance;
+          const dy = (candidate.b.y - candidate.a.y) / distance;
+          const extension = Math.max(halfWidth * 2, 0.004);
+          corridor = edgeQuad(
+            { x: candidate.a.x - dx * extension, y: candidate.a.y - dy * extension },
+            { x: candidate.b.x + dx * extension, y: candidate.b.y + dy * extension },
+            halfWidth
+          );
+        }
+        const next = difference(current, [ringAsMulti(corridor)]);
+        if (next.length !== 1 || next[0]!.length >= current[0]!.length) continue;
+        if (!next[0]!.every((ring) => validateRing(canonicalRing(ring)).ok)) continue;
+        const areaLoss = sourceArea - multiArea(next);
+        if (areaLoss < -GEOMETRY_EPSILON || areaLoss > MAX_FACE_OPENING_AREA_M2) continue;
+        opened = next;
+        break;
+      }
+      if (opened) break;
+    }
+    if (!opened) throw new Error("Canonical face hole could not be opened within the area-loss bound.");
+    current = opened;
+  }
+
+  const ring = canonicalRing(current[0]![0]!);
+  const validation = validateRing(ring);
+  if (!validation.ok) throw new Error(`Opened canonical face is not simple: ${validation.reason}`);
+  return ring;
+}
+
 function holeFreePieces(polygon: MultiPolygon[number]): Ring[] {
   if (polygon.length === 1 && validateRing(polygon[0]!).ok) return [polygon[0]!];
   const mesh = triangulate(polygon);
@@ -307,6 +473,7 @@ export function canonicalHoleFreePieces(polygon: MultiPolygon[number]): Ring[] {
 function ringSignature(ring: Ring): string {
   return canonicalRing(ring).map((point) => pointKey(point)).join(";");
 }
+
 
 function multiSignature(multi: MultiPolygon): string {
   return multi.map((polygon) => polygon.map(ringSignature).join("/")).sort().join("|");
@@ -480,8 +647,14 @@ function extractFaces(network: CompiledRouteNetwork, mask: Ring): { faces: FaceC
         discarded++;
         continue;
       }
-      const canonical = canonicalRing(ring);
-      faces.push({ ring: canonical, boundaryRoadIds: [...roadIds].sort(), boundaryRoles: [...boundaryRoles].sort(), geometrySignature: ringSignature(canonical) });
+      for (const canonical of splitSimpleFaceCycles(ring)) {
+        faces.push({
+          ring: canonical,
+          boundaryRoadIds: [...roadIds].sort(),
+          boundaryRoles: [...boundaryRoles].sort(),
+          geometrySignature: ringSignature(canonical)
+        });
+      }
     }
   }
   return { faces: faces.sort((a, b) => a.geometrySignature.localeCompare(b.geometrySignature)), discarded };
@@ -564,8 +737,9 @@ function blockCandidates(source: CitySourceV3, network: CompiledRouteNetwork, wa
     );
   };
   for (let first = 0; first < extracted.faces.length; first++) for (let second = first + 1; second < extracted.faces.length; second++) {
-    const overlap = multiArea(intersection(ringAsMulti(extracted.faces[first]!.ring), ringAsMulti(extracted.faces[second]!.ring)));
-    if (overlap <= GEOMETRY_EPSILON) continue;
+    const overlapGeometry = intersection(ringAsMulti(extracted.faces[first]!.ring), ringAsMulti(extracted.faces[second]!.ring));
+    if (isSnapNoise(overlapGeometry)) continue;
+    const overlap = multiArea(overlapGeometry);
     const firstArea = Math.abs(ringArea(extracted.faces[first]!.ring));
     const secondArea = Math.abs(ringArea(extracted.faces[second]!.ring));
     const tolerance = Math.max(GEOMETRY_EPSILON, Math.min(firstArea, secondArea) * 1e-8);

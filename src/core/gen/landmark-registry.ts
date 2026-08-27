@@ -2,11 +2,10 @@ import type { DistrictCompatibilityTag } from "./district-registry.js";
 import type { OpenSpaceCategory } from "./city.js";
 
 /**
- * Landmark grammar registry — ten curated landmark grammars: hero tower with required
- * approach plaza, civic/corporate multi-mass compound, infrastructure/utility site,
- * monument/special open-space composition, circular beacon tower, triangular spire,
- * megaframe block with courtyard void, communications mast field, arcology terraces,
- * and elevated transit hall.
+ * Landmark grammar registry — sixteen curated, overview-legible landmark grammars:
+ * towers, compounds, infrastructure yards, monuments, polygonal spires, megaframes,
+ * terraces, transit halls, arenas, cooling-tower fields, garden arcologies, event
+ * pylons, hexagonal headquarters, and logo gateways.
  *
  * Pure data. Deterministic one-site placement and mass generation happen in
  * complete-city-plan.ts; every landmark uses exactly one derived site polygon.
@@ -25,10 +24,32 @@ export const LANDMARK_GRAMMAR_IDS = [
   "megaframe-block",
   "comms-mast-field",
   "arcology-terraces",
-  "transit-hall"
+  "transit-hall",
+  "stadium-bowl",
+  "cooling-tower-yard",
+  "garden-arcology",
+  "event-plaza-pylon",
+  "hex-corporate-hq",
+  "logo-gateway"
 ] as const;
 
 export type LandmarkGrammarId = (typeof LANDMARK_GRAMMAR_IDS)[number];
+
+/**
+ * Overview-critical landmark grammars whose sites are reserved before roads are generated.
+ * The remaining eight grammars stay in the production registry and use deterministic
+ * block-inscribed placement after the road fabric exists.
+ */
+export const PRE_ROAD_LANDMARK_GRAMMAR_IDS = [
+  "hero-tower-plaza",
+  "civic-corporate-compound",
+  "circular-beacon-tower",
+  "tri-spire",
+  "megaframe-block",
+  "arcology-terraces",
+  "hex-corporate-hq",
+  "logo-gateway"
+] as const satisfies readonly LandmarkGrammarId[];
 
 export interface LandmarkMassTemplate {
   kind: string;
@@ -103,23 +124,23 @@ const landmark = (
 });
 
 export const LANDMARK_GRAMMARS: readonly LandmarkGrammarDefinition[] = Object.freeze([
-  landmark("hero-tower-plaza", "Hero Tower with Approach Plaza", ["formal", "waterfront"], 900, 6500, { category: "plaza", minShare: 0.18 }, [
+  landmark("hero-tower-plaza", "Hero Tower with Approach Plaza", ["formal", "waterfront"], 1600, 9000, { category: "plaza", minShare: 0.18 }, [
     { kind: "podium", widthFactor: 0.62, depthFactor: 0.62, heightMinM: 9, heightMaxM: 16, elevationFactor: 0 },
     { kind: "tower", widthFactor: 0.24, depthFactor: 0.24, heightMinM: 72, heightMaxM: 150, elevationFactor: 0.55 },
     { kind: "crown", widthFactor: 0.14, depthFactor: 0.14, heightMinM: 8, heightMaxM: 18, elevationFactor: 0.92 }
   ], ["glass-curtain", "civic-columns", "office-grid"], ["flat", "crown", "curved"], { rateMin: 0.2, rateMax: 0.7 }, { rateMin: 0.5, rateMax: 0.95 }, { min: 0.02, max: 0.15 }, { wall: [0.7, 0.2, 0.1], roof: [0.68, 0.22, 0.1], neon: [0.55, 0.45] }, { coarse: "volumes", detail: "facade", neon: true }),
-  landmark("civic-corporate-compound", "Civic or Corporate Compound", ["formal", "campus"], 1100, 8000, { category: "plaza", minShare: 0.12 }, [
+  landmark("civic-corporate-compound", "Civic or Corporate Compound", ["formal", "campus"], 1800, 10000, { category: "plaza", minShare: 0.12 }, [
     { kind: "hall", widthFactor: 0.52, depthFactor: 0.4, heightMinM: 14, heightMaxM: 28, elevationFactor: 0 },
     { kind: "pavilion", widthFactor: 0.3, depthFactor: 0.3, heightMinM: 8, heightMaxM: 16, elevationFactor: 0 },
     { kind: "tower", widthFactor: 0.18, depthFactor: 0.18, heightMinM: 36, heightMaxM: 84, elevationFactor: 0.2 }
   ], ["civic-columns", "glass-curtain", "masonry-window"], ["flat", "crown", "domed"], { rateMin: 0.05, rateMax: 0.35 }, { rateMin: 0.4, rateMax: 0.85 }, { min: 0.04, max: 0.25 }, { wall: [0.76, 0.18, 0.06], roof: [0.74, 0.2, 0.06], neon: [0.68, 0.32] }, { coarse: "volumes", detail: "facade", neon: false }),
-  landmark("infrastructure-utility-site", "Infrastructure and Utility Site", ["industrial"], 1400, 11000, null, [
+  landmark("infrastructure-utility-site", "Infrastructure and Utility Site", ["industrial"], 2200, 12500, null, [
     { kind: "shed", widthFactor: 0.44, depthFactor: 0.32, heightMinM: 5, heightMaxM: 10, elevationFactor: 0 },
     { kind: "tank", widthFactor: 0.3, depthFactor: 0.3, heightMinM: 6, heightMaxM: 14, elevationFactor: 0 },
     { kind: "silo", widthFactor: 0.14, depthFactor: 0.14, heightMinM: 16, heightMaxM: 34, elevationFactor: 0 },
     { kind: "stack", widthFactor: 0.06, depthFactor: 0.06, heightMinM: 28, heightMaxM: 60, elevationFactor: 0 }
   ], ["utility-louvre", "industrial-panel", "warehouse-ribs"], ["flat", "shed", "sawtooth"], { rateMin: 0.02, rateMax: 0.2 }, { rateMin: 0.85, rateMax: 1 }, { min: 0.3, max: 0.7 }, { wall: [0.7, 0.2, 0.1], roof: [0.58, 0.28, 0.14], neon: [0.6, 0.4] }, { coarse: "silhouette", detail: "rooftop", neon: false }),
-  landmark("monument-open-space", "Monument and Open Space Composition", ["irregular", "campus"], 800, 7000, { category: "park", minShare: 0.35 }, [
+  landmark("monument-open-space", "Monument and Open Space Composition", ["irregular", "campus"], 1400, 9000, { category: "park", minShare: 0.35 }, [
     { kind: "mound", widthFactor: 0.6, depthFactor: 0.6, heightMinM: 1.5, heightMaxM: 4, elevationFactor: 0 },
     { kind: "ring", widthFactor: 0.42, depthFactor: 0.42, heightMinM: 2, heightMaxM: 5, elevationFactor: 0.08 },
     { kind: "obelisk", widthFactor: 0.08, depthFactor: 0.08, heightMinM: 16, heightMaxM: 40, elevationFactor: 0.12 }
@@ -128,37 +149,60 @@ export const LANDMARK_GRAMMARS: readonly LandmarkGrammarDefinition[] = Object.fr
   // declaring polygonSides become regular n-gons (one seeded rotation per column so
   // stacked setbacks align), and the single "megaframe" template expands into four
   // L-shaped corner masses tiling a rectangular frame around an open courtyard.
-  landmark("circular-beacon-tower", "Circular Beacon Tower", ["formal", "waterfront"], 900, 6500, { category: "plaza", minShare: 0.15 }, [
+  landmark("circular-beacon-tower", "Circular Beacon Tower", ["formal", "waterfront"], 1500, 9000, { category: "plaza", minShare: 0.15 }, [
     { kind: "podium", widthFactor: 0.58, depthFactor: 0.58, heightMinM: 8, heightMaxM: 14, elevationFactor: 0, polygonSides: 18 },
     { kind: "shaft", widthFactor: 0.34, depthFactor: 0.34, heightMinM: 64, heightMaxM: 140, elevationFactor: 0.6, polygonSides: 12 },
     { kind: "beacon", widthFactor: 0.16, depthFactor: 0.16, heightMinM: 10, heightMaxM: 22, elevationFactor: 0.9, polygonSides: 12 }
   ], ["glass-curtain", "office-grid", "civic-columns"], ["curved", "crown", "flat"], { rateMin: 0.25, rateMax: 0.75 }, { rateMin: 0.4, rateMax: 0.9 }, { min: 0.02, max: 0.12 }, { wall: [0.68, 0.22, 0.1], roof: [0.66, 0.24, 0.1], neon: [0.5, 0.5] }, { coarse: "volumes", detail: "facade", neon: true }),
-  landmark("tri-spire", "Triangular Spire Tower", ["formal"], 800, 6000, null, [
+  landmark("tri-spire", "Triangular Spire Tower", ["formal"], 1400, 8500, null, [
     { kind: "base", widthFactor: 0.52, depthFactor: 0.52, heightMinM: 18, heightMaxM: 30, elevationFactor: 0, polygonSides: 3 },
     { kind: "mid-spire", widthFactor: 0.34, depthFactor: 0.34, heightMinM: 48, heightMaxM: 110, elevationFactor: 0.85, polygonSides: 3 },
     { kind: "tip", widthFactor: 0.14, depthFactor: 0.14, heightMinM: 12, heightMaxM: 28, elevationFactor: 0.92, polygonSides: 3 }
   ], ["glass-curtain", "office-grid"], ["crown", "flat", "stepped"], { rateMin: 0.15, rateMax: 0.55 }, { rateMin: 0.35, rateMax: 0.8 }, { min: 0.02, max: 0.14 }, { wall: [0.72, 0.2, 0.08], roof: [0.7, 0.22, 0.08], neon: [0.58, 0.42] }, { coarse: "volumes", detail: "facade", neon: true }),
-  landmark("megaframe-block", "Megaframe Block", ["residential", "campus"], 1200, 9000, { category: "plaza", minShare: 0.08 }, [
+  landmark("megaframe-block", "Megaframe Block", ["residential", "campus"], 2000, 11000, { category: "plaza", minShare: 0.08 }, [
     { kind: "megaframe", widthFactor: 0.86, depthFactor: 0.88, heightMinM: 26, heightMaxM: 64, elevationFactor: 0 }
   ], ["residential-balcony", "masonry-window", "glass-curtain"], ["flat", "parapet", "stepped"], { rateMin: 0.05, rateMax: 0.3 }, { rateMin: 0.5, rateMax: 0.9 }, { min: 0.06, max: 0.28 }, { wall: [0.6, 0.28, 0.12], roof: [0.62, 0.26, 0.12], neon: [0.55, 0.45] }, { coarse: "volumes", detail: "facade", neon: false }),
-  landmark("comms-mast-field", "Communications Mast Field", ["industrial", "campus"], 1200, 10000, null, [
+  landmark("comms-mast-field", "Communications Mast Field", ["industrial", "campus"], 1800, 11500, null, [
     { kind: "bunker", widthFactor: 0.4, depthFactor: 0.26, heightMinM: 5, heightMaxM: 9, elevationFactor: 0 },
     { kind: "mast", widthFactor: 0.05, depthFactor: 0.05, heightMinM: 90, heightMaxM: 210, elevationFactor: 0 },
     { kind: "equipment-shed", widthFactor: 0.3, depthFactor: 0.2, heightMinM: 4, heightMaxM: 8, elevationFactor: 0 },
     { kind: "dish-pad", widthFactor: 0.18, depthFactor: 0.18, heightMinM: 6, heightMaxM: 12, elevationFactor: 0 }
   ], ["utility-louvre", "industrial-panel", "warehouse-ribs"], ["flat", "shed"], { rateMin: 0.02, rateMax: 0.15 }, { rateMin: 0.85, rateMax: 1 }, { min: 0.25, max: 0.6 }, { wall: [0.66, 0.24, 0.1], roof: [0.56, 0.3, 0.14], neon: [0.6, 0.4] }, { coarse: "silhouette", detail: "rooftop", neon: false }),
-  landmark("arcology-terraces", "Arcology Terraces", ["residential"], 1600, 9500, { category: "park", minShare: 0.12 }, [
+  landmark("arcology-terraces", "Arcology Terraces", ["residential"], 2200, 11500, { category: "park", minShare: 0.12 }, [
     { kind: "terrace-base", widthFactor: 0.82, depthFactor: 0.74, heightMinM: 10, heightMaxM: 16, elevationFactor: 0 },
     { kind: "terrace-2", widthFactor: 0.68, depthFactor: 0.62, heightMinM: 10, heightMaxM: 16, elevationFactor: 0.9 },
     { kind: "terrace-3", widthFactor: 0.54, depthFactor: 0.5, heightMinM: 12, heightMaxM: 18, elevationFactor: 0.9 },
     { kind: "terrace-4", widthFactor: 0.4, depthFactor: 0.38, heightMinM: 14, heightMaxM: 20, elevationFactor: 0.9 },
     { kind: "terrace-crown", widthFactor: 0.26, depthFactor: 0.26, heightMinM: 16, heightMaxM: 26, elevationFactor: 0.9 }
   ], ["residential-balcony", "masonry-window", "office-grid"], ["terrace", "stepped", "flat"], { rateMin: 0.08, rateMax: 0.35 }, { rateMin: 0.45, rateMax: 0.85 }, { min: 0.04, max: 0.18 }, { wall: [0.58, 0.3, 0.12], roof: [0.56, 0.32, 0.12], neon: [0.52, 0.48] }, { coarse: "volumes", detail: "facade", neon: true }),
-  landmark("transit-hall", "Elevated Transit Hall", ["waterfront", "market"], 1300, 8500, { category: "plaza", minShare: 0.2 }, [
+  landmark("transit-hall", "Elevated Transit Hall", ["waterfront", "market"], 1800, 10000, { category: "plaza", minShare: 0.2 }, [
     { kind: "vault", widthFactor: 0.3, depthFactor: 0.88, heightMinM: 12, heightMaxM: 20, elevationFactor: 0 },
     { kind: "vault", widthFactor: 0.3, depthFactor: 0.88, heightMinM: 12, heightMaxM: 20, elevationFactor: 0 },
     { kind: "vault", widthFactor: 0.3, depthFactor: 0.88, heightMinM: 12, heightMaxM: 20, elevationFactor: 0 }
-  ], ["industrial-panel", "glass-curtain", "utility-louvre"], ["curved", "flat", "gable"], { rateMin: 0.1, rateMax: 0.4 }, { rateMin: 0.3, rateMax: 0.7 }, { min: 0.05, max: 0.2 }, { wall: [0.64, 0.26, 0.1], roof: [0.62, 0.28, 0.1], neon: [0.55, 0.45] }, { coarse: "silhouette", detail: "rooftop", neon: true })
+  ], ["industrial-panel", "glass-curtain", "utility-louvre"], ["curved", "flat", "gable"], { rateMin: 0.1, rateMax: 0.4 }, { rateMin: 0.3, rateMax: 0.7 }, { min: 0.05, max: 0.2 }, { wall: [0.64, 0.26, 0.1], roof: [0.62, 0.28, 0.1], neon: [0.55, 0.45] }, { coarse: "silhouette", detail: "rooftop", neon: true }),
+  landmark("stadium-bowl", "Segmented Stadium Bowl", ["market", "formal"], 2800, 12500, { category: "plaza", minShare: 0.08 }, [
+    { kind: "stadium-bowl", widthFactor: 0.9, depthFactor: 0.84, heightMinM: 16, heightMaxM: 28, elevationFactor: 0 }
+  ], ["civic-columns", "industrial-panel", "entertainment-arcade"], ["curved", "terrace", "flat"], { rateMin: 0.2, rateMax: 0.55 }, { rateMin: 0.25, rateMax: 0.6 }, { min: 0.04, max: 0.22 }, { wall: [0.64, 0.26, 0.1], roof: [0.6, 0.28, 0.12], neon: [0.42, 0.58] }, { coarse: "silhouette", detail: "facade", neon: true }),
+  landmark("cooling-tower-yard", "Cooling Tower Yard", ["industrial"], 2400, 12000, null, [
+    { kind: "cooling-tower-field", widthFactor: 0.82, depthFactor: 0.78, heightMinM: 42, heightMaxM: 86, elevationFactor: 0, polygonSides: 8 }
+  ], ["utility-louvre", "industrial-panel", "warehouse-ribs"], ["curved", "flat"], { rateMin: 0.01, rateMax: 0.08 }, { rateMin: 0.8, rateMax: 1 }, { min: 0.3, max: 0.7 }, { wall: [0.68, 0.22, 0.1], roof: [0.54, 0.3, 0.16], neon: [0.66, 0.34] }, { coarse: "silhouette", detail: "rooftop", neon: false }),
+  landmark("garden-arcology", "Garden Arcology", ["residential", "campus"], 2600, 12500, { category: "park", minShare: 0.14 }, [
+    { kind: "garden-arcology", widthFactor: 0.88, depthFactor: 0.82, heightMinM: 14, heightMaxM: 22, elevationFactor: 0 },
+    { kind: "garden-terrace", widthFactor: 0.68, depthFactor: 0.64, heightMinM: 16, heightMaxM: 24, elevationFactor: 0.9 },
+    { kind: "garden-crown", widthFactor: 0.42, depthFactor: 0.4, heightMinM: 26, heightMaxM: 48, elevationFactor: 0.9 }
+  ], ["residential-balcony", "glass-curtain", "masonry-window"], ["terrace", "stepped", "curved"], { rateMin: 0.06, rateMax: 0.28 }, { rateMin: 0.35, rateMax: 0.72 }, { min: 0.02, max: 0.16 }, { wall: [0.58, 0.3, 0.12], roof: [0.52, 0.36, 0.12], neon: [0.54, 0.46] }, { coarse: "volumes", detail: "facade", neon: true }),
+  landmark("event-plaza-pylon", "Event Plaza Pylon", ["market", "campus", "formal"], 2200, 10500, { category: "plaza", minShare: 0.42 }, [
+    { kind: "event-hall", widthFactor: 0.62, depthFactor: 0.5, heightMinM: 12, heightMaxM: 22, elevationFactor: 0 },
+    { kind: "luminous-pylon", widthFactor: 0.12, depthFactor: 0.12, heightMinM: 90, heightMaxM: 180, elevationFactor: 0 }
+  ], ["entertainment-arcade", "glass-curtain", "civic-columns"], ["crown", "curved", "flat"], { rateMin: 0.65, rateMax: 1 }, { rateMin: 0.2, rateMax: 0.55 }, { min: 0.02, max: 0.14 }, { wall: [0.56, 0.3, 0.14], roof: [0.58, 0.28, 0.14], neon: [0.12, 0.88] }, { coarse: "silhouette", detail: "facade", neon: true }),
+  landmark("hex-corporate-hq", "Hexagonal Corporate Headquarters", ["formal", "waterfront"], 2100, 10500, { category: "plaza", minShare: 0.16 }, [
+    { kind: "hex-podium", widthFactor: 0.78, depthFactor: 0.74, heightMinM: 14, heightMaxM: 24, elevationFactor: 0, polygonSides: 6 },
+    { kind: "hex-tower", widthFactor: 0.48, depthFactor: 0.46, heightMinM: 90, heightMaxM: 190, elevationFactor: 0.9, polygonSides: 6 },
+    { kind: "hex-crown", widthFactor: 0.26, depthFactor: 0.24, heightMinM: 16, heightMaxM: 34, elevationFactor: 0.9, polygonSides: 6 }
+  ], ["glass-curtain", "office-grid", "civic-columns"], ["crown", "stepped", "flat"], { rateMin: 0.24, rateMax: 0.62 }, { rateMin: 0.45, rateMax: 0.88 }, { min: 0.01, max: 0.12 }, { wall: [0.72, 0.2, 0.08], roof: [0.7, 0.22, 0.08], neon: [0.5, 0.5] }, { coarse: "volumes", detail: "facade", neon: true }),
+  landmark("logo-gateway", "Logo Gateway", ["market", "waterfront", "industrial"], 1800, 9500, { category: "plaza", minShare: 0.12 }, [
+    { kind: "logo-gateway", widthFactor: 0.86, depthFactor: 0.54, heightMinM: 46, heightMaxM: 78, elevationFactor: 0 }
+  ], ["entertainment-arcade", "glass-curtain", "industrial-panel"], ["crown", "flat", "curved"], { rateMin: 0.75, rateMax: 1 }, { rateMin: 0.28, rateMax: 0.62 }, { min: 0.04, max: 0.2 }, { wall: [0.58, 0.28, 0.14], roof: [0.58, 0.28, 0.14], neon: [0.1, 0.9] }, { coarse: "silhouette", detail: "facade", neon: true })
 ]);
 
 export const LANDMARK_GRAMMAR_REGISTRY: ReadonlyMap<LandmarkGrammarId, LandmarkGrammarDefinition> = new Map(
@@ -221,9 +265,9 @@ export function validateLandmarkRegistry(entries: readonly LandmarkGrammarDefini
     signatures.set(signature, entry.id);
   }
   for (const id of LANDMARK_GRAMMAR_IDS) if (!ids.has(id)) problems.push(`Landmark grammar "${id}" is unreachable.`);
-  // The curated set grows over time; the invariant is a healthy minimum, not an exact
-  // count. Reachability of every declared id is checked above.
-  if (LANDMARK_GRAMMAR_IDS.length < 4) problems.push(`At least four landmark grammars are required, found ${LANDMARK_GRAMMAR_IDS.length}.`);
+  // Sixteen is the production overview contract; reachability of every declared id is
+  // checked above so no curated landmark may become data-only.
+  if (LANDMARK_GRAMMAR_IDS.length < 16) problems.push(`At least sixteen landmark grammars are required, found ${LANDMARK_GRAMMAR_IDS.length}.`);
   const hero = LANDMARK_GRAMMAR_REGISTRY.get("hero-tower-plaza");
   if (hero && hero.requiredOpenSpace?.category !== "plaza") problems.push("The hero tower landmark grammar must require an approach plaza.");
   return { ok: problems.length === 0, problems };

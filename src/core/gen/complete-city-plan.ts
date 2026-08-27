@@ -4,9 +4,9 @@ import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compile
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, DEVELOPMENT_SPACE_CATEGORIES, districtStructuralInputSignature, type DevelopmentCellPlan, type DevelopmentSpaceRole, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
-import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type HeightBand } from "./district-registry.js";
-import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
-import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
+import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type DistrictTypeId, type HeightBand } from "./district-registry.js";
+import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
+import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
 import { normalizeRing, validateRing } from "./terrain.js";
 
 const GEOMETRY_EPSILON = 1e-6;
@@ -18,6 +18,20 @@ const KEY_SCALE = 1_000;
 export const MIN_PARCEL_AREA_M2 = 16;
 const MIN_OPEN_SPACE_AREA_M2 = 25;
 const MAX_RESIDUAL_REFINEMENT_DEPTH = 1;
+/** One bounded third pass may revisit only credible anonymous urban residuals. */
+const DENSITY_INFILL_RESIDUAL_DEPTH = MAX_RESIDUAL_REFINEMENT_DEPTH + 1;
+export const DENSITY_INFILL_SALT = "density/v3/infill";
+export const MAX_DENSITY_INFILL_BUILDINGS = 600;
+export const MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT = 72;
+export const MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL = 12;
+export const MAX_REFERENCE_DENSITY_BUILDINGS = 1_250;
+export const MIN_DENSITY_INFILL_AREA_M2 = 60;
+export const MAX_DENSITY_INFILL_AREA_M2 = 4_800;
+export const MIN_DENSITY_INFILL_MINOR_DIMENSION_M = 6.5;
+const MIN_DENSITY_POCKET_AREA_M2 = 100;
+export const MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 = 1_200;
+/** Large grammar-authored courts become plot-sized pockets; their remainder stays developable. */
+export const MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2 = 1_600;
 
 /**
  * Thin-building floor: ordinary (non-micro) building masses must present an oriented
@@ -181,6 +195,27 @@ function distinctHoleFreePieces(polygon: MultiPolygon[number]): Ring[] {
     pieces.push(piece);
   }
   return pieces;
+}
+
+/** Deterministically bisect anonymous remainder rings until no piece can read as a void. */
+function splitRingToAreaCap(ring: Ring, areaCapM2: number, depth = 0): Ring[] {
+  const areaM2 = Math.abs(ringArea(ring));
+  if (areaM2 <= areaCapM2 + 0.5 || depth >= 16) return [ring];
+  const bounds = ringBounds(ring);
+  const splitX = bounds.width >= bounds.height;
+  const firstRect = splitX
+    ? rectRing({ x: bounds.x, y: bounds.y, width: bounds.width / 2, height: bounds.height })
+    : rectRing({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height / 2 });
+  const secondRect = splitX
+    ? rectRing({ x: bounds.x + bounds.width / 2, y: bounds.y, width: bounds.width / 2, height: bounds.height })
+    : rectRing({ x: bounds.x, y: bounds.y + bounds.height / 2, width: bounds.width, height: bounds.height / 2 });
+  const pieces = [firstRect, secondRect].flatMap((clip) =>
+    intersection(ringAsMulti(ring), ringAsMulti(clip)).flatMap(distinctHoleFreePieces)
+  ).filter((piece) => Math.abs(ringArea(piece)) > GEOMETRY_EPSILON);
+  if (pieces.length < 2 || Math.max(...pieces.map((piece) => Math.abs(ringArea(piece)))) >= areaM2 - 0.5) return [ring];
+  return pieces
+    .flatMap((piece) => splitRingToAreaCap(piece, areaCapM2, depth + 1))
+    .sort((a, b) => ringKey(a).localeCompare(ringKey(b)));
 }
 
 function largestPiece(multi: MultiPolygon): Ring | null {
@@ -489,19 +524,33 @@ export interface MajorLandmarkSiteReservation {
 }
 
 const RESERVATION_GRID = 6;
+/** Compact pre-road anchors leave surrounding grid cells available for streets and parcels. */
+export const GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2 = 5_000;
+export const GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2 = 6_500;
+export const GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN = 1.1;
 
 /**
- * Deterministic pre-road major landmark sites for full generation. The Worker invokes
- * this before road generation so roads can route around the sites; the reserved site
- * polygons are then passed verbatim into `buildCompleteCityPlan`.
+ * Deterministic pre-road major landmark sites for full generation. By default only the
+ * curated overview anchors reserve land before the road pass; callers composing explicit
+ * acceptance galleries may provide another ordered, unique grammar subset. The Worker
+ * passes the resulting polygons verbatim through road generation and city planning.
  */
-export function reserveMajorLandmarkSites(source: CitySourceV3): MajorLandmarkSiteReservation[] {
+export function reserveMajorLandmarkSites(
+  source: CitySourceV3,
+  grammarIds: readonly LandmarkGrammarId[] = PRE_ROAD_LANDMARK_GRAMMAR_IDS
+): MajorLandmarkSiteReservation[] {
+  const seenGrammarIds = new Set<LandmarkGrammarId>();
+  for (const grammarId of grammarIds) {
+    if (!LANDMARK_GRAMMAR_REGISTRY.has(grammarId)) throw new Error(`Unknown landmark grammar "${grammarId}" in pre-road reservation list.`);
+    if (seenGrammarIds.has(grammarId)) throw new Error(`Duplicate landmark grammar "${grammarId}" in pre-road reservation list.`);
+    seenGrammarIds.add(grammarId);
+  }
   const mask = normalizeRing(source.terrain.urbanFootprint ?? source.terrain.land);
   const maskMulti = ringAsMulti(mask);
   const bounds = ringBounds(mask);
   const reservations: MajorLandmarkSiteReservation[] = [];
   const taken: Ring[] = [];
-  for (const grammarId of LANDMARK_GRAMMAR_IDS) {
+  for (const grammarId of grammarIds) {
     const definition = LANDMARK_GRAMMAR_REGISTRY.get(grammarId)!;
     const cellWidth = bounds.width / RESERVATION_GRID;
     const cellHeight = bounds.height / RESERVATION_GRID;
@@ -520,15 +569,25 @@ export function reserveMajorLandmarkSites(source: CitySourceV3): MajorLandmarkSi
     let chosenLineage = "";
     for (const cell of ordered) {
       const centre = { x: bounds.x + (cell.x + 0.5) * cellWidth, y: bounds.y + (cell.y + 0.5) * cellHeight };
-      const sizeFactor = 0.72 + hashUnit(`${source.citySeed}/landmarks/v3/size/${grammarId}/${cell.index}`) * 0.24;
-      // Height is 0.8 × width, so the site area is 0.8 × width²; cap the width so the
-      // site never exceeds the grammar's declared maximum site area.
-      const width = Math.min(Math.min(cellWidth, cellHeight) * sizeFactor, Math.sqrt(definition.maxSiteAreaM2 / 0.8));
+      const sizeUnit = hashUnit(`${source.citySeed}/landmarks/v3/size/${grammarId}/${cell.index}`);
+      const safeMinimumM2 = definition.minSiteAreaM2 * GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN;
+      // Normally sites vary deterministically over 5,000–6,500 m². A future grammar
+      // whose declared minimum exceeds that band expands only as far as its safe floor.
+      const targetMinimumM2 = Math.max(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2, safeMinimumM2);
+      const targetMaximumM2 = Math.max(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2, targetMinimumM2);
+      const targetAreaM2 = Math.min(
+        definition.maxSiteAreaM2,
+        targetMinimumM2 + sizeUnit * (targetMaximumM2 - targetMinimumM2)
+      );
+      // Height is 0.8 × width. Retaining the per-cell fit cap keeps compact/small masks
+      // on the fallback path instead of allowing neighbouring grid candidates to sprawl.
+      const cellFitWidth = Math.min(cellWidth, cellHeight) * (0.72 + sizeUnit * 0.24);
+      const width = Math.min(cellFitWidth, Math.sqrt(targetAreaM2 / 0.8));
       const height = width * 0.8;
       const candidate = rectAt(centre, width, height, 0);
       const candidateArea = Math.abs(ringArea(candidate));
-      if (candidateArea < definition.minSiteAreaM2) continue;
-      if (multiArea(intersection(ringAsMulti(candidate), maskMulti)) < candidateArea * 0.92) continue;
+      if (candidateArea + GEOMETRY_EPSILON < targetMinimumM2) continue;
+      if (!isSnapNoise(difference(ringAsMulti(candidate), [maskMulti]))) continue;
       if (taken.some((ring) => multiArea(intersection(ringAsMulti(candidate), ringAsMulti(ring))) > GEOMETRY_EPSILON)) continue;
       chosen = candidate;
       chosenLineage = `major:${grammarId}:${cell.index}`;
@@ -783,6 +842,61 @@ function openSpacePolygonForIntent(base: MultiPolygon, intentSeed: string, size:
   return piece;
 }
 
+/**
+ * Chooses one stable corner pocket from an oversized grammar-authored court. Retrying
+ * only changes the isolated semantic-pocket hash stream; it also lets cells just over
+ * the conversion threshold satisfy the same 100 m² floor as density pockets.
+ */
+function semanticPocketForPiece(piece: Ring, seed: string, targetShare: number): Ring | null {
+  const base = ringAsMulti(piece);
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const candidate = openSpacePolygonForIntent(base, `${seed}/${attempt}`, "pocket", targetShare);
+    if (!candidate) continue;
+    for (const capped of splitRingToAreaCap(candidate, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2)) {
+      const areaM2 = Math.abs(ringArea(capped));
+      if (areaM2 >= MIN_DENSITY_POCKET_AREA_M2 && areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5) return capped;
+    }
+  }
+  // Pathological narrow/concave pieces can reject every corner rectangle. Preserve
+  // accounting with one deterministic, capped piece rather than restoring the void.
+  return splitRingToAreaCap(piece, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2)
+    .find((candidate) => Math.abs(ringArea(candidate)) >= MIN_DENSITY_POCKET_AREA_M2) ?? null;
+}
+
+export const FALLBACK_LANDMARK_SITE_TARGET_MIN_M2 = 2_000;
+export const FALLBACK_LANDMARK_SITE_TARGET_MAX_M2 = 3_000;
+export const FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN = 1.1;
+
+interface LandmarkOpenSpaceGeometry {
+  openSpace: Ring | null;
+  massRegion: MultiPolygon;
+}
+
+/**
+ * Computes the exact required-open-space carve used by both fallback-site admission
+ * and final materialization. A compact site is never accepted on area alone only to
+ * disappear later because its authored plaza or park cannot be carved.
+ */
+function landmarkOpenSpaceGeometry(
+  sitePolygon: Ring,
+  definition: LandmarkGrammarDefinition,
+  seed: string
+): LandmarkOpenSpaceGeometry | null {
+  const site = ringAsMulti(sitePolygon);
+  const requirement = definition.requiredOpenSpace;
+  if (!requirement) return { openSpace: null, massRegion: site };
+  const siteArea = Math.abs(ringArea(sitePolygon));
+  const angle = longestEdgeAngle(sitePolygon);
+  const centre = ringCentroid(sitePolygon);
+  const bounds = ringBounds(sitePolygon.map((point) => rotatePoint(point, centre, -angle)));
+  const share = Math.max(requirement.minShare, range(`${seed}/open/share`, requirement.minShare, Math.min(0.5, requirement.minShare + 0.2)));
+  const band = localRect(bounds, angle, centre, 0, 0, bounds.width * share, bounds.height);
+  const piece = largestPiece(intersection(site, ringAsMulti(band)));
+  if (!piece || Math.abs(ringArea(piece)) + 0.5 < requirement.minShare * siteArea) return null;
+  const regionRect = ringAsMulti(localRect(bounds, angle, centre, bounds.width * share, 0, bounds.width * (1 - share), bounds.height));
+  return { openSpace: piece, massRegion: intersection(site, regionRect) };
+}
+
 function landmarkSiteForBlock(blockBuildable: MultiPolygon, minSiteAreaM2: number, maxSiteAreaM2 = Number.POSITIVE_INFINITY): Ring | null {
   const ring = largestPiece(blockBuildable);
   if (!ring) return null;
@@ -800,6 +914,47 @@ function landmarkSiteForBlock(blockBuildable: MultiPolygon, minSiteAreaM2: numbe
     if (Math.abs(ringArea(rect)) < minSiteAreaM2) return null;
   }
   return fitRectInside(rect, blockBuildable) ?? largestPiece(intersection(blockBuildable, ringAsMulti(rect)));
+}
+
+function landmarkSiteSatisfiesGrammar(
+  site: Ring,
+  available: MultiPolygon,
+  definition: LandmarkGrammarDefinition,
+  seed: string,
+  minAreaM2: number,
+  maxAreaM2: number
+): boolean {
+  if (!validateRing(site).ok) return false;
+  const areaM2 = Math.abs(ringArea(site));
+  if (areaM2 + 0.5 < minAreaM2 || areaM2 > maxAreaM2 + 0.5) return false;
+  if (!isSnapNoise(difference(ringAsMulti(site), [available]))) return false;
+  const geometry = landmarkOpenSpaceGeometry(site, definition, seed);
+  if (!geometry) return false;
+  return rawLandmarkMassesForSite(site, definition, seed, geometry.massRegion).length > 0;
+}
+
+/**
+ * Post-road fallback landmarks occupy one centred, plot-sized rectangle rather than
+ * consuming their selected block. Major and explicit sites bypass this helper.
+ */
+function compactFallbackLandmarkSite(
+  available: MultiPolygon,
+  definition: LandmarkGrammarDefinition,
+  seed: string
+): Ring | null {
+  const safeMinimumM2 = definition.minSiteAreaM2 * FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN;
+  const boundedTargetM2 = Math.min(
+    FALLBACK_LANDMARK_SITE_TARGET_MAX_M2,
+    Math.max(FALLBACK_LANDMARK_SITE_TARGET_MIN_M2, safeMinimumM2)
+  );
+  const targetAreaM2 = Math.min(
+    definition.maxSiteAreaM2,
+    Math.max(safeMinimumM2, boundedTargetM2)
+  );
+  const site = landmarkSiteForBlock(available, safeMinimumM2, targetAreaM2);
+  return site && landmarkSiteSatisfiesGrammar(site, available, definition, seed, safeMinimumM2, targetAreaM2)
+    ? site
+    : null;
 }
 
 function landmarkMassRects(site: Ring, definition: LandmarkGrammarDefinition, seed: string, region: MultiPolygon): RawMass[] {
@@ -1002,6 +1157,160 @@ function landmarkMassPolygons(site: Ring, definition: LandmarkGrammarDefinition,
   return output;
 }
 
+/**
+ * Overview landmarks whose identity comes from a compound arrangement rather than one
+ * template per column. New streams live under landmarks/v4; the ten established
+ * grammars keep their original placement and mass streams.
+ */
+function landmarkMassSpecial(
+  site: Ring,
+  definition: LandmarkGrammarDefinition,
+  seed: string,
+  region: MultiPolygon
+): RawMass[] | null {
+  if (!["stadium-bowl", "cooling-tower-yard", "garden-arcology", "event-plaza-pylon", "logo-gateway"].includes(definition.id)) return null;
+  const frame = largestPiece(region) ?? site;
+  const angle = longestEdgeAngle(frame);
+  const centre = ringCentroid(frame);
+  const bounds = ringBounds(frame.map((point) => rotatePoint(point, centre, -angle)));
+  const localCentre = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+  const v4 = `${seed}/landmarks/v4/${definition.id}`;
+  const fit = (ring: Ring): Ring | null => fitRingInside(ring, region);
+
+  if (definition.id === "stadium-bowl") {
+    const template = definition.massTemplates[0]!;
+    const radiusX = bounds.width * 0.34;
+    const radiusY = bounds.height * 0.32;
+    // Size every rotated seating segment from the frame's minor dimension. Scaling
+    // width from bounds.width and depth from bounds.height made the diagonal pairs
+    // (1/7 and 3/5) intersect on wide sites even though their ellipse centres were
+    // distinct. A common isotropic unit keeps the eight-part bowl disjoint at any
+    // site aspect ratio while preserving the elliptical arrangement.
+    const segmentUnit = Math.min(bounds.width, bounds.height);
+    const segmentWidth = segmentUnit * 0.15;
+    const segmentDepth = segmentUnit * 0.13;
+    const output: RawMass[] = [];
+    for (let index = 0; index < 8; index++) {
+      const theta = (index * Math.PI * 2) / 8;
+      const localPosition = {
+        x: localCentre.x + Math.cos(theta) * radiusX,
+        y: localCentre.y + Math.sin(theta) * radiusY
+      };
+      const position = rotatePoint(localPosition, centre, angle);
+      const ring = rectAt(position, segmentWidth, segmentDepth, angle + theta + Math.PI / 2);
+      const fitted = fit(ring);
+      if (!fitted) return [];
+      output.push({
+        footprint: fitted,
+        elevationM: 0,
+        heightM: range(`${v4}/segment-height/${index}`, template.heightMinM, template.heightMaxM),
+        kind: "stadium-bowl-segment"
+      });
+    }
+    return output;
+  }
+
+  if (definition.id === "cooling-tower-yard") {
+    const template = definition.massTemplates[0]!;
+    const positions: readonly (readonly [number, number])[] = [
+      [-0.25, -0.24],
+      [0.25, -0.24],
+      [-0.25, 0.24],
+      [0.25, 0.24],
+      [0, 0]
+    ];
+    const count = 3 + Math.floor(hashUnit(`${v4}/tower-count`) * 3);
+    const diameter = Math.min(bounds.width, bounds.height) * 0.22;
+    const rotation = hashUnit(`${v4}/rotation`) * Math.PI / 4;
+    const output: RawMass[] = [];
+    for (let index = 0; index < count; index++) {
+      const [dx, dy] = positions[index]!;
+      const boxCentre = rotatePoint({
+        x: localCentre.x + dx * bounds.width,
+        y: localCentre.y + dy * bounds.height
+      }, centre, angle);
+      const fitted = fit(polygonRingInBox(boxCentre, diameter, diameter, angle, 8, rotation));
+      if (!fitted) return [];
+      output.push({
+        footprint: fitted,
+        elevationM: 0,
+        heightM: range(`${v4}/tower-height/${index}`, template.heightMinM, template.heightMaxM),
+        kind: "cooling-tower"
+      });
+    }
+    return output;
+  }
+
+  if (definition.id === "garden-arcology") {
+    const output: RawMass[] = [];
+    let elevationM = 0;
+    let base: Ring | null = null;
+    for (let index = 0; index < definition.massTemplates.length; index++) {
+      const template = definition.massTemplates[index]!;
+      const scale = 1 - index * 0.18;
+      const ring = localRect(
+        bounds,
+        angle,
+        centre,
+        bounds.width * (1 - scale) / 2,
+        bounds.height * (1 - scale) / 2,
+        bounds.width * scale,
+        bounds.height * scale
+      );
+      const fitted = fitRingInside(ring, base === null ? region : ringAsMulti(base));
+      if (!fitted) return [];
+      base ??= fitted;
+      const heightM = range(`${v4}/terrace-height/${index}`, template.heightMinM, template.heightMaxM);
+      output.push({ footprint: fitted, elevationM, heightM, kind: template.kind });
+      elevationM += heightM;
+    }
+    return output;
+  }
+
+  if (definition.id === "event-plaza-pylon") {
+    const hallTemplate = definition.massTemplates[0]!;
+    const pylonTemplate = definition.massTemplates[1]!;
+    const hall = fit(localRect(bounds, angle, centre, bounds.width * 0.04, bounds.height * 0.2, bounds.width * 0.62, bounds.height * 0.6));
+    const pylonCentre = rotatePoint({
+      x: bounds.x + bounds.width * 0.84,
+      y: localCentre.y
+    }, centre, angle);
+    const pylon = fit(polygonRingInBox(pylonCentre, bounds.width * 0.12, bounds.height * 0.18, angle, 6, hashUnit(`${v4}/pylon-rotation`) * Math.PI / 3));
+    if (!hall || !pylon) return [];
+    return [
+      { footprint: hall, elevationM: 0, heightM: range(`${v4}/hall-height`, hallTemplate.heightMinM, hallTemplate.heightMaxM), kind: "event-hall" },
+      { footprint: pylon, elevationM: 0, heightM: range(`${v4}/pylon-height`, pylonTemplate.heightMinM, pylonTemplate.heightMaxM), kind: "luminous-pylon" }
+    ];
+  }
+
+  const template = definition.massTemplates[0]!;
+  const supportWidth = bounds.width * 0.18;
+  const supportDepth = bounds.height * 0.68;
+  const leftX = bounds.width * 0.06;
+  const rightX = bounds.width * 0.76;
+  const y = bounds.height * 0.16;
+  const supportHeight = range(`${v4}/support-height`, template.heightMinM, template.heightMaxM);
+  const left = fit(localRect(bounds, angle, centre, leftX, y, supportWidth, supportDepth));
+  const right = fit(localRect(bounds, angle, centre, rightX, y, supportWidth, supportDepth));
+  const connectorElevation = supportHeight * 0.58;
+  const connectorHeight = Math.min(16, Math.max(8, supportHeight * 0.2));
+  const connector = fit(localRect(
+    bounds,
+    angle,
+    centre,
+    leftX + supportWidth,
+    bounds.height * 0.36,
+    rightX - leftX - supportWidth,
+    bounds.height * 0.28
+  ));
+  if (!left || !right || !connector) return [];
+  return [
+    { footprint: left, elevationM: 0, heightM: supportHeight, kind: "logo-gateway-support" },
+    { footprint: right, elevationM: 0, heightM: supportHeight, kind: "logo-gateway-support" },
+    { footprint: connector, elevationM: connectorElevation, heightM: connectorHeight, kind: "elevated-logo-sign" }
+  ];
+}
+
 const EMPTY_COMPATIBILITY_TAGS: ReadonlySet<string> = new Set();
 
 function districtCompatibilityTags(districtId: string | null, districtById: Map<string, DistrictSource>): ReadonlySet<string> {
@@ -1108,14 +1417,31 @@ function planLandmarks(
       const compatibleArea = union(compatibleFragments.map((fragment) => fragment.buildable));
       const available = existing.length > 0 ? difference(compatibleArea, [union(existing.map((ring) => ringAsMulti(ring)))]) : compatibleArea;
       if (multiArea(available) < definition.minSiteAreaM2) continue;
-      const site = landmarkSiteForBlock(available, definition.minSiteAreaM2, definition.maxSiteAreaM2);
+      const blockSeed = stableId("seed", `${source.citySeed}/landmarks/v3/fallback/${grammarId}/${block.id}`);
+      const compactSite = compactFallbackLandmarkSite(available, definition, blockSeed);
+      // Keep the established full block-inscribed fallback only for geometries that cannot
+      // carry the grammar (including its required open-space carve) at the compact target.
+      const fullSite = compactSite === null
+        ? landmarkSiteForBlock(available, definition.minSiteAreaM2, definition.maxSiteAreaM2)
+        : null;
+      const site = compactSite ?? (
+        fullSite && landmarkSiteSatisfiesGrammar(
+          fullSite,
+          available,
+          definition,
+          blockSeed,
+          definition.minSiteAreaM2,
+          definition.maxSiteAreaM2
+        )
+          ? fullSite
+          : null
+      );
       if (!site) continue;
       const fragments = block.districtFragments
         .filter((fragment) => multiArea(intersection(ringAsMulti(site), fragment.buildable)) > GEOMETRY_EPSILON)
         .sort((a, b) => a.id.localeCompare(b.id));
       const compatible = fragments.find((fragment) => landmarkFitsDistrict(definition, districtCompatibilityTags(fragment.districtId, districtById)));
       if (!compatible) continue;
-      const blockSeed = stableId("seed", `${source.citySeed}/landmarks/v3/fallback/${grammarId}/${block.id}`);
       landmarks.push({
         id: stableId("landmark", `${grammarId}|fallback|${block.id}|${pointKey(site[0]!)}`),
         landmarkGrammarId: grammarId,
@@ -1155,29 +1481,19 @@ function carveLandmarkOpenSpaces(
   const failures: string[] = [];
   for (const landmark of landmarks) {
     const definition = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)!;
-    const site = ringAsMulti(landmark.sitePolygon);
-    if (!definition.requiredOpenSpace) {
-      regions.set(landmark.id, site);
-      continue;
-    }
-    const requirement = definition.requiredOpenSpace;
-    const siteArea = Math.abs(ringArea(landmark.sitePolygon));
-    const angle = longestEdgeAngle(landmark.sitePolygon);
-    const centre = ringCentroid(landmark.sitePolygon);
-    const bounds = ringBounds(landmark.sitePolygon.map((point) => rotatePoint(point, centre, -angle)));
-    const share = Math.max(requirement.minShare, range(`${landmark.seed}/open/share`, requirement.minShare, Math.min(0.5, requirement.minShare + 0.2)));
-    // The required open space is a full-height band along one end of the site covering at
-    // least minShare of the site area, so the landmark's own masses keep the rest of the
-    // site to fit into (approach plaza / park frontage) and the validator's minShare rule
-    // always holds for the carved piece.
-    const band = localRect(bounds, angle, centre, 0, 0, bounds.width * share, bounds.height);
-    const piece = largestPiece(intersection(site, ringAsMulti(band)));
-    if (!piece || Math.abs(ringArea(piece)) + 0.5 < requirement.minShare * siteArea) {
-      failures.push(`Landmark "${landmark.landmarkGrammarId}" at "${landmark.placementLineage}" could not carve its required ${requirement.category} open space; the landmark is dropped and its site returns to parcel accounting.`);
+    const geometry = landmarkOpenSpaceGeometry(landmark.sitePolygon, definition, landmark.seed);
+    if (!geometry) {
+      const category = definition.requiredOpenSpace?.category ?? "open space";
+      failures.push(`Landmark "${landmark.landmarkGrammarId}" at "${landmark.placementLineage}" could not carve its required ${category} open space; the landmark is dropped and its site returns to parcel accounting.`);
       failedLandmarkIds.add(landmark.id);
       continue;
     }
-    const category = requirement.category;
+    if (!definition.requiredOpenSpace) {
+      regions.set(landmark.id, geometry.massRegion);
+      continue;
+    }
+    const category = definition.requiredOpenSpace.category;
+    const piece = geometry.openSpace!;
     const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
     const bank = district ? (banks.get(district.paletteId) ?? BASE_BANK) : BASE_BANK;
     const openSpace: OpenSpacePlan = {
@@ -1199,10 +1515,7 @@ function carveLandmarkOpenSpaces(
     };
     landmark.openSpaceIds.push(openSpace.id);
     openSpaces.push(openSpace);
-    // The mass region is the site minus the band, so masses never overlap their own
-    // required open space and can never extend past an irregular fallback site.
-    const regionRect = ringAsMulti(localRect(bounds, angle, centre, bounds.width * share, 0, bounds.width * (1 - share), bounds.height));
-    regions.set(landmark.id, intersection(site, regionRect));
+    regions.set(landmark.id, geometry.massRegion);
   }
   return { openSpaces, regions, failedLandmarkIds, failures };
 }
@@ -1222,6 +1535,29 @@ function planFragments(
   const parcels: ParcelPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
   const warnings: string[] = [];
+  // One or two plot-sized courts in sufficiently fine-grained blocks produce a dense /
+  // breathe rhythm without surrendering broad development bands. Selection is stable
+  // under encounter order and isolated from all established grammar streams.
+  const densityPocketCellIds = new Set<string>();
+  for (const block of districtPlan.blocks) {
+    const eligible = block.districtFragments
+      .flatMap((fragment) => cellsByFragment.get(fragment.id) ?? [])
+      .filter((cell) => {
+        const areaM2 = Math.abs(ringArea(cell.polygon));
+        return cell.classification === "building"
+          && areaM2 >= MIN_DENSITY_POCKET_AREA_M2
+          && areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2;
+      })
+      .sort((a, b) => {
+        const aScore = fnv1a(`${block.id}/density/v1/pocket/${a.id}`);
+        const bScore = fnv1a(`${block.id}/density/v1/pocket/${b.id}`);
+        return aScore - bScore || a.id.localeCompare(b.id);
+      });
+    const target = eligible.length < 6
+      ? 0
+      : 1 + (eligible.length >= 18 && hashUnit(`${block.id}/density/v1/pocket-count`) < 0.55 ? 1 : 0);
+    for (const cell of eligible.slice(0, target)) densityPocketCellIds.add(cell.id);
+  }
   for (const block of districtPlan.blocks) {
     for (const fragment of block.districtFragments) {
       let available = fragment.buildable;
@@ -1235,30 +1571,41 @@ function planFragments(
       // space surfacing again (duplicate polygon members or a repeated earcut triangle),
       // so a repeat is skipped instead of minting a second id for one planned space.
       const emittedDerived = new Set<string>();
-      const emitDerivedOpenSpace = (piece: Ring, semanticRole: DevelopmentSpaceRole, lineage: string, category = DEVELOPMENT_SPACE_CATEGORIES[semanticRole]): void => {
-        const areaM2 = Math.abs(ringArea(piece));
-        const material = `${fragment.id}|${semanticRole}|${lineage}|${ringKey(piece)}`;
-        if (emittedDerived.has(material)) return;
-        emittedDerived.add(material);
-        const size: OpenSpaceSize = areaM2 < 150 ? "pocket" : areaM2 < 1_200 ? "small" : "large";
-        openSpaces.push({
-          id: stableId("open", material),
-          parcelId: null,
-          blockId: block.id,
-          fragmentId: fragment.id,
-          districtId: fragment.districtId,
-          landmarkId: null,
-          semanticRole,
-          category,
-          size,
-          polygon: piece,
-          surfaceStyle: OPEN_SPACE_SURFACE_STYLES[category],
-          detailStyle: OPEN_SPACE_DETAIL_STYLES[category],
-          lineage,
-          seed: `${lineage}/open`,
-          areaM2,
-          material: materialIndex(bank, OPEN_SPACE_SLOTS[category])
-        });
+      const emitDerivedOpenSpace = (
+        piece: Ring,
+        semanticRole: DevelopmentSpaceRole,
+        lineage: string,
+        category = DEVELOPMENT_SPACE_CATEGORIES[semanticRole],
+        forcedSize?: OpenSpaceSize
+      ): void => {
+        const derivedPieces = semanticRole === "landscape"
+          ? splitRingToAreaCap(piece, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2)
+          : [piece];
+        for (const derivedPiece of derivedPieces) {
+          const areaM2 = Math.abs(ringArea(derivedPiece));
+          const material = `${fragment.id}|${semanticRole}|${lineage}|${ringKey(derivedPiece)}`;
+          if (emittedDerived.has(material)) continue;
+          emittedDerived.add(material);
+          const size: OpenSpaceSize = forcedSize ?? (areaM2 < 150 ? "pocket" : areaM2 < 1_200 ? "small" : "large");
+          openSpaces.push({
+            id: stableId("open", material),
+            parcelId: null,
+            blockId: block.id,
+            fragmentId: fragment.id,
+            districtId: fragment.districtId,
+            landmarkId: null,
+            semanticRole,
+            category,
+            size,
+            polygon: derivedPiece,
+            surfaceStyle: OPEN_SPACE_SURFACE_STYLES[category],
+            detailStyle: OPEN_SPACE_DETAIL_STYLES[category],
+            lineage,
+            seed: `${lineage}/open`,
+            areaM2,
+            material: materialIndex(bank, OPEN_SPACE_SLOTS[category])
+          });
+        }
       };
       const intent = intentByFragment.get(fragment.id);
       const openPiece = intent && intent.targetShare > 0 && intent.category
@@ -1289,19 +1636,33 @@ function planFragments(
 
       const cells = (cellsByFragment.get(fragment.id) ?? []).sort((a, b) => a.id.localeCompare(b.id));
       for (const cell of cells) {
-        if (cell.classification === "building") continue;
+        const densityPocket = densityPocketCellIds.has(cell.id);
+        if (cell.classification === "building" && !densityPocket) continue;
         const clipped = intersectMultiWithRing(available, cell.polygon);
-        const semanticRole = cell.semanticRole ?? cell.classification;
-        const category = cell.openSpaceCategory ?? DEVELOPMENT_SPACE_CATEGORIES[semanticRole];
-        let carved = false;
+        const semanticRole: DevelopmentSpaceRole = densityPocket ? "plaza" : (cell.semanticRole ?? cell.classification as DevelopmentSpaceRole);
+        const category = densityPocket ? "plaza" : (cell.openSpaceCategory ?? DEVELOPMENT_SPACE_CATEGORIES[semanticRole]);
+        const lineage = densityPocket ? `${fragment.id}/density/v1/pocket/${cell.id}` : cell.id;
         for (const polygon of clipped) {
           for (const piece of distinctHoleFreePieces(polygon)) {
-            if (Math.abs(ringArea(piece)) <= GEOMETRY_EPSILON) continue;
-            emitDerivedOpenSpace(piece, semanticRole, cell.id, category);
-            carved = true;
+            const areaM2 = Math.abs(ringArea(piece));
+            if (areaM2 <= GEOMETRY_EPSILON || (densityPocket && areaM2 < MIN_DENSITY_POCKET_AREA_M2)) continue;
+            const oversizedSemanticCourt = !densityPocket
+              && (semanticRole === "courtyard" || semanticRole === "plaza")
+              && areaM2 > MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2;
+            if (oversizedSemanticCourt) {
+              const semanticPocketLineage = `${fragment.id}/density/v2/semantic-pocket/${cell.id}/${ringKey(piece)}`;
+              const targetShare = 0.1 + hashUnit(`${semanticPocketLineage}/share`) * 0.04;
+              const pocket = semanticPocketForPiece(piece, semanticPocketLineage, targetShare);
+              if (pocket) {
+                emitDerivedOpenSpace(pocket, semanticRole, semanticPocketLineage, category, "pocket");
+                available = subtractPieceFromMulti(available, pocket);
+              }
+              continue;
+            }
+            emitDerivedOpenSpace(piece, semanticRole, lineage, category, densityPocket ? "pocket" : undefined);
+            available = subtractPieceFromMulti(available, piece);
           }
         }
-        if (carved) available = subtractPieceFromMulti(available, cell.polygon);
       }
 
       const indexByCell = new Map(cells.map((cell, index) => [cell.id, index]));
@@ -1687,6 +2048,106 @@ function archetypeMasses(
     );
     if (!mechanical) return [];
     return [base, mechanical, upper];
+  }
+  if (archetype === "t-shape" || archetype === "cross" || archetype === "h-shape" || archetype === "hexagonal" || archetype === "sawtooth") {
+    const v4 = `${seed}/massing/v4`;
+    const massCount = definition.massing.minMasses +
+      Math.floor(hashUnit(`${v4}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
+    const fittedMerged = (pieces: readonly Ring[]): Ring | null => {
+      const merged = mergePieces(pieces);
+      return merged === null ? null : fitRingInside(merged, container);
+    };
+    const stacked = (base: Ring, upper: Ring, baseKind: string, upperKind: string): RawMass[] => {
+      if (massCount < 2) return [{ footprint: base, elevationM: 0, heightM, kind: baseKind }];
+      const fittedUpper = fitRingInside(upper, ringAsMulti(base));
+      if (!fittedUpper) return [];
+      const baseShare = range(`${v4}/stack/base-share`, 0.52, 0.68);
+      return [
+        { footprint: base, elevationM: 0, heightM: heightM * baseShare, kind: baseKind },
+        { footprint: fittedUpper, elevationM: heightM * baseShare, heightM: heightM * (1 - baseShare), kind: upperKind }
+      ];
+    };
+
+    if (archetype === "t-shape") {
+      const headDepth = mainH * range(`${v4}/t-shape/head-depth`, 0.32, 0.4);
+      const stemWidth = mainW * range(`${v4}/t-shape/stem-width`, 0.36, 0.44);
+      const headAtBack = hashUnit(`${v4}/t-shape/orientation`) < 0.5;
+      const headY = headAtBack ? baseY : baseY + mainH - headDepth;
+      const stemY = headAtBack ? baseY + headDepth : baseY;
+      const base = fittedMerged([
+        localRect(bounds, angle, centre, baseX, headY, mainW, headDepth),
+        localRect(bounds, angle, centre, baseX + (mainW - stemWidth) / 2, stemY, stemWidth, mainH - headDepth)
+      ]);
+      if (!base) return [];
+      const upper = localRect(bounds, angle, centre, baseX + mainW * 0.3, baseY + mainH * 0.15, mainW * 0.4, mainH * 0.7);
+      return stacked(base, upper, "t-shaped-base", "t-shaped-upper");
+    }
+
+    if (archetype === "cross") {
+      const armWidth = mainW * range(`${v4}/cross/vertical-width`, 0.34, 0.42);
+      const armDepth = mainH * range(`${v4}/cross/horizontal-depth`, 0.34, 0.42);
+      const base = fittedMerged([
+        localRect(bounds, angle, centre, baseX + (mainW - armWidth) / 2, baseY, armWidth, mainH),
+        localRect(bounds, angle, centre, baseX, baseY + (mainH - armDepth) / 2, mainW, armDepth)
+      ]);
+      if (!base) return [];
+      const upper = localRect(bounds, angle, centre, baseX + mainW * 0.22, baseY + mainH * 0.22, mainW * 0.56, mainH * 0.56);
+      return stacked(base, upper, "cross-base", "cross-tower");
+    }
+
+    if (archetype === "h-shape") {
+      const sideWidth = mainW * range(`${v4}/h-shape/side-width`, 0.27, 0.33);
+      const connectorDepth = mainH * range(`${v4}/h-shape/connector-depth`, 0.26, 0.34);
+      const base = fittedMerged([
+        localRect(bounds, angle, centre, baseX, baseY, sideWidth, mainH),
+        localRect(bounds, angle, centre, baseX + mainW - sideWidth, baseY, sideWidth, mainH),
+        localRect(bounds, angle, centre, baseX + sideWidth, baseY + (mainH - connectorDepth) / 2, mainW - sideWidth * 2, connectorDepth)
+      ]);
+      if (!base) return [];
+      const upper = localRect(bounds, angle, centre, baseX + mainW * 0.3, baseY + mainH * 0.22, mainW * 0.4, mainH * 0.56);
+      return stacked(base, upper, "h-shaped-base", "h-shaped-upper");
+    }
+
+    if (archetype === "hexagonal") {
+      const boxCentre = rotatePoint({ x: bounds.x + baseX + mainW / 2, y: bounds.y + baseY + mainH / 2 }, centre, angle);
+      const rotation = hashUnit(`${v4}/hexagonal/rotation`) * Math.PI / 3;
+      const tierHeight = heightM / massCount;
+      const masses: RawMass[] = [];
+      let base: Ring | null = null;
+      for (let index = 0; index < massCount; index++) {
+        const scale = 1 - index * 0.14;
+        const ring = polygonRingInBox(boxCentre, mainW * scale, mainH * scale, angle, 6, rotation);
+        const fitted = fitRingInside(ring, base === null ? container : ringAsMulti(base));
+        if (!fitted) return [];
+        base ??= fitted;
+        masses.push({ footprint: fitted, elevationM: tierHeight * index, heightM: tierHeight, kind: index === 0 ? "hexagonal-base" : "hexagonal-tier" });
+      }
+      return masses;
+    }
+
+    const toothCount = 3 + Math.floor(hashUnit(`${v4}/sawtooth/tooth-count`) * 2);
+    const spineDepth = mainH * range(`${v4}/sawtooth/spine-depth`, 0.3, 0.38);
+    const toothBand = mainW / toothCount;
+    const toothWidth = toothBand * range(`${v4}/sawtooth/tooth-width`, 0.58, 0.72);
+    const spineAtBack = hashUnit(`${v4}/sawtooth/orientation`) < 0.5;
+    const spineY = spineAtBack ? baseY : baseY + mainH - spineDepth;
+    const toothY = spineAtBack ? baseY + spineDepth : baseY;
+    const pieces: Ring[] = [localRect(bounds, angle, centre, baseX, spineY, mainW, spineDepth)];
+    for (let index = 0; index < toothCount; index++) {
+      pieces.push(localRect(
+        bounds,
+        angle,
+        centre,
+        baseX + index * toothBand + (toothBand - toothWidth) / 2,
+        toothY,
+        toothWidth,
+        mainH - spineDepth
+      ));
+    }
+    const base = fittedMerged(pieces);
+    if (!base || base.length <= 8) return [];
+    const upper = localRect(bounds, angle, centre, baseX + mainW * 0.1, spineY, mainW * 0.8, spineDepth);
+    return stacked(base, upper, "merged-sawtooth-base", "sawtooth-spine");
   }
   const declaredCount = definition.massing.minMasses + Math.floor(hashUnit(`${seed}/mass-count`) * (definition.massing.maxMasses - definition.massing.minMasses + 1));
 
@@ -2077,7 +2538,9 @@ function refineParcelVariant(
   district: DistrictSource | undefined,
   banks: Map<string, number>,
   frontage: FrontageSide | null,
-  heightBands: ReadonlyMap<string, HeightBand>
+  heightBands: ReadonlyMap<string, HeightBand>,
+  maxBuildings: number,
+  minBuildingAreaM2: number
 ): RefinedParcelResult | null {
   const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
@@ -2117,6 +2580,12 @@ function refineParcelVariant(
             pieceIndex++;
             continue;
           }
+          if (pieceAreaM2 < minBuildingAreaM2) {
+            unbuilt.push(piece);
+            candidateIndex++;
+            pieceIndex++;
+            continue;
+          }
           // Sub-floor partition pieces (diagonal/boundary clippings) never build, even
           // via micro grammars; they fall to the residual vacant classification.
           if (frameMinorDimension(piece, partition.angleRad) < MIN_MASS_MINOR_DIMENSION_M) {
@@ -2140,7 +2609,11 @@ function refineParcelVariant(
             areaM2: pieceAreaM2
           };
           const building = planParcelBuilding(candidate, weights, useWeights, district, banks, undefined, cellFrontage, heightBands.get(candidate.blockId) ?? null);
+          // Density infill is admitted as an atomic partition. Abandon a variant as
+          // soon as it would cross its parcel/city allowance, rather than materializing
+          // an unbounded grid only to discard it later.
           if (building !== null) {
+            if (buildings.length >= maxBuildings) return null;
             parcels.push(candidate);
             buildings.push(building);
             areaM2 += pieceAreaM2;
@@ -2162,13 +2635,15 @@ function refineParcel(
   district: DistrictSource | undefined,
   banks: Map<string, number>,
   frontage: FrontageSide | null,
-  heightBands: ReadonlyMap<string, HeightBand>
+  heightBands: ReadonlyMap<string, HeightBand>,
+  maxBuildings = Number.POSITIVE_INFINITY,
+  minBuildingAreaM2 = MIN_PARCEL_AREA_M2
 ): RefinedParcelResult | null {
   let best: RefinedParcelResult | null = null;
   for (const partition of parcelPartitionCandidates(parcel, weights)) {
     for (let offsetX = 0; offsetX < 3; offsetX++) {
       for (let offsetY = 0; offsetY < 3; offsetY++) {
-        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks, frontage, heightBands);
+        const result = refineParcelVariant(parcel, partition, offsetX, offsetY, weights, useWeights, district, banks, frontage, heightBands, maxBuildings, minBuildingAreaM2);
         if (result !== null && (best === null || result.areaM2 > best.areaM2)) best = result;
         if (best !== null && best.areaM2 >= parcel.areaM2 * 0.97) return best;
       }
@@ -2208,23 +2683,26 @@ function residualParcelPlans(
       continue;
     }
     parcels.push(residualParcel);
-    openSpaces.push({
-      id: stableId("open", `${residualParcel.id}|${ringKey(piece)}`),
-      parcelId: residualParcel.id,
-      blockId: parcel.blockId,
-      fragmentId: parcel.fragmentId,
-      districtId: parcel.districtId,
-      landmarkId: null,
-      category: "vacant",
-      size: areaM2 < 800 ? "small" : "large",
-      polygon: piece,
-      surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
-      detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
-      lineage: seed,
-      seed,
-      areaM2,
-      material: MATERIAL.GROUND
-    });
+    for (const openPiece of splitRingToAreaCap(piece, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2)) {
+      const openAreaM2 = Math.abs(ringArea(openPiece));
+      openSpaces.push({
+        id: stableId("open", `${residualParcel.id}|${ringKey(openPiece)}`),
+        parcelId: residualParcel.id,
+        blockId: parcel.blockId,
+        fragmentId: parcel.fragmentId,
+        districtId: parcel.districtId,
+        landmarkId: null,
+        category: "vacant",
+        size: openAreaM2 < 150 ? "pocket" : "small",
+        polygon: openPiece,
+        surfaceStyle: OPEN_SPACE_SURFACE_STYLES.vacant,
+        detailStyle: OPEN_SPACE_DETAIL_STYLES.vacant,
+        lineage: seed,
+        seed,
+        areaM2: openAreaM2,
+        material: MATERIAL.GROUND
+      });
+    }
     index++;
   }
   return { parcels, retryParcels, openSpaces };
@@ -2232,97 +2710,298 @@ function residualParcelPlans(
 
 /**
  * Explicitly unbuilt parcel classification: landscaping surface (paving + planters) so
- * sub-floor slivers and no-fitting-grammar parcels blend with the sidewalk instead of
- * reading as derelict scrub. One open space per parcel, full-area, ground material.
+ * sub-floor slivers and no-fitting-grammar parcels blend with the sidewalk. Oversized
+ * anonymous surfaces are split, while every piece remains linked to the same parcel.
  */
-function unbuiltOpenSpacePlan(parcel: ParcelPlan): OpenSpacePlan {
-  return {
-    id: stableId("open", `unbuilt|${parcel.id}|${ringKey(parcel.polygon)}`),
-    parcelId: parcel.id,
-    blockId: parcel.blockId,
-    fragmentId: parcel.fragmentId,
-    districtId: parcel.districtId,
-    landmarkId: null,
-    category: "landscaping",
-    size: "large",
-    polygon: parcel.polygon,
-    surfaceStyle: "paving",
-    detailStyle: OPEN_SPACE_DETAIL_STYLES.landscaping,
-    lineage: parcel.seed,
-    seed: `${parcel.seed}/unbuilt`,
-    areaM2: parcel.areaM2,
-    material: MATERIAL.GROUND
-  };
+function unbuiltOpenSpacePlans(parcel: ParcelPlan): OpenSpacePlan[] {
+  return splitRingToAreaCap(parcel.polygon, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2).map((piece) => {
+    const areaM2 = Math.abs(ringArea(piece));
+    return {
+      id: stableId("open", `unbuilt|${parcel.id}|${ringKey(piece)}`),
+      parcelId: parcel.id,
+      blockId: parcel.blockId,
+      fragmentId: parcel.fragmentId,
+      districtId: parcel.districtId,
+      landmarkId: null,
+      category: "landscaping",
+      size: areaM2 < 150 ? "pocket" : "small",
+      polygon: piece,
+      surfaceStyle: "paving",
+      detailStyle: OPEN_SPACE_DETAIL_STYLES.landscaping,
+      lineage: parcel.seed,
+      seed: `${parcel.seed}/unbuilt`,
+      areaM2,
+      material: MATERIAL.GROUND
+    };
+  });
+}
+/** Districts whose anonymous residuals should read as continuous urban fabric. */
+export const DENSITY_INFILL_DISTRICT_TYPE_IDS: Readonly<Partial<Record<DistrictTypeId, true>>> = Object.freeze({
+  "corporate-core": true,
+  "commercial-highrise": true,
+  "mixed-use-centre": true,
+  "residential-megablocks": true,
+  "dense-residential": true,
+  "low-rise-residential": true,
+  "night-market": true,
+  "entertainment-strip": true,
+  "old-city": true,
+  "waterfront": true,
+  "civic-institutional": true,
+  "heavy-industrial": true,
+  "light-industrial": true,
+  "logistics-port": true,
+  "derelict-reclamation": true
+});
+
+/**
+ * Infill strongly prefers the five broad residual grammars, with two credible
+ * small-site shipping grammars covering the 60–100 m² edge. Every other micro grammar
+ * and every tower remains excluded; compatible ordinary low/mid-rise grammars retain
+ * a small share of their district weight.
+ */
+const DENSITY_INFILL_GRAMMAR_IDS: Readonly<Partial<Record<BuildingGrammarId, true>>> = Object.freeze(
+  Object.fromEntries(INFILL_BUILDING_GRAMMAR_IDS.map((id) => [id, true])) as Partial<Record<BuildingGrammarId, true>>
+);
+export const DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS: Readonly<Partial<Record<BuildingGrammarId, number>>> = Object.freeze({
+  "campus-annex": 0.7,
+  "narrow-strip": 0.75
+});
+const DENSITY_INFILL_WEIGHTS_BY_DISTRICT_TYPE = Object.freeze(Object.fromEntries(
+  [...DISTRICT_TYPE_REGISTRY].map(([typeId, definition]) => [
+    typeId,
+    Object.freeze(Object.fromEntries(BUILDING_GRAMMAR_IDS.map((grammarId) => {
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
+      const compatible = grammar.compatibilityTags.some((tag) => definition.compatibilityTags.includes(tag));
+      if (DENSITY_INFILL_GRAMMAR_IDS[grammarId] === true) {
+        const industrialFabric = typeId === "heavy-industrial" || typeId === "derelict-reclamation";
+        const preferred = !industrialFabric || grammarId === "infill-courtyard-cluster";
+        return [grammarId, compatible && preferred ? 1 : 0];
+      }
+      const smallSiteWeight = DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS[grammarId];
+      if (smallSiteWeight !== undefined) return [grammarId, compatible ? smallSiteWeight : 0];
+      const excluded = isTowerGrammar(grammar) || MICRO_BUILDING_GRAMMAR_IDS.has(grammarId);
+      return [grammarId, excluded ? 0 : definition.buildingGrammarWeights[grammarId] * 0.15];
+    }))) as Record<BuildingGrammarId, number>
+  ])
+)) as Readonly<Record<DistrictTypeId, Readonly<Record<BuildingGrammarId, number>>>>;
+export const DENSITY_INFILL_UNZONED_WEIGHTS: Readonly<Record<BuildingGrammarId, number>> = Object.freeze(
+  Object.fromEntries(BUILDING_GRAMMAR_IDS.map((grammarId) => {
+    if (DENSITY_INFILL_GRAMMAR_IDS[grammarId] === true) return [grammarId, 1];
+    const smallSiteWeight = DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS[grammarId];
+    if (smallSiteWeight !== undefined) return [grammarId, smallSiteWeight];
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
+    const excluded = isTowerGrammar(grammar) || MICRO_BUILDING_GRAMMAR_IDS.has(grammarId);
+    return [grammarId, excluded ? 0 : UNZONED_BUILDING_GRAMMAR_WEIGHTS[grammarId] * 0.15];
+  })) as Record<BuildingGrammarId, number>
+);
+
+
+function eligibleDensityInfillParcel(parcel: ParcelPlan, district: DistrictSource | undefined): boolean {
+  return (parcel.districtId === null || (district !== undefined && DENSITY_INFILL_DISTRICT_TYPE_IDS[district.typeId] === true))
+    && parcel.areaM2 >= MIN_DENSITY_INFILL_AREA_M2
+    && parcel.areaM2 <= MAX_DENSITY_INFILL_AREA_M2
+    && frameMinorDimension(parcel.polygon, parcel.frontageAngleRad) >= MIN_DENSITY_INFILL_MINOR_DIMENSION_M;
+}
+
+interface PendingBuildingParcel {
+  parcel: ParcelPlan;
+  residualDepth: number;
+  densityInfill: boolean;
+  densityPriority: number;
+  densityDistanceSq: number;
 }
 
 function planBuildings(
   sourceParcels: ParcelPlan[],
   districtById: Map<string, DistrictSource>,
   banks: Map<string, number>,
-  occupancy: MultiPolygon
+  occupancy: MultiPolygon,
+  cityCentre: Vec2
 ): { parcels: ParcelPlan[]; buildings: BuildingPlan[]; openSpaces: OpenSpacePlan[]; warnings: string[] } {
   const parcels: ParcelPlan[] = [];
   const buildings: BuildingPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
   const warnings: string[] = [];
   let refinedCount = 0;
+  let densityInfillCount = 0;
+  const densityInfillCountByFragment = new Map<string, number>();
   let unbuiltCount = 0;
   const occBoxes = occupancyBoxes(occupancy);
   const heightBands = deriveBlockHeightBands(sourceParcels, districtById);
-  const pending = sourceParcels.map((parcel) => ({ parcel, residualDepth: 0 }));
-  for (let pendingIndex = 0; pendingIndex < pending.length; pendingIndex++) {
-    const { parcel, residualDepth } = pending[pendingIndex]!;
+  const pending: PendingBuildingParcel[] = sourceParcels.map((parcel) => ({
+    parcel,
+    residualDepth: 0,
+    densityInfill: false,
+    densityPriority: 0,
+    densityDistanceSq: 0
+  }));
+  // Infill is deliberately deferred until every ordinary depth-0/depth-1 parcel has
+  // completed, so its absolute city allowance measures the stable baseline.
+  const densityPending: PendingBuildingParcel[] = [];
+  const queueDensityInfill = (candidate: ParcelPlan): boolean => {
+    const district = candidate.districtId ? districtById.get(candidate.districtId) : undefined;
+    if (!eligibleDensityInfillParcel(candidate, district)) return false;
+    const centre = ringCentroid(candidate.polygon);
+    const industrialOrUnzoned = district === undefined
+      || district.typeId === "heavy-industrial"
+      || district.typeId === "light-industrial"
+      || district.typeId === "logistics-port"
+      || district.typeId === "derelict-reclamation";
+    densityPending.push({
+      parcel: {
+        ...candidate,
+        role: `${candidate.role}-density-infill`,
+        seed: `${candidate.seed}/${DENSITY_INFILL_SALT}/${candidate.id}`
+      },
+      residualDepth: DENSITY_INFILL_RESIDUAL_DEPTH,
+      densityInfill: true,
+      densityPriority: industrialOrUnzoned ? 1 : 0,
+      densityDistanceSq: (centre.x - cityCentre.x) ** 2 + (centre.y - cityCentre.y) ** 2
+    });
+    return true;
+  };
+
+  for (let pendingIndex = 0; pendingIndex < pending.length || densityPending.length > 0; pendingIndex++) {
+    if (pendingIndex === pending.length) {
+      densityPending.sort((a, b) =>
+        a.densityPriority - b.densityPriority
+        || a.densityDistanceSq - b.densityDistanceSq
+        || a.parcel.id.localeCompare(b.parcel.id)
+      );
+      pending.push(...densityPending);
+      densityPending.length = 0;
+    }
+    const { parcel, residualDepth, densityInfill } = pending[pendingIndex]!;
     // Thin-parcel floor: a parcel whose own-frame oriented minor dimension is below
     // the emission floor is a clipped boundary/stagger sliver. Route it straight to
     // the explicit unbuilt path — no grammar, micro included, may raise a sub-floor
-    // bar on it. Normal (>= 6 m) parcels proceed unchanged, so intentional micro
-    // sites on credible parcels still build.
+    // bar on it.
     if (frameMinorDimension(parcel.polygon, parcel.frontageAngleRad) < MIN_MASS_MINOR_DIMENSION_M) {
       parcels.push(parcel);
       unbuiltCount++;
-      openSpaces.push(unbuiltOpenSpacePlan(parcel));
+      openSpaces.push(...unbuiltOpenSpacePlans(parcel));
+      continue;
+    }
+    const densityCapacity = densityInfill
+      ? Math.min(
+        MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL,
+        MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT - (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0),
+        MAX_DENSITY_INFILL_BUILDINGS - densityInfillCount,
+        MAX_REFERENCE_DENSITY_BUILDINGS - buildings.length
+      )
+      : Number.POSITIVE_INFINITY;
+    if (densityCapacity <= 0) {
+      parcels.push(parcel);
+      unbuiltCount++;
+      openSpaces.push(...unbuiltOpenSpacePlans(parcel));
       continue;
     }
     const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
     const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
-    const weights = definition ? definition.buildingGrammarWeights : UNZONED_BUILDING_GRAMMAR_WEIGHTS;
+    const weights = densityInfill
+      ? district
+        ? DENSITY_INFILL_WEIGHTS_BY_DISTRICT_TYPE[district.typeId]
+        : DENSITY_INFILL_UNZONED_WEIGHTS
+      : definition?.buildingGrammarWeights ?? UNZONED_BUILDING_GRAMMAR_WEIGHTS;
     const useWeights = definition ? definition.visualUseWeights : UNZONED_VISUAL_USE_WEIGHTS;
     const frontage = detectFrontage(parcel, occBoxes);
     const building = planParcelBuilding(parcel, weights, useWeights, district, banks, undefined, frontage, heightBands.get(parcel.blockId) ?? null);
     if (building !== null) {
       parcels.push(parcel);
       buildings.push(building);
+      if (densityInfill) {
+        densityInfillCount++;
+        densityInfillCountByFragment.set(parcel.fragmentId, (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0) + 1);
+      }
       continue;
     }
-    const refined = refineParcel(parcel, weights, useWeights, district, banks, frontage, heightBands);
+    const refined = refineParcel(
+      parcel,
+      weights,
+      useWeights,
+      district,
+      banks,
+      frontage,
+      heightBands,
+      densityCapacity,
+      densityInfill ? MIN_DENSITY_INFILL_AREA_M2 : MIN_PARCEL_AREA_M2
+    );
     if (refined !== null) {
       const residual = residualParcelPlans(parcel, refined);
-      parcels.push(...refined.parcels, ...residual.parcels);
+      parcels.push(...refined.parcels);
       buildings.push(...refined.buildings);
-      openSpaces.push(...residual.openSpaces);
+      if (densityInfill) {
+        densityInfillCount += refined.buildings.length;
+        densityInfillCountByFragment.set(
+          parcel.fragmentId,
+          (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0) + refined.buildings.length
+        );
+      }
+
+      // residual.parcels already have vacant OpenSpacePlans. Queue only eligible
+      // anonymous pieces and withhold both their parcel and open-space records until
+      // their one infill attempt completes.
+      const terminalResidualIds = new Set<string>();
+      for (const residualParcel of residual.parcels) {
+        if (!densityInfill && queueDensityInfill(residualParcel)) continue;
+        parcels.push(residualParcel);
+        terminalResidualIds.add(residualParcel.id);
+        unbuiltCount++;
+      }
+      openSpaces.push(...residual.openSpaces.filter((openSpace) =>
+        openSpace.parcelId !== null && terminalResidualIds.has(openSpace.parcelId)
+      ));
+
       if (residualDepth < MAX_RESIDUAL_REFINEMENT_DEPTH) {
-        pending.push(...residual.retryParcels.map((retryParcel) => ({ parcel: retryParcel, residualDepth: residualDepth + 1 })));
+        pending.push(...residual.retryParcels.map((retryParcel) => ({
+          parcel: retryParcel,
+          residualDepth: residualDepth + 1,
+          densityInfill: false,
+          densityPriority: 0,
+          densityDistanceSq: 0
+        })));
       } else {
-        parcels.push(...residual.retryParcels);
-        openSpaces.push(...residual.retryParcels.map(unbuiltOpenSpacePlan));
-        unbuiltCount += residual.retryParcels.length;
+        for (const retryParcel of residual.retryParcels) {
+          if (!densityInfill && queueDensityInfill(retryParcel)) continue;
+          parcels.push(retryParcel);
+          openSpaces.push(...unbuiltOpenSpacePlans(retryParcel));
+          unbuiltCount++;
+        }
       }
       refinedCount++;
-      unbuiltCount += residual.parcels.length;
       continue;
     }
+
+    // A normal parcel with no fitting grammar is itself an anonymous-landscaping
+    // candidate. Give credible urban parcels one broad infill attempt; failure during
+    // that attempt is terminal and can never re-enter the queue.
+    if (!densityInfill && queueDensityInfill(parcel)) continue;
     parcels.push(parcel);
     unbuiltCount++;
-    // Unbuilt parcels (too small or no fitting grammar) become landscaping rather
-    // than vacant scrub, so they blend with sidewalk surface instead of looking derelict.
-    openSpaces.push(unbuiltOpenSpacePlan(parcel));
+    openSpaces.push(...unbuiltOpenSpacePlans(parcel));
   }
   if (refinedCount > 0) warnings.push(`${refinedCount} planning parcels were partitioned into building-compatible final parcels.`);
+  if (densityInfillCount > 0) warnings.push(`${densityInfillCount} low/mid-rise buildings filled eligible anonymous urban residuals.`);
   if (unbuiltCount > 0) warnings.push(`${unbuiltCount} parcels have no fitting building grammar and remain explicitly unbuilt.`);
   parcels.sort((a, b) => a.id.localeCompare(b.id));
   buildings.sort((a, b) => a.id.localeCompare(b.id));
   openSpaces.sort((a, b) => a.id.localeCompare(b.id));
   return { parcels, buildings, openSpaces, warnings };
+}
+
+function rawLandmarkMassesForSite(
+  site: Ring,
+  definition: LandmarkGrammarDefinition,
+  seed: string,
+  massRegion: MultiPolygon
+): RawMass[] {
+  const special = landmarkMassSpecial(site, definition, seed, massRegion);
+  return special ?? (
+    definition.massTemplates.some((template) => template.polygonSides !== undefined || template.kind === MEGAFRAME_KIND)
+      ? landmarkMassPolygons(site, definition, seed, massRegion)
+      : landmarkMassRects(site, definition, seed, massRegion)
+  );
 }
 
 function materializeLandmarkMasses(
@@ -2335,12 +3014,10 @@ function materializeLandmarkMasses(
     const definition = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)!;
     const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
     const bank = parcelBank(district, banks);
-    // Grammars with polygonal templates (or the megaframe kind) emit ring footprints;
-    // every other grammar keeps the rect branch and its exact original streams.
+    // Compound overview grammars own a dedicated arrangement branch; polygonal and
+    // established rectangular grammars retain their prior paths and seed streams.
     const massRegion = regions.get(landmark.id) ?? ringAsMulti(landmark.sitePolygon);
-    landmark.rawMasses = definition.massTemplates.some((template) => template.polygonSides !== undefined || template.kind === MEGAFRAME_KIND)
-      ? landmarkMassPolygons(landmark.sitePolygon, definition, landmark.seed, massRegion)
-      : landmarkMassRects(landmark.sitePolygon, definition, landmark.seed, massRegion);
+    landmark.rawMasses = rawLandmarkMassesForSite(landmark.sitePolygon, definition, landmark.seed, massRegion);
     landmark.masses = landmark.rawMasses.map((raw, index) => {
       const massSeed = `${landmark.seed}/mass/${index}`;
       // WHY: landmark appearance changes must not move geometry or IDs.
@@ -2430,7 +3107,13 @@ export function buildCompleteCityPlan(
   // leaving an unexplained void in the city.
   const landmarkSites = new Map(landmarks.map((landmark) => [landmark.id, landmark.sitePolygon]));
   const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, landmarkSites, districtById, banks);
-  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(planningParcels, districtById, banks, occupancy.all);
+  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(
+    planningParcels,
+    districtById,
+    banks,
+    occupancy.all,
+    ringCentroid(source.terrain.land)
+  );
   const placedLandmarkIds = new Set(landmarks.map((landmark) => landmark.id));
   const keptLandmarkOpenSpaces = landmarkOpenSpaces.filter((openSpace) => openSpace.landmarkId === null || placedLandmarkIds.has(openSpace.landmarkId));
   const allOpenSpaces = [...keptLandmarkOpenSpaces, ...openSpaces, ...unbuiltOpenSpaces].sort((a, b) => a.id.localeCompare(b.id));
@@ -2606,6 +3289,28 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
       if (!parcel) problems.push(`Open space "${openSpace.id}" references unknown parcel "${openSpace.parcelId}".`);
       else if (validRing(openSpace.polygon) && !ringContained(openSpace.polygon, parcel.polygon)) problems.push(`Open space "${openSpace.id}" is not contained in its parcel "${parcel.id}".`);
     }
+    const anonymousRemainder = openSpace.parcelId !== null
+      || (openSpace.semanticRole === "landscape" && /boundary-sliver|residual/.test(openSpace.lineage));
+    if (anonymousRemainder && openSpace.areaM2 > MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5) {
+      problems.push(`Anonymous open space "${openSpace.id}" exceeds the remainder area cap.`);
+    }
+    const oversizedSemanticCourt = openSpace.landmarkId === null
+      && openSpace.parcelId === null
+      && (openSpace.semanticRole === "courtyard" || openSpace.semanticRole === "plaza");
+    if (oversizedSemanticCourt && openSpace.areaM2 > MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2 + 0.5) {
+      problems.push(`Semantic ${openSpace.semanticRole} open space "${openSpace.id}" exceeds the development-cell area cap.`);
+    }
+    const derivedSemanticPocket = openSpace.lineage.includes("/density/v2/semantic-pocket/");
+    if (derivedSemanticPocket && (
+      openSpace.landmarkId !== null
+      || openSpace.parcelId !== null
+      || (openSpace.semanticRole !== "courtyard" && openSpace.semanticRole !== "plaza")
+      || openSpace.size !== "pocket"
+      || openSpace.areaM2 < MIN_DENSITY_POCKET_AREA_M2
+      || openSpace.areaM2 > MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 + 0.5
+    )) {
+      problems.push(`Derived semantic pocket "${openSpace.id}" violates the plot-sized pocket contract.`);
+    }
     if (typeof openSpace.material !== "number" || !Number.isFinite(openSpace.material) || openSpace.material < 0 || openSpace.material >= BANK_COUNT * 8) problems.push(`Open space "${openSpace.id}" has an invalid material index.`);
   }
   const buildingIds = new Set<string>();
@@ -2687,6 +3392,16 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
       if (!validRing(mass.footprint)) problems.push(`Landmark "${landmark.id}" mass ${mass.index} has an invalid footprint.`);
       if (validRing(mass.footprint) && !ringContained(mass.footprint, landmark.sitePolygon)) problems.push(`Landmark "${landmark.id}" mass ${mass.index} is not contained in its site.`);
       if (typeof mass.neonEnabled !== "boolean") problems.push(`Landmark "${landmark.id}" mass ${mass.index} has an invalid neon flag.`);
+    }
+    for (let left = 0; left < landmark.masses.length; left++) {
+      for (let right = left + 1; right < landmark.masses.length; right++) {
+        const a = landmark.masses[left]!;
+        const b = landmark.masses[right]!;
+        const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
+        if (spansOverlap && validRing(a.footprint) && validRing(b.footprint) && ringOverlaps(a.footprint, b.footprint)) {
+          problems.push(`Landmark "${landmark.id}" masses ${left} and ${right} overlap.`);
+        }
+      }
     }
     for (const openSpaceId of landmark.openSpaceIds) {
       if (!openSpaceIds.has(openSpaceId)) problems.push(`Landmark "${landmark.id}" references unknown open space "${openSpaceId}".`);

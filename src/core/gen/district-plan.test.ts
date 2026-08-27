@@ -3,9 +3,10 @@ import { validateRouteTopology } from "../graph/topology.js";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
 import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, type DistrictBlockFragment } from "./district-plan.js";
+import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, splitSimpleFaceCycles, type DistrictBlockFragment } from "./district-plan.js";
 import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictPlanningBounds } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
+import { validateRing } from "./terrain.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -150,6 +151,56 @@ describe("buildDistrictPlan", () => {
     expect(first.blocks.map((block) => Math.round(area(block.zoningFace) * 100) / 100).sort((a, b) => a - b)).toEqual([6_207.51, 12_000, 21_792.49]);
     const permuted = buildDistrictPlan({ ...source, roads: { nodes: [...source.roads.nodes].reverse(), routes: [...source.roads.routes].reverse(), edges: [...source.roads.edges].reverse() } });
     expect(permuted.blocks).toEqual(first.blocks);
+  });
+
+  it("splits a shared-vertex figure-eight into stable simple cycles without changing area", () => {
+    const shared = { x: 0, y: 0 };
+    const walk: Ring = [
+      shared,
+      { x: 4, y: 0 },
+      { x: 4, y: 4 },
+      { x: 0, y: 4 },
+      shared,
+      { x: -4, y: 0 },
+      { x: -4, y: -4 },
+      { x: 0, y: -4 }
+    ];
+    const cycles = splitSimpleFaceCycles(walk);
+
+    expect(cycles).toEqual([
+      [{ x: -4, y: -4 }, { x: 0, y: -4 }, { x: 0, y: 0 }, { x: -4, y: 0 }],
+      [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 4 }, { x: 0, y: 4 }]
+    ]);
+    expect(cycles.every((cycle) => validateRing(cycle).ok)).toBe(true);
+    expect(cycles.reduce((sum, cycle) => sum + area(cycle), 0)).toBeCloseTo(area(walk), 8);
+
+    const shifted = [...walk.slice(3), ...walk.slice(0, 3)];
+    expect(splitSimpleFaceCycles(shifted)).toEqual(cycles);
+    expect(splitSimpleFaceCycles([...shifted].reverse())).toEqual(cycles);
+  });
+
+  it("opens a negative shared-vertex hole into a deterministic simple face", () => {
+    const shared = { x: 0, y: 0 };
+    const walk: Ring = [
+      shared,
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 },
+      shared,
+      { x: 1, y: 3 },
+      { x: 3, y: 1 }
+    ];
+    const cycles = splitSimpleFaceCycles(walk);
+
+    expect(cycles).toHaveLength(1);
+    expect(validateRing(cycles[0]!).ok).toBe(true);
+    const emittedArea = area(cycles[0]!);
+    expect(emittedArea).toBeLessThan(area(walk));
+    expect(area(walk) - emittedArea).toBeLessThan(1);
+
+    const shifted = [...walk.slice(5), ...walk.slice(0, 5)];
+    expect(splitSimpleFaceCycles(shifted)).toEqual(cycles);
+    expect(splitSimpleFaceCycles([...shifted].reverse())).toEqual(cycles);
   });
 
   it("plans the Phase 2 generated route fixtures without treating internal rings as fatal", () => {
