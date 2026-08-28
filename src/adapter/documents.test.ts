@@ -2,25 +2,41 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
 import type { CityStateV3 } from "../core/gen/city.js";
+import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import { cityFlagIdentity, clearCityState, loadCityState, saveCityState } from "./documents.js";
 
 let stored: unknown;
+let cacheStored: unknown;
 let setFlag: ReturnType<typeof vi.fn>;
 let unsetFlag: ReturnType<typeof vi.fn>;
 
-function installScene(flag: unknown, write: (value: unknown) => Promise<void> = async (value) => {
-  stored = value;
-}): void {
+function installScene(
+  flag: unknown,
+  write: (value: unknown) => Promise<void> = async (value) => {
+    stored = value;
+  },
+  cache: unknown = undefined
+): void {
   stored = flag;
-  setFlag = vi.fn(async (_module: string, key: string, value: unknown) => {
+  cacheStored = cache;
+  setFlag = vi.fn(async (module: string, key: string, value: unknown) => {
+    if (module !== MODULE_ID) return;
     if (key === FLAG_CITY) await write(value);
+    else if (key === CITY_CACHE_FLAG) cacheStored = value;
   });
-  unsetFlag = vi.fn(async (_module: string, key: string) => {
+  unsetFlag = vi.fn(async (module: string, key: string) => {
+    if (module !== MODULE_ID) return;
     if (key === FLAG_CITY) stored = undefined;
+    else if (key === CITY_CACHE_FLAG) cacheStored = undefined;
   });
   vi.stubGlobal("canvas", {
     scene: {
-      getFlag: (module: string, key: string) => (module === MODULE_ID && key === FLAG_CITY ? stored : undefined),
+      getFlag: (module: string, key: string) => {
+        if (module !== MODULE_ID) return undefined;
+        if (key === FLAG_CITY) return stored;
+        if (key === CITY_CACHE_FLAG) return cacheStored;
+        return undefined;
+      },
       setFlag,
       unsetFlag
     }
@@ -284,21 +300,27 @@ describe("loadCityState", () => {
 });
 
 describe("saveCityState", () => {
-  it("creates an absent city at revision 1", async () => {
-    installScene(undefined);
+  it("creates an absent city without touching an existing cache manifest", async () => {
+    const cache = { slot: 0 };
+    installScene(undefined, undefined, cache);
     const candidate = state();
     await expect(saveCityState(candidate, "absent")).resolves.toEqual(candidate);
-    expect(setFlag).toHaveBeenCalledOnce();
+    expect(setFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY, candidate);
+    expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toEqual(candidate);
+    expect(cacheStored).toBe(cache);
   });
 
-  it("writes the guarded revision plus one over a supported city", async () => {
+  it("writes the guarded revision plus one without touching the cache manifest", async () => {
     const current = state(4, roads);
-    installScene(current);
+    const cache = { slot: 1 };
+    installScene(current, undefined, cache);
     const candidate = state(5, roads);
     await expect(saveCityState(candidate, 4)).resolves.toEqual(candidate);
-    expect(setFlag).toHaveBeenCalledOnce();
+    expect(setFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY, candidate);
+    expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toEqual(candidate);
+    expect(cacheStored).toBe(cache);
   });
 
   it("guards a revision-1 save against an existing supported Scene", async () => {
@@ -375,85 +397,112 @@ describe("saveCityState", () => {
 });
 
 describe("clearCityState", () => {
-  it("is an idempotent no-op when the Scene is already absent", async () => {
-    installScene(undefined);
+  it("removes an orphaned cache when the authoritative city is already absent", async () => {
+    const cache = { slot: 0 };
+    installScene(undefined, undefined, cache);
     await clearCityState("absent");
-    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(unsetFlag.mock.calls).toEqual([[MODULE_ID, CITY_CACHE_FLAG]]);
+    expect(cacheStored).toBeUndefined();
     expect(loadCityState()).toEqual({ kind: "absent" });
   });
 
-  it("clears legacy data only with a matching confirmation", async () => {
+  it("clears legacy data and its cache only with a matching confirmation", async () => {
     const legacy = { formatVersion: 4 };
-    installScene(legacy);
+    const cache = { slot: 0 };
+    installScene(legacy, undefined, cache);
     await expect(clearCityState("absent")).rejects.toThrow(/appeared/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(legacy);
+    expect(cacheStored).toBe(cache);
 
     await clearCityState({ kind: "legacy", identity: cityFlagIdentity(legacy) });
-    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(unsetFlag.mock.calls).toEqual([
+      [MODULE_ID, FLAG_CITY],
+      [MODULE_ID, CITY_CACHE_FLAG]
+    ]);
+    expect(cacheStored).toBeUndefined();
     expect(loadCityState()).toEqual({ kind: "absent" });
   });
 
-  it("clears obsolete-precomplete flags only at the confirmed revision", async () => {
+  it("clears obsolete-precomplete flags and their cache only at the confirmed revision", async () => {
     const raw = schemaOne(6);
-    installScene(raw);
+    const cache = { slot: 1 };
+    installScene(raw, undefined, cache);
     await expect(clearCityState({ kind: "obsolete-precomplete", revision: 5, identity: cityFlagIdentity(raw) })).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(raw);
+    expect(cacheStored).toBe(cache);
 
     await clearCityState({ kind: "obsolete-precomplete", revision: 6, identity: cityFlagIdentity(raw) });
-    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(unsetFlag.mock.calls).toEqual([
+      [MODULE_ID, FLAG_CITY],
+      [MODULE_ID, CITY_CACHE_FLAG]
+    ]);
+    expect(cacheStored).toBeUndefined();
     expect(loadCityState()).toEqual({ kind: "absent" });
   });
 
-  it("clears supported cities only at the exact revision", async () => {
+  it("clears supported cities and their cache only at the exact revision", async () => {
     const current = state(7, roads);
-    installScene(current);
+    const cache = { slot: 0 };
+    installScene(current, undefined, cache);
     await expect(clearCityState({ kind: "supported", revision: 6, identity: cityFlagIdentity(current) })).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(current);
+    expect(cacheStored).toBe(cache);
 
     await clearCityState({ kind: "supported", revision: 7, identity: cityFlagIdentity(current) });
-    expect(unsetFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY);
+    expect(unsetFlag.mock.calls).toEqual([
+      [MODULE_ID, FLAG_CITY],
+      [MODULE_ID, CITY_CACHE_FLAG]
+    ]);
+    expect(cacheStored).toBeUndefined();
     expect(loadCityState()).toEqual({ kind: "absent" });
   });
 
-  it("rejects a different legacy payload with the same confirmation kind", async () => {
+  it("rejects a different legacy payload without clearing either flag", async () => {
     const legacyA = { formatVersion: 4, label: "A" };
-    installScene(legacyA);
+    const cache = { slot: 1 };
+    installScene(legacyA, undefined, cache);
     const pin = { kind: "legacy" as const, identity: cityFlagIdentity(legacyA) };
     // The legacy payload is replaced while the confirmation is pending.
     const legacyB = { formatVersion: 4, label: "B", graph: { nodes: [] } };
-    installScene(legacyB);
+    installScene(legacyB, undefined, cache);
     await expect(clearCityState(pin)).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(legacyB);
+    expect(cacheStored).toBe(cache);
   });
 
-  it("rejects a different supported source at the same confirmed revision", async () => {
+  it("rejects a different supported source without clearing either flag", async () => {
     const cityA = state(7, roads);
-    installScene(cityA);
+    const cache = { slot: 0 };
+    installScene(cityA, undefined, cache);
     const pin = { kind: "supported" as const, revision: 7, identity: cityFlagIdentity(cityA) };
     // A different city is written at the same revision while the confirmation is pending.
     const cityB = { ...state(7, roads), source: { ...state(7, roads).source, citySeed: "different-source" } };
-    installScene(cityB);
+    installScene(cityB, undefined, cache);
     await expect(clearCityState(pin)).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(cityB);
+    expect(cacheStored).toBe(cache);
   });
 
-  it("never clears unsupported or malformed flags", async () => {
+  it("never clears caches alongside unsupported or malformed city flags", async () => {
+    const cache = { slot: 1 };
     const unsupported = { ...state(), generatorVersion: 12 };
-    installScene(unsupported);
+    installScene(unsupported, undefined, cache);
     await expect(clearCityState({ kind: "legacy", identity: "x" })).rejects.toThrow(/changed/i);
     await expect(clearCityState({ kind: "supported", revision: 1, identity: "x" })).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(unsupported);
+    expect(cacheStored).toBe(cache);
 
     const malformed = { ...state(), source: { ...state().source, roads: { nodes: [], routes: [{ id: "orphan", curvePreset: "tight" }], edges: [] } } };
-    installScene(malformed);
+    installScene(malformed, undefined, cache);
     await expect(clearCityState({ kind: "legacy", identity: "x" })).rejects.toThrow(/changed/i);
     expect(unsetFlag).not.toHaveBeenCalled();
     expect(stored).toBe(malformed);
+    expect(cacheStored).toBe(cache);
   });
 });

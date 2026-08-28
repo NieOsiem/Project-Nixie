@@ -6,6 +6,7 @@ import {
   GENERATOR_VERSION,
   MODULE_ID
 } from "../constants.js";
+import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import {
   OPEN_SPACE_CATEGORIES,
   OPEN_SPACE_SIZES,
@@ -48,8 +49,8 @@ export type SaveExpectation = "absent" | number;
  * flag observed at confirmation time — kind + revision alone cannot tell a legacy
  * payload edit or a different supported source written at the same revision apart.
  * The identity is transient only (never persisted or Worker-transferred). "absent" is
- * its own identity and is an idempotent no-op. Unsupported and malformed flags are
- * never cleared.
+ * its own identity and permits clearing an orphaned, non-authoritative city cache.
+ * Unsupported and malformed flags are never cleared.
  */
 export type ClearConfirmation =
   | "absent"
@@ -438,15 +439,16 @@ export async function saveCityState(
 }
 
 /**
- * Destructive clear of the city flag, guarded by the caller's confirmation of the
- * current Scene state. Only known replaceable kinds are removed — legacy 1.0 data,
- * obsolete-precomplete generations at an exact revision, and a supported city at an
- * exact revision — and each must still carry the exact raw identity that was confirmed;
- * a payload swap at the same kind and revision is never cleared. Unsupported and
- * malformed flags are never cleared. "absent" is an idempotent no-op. The clear and the
- * follow-up revision-1 save stay separate so the destructive step happens immediately
- * after confirmation and a later planning failure never leaves an authoritative flag
- * behind.
+ * Destructive clear of the city flag and its non-authoritative plan cache, guarded by
+ * the caller's confirmation of the current Scene state. Only known replaceable kinds
+ * are removed — legacy 1.0 data, obsolete-precomplete generations at an exact revision,
+ * and a supported city at an exact revision — and each must still carry the exact raw
+ * identity that was confirmed; a payload swap at the same kind and revision is never
+ * cleared. Unsupported and malformed flags are never cleared. An "absent" confirmation
+ * may remove an orphaned cache. The authoritative city flag is always cleared before
+ * its cache. The clear and the follow-up revision-1 save stay separate so the
+ * destructive step happens immediately after confirmation and a later planning failure
+ * never leaves an authoritative flag behind.
  */
 export async function clearCityState(confirmation: ClearConfirmation): Promise<void> {
   requireGM();
@@ -457,6 +459,7 @@ export async function clearCityState(confirmation: ClearConfirmation): Promise<v
     if (current.kind !== "absent") {
       throw new Error("City flag appeared before clearing; retry from the current Scene.");
     }
+    await scene.unsetFlag(MODULE_ID, CITY_CACHE_FLAG);
     return;
   }
   if (confirmation.kind === "legacy") {
@@ -471,6 +474,7 @@ export async function clearCityState(confirmation: ClearConfirmation): Promise<v
     throw new Error("City revision changed before clearing; retry from the current Scene.");
   }
   await scene.unsetFlag(MODULE_ID, FLAG_CITY);
+  await scene.unsetFlag(MODULE_ID, CITY_CACHE_FLAG);
 }
 
 export function generatedWallIds(): string[] {

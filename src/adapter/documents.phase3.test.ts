@@ -2,21 +2,38 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
 import type { CityStateV3 } from "../core/gen/city.js";
+import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { loadCityState, replaceGeneratedWalls, saveCityState } from "./documents.js";
 
 let stored: unknown;
+let cacheStored: unknown;
 let setFlag: ReturnType<typeof vi.fn>;
+let unsetFlag: ReturnType<typeof vi.fn>;
 
-function installScene(flag: unknown): void {
+function installScene(flag: unknown, cache: unknown = undefined): void {
   stored = flag;
-  setFlag = vi.fn(async (_module: string, key: string, value: unknown) => {
+  cacheStored = cache;
+  setFlag = vi.fn(async (module: string, key: string, value: unknown) => {
+    if (module !== MODULE_ID) return;
     if (key === FLAG_CITY) stored = value;
+    else if (key === CITY_CACHE_FLAG) cacheStored = value;
+  });
+  unsetFlag = vi.fn(async (module: string, key: string) => {
+    if (module !== MODULE_ID) return;
+    if (key === FLAG_CITY) stored = undefined;
+    else if (key === CITY_CACHE_FLAG) cacheStored = undefined;
   });
   vi.stubGlobal("canvas", {
     scene: {
-      getFlag: (module: string, key: string) => module === MODULE_ID && key === FLAG_CITY ? stored : undefined,
-      setFlag
+      getFlag: (module: string, key: string) => {
+        if (module !== MODULE_ID) return undefined;
+        if (key === FLAG_CITY) return stored;
+        if (key === CITY_CACHE_FLAG) return cacheStored;
+        return undefined;
+      },
+      setFlag,
+      unsetFlag
     }
   });
   vi.stubGlobal("game", { user: { isGM: true } });
@@ -107,6 +124,19 @@ describe("Phase 3 Scene persistence", () => {
     expect(stored).toBe(raw);
     expect(raw.schemaVersion).toBe(2);
     expect(raw.generatorVersion).toBe(9);
+  });
+
+  it("preserves the plan cache across an ordinary schema-3 save", async () => {
+    const current = schema3(4);
+    const cache = { slot: 1 };
+    installScene(current, cache);
+    const candidate = schema3(5);
+    await expect(saveCityState(candidate, 4)).resolves.toEqual(candidate);
+    expect(setFlag).toHaveBeenCalledOnce();
+    expect(setFlag).toHaveBeenCalledWith(MODULE_ID, FLAG_CITY, candidate);
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toEqual(candidate);
+    expect(cacheStored).toBe(cache);
   });
 
   it("round-trips district source fields without persisting derived objects", () => {

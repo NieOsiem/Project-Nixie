@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
 import type { CityStateV3, DistrictSource } from "../core/gen/city.js";
+import { buildCompleteCityPlan, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
+import type { CityCacheManifestV1 } from "../core/gen/city-cache.js";
+import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
 import { BANK_SIZE, BASE_BANK, builtinPalette, packPalette, paletteBanks } from "../core/palette.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import type { Ring } from "../core/geom/types.js";
@@ -60,7 +63,35 @@ import {
 
 /** Every CityRenderer the adapter constructs, with the palettes it was handed. */
 const rendererState = vi.hoisted(() => ({
-  instances: [] as Array<{ paletteUpdates: Uint8Array[] }>
+  instances: [] as Array<{ paletteUpdates: Uint8Array[] }>,
+  setChunkError: null as Error | null
+}));
+
+const cacheState = vi.hoisted(() => ({
+  load: vi.fn<(city: CityStateV3) => Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null>>(),
+  publish: vi.fn<(city: CityStateV3, plan: CompleteCityPlan) => Promise<CityCacheManifestV1>>(),
+  loadChunks: vi.fn<(
+    city: CityStateV3,
+    plan: CompleteCityPlan,
+    boundsM: { x: number; y: number; width: number; height: number },
+    pixelsPerMetre: number,
+    expectedChunkIds: readonly string[],
+    onRecord?: (record: CachedCompleteChunkRecord) => void
+  ) => Promise<{ records: CachedCompleteChunkRecord[]; missingChunkIds: string[]; manifest: CityCacheManifestV1 } | null>>(),
+  publishChunks: vi.fn<(
+    city: CityStateV3,
+    plan: CompleteCityPlan,
+    boundsM: { x: number; y: number; width: number; height: number },
+    pixelsPerMetre: number,
+    records: readonly CachedCompleteChunkRecord[]
+  ) => Promise<CityCacheManifestV1>>()
+}));
+
+vi.mock("./city-cache.js", () => ({
+  loadCachedCompleteChunks: cacheState.loadChunks,
+  loadCachedCompletePlan: cacheState.load,
+  publishCompleteChunkCache: cacheState.publishChunks,
+  publishCompletePlanCache: cacheState.publish
 }));
 
 // WHY: the adapter constructs CityRenderer at mount once canvas.app.renderer exists; the
@@ -96,7 +127,9 @@ vi.mock("../render/city-renderer.js", () => {
     }
 
     clearChunks(): void {}
-    setChunk(_chunk: unknown): void {}
+    setChunk(_chunk: unknown): void {
+      if (rendererState.setChunkError !== null) throw rendererState.setChunkError;
+    }
     updatePalette(palette: Uint8Array): void {
       this.paletteUpdates.push(palette);
     }
@@ -119,8 +152,10 @@ class FakeWorker {
   onerror: unknown = null;
   onmessageerror: unknown = null;
   terminate = vi.fn();
-  /** Number of complete-plan builds the worker has served (for reuse assertions). */
+  /** Number of complete-plan and complete-chunk builds served. */
   planBuilds = 0;
+  chunkBuilds = 0;
+  chunkRequests: string[][] = [];
   /** Test hook: mutate a response before it is dispatched to the adapter. */
   tamper: ((request: WorkerRequest, message: WorkerMessage) => void) | null = null;
 
@@ -128,6 +163,10 @@ class FakeWorker {
 
   postMessage(message: WorkerRequest): void {
     if (message.type === "buildCompleteCityPlan") this.planBuilds += 1;
+    if (message.type === "buildCompleteCityChunks") this.chunkBuilds += 1;
+    if (message.type === "buildCompleteCityChunks") {
+      this.chunkRequests.push(message.keys.map((key) => `${key.cx},${key.cy}`));
+    }
     queueMicrotask(() => {
       void handleWorkerMessage(
         {
@@ -145,6 +184,58 @@ class FakeWorker {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function cacheManifest(city: CityStateV3, plan: CompleteCityPlan, byteLength = 321): CityCacheManifestV1 {
+  return {
+    kind: "project-nixie-city-cache",
+    cacheSchemaVersion: 1,
+    generatorVersion: 11,
+    cityRevision: city.revision,
+    structuralInput: plan.structuralInput,
+    slot: 0,
+    plan: {
+      formatVersion: 1,
+      artifact: {
+        path: `complete-city-plan/${city.revision}/slot-0/plan.json.gz`,
+        byteLength,
+        checksum: "1234abcd"
+      }
+    }
+  };
+}
+
+function cachedChunk(id: string): CachedCompleteChunkRecord {
+  const mesh = {
+    vertices: new Float32Array(0),
+    indices: new Uint32Array(0),
+    vertexCount: 0,
+    triangleCount: 0
+  };
+  return {
+    id,
+    mesh,
+    detail: { ...mesh },
+    neon: { ...mesh },
+    boundsM: { x: 0, y: 0, width: 128, height: 128 },
+    boundsPx: { x: 0, y: 0, width: 128, height: 128 },
+    landTriangleCount: 0,
+    waterTriangleCount: 0,
+    markingTriangleCount: 0,
+    openSpaceTriangleCount: 0,
+    buildingCount: 0,
+    landmarkCount: 0,
+    openSpaceCount: 0,
+    bytes: 0
+  };
+}
+
+beforeEach(() => {
+  cacheState.load.mockReset().mockResolvedValue(null);
+  cacheState.publish.mockReset().mockImplementation(async (city, plan) => cacheManifest(city, plan));
+  cacheState.loadChunks.mockReset().mockResolvedValue(null);
+  cacheState.publishChunks.mockReset().mockImplementation(async (city, plan) => cacheManifest(city, plan));
+  rendererState.setChunkError = null;
+});
 
 function state(): CityStateV3 {
   return {
@@ -170,6 +261,351 @@ function state(): CityStateV3 {
     }
   };
 }
+
+describe("complete plan cache pipeline", () => {
+  let saved: CityStateV3;
+  let worker: FakeWorker;
+
+  function workerFactory(): FakeWorker {
+    return worker;
+  }
+
+  function setupScene(): void {
+    const scene = {
+      get walls(): unknown[] { return []; },
+      getFlag: (_module: string, flag: string): unknown =>
+        flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+        saved = structuredClone(value);
+        return saved;
+      }),
+      unsetFlag: vi.fn(async (): Promise<void> => undefined),
+      deleteEmbeddedDocuments: vi.fn(async (): Promise<unknown[]> => []),
+      createEmbeddedDocuments: vi.fn(async (): Promise<unknown[]> => [])
+    };
+    vi.stubGlobal("canvas", {
+      ready: true,
+      dimensions: {
+        sceneRect: { x: 400, y: 320, width: 200, height: 160 },
+        size: 1,
+        distance: 1
+      },
+      scene,
+      app: undefined
+    });
+    vi.stubGlobal("game", { user: { isGM: true } });
+    vi.stubGlobal("ui", { notifications: { error: vi.fn(), warn: vi.fn() } });
+    vi.stubGlobal("CONST", { EDGE_SENSE_TYPES: { LIMITED: 1 }, WALL_MOVEMENT_TYPES: { NORMAL: 1 } });
+    vi.stubGlobal("document", { baseURI: "http://test.local/" });
+    vi.stubGlobal("Worker", workerFactory);
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    saved = state();
+    worker = new FakeWorker("worker-url");
+    setupScene();
+  });
+
+  afterEach(() => {
+    unmount();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("uses a cached plan on mount, skips plan generation, builds chunks, and does not republish", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({
+      plan,
+      manifest: cacheManifest(saved, plan, 777)
+    });
+
+    mount();
+
+    await vi.waitFor(() => expect(worker.chunkBuilds).toBeGreaterThan(0), { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(0);
+    expect(cacheState.publish).not.toHaveBeenCalled();
+    expect(stats()?.planCache).toEqual(expect.objectContaining({
+      status: "hit",
+      revision: 1,
+      bytes: 777
+    }));
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 1 }));
+  }, 120_000);
+
+  it("builds and publishes after a cache miss", async () => {
+    mount();
+
+    await vi.waitFor(() => expect(cacheState.publish).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(1);
+    expect(worker.chunkBuilds).toBeGreaterThan(0);
+    expect(cacheState.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ revision: 1 }),
+      expect.objectContaining({ sourceRevision: 1 })
+    );
+    expect(stats()?.planCache).toEqual(expect.objectContaining({
+      status: "published",
+      revision: 1,
+      bytes: 321
+    }));
+  }, 120_000);
+
+  it("restamps and republishes a reused metadata plan so the next load hits", async () => {
+    saved = bulkRoadState();
+    mount();
+    await vi.waitFor(() => expect(cacheState.publish).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    const initialPlanBuilds = worker.planBuilds;
+    const initialPlan = cacheState.publish.mock.calls[0]![1];
+    cacheState.publish.mockClear();
+
+    await renameRoad("Renamed", false, ["edge-a"]);
+
+    await vi.waitFor(() => expect(cacheState.publish).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(initialPlanBuilds);
+    const republishedPlan = cacheState.publish.mock.calls[0]![1];
+    expect(republishedPlan).toMatchObject({
+      sourceRevision: 2,
+      buildToken: initialPlan.buildToken
+    });
+    expect(republishedPlan.actionToken).not.toBe(initialPlan.actionToken);
+
+    unmount();
+    cacheState.load.mockResolvedValue({
+      plan: republishedPlan,
+      manifest: cacheManifest(saved, republishedPlan, 456)
+    });
+    cacheState.publish.mockClear();
+    const chunksBeforeReload = worker.chunkBuilds;
+    mount();
+
+    await vi.waitFor(() => expect(worker.chunkBuilds).toBeGreaterThan(chunksBeforeReload), { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(initialPlanBuilds);
+    expect(cacheState.publish).not.toHaveBeenCalled();
+    expect(stats()?.planCache).toEqual(expect.objectContaining({
+      status: "hit",
+      revision: 2,
+      bytes: 456
+    }));
+  }, 120_000);
+
+  it("falls back to generation when cache loading fails", async () => {
+    cacheState.load.mockRejectedValue(new Error("corrupt compressed cache"));
+
+    mount();
+
+    await vi.waitFor(() => expect(worker.chunkBuilds).toBeGreaterThan(0), { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(1);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 1 }));
+    await vi.waitFor(() => expect(cacheState.publish).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+  }, 120_000);
+
+  it("keeps generated geometry usable and diagnoses a cache upload failure", async () => {
+    cacheState.publish.mockRejectedValue(new Error("cache upload denied"));
+
+    mount();
+
+    await vi.waitFor(() => {
+      expect(stats()?.planCache).toEqual(expect.objectContaining({
+        status: "error",
+        revision: 1,
+        reason: "cache upload denied"
+      }));
+    }, { timeout: 15_000 });
+    expect(worker.planBuilds).toBe(1);
+    expect(worker.chunkBuilds).toBeGreaterThan(0);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 1 }));
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subsystem: "plan-cache",
+        message: "cache upload denied",
+        revision: 1
+      })
+    ]));
+  }, 120_000);
+
+  it("does not generate or publish a stale cache after the source revision changes", async () => {
+    let resolveFirstLoad!: (value: null) => void;
+    cacheState.load
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveFirstLoad = resolve;
+      }))
+      .mockResolvedValue(null);
+
+    mount();
+    await vi.waitFor(() => expect(cacheState.load).toHaveBeenCalledTimes(1));
+
+    unmount();
+    saved = { ...saved, revision: 2 };
+    mount();
+    resolveFirstLoad(null);
+
+    await vi.waitFor(() => expect(cacheState.publish).toHaveBeenCalled(), { timeout: 15_000 });
+    expect(cacheState.publish.mock.calls.map(([city]) => city.revision)).toEqual([2]);
+    expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 2 }));
+  }, 120_000);
+
+  it("installs a full chunk-cache hit without constructing a Worker", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    cacheState.loadChunks.mockImplementation(async (city, _plan, _bounds, _ppm, expectedIds, onRecord) => {
+      const records = expectedIds.map(cachedChunk);
+      for (const record of records) onRecord?.(record);
+      return { records, missingChunkIds: [], manifest: cacheManifest(city, plan) };
+    });
+    vi.stubGlobal("Worker", class {
+      constructor() {
+        throw new Error("Worker unavailable");
+      }
+    });
+
+    mount();
+
+    await vi.waitFor(() => expect(stats()?.chunkCache).toEqual(expect.objectContaining({
+      status: "hit",
+      loaded: 4,
+      generated: 0
+    })), { timeout: 15_000 });
+    expect(worker.chunkBuilds).toBe(0);
+    expect(cacheState.publishChunks).not.toHaveBeenCalled();
+  }, 120_000);
+
+  it("aborts a cached hit when renderer installation fails before publishing the record", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    cacheState.loadChunks.mockImplementation(async (city, _plan, _bounds, _ppm, expectedIds, onRecord) => {
+      const records = expectedIds.map(cachedChunk);
+      for (const record of records) onRecord?.(record);
+      return { records, missingChunkIds: [], manifest: cacheManifest(city, plan) };
+    });
+    Object.assign(canvas, {
+      app: {
+        renderer: {},
+        ticker: { add: vi.fn(), remove: vi.fn() }
+      },
+      primary: {
+        constructor: { BACKGROUND_ELEVATION: 0 },
+        addChild: vi.fn(),
+        sortDirty: false
+      }
+    });
+    vi.stubGlobal("PIXI", { UPDATE_PRIORITY: { HIGH: 1 } });
+    rendererState.setChunkError = new Error("renderer rejected cached geometry");
+
+    mount();
+
+    await vi.waitFor(() => expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        subsystem: "geometry",
+        message: expect.stringContaining("renderer rejected cached geometry"),
+        revision: 1
+      })
+    ])), { timeout: 15_000 });
+    expect(worker.chunkBuilds).toBe(0);
+    expect(stats()?.chunkCache).toBeNull();
+    expect(cacheState.publishChunks).not.toHaveBeenCalled();
+  }, 120_000);
+
+  it("retains cached chunks, requests only misses, and republishes the full batch", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    let expectedIds: readonly string[] = [];
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    cacheState.loadChunks.mockImplementation(async (city, _plan, _bounds, _ppm, ids, onRecord) => {
+      expectedIds = [...ids];
+      const record = cachedChunk(ids[0]!);
+      onRecord?.(record);
+      return {
+        records: [record],
+        missingChunkIds: ids.slice(1),
+        manifest: cacheManifest(city, plan)
+      };
+    });
+
+    mount();
+
+    await vi.waitFor(() => expect(cacheState.publishChunks).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    expect(worker.chunkRequests).toEqual([expectedIds.slice(1)]);
+    expect(cacheState.publishChunks.mock.calls[0]![4].map((record) => record.id)).toEqual(expectedIds);
+    expect(stats()?.chunkCache).toEqual(expect.objectContaining({
+      status: "published",
+      loaded: 1,
+      generated: expectedIds.length - 1
+    }));
+    expect(stats()?.roadBuild).toEqual(expect.objectContaining({
+      requested: expectedIds.length - 1,
+      built: expectedIds.length - 1
+    }));
+  }, 120_000);
+
+  it("falls back from a corrupt chunk cache and keeps publication failure non-fatal", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    cacheState.loadChunks.mockRejectedValue(new Error("corrupt chunk cache"));
+    cacheState.publishChunks.mockRejectedValue(new Error("chunk upload denied"));
+
+    mount();
+
+    await vi.waitFor(() => expect(stats()?.chunkCache).toEqual(expect.objectContaining({
+      status: "error",
+      loaded: 0,
+      reason: "chunk upload denied"
+    })), { timeout: 15_000 });
+    expect(worker.chunkBuilds).toBe(1);
+    expect(stats()?.lastBuild).toEqual(expect.objectContaining({ full: true, stale: false }));
+    expect(districtDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        message: "chunk upload denied",
+        revision: 1
+      })
+    ]));
+  }, 120_000);
+
+  it("regenerates and republishes when Scene pixels-per-metre does not match", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    Object.assign(canvas.dimensions, { size: 2 });
+
+    mount();
+
+    await vi.waitFor(() => expect(cacheState.publishChunks).toHaveBeenCalledTimes(1), { timeout: 15_000 });
+    expect(cacheState.loadChunks).toHaveBeenCalledWith(
+      expect.objectContaining({ revision: 1 }),
+      plan,
+      expect.any(Object),
+      2,
+      expect.any(Array),
+      expect.any(Function)
+    );
+    expect(worker.chunkBuilds).toBe(1);
+    expect(cacheState.publishChunks.mock.calls[0]![3]).toBe(2);
+    expect(stats()?.chunkCache).toEqual(expect.objectContaining({
+      status: "published",
+      loaded: 0
+    }));
+  }, 120_000);
+
+  it("rejects progressive cached records after the install epoch becomes stale", async () => {
+    const plan = buildCompleteCityPlan(saved.source, saved.revision);
+    cacheState.load.mockResolvedValue({ plan, manifest: cacheManifest(saved, plan) });
+    cacheState.loadChunks.mockImplementation(async (city, _plan, _bounds, _ppm, ids, onRecord) => {
+      const records = ids.map(cachedChunk);
+      onRecord?.(records[0]!);
+      unmount();
+      for (const record of records.slice(1)) onRecord?.(record);
+      return { records, missingChunkIds: [], manifest: cacheManifest(city, plan) };
+    });
+
+    mount();
+
+    await vi.waitFor(() => {
+      expect(cacheState.loadChunks).toHaveBeenCalledTimes(1);
+      expect(stats()).toBeNull();
+    });
+    expect(worker.chunkBuilds).toBe(0);
+    expect(cacheState.publishChunks).not.toHaveBeenCalled();
+  }, 120_000);
+});
+
 
 describe("terrain Scene scale mapping", () => {
   it("cancels terrain, road, and district drafts together", () => {

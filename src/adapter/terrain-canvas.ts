@@ -10,7 +10,7 @@ import {
   type Weather
 } from "../constants.js";
 import type { CameraState } from "../core/camera.js";
-import { chunksCovering, chunkId } from "../core/gen/chunks.js";
+import { chunksCovering, chunkId, type ChunkKey } from "../core/gen/chunks.js";
 import {
   normalizeCitySeed,
   normalizeRing,
@@ -34,6 +34,7 @@ import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type D
 import type { DistrictPlan } from "../core/gen/district-plan.js";
 import { completeCityStructuralInput, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import type { CompleteChunkBuild } from "../core/gen/complete-city-chunk.js";
+import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
 import { districtGenerationAvailability, generateInitialDistricts } from "../core/gen/district-generator.js";
 import {
   districtDeleteCandidate,
@@ -97,6 +98,12 @@ import {
   type SaveExpectation
 } from "./documents.js";
 import { replaceGeneratedWalls } from "./documents.js";
+import {
+  loadCachedCompleteChunks,
+  loadCachedCompletePlan,
+  publishCompleteChunkCache,
+  publishCompletePlanCache
+} from "./city-cache.js";
 import { WallReplacementScheduler, wallSegmentsForPlan } from "./generated-walls.js";
 import {
   TerrainActionQueue,
@@ -271,6 +278,26 @@ let completePlanRevision: number | null = null;
 let completePlanEpoch: number | null = null;
 let completePlanRoundTripMs = 0;
 let completePlanDiagnostic: { kind: "degraded"; reason: string; revision: number } | null = null;
+type PlanCacheStats = {
+  status: "hit" | "miss" | "published" | "error";
+  revision: number;
+  roundTripMs: number;
+  bytes?: number;
+  reason?: string;
+};
+let planCacheStats: PlanCacheStats | null = null;
+let planCacheOperationSequence = 0;
+type ChunkCacheStats = {
+  status: "hit" | "miss" | "partial" | "published" | "error";
+  revision: number;
+  loaded: number;
+  generated: number;
+  bytes: number;
+  roundTripMs: number;
+  reason?: string;
+};
+let chunkCacheStats: ChunkCacheStats | null = null;
+let chunkCacheOperationSequence = 0;
 let planBuildInFlight: { revision: number; epoch: number } | null = null;
 let planBuildQueued: { revision: number; epoch: number } | null = null;
 const planWaiters = new Map<number, Array<() => void>>();
@@ -510,14 +537,19 @@ function notifyCityChanged(): void {
 
 // WHY: the plan is derived state that always travels with a saved revision. Structural
 // commits build and validate it through the worker BEFORE saving and publish it
-// atomically with the commit; the async rebuild path below exists only for derived
-// rebuilds (mount, Scene scale changes, retries) where no save happens.
+// atomically with the commit; the async rebuild path below first checks the optional
+// server cache, then falls back to worker generation for derived rebuilds (mount, Scene
+// scale changes, retries) where no save happens.
 function resetCompletePlanState(): void {
   completePlan = null;
   completePlanRevision = null;
   completePlanEpoch = null;
   completePlanRoundTripMs = 0;
   completePlanDiagnostic = null;
+  planCacheStats = null;
+  planCacheOperationSequence += 1;
+  chunkCacheStats = null;
+  chunkCacheOperationSequence += 1;
   geometryDiagnostic = null;
   planBuildInFlight = null;
   planBuildQueued = null;
@@ -556,8 +588,123 @@ async function requireCompletePlan(city: CityStateV3): Promise<CompleteCityPlan>
   if (completePlanRevision === city.revision && completePlan !== null) return completePlan;
   throw new Error(completePlanDiagnostic?.reason ?? "The complete city plan for this revision is unavailable.");
 }
+type CompletePlanOrigin = "cache" | "generated" | "restamped";
 
-function publishCompletePlan(plan: CompleteCityPlan, revision: number, epoch: number, walls: boolean, roundTripMs = completePlanRoundTripMs): void {
+function structuralInputMatchesCity(city: CityStateV3, plan: CompleteCityPlan): boolean {
+  const current = completeCityStructuralInput(city.source);
+  const planned = plan.structuralInput;
+  return current.terrain === planned.terrain &&
+    current.roads === planned.roads &&
+    current.districts === planned.districts &&
+    current.generation === planned.generation;
+}
+
+function restampCompletePlan(plan: CompleteCityPlan, revision: number, epoch: number): CompleteCityPlan {
+  if (plan.sourceRevision === revision && plan.epoch === epoch) return plan;
+  return {
+    ...plan,
+    sourceRevision: revision,
+    actionToken: `restamped:${String(plan.buildToken)}:${revision}`,
+    epoch
+  };
+}
+
+function recordPlanCache(operation: number, value: PlanCacheStats): void {
+  if (operation !== planCacheOperationSequence) return;
+  planCacheStats = value;
+  notifyCityChanged();
+}
+
+async function tryLoadCachedPlan(
+  city: CityStateV3,
+  revision: number,
+  epoch: number
+): Promise<{ plan: CompleteCityPlan | null; stale: boolean }> {
+  const operation = ++planCacheOperationSequence;
+  const started = performance.now();
+  try {
+    const cached = await loadCachedCompletePlan(city);
+    const current = session.current;
+    if (!terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+      return { plan: null, stale: true };
+    }
+    const roundTripMs = performance.now() - started;
+    if (cached === null) {
+      recordPlanCache(operation, { status: "miss", revision, roundTripMs });
+      return { plan: null, stale: false };
+    }
+    recordPlanCache(operation, {
+      status: "hit",
+      revision,
+      roundTripMs,
+      bytes: cached.manifest.plan.artifact.byteLength
+    });
+    return { plan: cached.plan, stale: false };
+  } catch (error) {
+    const current = session.current;
+    if (!terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+      return { plan: null, stale: true };
+    }
+    recordPlanCache(operation, {
+      status: "error",
+      revision,
+      roundTripMs: performance.now() - started,
+      reason: error instanceof Error ? error.message : String(error)
+    });
+    return { plan: null, stale: false };
+  }
+}
+
+function schedulePlanCachePublish(city: CityStateV3, plan: CompleteCityPlan): void {
+  if (game.user?.isGM !== true) return;
+  const operation = ++planCacheOperationSequence;
+  queueMicrotask(() => {
+    const current = session.current;
+    if (
+      operation !== planCacheOperationSequence ||
+      current === null ||
+      current.revision !== city.revision ||
+      !structuralInputMatchesCity(current, plan)
+    ) return;
+    const started = performance.now();
+    void publishCompletePlanCache(city, plan).then((manifest) => {
+      const latest = session.current;
+      if (
+        latest === null ||
+        latest.revision !== city.revision ||
+        !structuralInputMatchesCity(latest, plan)
+      ) return;
+      recordPlanCache(operation, {
+        status: "published",
+        revision: city.revision,
+        roundTripMs: performance.now() - started,
+        bytes: manifest.plan.artifact.byteLength
+      });
+    }).catch((error) => {
+      const latest = session.current;
+      if (
+        latest === null ||
+        latest.revision !== city.revision ||
+        !structuralInputMatchesCity(latest, plan)
+      ) return;
+      recordPlanCache(operation, {
+        status: "error",
+        revision: city.revision,
+        roundTripMs: performance.now() - started,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    });
+  });
+}
+
+function publishCompletePlan(
+  plan: CompleteCityPlan,
+  revision: number,
+  epoch: number,
+  walls: boolean,
+  roundTripMs = completePlanRoundTripMs,
+  origin: CompletePlanOrigin = "restamped"
+): void {
   completePlan = plan;
   completePlanRevision = revision;
   completePlanEpoch = epoch;
@@ -570,6 +717,11 @@ function publishCompletePlan(plan: CompleteCityPlan, revision: number, epoch: nu
       wallDiagnostic = null;
       scheduleGeneratedWallRebuild(current, plan.districtPlan);
     }
+    if (
+      origin !== "cache" &&
+      current.revision === revision &&
+      structuralInputMatchesCity(current, plan)
+    ) schedulePlanCachePublish(current, plan);
   }
   resolvePlanWaiters();
   refreshPalette();
@@ -592,12 +744,17 @@ async function runCompletePlanRebuild(city: CityStateV3, revision: number, epoch
   planBuildInFlight = { revision, epoch };
   const actionToken = nextCompleteSequence();
   try {
-    const plan = await buildCompletePlanThroughWorker(city.source, revision, epoch, actionToken);
-    const current = session.current;
-    if (current !== null && terrainBuildIsCurrent(revision, epoch, current.revision, session.buildEpoch)) {
-      publishCompletePlan(plan, revision, epoch, false);
-    } else {
+    const cached = await tryLoadCachedPlan(city, revision, epoch);
+    if (cached.stale) {
       resolvePlanWaiters();
+    } else {
+      const plan = cached.plan ?? await buildCompletePlanThroughWorker(city.source, revision, epoch, actionToken);
+      const current = session.current;
+      if (current !== null && terrainBuildIsCurrent(revision, epoch, current.revision, session.buildEpoch)) {
+        publishCompletePlan(plan, revision, epoch, false, completePlanRoundTripMs, cached.plan === null ? "generated" : "cache");
+      } else {
+        resolvePlanWaiters();
+      }
     }
   } catch (error) {
     // WHY: buildCompletePlanThroughWorker already handles worker teardown on transport
@@ -1012,17 +1169,128 @@ function completeRecordFrom(build: CompleteChunkBuild): TerrainChunkRecord {
   };
 }
 
-function completeChunkGeometry(build: CompleteChunkBuild): ChunkGeometry {
+function cachedRecordFrom(record: CachedCompleteChunkRecord): TerrainChunkRecord {
   return {
-    id: build.id,
-    mesh: build.mesh,
-    detail: build.detail,
-    neon: build.neon,
-    boundsPx: build.boundsPx,
-    buildingCount: build.buildingCount,
-    landmarkCount: build.landmarkCount,
-    openSpaceCount: build.openSpaceCount
+    id: record.id,
+    mesh: record.mesh,
+    detail: record.detail,
+    neon: record.neon,
+    boundsM: record.boundsM,
+    boundsPx: record.boundsPx,
+    landTriangleCount: record.landTriangleCount,
+    waterTriangleCount: record.waterTriangleCount,
+    markingTriangleCount: record.markingTriangleCount,
+    openSpaceTriangleCount: record.openSpaceTriangleCount,
+    buildingCount: record.buildingCount,
+    landmarkCount: record.landmarkCount,
+    openSpaceCount: record.openSpaceCount,
+    bytes: record.bytes
   };
+}
+
+function cachedRecordFor(record: TerrainChunkRecord): CachedCompleteChunkRecord {
+  if (record.detail === null || record.neon === null) {
+    throw new Error(`Complete city chunk ${record.id} is missing its detail or neon geometry.`);
+  }
+  return {
+    id: record.id,
+    mesh: record.mesh,
+    detail: record.detail,
+    neon: record.neon,
+    boundsM: record.boundsM,
+    boundsPx: record.boundsPx,
+    landTriangleCount: record.landTriangleCount,
+    waterTriangleCount: record.waterTriangleCount,
+    markingTriangleCount: record.markingTriangleCount,
+    openSpaceTriangleCount: record.openSpaceTriangleCount,
+    buildingCount: record.buildingCount,
+    landmarkCount: record.landmarkCount,
+    openSpaceCount: record.openSpaceCount,
+    bytes: record.bytes
+  };
+}
+
+function completeChunkGeometry(record: TerrainChunkRecord): ChunkGeometry {
+  return {
+    id: record.id,
+    mesh: record.mesh,
+    ...(record.detail === null ? {} : { detail: record.detail }),
+    ...(record.neon === null ? {} : { neon: record.neon }),
+    boundsPx: record.boundsPx,
+    buildingCount: record.buildingCount,
+    landmarkCount: record.landmarkCount,
+    openSpaceCount: record.openSpaceCount
+  };
+}
+
+function recordChunkCache(operation: number, value: ChunkCacheStats): void {
+  if (operation !== chunkCacheOperationSequence) return;
+  chunkCacheStats = value;
+  notifyCityChanged();
+}
+
+function sameRect(a: Rect, b: Rect): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
+function scheduleCompleteChunkCachePublish(
+  operation: number,
+  city: CityStateV3,
+  plan: CompleteCityPlan,
+  epoch: number,
+  boundsM: Rect,
+  ppm: number,
+  records: CachedCompleteChunkRecord[],
+  loaded: number,
+  generated: number
+): void {
+  if (game.user?.isGM !== true || generated === 0) return;
+  const bytes = records.reduce((sum, record) => sum + record.bytes, 0);
+  queueMicrotask(() => {
+    const current = session.current;
+    if (
+      operation !== chunkCacheOperationSequence ||
+      current === null ||
+      !terrainBuildIsCurrent(city.revision, epoch, current.revision, session.buildEpoch) ||
+      !sameRect(sceneBoundsM(current.source.origin), boundsM) ||
+      ppm !== pixelsPerMetre()
+    ) return;
+    const started = performance.now();
+    void publishCompleteChunkCache(city, plan, boundsM, ppm, records).then(() => {
+      const latest = session.current;
+      if (
+        latest === null ||
+        !terrainBuildIsCurrent(city.revision, epoch, latest.revision, session.buildEpoch) ||
+        !sameRect(sceneBoundsM(latest.source.origin), boundsM) ||
+        ppm !== pixelsPerMetre()
+      ) return;
+      recordChunkCache(operation, {
+        status: "published",
+        revision: city.revision,
+        loaded,
+        generated,
+        bytes,
+        roundTripMs: performance.now() - started
+      });
+    }).catch((error) => {
+      const latest = session.current;
+      if (
+        latest === null ||
+        !terrainBuildIsCurrent(city.revision, epoch, latest.revision, session.buildEpoch) ||
+        !sameRect(sceneBoundsM(latest.source.origin), boundsM) ||
+        ppm !== pixelsPerMetre()
+      ) return;
+      recordChunkCache(operation, {
+        status: "error",
+        revision: city.revision,
+        loaded,
+        generated,
+        bytes,
+        roundTripMs: performance.now() - started,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    });
+  });
 }
 
 // WHY: post-save render failures keep their own copy, distinct from structural-before-save
@@ -1032,12 +1300,9 @@ function renderFailureReason(error: unknown): string {
 }
 
 /**
- * Build the final complete chunks for a saved revision through the worker and install
- * them as they arrive. Every progress message is identity-checked; stale ones install
- * nothing, and the number of sequentially accepted progress chunks must match the worker
- * summary before the batch can report success. Throws when the worker fails so callers
- * decide between a degraded result (ordinary commits, rebuilds) and a durable failure
- * (full generation).
+ * Install cached complete chunks first, then ask the worker only for artifacts which the
+ * cache could not validate. Both progressive sources share the same revision/epoch gate,
+ * and publication happens only after the complete live set is present.
  */
 async function installCompleteChunks(
   city: CityStateV3,
@@ -1053,59 +1318,184 @@ async function installCompleteChunks(
   const started = performance.now();
   const bounds = sceneBoundsM(city.source.origin);
   const keys = chunksCovering(bounds);
+  const expectedIds = keys.map(chunkId);
+  const keysById = new Map<string, ChunkKey>(keys.map((key) => [chunkId(key), key]));
   const ppm = pixelsPerMetre();
   if (renderer !== null) renderer.pixelsPerMetre = ppm;
-  const live = new Set(keys.map(chunkId));
+  const live = new Set(expectedIds);
   for (const id of [...chunks.keys()]) {
     if (live.has(id)) continue;
     chunks.delete(id);
     renderer?.removeChunk(id);
   }
-  const client = ensureWorker();
-  if (client === null) throw new Error("The city worker is unavailable; final city geometry cannot be built.");
+
+  const operation = ++chunkCacheOperationSequence;
   const identity: CompleteIdentity = { sourceRevision: city.revision, actionToken, buildToken: epoch, epoch };
+  const loadedIds = new Set<string>();
   let installed = 0;
-  let accepted = 0;
+  let loadedBytes = 0;
   let staleProgress = false;
-  const summary = await client.buildCompleteCityChunks(
-    {
-      source: city.source,
-      plan,
-      sceneBoundsM: bounds,
-      pixelsPerMetre: ppm,
-      keys,
-      ...identity
-    },
-    (progress: CompleteCityChunkProgress) => {
-      if (staleProgress) return;
-      if (!completeIdentityMatches(progress, identity)) {
-        staleProgress = true;
-        return;
-      }
-      const current = session.current;
-      if (!terrainBuildIsCurrent(city.revision, epoch, current?.revision ?? null, session.buildEpoch)) {
-        staleProgress = true;
-        return;
-      }
-      const record = completeRecordFrom(progress.chunk);
-      chunks.set(record.id, record);
-      accepted += 1;
-      if (renderer !== null) {
-        renderer.setChunk(completeChunkGeometry(progress.chunk));
-        frameQuality.reset();
-        installed++;
-      }
-      onProgress?.(progress.index + 1, progress.total);
+  let cacheInstallFailed = false;
+  let cacheInstallError: unknown;
+  const installCachedRecord = (cached: CachedCompleteChunkRecord): void => {
+    if (staleProgress || cacheInstallFailed || loadedIds.has(cached.id) || !live.has(cached.id)) return;
+    const current = session.current;
+    if (!terrainBuildIsCurrent(city.revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+      staleProgress = true;
+      return;
     }
-  );
-  if (staleProgress || !completeIdentityMatches(summary, identity)) {
-    throw new Error("Worker returned a stale complete city chunk batch.");
+    const record = cachedRecordFrom(cached);
+    if (renderer !== null) {
+      try {
+        renderer.setChunk(completeChunkGeometry(record));
+        frameQuality.reset();
+      } catch (error) {
+        // The cache adapter treats callback exceptions as cache misses. Preserve the
+        // presentation failure explicitly so a failed renderer install cannot become a
+        // false cache hit or silently fall through to Worker generation.
+        cacheInstallFailed = true;
+        cacheInstallError = error;
+        return;
+      }
+    }
+    chunks.set(record.id, record);
+    loadedIds.add(record.id);
+    loadedBytes += record.bytes;
+    if (renderer !== null) installed += 1;
+    onProgress?.(loadedIds.size, keys.length);
+  };
+
+  const cacheStarted = performance.now();
+  let cacheReason: string | undefined;
+  try {
+    const cached = await loadCachedCompleteChunks(
+      city,
+      plan,
+      bounds,
+      ppm,
+      expectedIds,
+      installCachedRecord
+    );
+    if (cached !== null) {
+      // Mocks and alternate storage implementations may batch delivery even though the
+      // production loader calls onRecord progressively.
+      for (const record of cached.records) installCachedRecord(record);
+    }
+  } catch (error) {
+    cacheReason = error instanceof Error ? error.message : String(error);
   }
+  if (cacheInstallFailed) throw cacheInstallError;
   if (
-    accepted !== keys.length ||
-    summary.counters.requested !== keys.length ||
-    summary.counters.built !== accepted
-  ) throw new Error("Worker posted incomplete city chunk progress; its summary does not match the requested chunk count.");
+    staleProgress ||
+    !terrainBuildIsCurrent(city.revision, epoch, session.current?.revision ?? null, session.buildEpoch)
+  ) {
+    throw new Error("Cached complete city chunks became stale while loading.");
+  }
+
+  const missingKeys = expectedIds
+    .filter((id) => !loadedIds.has(id))
+    .map((id) => keysById.get(id)!);
+  const cacheStatus: ChunkCacheStats["status"] =
+    loadedIds.size === keys.length ? "hit" : loadedIds.size === 0 ? (cacheReason === undefined ? "miss" : "error") : "partial";
+  recordChunkCache(operation, {
+    status: cacheStatus,
+    revision: city.revision,
+    loaded: loadedIds.size,
+    generated: 0,
+    bytes: loadedBytes,
+    roundTripMs: performance.now() - cacheStarted,
+    ...(cacheReason === undefined
+      ? cacheStatus === "miss"
+        ? { reason: "No matching complete chunk cache." }
+        : cacheStatus === "partial"
+          ? { reason: `${missingKeys.length} complete chunk artifacts were missing or invalid.` }
+          : {}
+      : { reason: cacheReason })
+  });
+
+  let generated = 0;
+  let workerRequested = 0;
+  let workerBuilt = 0;
+  if (missingKeys.length > 0) {
+    const client = ensureWorker();
+    if (client === null) throw new Error("The city worker is unavailable; final city geometry cannot be built.");
+    const generatedIds = new Set<string>();
+    const requestedIds = new Set(missingKeys.map(chunkId));
+    const summary = await client.buildCompleteCityChunks(
+      {
+        source: city.source,
+        plan,
+        sceneBoundsM: bounds,
+        pixelsPerMetre: ppm,
+        keys: missingKeys,
+        ...identity
+      },
+      (progress: CompleteCityChunkProgress) => {
+        if (staleProgress) return;
+        if (!completeIdentityMatches(progress, identity)) {
+          staleProgress = true;
+          return;
+        }
+        const current = session.current;
+        if (!terrainBuildIsCurrent(city.revision, epoch, current?.revision ?? null, session.buildEpoch)) {
+          staleProgress = true;
+          return;
+        }
+        const record = completeRecordFrom(progress.chunk);
+        if (!requestedIds.has(record.id) || generatedIds.has(record.id)) {
+          staleProgress = true;
+          return;
+        }
+        chunks.set(record.id, record);
+        generatedIds.add(record.id);
+        generated += 1;
+        if (renderer !== null) {
+          renderer.setChunk(completeChunkGeometry(record));
+          frameQuality.reset();
+          installed += 1;
+        }
+        onProgress?.(loadedIds.size + generated, keys.length);
+      }
+    );
+    if (staleProgress || !completeIdentityMatches(summary, identity)) {
+      throw new Error("Worker returned a stale complete city chunk batch.");
+    }
+    workerRequested = summary.counters.requested;
+    workerBuilt = summary.counters.built;
+    if (
+      generated !== missingKeys.length ||
+      summary.counters.requested !== missingKeys.length ||
+      summary.counters.built !== generated
+    ) throw new Error("Worker posted incomplete city chunk progress; its summary does not match the requested chunk count.");
+  }
+
+  const liveRecords = expectedIds.map((id) => chunks.get(id));
+  if (liveRecords.some((record) => record === undefined)) {
+    throw new Error("The complete city chunk batch did not install every expected chunk.");
+  }
+  const completeRecords = (liveRecords as TerrainChunkRecord[]).map(cachedRecordFor);
+  const totalBytes = completeRecords.reduce((sum, record) => sum + record.bytes, 0);
+  const totalTriangles = completeRecords.reduce(
+    (sum, record) => sum + record.mesh.triangleCount + record.detail.triangleCount + record.neon.triangleCount,
+    0
+  );
+  const markingTriangles = completeRecords.reduce((sum, record) => sum + record.markingTriangleCount, 0);
+  recordChunkCache(operation, {
+    status: cacheStatus,
+    revision: city.revision,
+    loaded: loadedIds.size,
+    generated,
+    bytes: totalBytes,
+    roundTripMs: performance.now() - cacheStarted,
+    ...(cacheReason === undefined
+      ? cacheStatus === "miss"
+        ? { reason: "No matching complete chunk cache." }
+        : cacheStatus === "partial"
+          ? { reason: `${missingKeys.length} complete chunk artifacts were missing or invalid.` }
+          : {}
+      : { reason: cacheReason })
+  });
+
   // WHY: the render diagnostic clears only once the matching revision's chunks all installed.
   if (geometryDiagnostic !== null && geometryDiagnostic.revision <= city.revision) {
     geometryDiagnostic = null;
@@ -1113,25 +1503,38 @@ async function installCompleteChunks(
   const result: RebuildResult = {
     full: true,
     chunks: installed,
-    triangles: [...chunks.values()].reduce((sum, record) => sum + record.mesh.triangleCount, 0),
-    bytes: [...chunks.values()].reduce((sum, record) => sum + record.bytes, 0),
+    triangles: completeRecords.reduce((sum, record) => sum + record.mesh.triangleCount, 0),
+    bytes: totalBytes,
     ms: performance.now() - started,
     stale: !terrainBuildIsCurrent(city.revision, epoch, session.current?.revision ?? null, session.buildEpoch)
   };
   lastBuild = result;
   lastRoadBuild = {
-    requested: summary.counters.requested,
-    built: summary.counters.built,
+    requested: workerRequested,
+    built: workerBuilt,
     compiledRoutes: 0,
     compiledSegments: 0,
-    markingTriangleCount: summary.counters.markingTriangleCount,
-    totalTriangles: summary.counters.triangleCount,
-    totalBytes: summary.counters.bytes,
+    markingTriangleCount: markingTriangles,
+    totalTriangles,
+    totalBytes,
     roundTripMs: performance.now() - started,
     workerMode: "worker",
     dirty: false,
     scope: "all"
   };
+  if (!result.stale) {
+    scheduleCompleteChunkCachePublish(
+      operation,
+      city,
+      plan,
+      epoch,
+      bounds,
+      ppm,
+      completeRecords,
+      loadedIds.size,
+      generated
+    );
+  }
   return result;
 }
 
@@ -1156,7 +1559,8 @@ async function commitCandidate(candidate: CityStateV3, options: { wallRelevant?:
   }
   const saved = await guardedSave(candidate, current.revision);
   session.publishCommit(saved);
-  publishCompletePlan(plan, saved.revision, session.buildEpoch, wallRelevant);
+  if (reusable !== null) plan = restampCompletePlan(plan, saved.revision, session.buildEpoch);
+  publishCompletePlan(plan, saved.revision, session.buildEpoch, wallRelevant, completePlanRoundTripMs, reusable === null ? "generated" : "restamped");
   const districtIds = new Set(saved.source.districts.map((district) => district.id));
   districtSelection = districtSelection.filter((id) => districtIds.has(id));
   cancelTerrainDraft();
@@ -1575,6 +1979,12 @@ export function districtDiagnostics(): Array<Record<string, unknown>> {
   if (completePlanDiagnostic !== null) {
     entries.push({ subsystem: "districts", retry: "plan", message: completePlanDiagnostic.reason, revision: completePlanDiagnostic.revision });
   }
+  if (planCacheStats?.status === "error") {
+    entries.push({ subsystem: "plan-cache", message: planCacheStats.reason, revision: planCacheStats.revision });
+  }
+  if (chunkCacheStats?.status === "error") {
+    entries.push({ subsystem: "chunk-cache", message: chunkCacheStats.reason, revision: chunkCacheStats.revision });
+  }
   if (completePlan !== null && completePlan.districtPlan.diagnostics.warnings.length) {
     entries.push(...completePlan.districtPlan.diagnostics.warnings.map((message) => ({ subsystem: "districts", message })));
   }
@@ -1812,7 +2222,8 @@ async function applyHistory(direction: "undo" | "redo"): Promise<boolean> {
   const saved = await guardedSave(target, current.revision);
   if (direction === "undo") session.publishUndo(saved);
   else session.publishRedo(saved);
-  publishCompletePlan(plan, saved.revision, session.buildEpoch, true);
+  if (reusable !== null) plan = restampCompletePlan(plan, saved.revision, session.buildEpoch);
+  publishCompletePlan(plan, saved.revision, session.buildEpoch, true, completePlanRoundTripMs, reusable === null ? "generated" : "restamped");
   roadSelection = pruneRoadSelection(roadSelection, saved.source.roads);
   const districtIds = new Set(saved.source.districts.map((district) => district.id));
   districtSelection = districtSelection.filter((id) => districtIds.has(id));
@@ -2161,7 +2572,7 @@ async function runFullGeneration(staging: FullGenerationStaging, seed: string, p
     // chunk install use; the operation epoch follows so request, plan, and published
     // session agree on one post-clear epoch.
     operation.epoch = session.buildEpoch;
-    publishCompletePlan(generated.plan, saved.revision, session.buildEpoch, false);
+    publishCompletePlan(generated.plan, saved.revision, session.buildEpoch, false, completePlanRoundTripMs, "generated");
     operation.sourceRevision = saved.revision;
     operation.phase = "installing";
     operation.progress = { index: 0, total: 0 };
@@ -2366,29 +2777,38 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
   const epoch = session.buildEpoch;
   const revision = city.revision;
   // WHY: scale/bounds rebuilds reuse the current semantic plan — only pixels and chunk
-  // coverage change. The plan is rebuilt (through the worker, never synchronously) only
-  // when it is missing for this revision (e.g. after a fresh mount); the build epoch
-  // intentionally does not invalidate it.
+  // coverage change. When the plan is missing (e.g. after a fresh mount), the expendable
+  // cache is tried first and the worker remains the authoritative fallback; the build
+  // epoch intentionally does not invalidate an already-published semantic plan.
   let plan = completePlan !== null && completePlanRevision === revision ? completePlan : null;
   if (plan === null) {
-    try {
-      plan = await buildCompletePlanThroughWorker(city.source, revision, epoch, nextCompleteSequence());
-    } catch (error) {
-      noteWorkerFailure(error);
-      completePlanDiagnostic = {
-        kind: "degraded",
-        reason: error instanceof Error ? error.message : String(error),
-        revision
-      };
-      console.log(`${MODULE_ID} | complete plan rebuild failed — ${String(error)}`);
-      return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: performance.now() - started, stale: false, degraded: true };
+    const cached = await tryLoadCachedPlan(city, revision, epoch);
+    if (cached.stale) {
+      return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: performance.now() - started, stale: true };
+    }
+    plan = cached.plan;
+    let origin: CompletePlanOrigin = "cache";
+    if (plan === null) {
+      try {
+        plan = await buildCompletePlanThroughWorker(city.source, revision, epoch, nextCompleteSequence());
+        origin = "generated";
+      } catch (error) {
+        noteWorkerFailure(error);
+        completePlanDiagnostic = {
+          kind: "degraded",
+          reason: error instanceof Error ? error.message : String(error),
+          revision
+        };
+        console.log(`${MODULE_ID} | complete plan rebuild failed — ${String(error)}`);
+        return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: performance.now() - started, stale: false, degraded: true };
+      }
     }
     const current = session.current;
     if (!terrainBuildIsCurrent(revision, epoch, current?.revision ?? null, session.buildEpoch)) {
-      // WHY: a newer commit landed while this plan was building; its plan is authoritative.
+      // WHY: a newer commit landed while this plan was loading or building; its plan is authoritative.
       return { full: true, chunks: 0, triangles: 0, bytes: 0, ms: performance.now() - started, stale: true };
     }
-    publishCompletePlan(plan, revision, epoch, false);
+    publishCompletePlan(plan, revision, epoch, false, completePlanRoundTripMs, origin);
   }
   try {
     return await installCompleteChunks(city, plan, nextCompleteSequence(), epoch);
@@ -2568,6 +2988,8 @@ export function stats(): Record<string, unknown> | null {
       buildings: completePlan.buildings.length,
       landmarks: completePlan.landmarks.length
     },
+    planCache: planCacheStats,
+    chunkCache: chunkCacheStats,
     districtDiagnostics: districtDiagnostics(),
     generation: generationState(),
     generatedWalls: lastWallBuild,
