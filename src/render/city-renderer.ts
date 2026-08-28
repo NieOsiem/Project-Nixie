@@ -9,6 +9,8 @@ import {
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
 import {
+  LEAN_ZOOM_IN_CUTOFF,
+  LEAN_ZOOM_OUT_CUTOFF,
   capOverviewLeanStrength,
   dollyLeanStrength
 } from "../core/lean-curve.js";
@@ -256,15 +258,25 @@ export class CityRenderer {
   leanCalibrationPoint(): LeanCalibrationPoint {
     const camera = this.#lastCamera;
     if (camera === null) throw new Error("The city has not rendered a camera frame yet.");
+    const clampedZoom = Math.min(
+      Math.max(this.#cameraZoom, LEAN_ZOOM_OUT_CUTOFF),
+      LEAN_ZOOM_IN_CUTOFF
+    );
+    const automaticLeanStrength = dollyLeanStrength(clampedZoom);
     const selectedLeanStrength =
       this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
-        ? (this.#leanOverride ?? this.#automaticLeanStrength)
+        ? (this.#leanOverride ?? automaticLeanStrength)
         : 1;
-    const leanStrength = capOverviewLeanStrength(this.#cameraZoom, selectedLeanStrength);
+    const leanStrength =
+      this.#leanOverride !== null
+        ? this.#leanOverride
+        : this.#cameraZoomMode === CAMERA_ZOOM_MODE.FIXED
+          ? (this.#cameraZoom < LEAN_ZOOM_OUT_CUTOFF ? this.#cameraZoom / LEAN_ZOOM_OUT_CUTOFF : 1)
+          : capOverviewLeanStrength(this.#cameraZoom, selectedLeanStrength);
     return {
       zoom: this.#cameraZoom,
       leanStrength,
-      automaticLeanStrength: this.#automaticLeanStrength,
+      automaticLeanStrength,
       leanOverride: this.#leanOverride,
       cameraZoomMode: this.#cameraZoomMode,
       cameraHeightMetres: this.#cameraHeightMetres,
@@ -449,13 +461,22 @@ export class CityRenderer {
     this.#pivotUv[0] = camera.stageX / camera.screenWidth;
     this.#pivotUv[1] = camera.stageY / camera.screenHeight;
     const zoom = camera.scale > 0 ? camera.scale : 1;
-    const automaticLeanStrength = dollyLeanStrength(zoom);
+    const clampedZoom = Math.min(
+      Math.max(zoom, LEAN_ZOOM_OUT_CUTOFF),
+      LEAN_ZOOM_IN_CUTOFF
+    );
+    const automaticLeanStrength = dollyLeanStrength(clampedZoom);
     const selectedLeanStrength =
       this.#cameraZoomMode === CAMERA_ZOOM_MODE.DOLLY
         ? (this.#leanOverride ?? automaticLeanStrength)
         : 1;
-    // Preserve the calibrated overview's apparent facade-height/building-width ratio.
-    const leanStrength = capOverviewLeanStrength(zoom, selectedLeanStrength);
+    // Preserve the calibrated overview and close-up apparent facade-height/building-width ratio.
+    const leanStrength =
+      this.#leanOverride !== null
+        ? this.#leanOverride
+        : this.#cameraZoomMode === CAMERA_ZOOM_MODE.FIXED
+          ? (zoom < LEAN_ZOOM_OUT_CUTOFF ? zoom / LEAN_ZOOM_OUT_CUTOFF : 1)
+          : capOverviewLeanStrength(zoom, selectedLeanStrength);
     const cameraHeightPx = this.#cameraHeightMetres * this.#pixelsPerMetre;
     this.#cameraZoom = zoom;
     this.#automaticLeanStrength = automaticLeanStrength;

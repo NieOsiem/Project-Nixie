@@ -8,6 +8,12 @@ export interface LeanCurvePoint {
  */
 export const LEAN_ZOOM_OUT_CUTOFF = 0.05053900390751178;
 
+/**
+ * Above the user-calibrated zoom-in cutoff, lean strength scales with zoom so facade
+ * height does not flatten relative to expanding building footprints.
+ */
+export const LEAN_ZOOM_IN_CUTOFF = 0.24765328766178382;
+
 export const DOLLY_LEAN_POINTS: readonly LeanCurvePoint[] = [
   { zoom: 0.03, strength: 0.15 },
   { zoom: 0.07219857701073255, strength: 0.4 },
@@ -85,7 +91,11 @@ export function dollyLeanStrength(zoom: number): number {
 }
 
 export function capOverviewLeanStrength(zoom: number, leanStrength: number): number {
-  return zoom < LEAN_ZOOM_OUT_CUTOFF
-    ? leanStrength * zoom / LEAN_ZOOM_OUT_CUTOFF
-    : leanStrength;
+  if (zoom < LEAN_ZOOM_OUT_CUTOFF) {
+    return (leanStrength * zoom) / LEAN_ZOOM_OUT_CUTOFF;
+  }
+  if (zoom > LEAN_ZOOM_IN_CUTOFF) {
+    return (leanStrength * zoom) / LEAN_ZOOM_IN_CUTOFF;
+  }
+  return leanStrength;
 }

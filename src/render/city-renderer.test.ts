@@ -3,7 +3,12 @@ import { CAMERA_ZOOM_MODE } from "../constants.js";
 import { visibleWorldRect, type CameraState } from "../core/camera.js";
 import type { MeshBuffers } from "../core/geom/mesh.js";
 import type { Rect } from "../core/geom/types.js";
-import { LEAN_ZOOM_OUT_CUTOFF, dollyLeanStrength } from "../core/lean-curve.js";
+import {
+  LEAN_ZOOM_IN_CUTOFF,
+  LEAN_ZOOM_OUT_CUTOFF,
+  capOverviewLeanStrength,
+  dollyLeanStrength
+} from "../core/lean-curve.js";
 import { WHOLE_CITY_CHUNK_ID } from "./chunk-culling.js";
 import { CityRenderer, type ChunkGeometry } from "./city-renderer.js";
 import { FRAME_QUALITY } from "./frame-quality.js";
@@ -930,7 +935,9 @@ describe("CityRenderer bloom", () => {
 
     let uniforms = (lastCall().content as StubMesh).shader.uniforms;
     expect(uniforms.uSmearStrength).toBe(1.5);
-    expect(uniforms.uRadialSmear).toBeCloseTo((70 / (900 - 70)) * dollyLeanStrength(1));
+    expect(uniforms.uRadialSmear).toBeCloseTo(
+      (70 / (900 - 70)) * capOverviewLeanStrength(1, dollyLeanStrength(LEAN_ZOOM_IN_CUTOFF))
+    );
 
     const before = renderCalls;
     r.lookDials.smearStrength = 0.25;
@@ -1252,7 +1259,9 @@ describe("CityRenderer culling", () => {
     expect(uniforms).toHaveLength(3);
     for (const u of uniforms.slice(0, 2)) {
       expect(u.uCamHeight).toBe(900 * 25);
-      expect(u.uLeanStrength).toBeCloseTo(dollyLeanStrength(1));
+      expect(u.uLeanStrength).toBeCloseTo(
+        capOverviewLeanStrength(1, dollyLeanStrength(LEAN_ZOOM_IN_CUTOFF))
+      );
       expect(u.uPixelsPerMetre).toBe(25);
     }
     expect(uniforms[2]?.uCamHeight).toBe(8750);
@@ -1276,19 +1285,21 @@ describe("CityRenderer culling", () => {
 
     const u = renderedContent?.children[0]?.shader.uniforms;
     expect(u?.uCamHeight).toBe(900 * 25);
-    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(2));
+    expect(u?.uLeanStrength).toBeCloseTo(
+      capOverviewLeanStrength(2, dollyLeanStrength(LEAN_ZOOM_IN_CUTOFF))
+    );
     r.destroy();
   });
 
   it("leaves the Dolly curve uncapped below its reference zoom", () => {
     const r = make();
-    r.update(cam({ scale: 0.5 }));
+    r.update(cam({ scale: 0.1 }));
 
     const u = renderedContent?.children[0]?.shader.uniforms;
     expect(u?.uCamHeight).toBe(900 * 25);
-    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(0.5));
+    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(0.1));
     expect(r.stats()).toMatchObject({
-      cameraZoom: 0.5,
+      cameraZoom: 0.1,
       leanOverride: null
     });
     r.destroy();
@@ -1298,7 +1309,7 @@ describe("CityRenderer culling", () => {
     const farZoom = LEAN_ZOOM_OUT_CUTOFF / 2;
     r.update(cam({ scale: farZoom }));
     expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBeCloseTo(
-      dollyLeanStrength(farZoom) / 2
+      capOverviewLeanStrength(farZoom, dollyLeanStrength(LEAN_ZOOM_OUT_CUTOFF))
     );
 
     r.cameraZoomMode = CAMERA_ZOOM_MODE.FIXED;
@@ -1343,7 +1354,7 @@ describe("CityRenderer culling", () => {
     r.leanOverride = null;
     r.update(cam({ scale: 2 }));
     expect(renderedContent?.children[0]?.shader.uniforms.uLeanStrength).toBeCloseTo(
-      dollyLeanStrength(2)
+      capOverviewLeanStrength(2, dollyLeanStrength(LEAN_ZOOM_IN_CUTOFF))
     );
     r.destroy();
   });
@@ -1370,7 +1381,9 @@ describe("CityRenderer culling", () => {
 
     const u = renderedContent?.children[0]?.shader.uniforms;
     expect(u?.uCamHeight).toBe(900 * 25);
-    expect(u?.uLeanStrength).toBeCloseTo(dollyLeanStrength(20));
+    expect(u?.uLeanStrength).toBeCloseTo(
+      capOverviewLeanStrength(20, dollyLeanStrength(LEAN_ZOOM_IN_CUTOFF))
+    );
     r.destroy();
   });
 });

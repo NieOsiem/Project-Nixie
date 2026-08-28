@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DOLLY_LEAN_POINTS,
+  LEAN_ZOOM_IN_CUTOFF,
   LEAN_ZOOM_OUT_CUTOFF,
   capOverviewLeanStrength,
   dollyLeanStrength
@@ -51,6 +52,12 @@ describe("dollyLeanStrength", () => {
     expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF, 1)).toBe(1);
     expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF / 2, 1)).toBe(0.5);
     expect(capOverviewLeanStrength(LEAN_ZOOM_OUT_CUTOFF / 4, 3)).toBe(0.75);
+  });
+
+  it("scales perceived facade height above the calibrated zoom-in cutoff to prevent flattening", () => {
+    expect(capOverviewLeanStrength(LEAN_ZOOM_IN_CUTOFF, 1)).toBe(1);
+    expect(capOverviewLeanStrength(LEAN_ZOOM_IN_CUTOFF * 2, 1)).toBe(2);
+    expect(capOverviewLeanStrength(LEAN_ZOOM_IN_CUTOFF * 4, 3)).toBe(12);
   });
 
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid zoom %s", (zoom) => {
