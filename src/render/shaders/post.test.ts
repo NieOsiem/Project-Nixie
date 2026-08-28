@@ -171,19 +171,18 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG.match(/texture2D\(uScene/g)).toHaveLength(5);
     expect(COMPOSITE_FRAG).toContain("float roadEdge = smoothstep(0.025, 0.12, max(");
     expect(COMPOSITE_FRAG).toContain("float broadRoad = (leftRoad + rightRoad + upRoad + downRoad) * 0.25;");
-    expect(COMPOSITE_FRAG).toContain("float drainageBand = 1.0 - smoothstep(");
     expect(COMPOSITE_FRAG).toContain("float tinyField =");
     expect(COMPOSITE_FRAG).toContain("float mediumField =");
     expect(COMPOSITE_FRAG).toContain("float hugeField =");
     expect(COMPOSITE_FRAG).toContain(
-      "float puddleNoise = max(tinyField - 0.08, max(mediumField, hugeField - 0.04))"
+      "float puddleNoise = hugeField * 0.46 + mediumField * 0.42 + tinyField * 0.12 + drainageBias;"
     );
     expect(COMPOSITE_FRAG).toContain("* roadMask * coverageGate;");
     expect(COMPOSITE_FRAG).toContain("float coverageGate = step(0.0001, uPuddleCoverage);");
   });
 
   it("orders damp road, matte occlusion, sharp reflection, spill, then the locked grade", () => {
-    const wetDarken = COMPOSITE_FRAG.indexOf("c *= mix(vec3(1.0), darkTarget, darkMask);");
+    const wetDarken = COMPOSITE_FRAG.indexOf("c *= darkTarget;");
     const broadGloss = COMPOSITE_FRAG.indexOf(
       "c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), broadGloss);"
     );
@@ -220,13 +219,13 @@ describe("composite shader", () => {
     expect(COMPOSITE_FRAG).toContain("vec3 reflectionBloom = wideBloom;");
     expect(COMPOSITE_FRAG).not.toContain("reflectionBloom = max(");
     expect(COMPOSITE_FRAG).toContain("float reflectionChroma =");
-    expect(COMPOSITE_FRAG).toContain("float reflectionAmount = wet * smoothstep(0.48, 0.90, puddle)");
+    expect(COMPOSITE_FRAG).toContain("float reflectionAmount = wet * smoothstep(0.35, 0.85, puddle)");
     expect(COMPOSITE_FRAG).toContain(
-      "float reflectionSelect = smoothstep(0.020, 0.120, reflectionLuma)"
+      "float reflectionSelect = smoothstep(0.015, 0.090, reflectionLuma)"
     );
-    expect(COMPOSITE_FRAG).toContain("* smoothstep(0.010, 0.080, reflectionChroma);");
+    expect(COMPOSITE_FRAG).toContain("* smoothstep(0.008, 0.060, reflectionChroma);");
     expect(COMPOSITE_FRAG).toContain(
-      "* min(reflectionLuma * uWideStrength * 1.8, 0.60);"
+      "* min(reflectionLuma * uWideStrength * 2.2, 0.70) * reflectionSelect;"
     );
     expect(COMPOSITE_FRAG).toContain("float spillChroma =");
     expect(COMPOSITE_FRAG).toContain(

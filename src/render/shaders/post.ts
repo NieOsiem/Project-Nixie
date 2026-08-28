@@ -282,10 +282,9 @@ const float PUDDLE_RIM_DARKEN = ${glslFloat(PUDDLE_RIM_DARKEN)};
 const vec3 WET_DARKEN_TINT = vec3(${glslFloat(WET_DARKEN_TINT_R)}, ${glslFloat(WET_DARKEN_TINT_G)}, ${glslFloat(WET_DARKEN_TINT_B)});
 const float GLOSS_LIFT = ${glslFloat(GLOSS_LIFT)};
 const float ROAD_SAMPLE_M = ${glslFloat(2.0)};
-const float TINY_PUDDLE_SCALE = ${glslFloat(0.24)};
-const float HUGE_PUDDLE_SCALE = ${glslFloat(4.5)};
-const float HUGE_ASPECT_MIN = ${glslFloat(2.8)};
-const float HUGE_ASPECT_SPAN = ${glslFloat(2.7)};
+const float TINY_PUDDLE_SCALE = ${glslFloat(0.35)};
+const float MEDIUM_PUDDLE_SCALE = ${glslFloat(1.0)};
+const float HUGE_PUDDLE_SCALE = ${glslFloat(2.4)};
 const float TAU = ${glslFloat(Math.PI * 2)};
 
 float hash21(vec2 p) {
@@ -352,39 +351,31 @@ void main() {
   float longRoad = max(min(leftRoad, rightRoad), min(upRoad, downRoad));
   float junction = smoothstep(0.52, 0.82, broadRoad)
     * smoothstep(0.30, 0.65, min(max(leftRoad, rightRoad), max(upRoad, downRoad)));
+  float markingCue = smoothstep(0.20, 0.70, sceneLuma) * smoothstep(0.12, 0.45, broadRoad);
   float roadLikelihood = clamp(
-    centreRoad * 0.65 + broadRoad * 0.25 + roadEdge * 0.35 + longRoad * 0.15,
+    max(centreRoad, markingCue) * 0.65 + broadRoad * 0.25 + roadEdge * 0.15 + longRoad * 0.15,
     0.0, 1.0);
-  float roadMask = smoothstep(0.18, 0.62, roadLikelihood) * ground;
+  float roadMask = smoothstep(0.15, 0.55, roadLikelihood) * ground;
 
-  // A stationary drainage band breaks up otherwise even road odds. It is world-anchored, and the
-  // broad probe raises odds at junctions and along long sections without knowing road topology.
-  float drainageBand = 1.0 - smoothstep(
-    0.34, 0.50, abs(fract(dot(worldM, vec2(0.035, 0.012))) - 0.5));
-  float placementBias = roadMask
-    * (roadEdge * 0.12 + junction * 0.10 + longRoad * 0.06 + drainageBand * 0.08);
+  float drainageBias = roadMask * (roadEdge * 0.10 + junction * 0.08 + longRoad * 0.05);
 
-  // Deterministic multi-scale union. Tiny pockets use a broken high-frequency pair, medium
-  // puddles merge two offset lobes, and the huge tier stretches along a seeded local direction.
+  // Deterministic multi-scale organic puddle field: continuous domain-warped noise in world space.
+  // Zero cell floor / grid discontinuities so puddles have smooth natural shores across the entire map.
   float puddleScale = max(uPuddleScaleM, 0.001);
-  vec2 orientationCell = floor(worldM / (puddleScale * HUGE_PUDDLE_SCALE));
-  float angle = hash21(orientationCell + vec2(71.0, 19.0)) * TAU;
-  vec2 axis = vec2(cos(angle), sin(angle));
-  vec2 across = vec2(-axis.y, axis.x);
-  vec2 orientedM = vec2(dot(worldM, axis), dot(worldM, across));
-  float tinyA = valueNoise((worldM + vec2(13.7, -9.2)) / (puddleScale * TINY_PUDDLE_SCALE));
-  float tinyB = valueNoise((worldM + vec2(-4.1, 21.3)) / (puddleScale * TINY_PUDDLE_SCALE * 0.63));
-  float tinyField = min(max(tinyA, tinyB * 0.96), min(tinyA, tinyB) + 0.34);
-  float mediumA = valueNoise(orientedM / puddleScale);
-  float mediumB = valueNoise((orientedM + vec2(puddleScale * 0.46, -puddleScale * 0.24)) / puddleScale);
-  float mediumField = max(mediumA, mediumB * 0.98);
-  float hugeAspect = HUGE_ASPECT_MIN
-    + HUGE_ASPECT_SPAN * hash21(orientationCell + vec2(29.0, 83.0));
-  float hugeField = valueNoise(vec2(
-    orientedM.x / (puddleScale * HUGE_PUDDLE_SCALE * hugeAspect),
-    orientedM.y / (puddleScale * HUGE_PUDDLE_SCALE)));
-  float puddleNoise = max(tinyField - 0.08, max(mediumField, hugeField - 0.04))
-    + placementBias;
+  vec2 warp = vec2(
+    valueNoise((worldM + vec2(17.1, -9.3)) / (puddleScale * 2.5)),
+    valueNoise((worldM + vec2(-23.4, 41.7)) / (puddleScale * 2.5))) - 0.5;
+  vec2 p = worldM + warp * (puddleScale * 0.75);
+
+  // Fixed continuous rotations for octave decorrelation (Pythagorean 0.8/0.6 basis)
+  vec2 pRot1 = vec2(p.x * 0.8 - p.y * 0.6, p.x * 0.6 + p.y * 0.8);
+  vec2 pRot2 = vec2(-p.x * 0.6 + p.y * 0.8, -p.x * 0.8 - p.y * 0.6);
+
+  float hugeField = valueNoise(p / (puddleScale * HUGE_PUDDLE_SCALE));
+  float mediumField = valueNoise(pRot1 / (puddleScale * MEDIUM_PUDDLE_SCALE));
+  float tinyField = valueNoise((pRot2 + vec2(11.3, -7.1)) / (puddleScale * TINY_PUDDLE_SCALE));
+
+  float puddleNoise = hugeField * 0.46 + mediumField * 0.42 + tinyField * 0.12 + drainageBias;
   float puddleThreshold = 1.0 - clamp(uPuddleCoverage, 0.0, 1.0);
   float wetIn = puddleThreshold - PUDDLE_EDGE_WET;
   float coverageGate = step(0.0001, uPuddleCoverage);
@@ -396,14 +387,14 @@ void main() {
   float roadWet = clamp(uWetStrength, 0.0, 1.0) * roadMask * coverageGate;
   float wet = roadWet * puddle;
 
-  // Material tiers: damp carriageway stays broad and subdued; deep water makes more headroom for
-  // a sharper coloured reflection. The explicit coverage gate keeps the dry preset byte-identical.
-  float darkMask = clamp(roadWet * 0.18 + wet * 0.82 + PUDDLE_RIM_DARKEN * rim, 0.0, 1.0);
-  vec3 darkTarget = clamp(uWetDarken, 0.0, 1.0) * WET_DARKEN_TINT
-    * mix(1.0, 0.42, puddle);
-  c *= mix(vec3(1.0), darkTarget, darkMask);
+  // Material tiers: damp carriageway darkens asphalt naturally while preserving texture;
+  // puddles settle into a rich, deep reflective water tone without crushing albedo to black.
+  float darkMask = clamp(roadWet * 0.22 + wet * 0.45 + PUDDLE_RIM_DARKEN * rim * 0.4, 0.0, 1.0);
+  vec3 darkTarget = mix(vec3(1.0), WET_DARKEN_TINT * (1.0 - clamp(uWetDarken, 0.0, 1.0) * 0.45), darkMask);
+  c *= darkTarget;
+
   float light = clamp(dot(c, ${LUMA}), 0.0, 1.0);
-  float broadGloss = roadWet * (1.0 - puddle * 0.70)
+  float broadGloss = roadWet * (1.0 - puddle * 0.60)
     * clamp(uWetGloss, 0.0, 1.0) * smoothstep(0.02, 0.60, light) * 0.28;
   c = mix(c, min(c * (1.0 + GLOSS_LIFT), vec3(1.0)), broadGloss);
 
@@ -426,13 +417,19 @@ void main() {
   float reflectionLuma = dot(reflectionBloom, ${LUMA});
   float reflectionChroma = max(max(reflectionBloom.r, reflectionBloom.g), reflectionBloom.b)
     - min(min(reflectionBloom.r, reflectionBloom.g), reflectionBloom.b);
-  float reflectionSelect = smoothstep(0.020, 0.120, reflectionLuma)
-    * smoothstep(0.010, 0.080, reflectionChroma);
+  float reflectionSelect = smoothstep(0.015, 0.090, reflectionLuma)
+    * smoothstep(0.008, 0.060, reflectionChroma);
   vec3 reflectionHue = reflectionBloom / max(reflectionLuma, 0.001);
   vec3 reflectionLift = reflectionHue
-    * min(reflectionLuma * uWideStrength * 1.8, 0.60);
-  float reflectionAmount = wet * smoothstep(0.48, 0.90, puddle)
-    * clamp(uPuddleReflectionStrength, 0.0, 2.0) * reflectionSelect;
+    * min(reflectionLuma * uWideStrength * 2.2, 0.70) * reflectionSelect;
+
+  // Baseline ambient sky/environment reflection in puddles (so water is luminous and readable even in dark streets)
+  vec3 waterAmbient = vec3(0.016, 0.020, 0.032) * clamp(uWetGloss, 0.0, 1.0)
+    + reflectionBloom * 0.18 * uWideStrength;
+  vec3 totalReflection = (reflectionLift + waterAmbient)
+    * clamp(uPuddleReflectionStrength, 0.0, 2.0);
+
+  float reflectionAmount = wet * smoothstep(0.35, 0.85, puddle);
 
   // Preserve the original radial wet smear as a longer, softer tier behind the sharp local reflection.
   float smearAmount = wet * clamp(uSmearStrength, 0.0, 1.0);
@@ -488,7 +485,7 @@ void main() {
 
   // Water receives the sharp local source colour after every matte occlusion term, so a puddle
   // catches nearby light on top of the cast shadow instead of having its reflection multiplied away.
-  vec3 reflectionTarget = min(c + reflectionLift, vec3(1.0));
+  vec3 reflectionTarget = min(c + totalReflection, vec3(1.0));
   c = mix(c, reflectionTarget, clamp(reflectionAmount, 0.0, 1.0));
 
   // Selected chromatic bloom paints only ground and low walls. White markings fail the chroma
