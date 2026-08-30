@@ -35,7 +35,7 @@ import { hash2 } from "./hash.js";
 import { neonMesh } from "./neon.js";
 import { chunkId, chunkRect, type ChunkKey } from "./chunks.js";
 import { citySurfaces, type CitySurfacePartitions } from "./city-chunk.js";
-import type { CitySourceV3 } from "./city.js";
+import type { CitySourceV4 } from "./city.js";
 import type {
   BuildingMassPlan,
   BuildingPlan,
@@ -71,11 +71,12 @@ import { validateCompleteCityPlan } from "./complete-city-plan.js";
  * - Terrain, roads, markings and open spaces are flat surfaces, clipped to the chunk
  *   rect. Clipping is seamless and disjoint, so a seam never shows and no triangle is
  *   emitted twice.
- * - Buildings are owned by the centroid of their parcel, landmarks by the centroid of
- *   their site, half-open on the max edges (matching `chunkRect`). A kept building is
- *   emitted uncut in its owner chunk — it may overhang the chunk rect, and `boundsPx`
- *   grows to cover the overhang, its shadows, its detail tier and its neon glow so
- *   culling never drops it.
+ * - Buildings are owned by the centroid of their source site when persistent (`sourceId` is
+ *   non-null), otherwise by their parcel centroid. Places are always owned by their site
+ *   centroid. Ownership is half-open on the max edges (matching `chunkRect`), so a kept
+ *   architecture object is emitted uncut by exactly one chunk — it may overhang the chunk
+ *   rect, and `boundsPx` grows to cover the overhang, its shadows, its detail tier and its
+ *   neon glow so culling never drops it.
  * - Elevated connectors (skybridges, circulation bridges, service conduits) are planned
  *   once per plan, capped per block, and owned by the midpoint between their two
  *   endpoint buildings, half-open like everything else, so each connector is emitted by
@@ -185,6 +186,24 @@ function ownsCentroid(chunkM: Rect, p: Vec2): boolean {
     p.y >= chunkM.y &&
     p.y < chunkM.y + chunkM.height
   );
+}
+
+/**
+ * Persistent buildings own the chunk containing their source site's centroid. Derived
+ * buildings retain the established parcel-centroid ownership. A missing derived parcel
+ * association is not renderable and therefore owns no chunk; the plan validator reports
+ * that structural error before normal batches are opened.
+ */
+function buildingOwnershipPoint(
+  building: BuildingPlan,
+  parcelById: ReadonlyMap<string, { polygon: Ring }>
+): Vec2 | null {
+  if (building.sourceId !== null && building.sourceId !== undefined) {
+    return ringCentroid(building.sitePolygon!);
+  }
+  if (building.parcelId === null || building.parcelId === undefined) return null;
+  const parcel = parcelById.get(building.parcelId);
+  return parcel === undefined ? null : ringCentroid(parcel.polygon);
 }
 
 /**
@@ -641,11 +660,12 @@ function buildingVerticalM(building: BuildingPlan): { baseM: number; topM: numbe
  * filler grammars never anchor infrastructure.
  */
 function pairConnectorKind(a: BuildingPlan, b: BuildingPlan): ConnectorKind | null {
+  if (a.blockId === null || a.blockId === undefined || b.blockId === null || b.blockId === undefined) return null;
   if (MICRO_BUILDING_GRAMMAR_IDS.has(a.grammarId) || MICRO_BUILDING_GRAMMAR_IDS.has(b.grammarId)) {
     return null;
   }
-  const kind = connectorKindForDistrict(a.districtId);
-  if (kind === null || connectorKindForDistrict(b.districtId) !== kind) return null;
+  const kind = connectorKindForDistrict(a.districtId ?? null);
+  if (kind === null || connectorKindForDistrict(b.districtId ?? null) !== kind) return null;
   const uses = CONNECTOR_CONFIGS[kind].uses;
   if (uses[a.visualUse] !== true || uses[b.visualUse] !== true) return null;
   return kind;
@@ -662,6 +682,10 @@ function makeConnector(
   kind: ConnectorKind,
   config: ConnectorConfig
 ): BlockConnector | null {
+  const blockId = a.blockId;
+  if (blockId === null || blockId === undefined || b.blockId === null || b.blockId === undefined || blockId !== b.blockId) {
+    return null;
+  }
   const aRange = buildingVerticalM(a);
   const bRange = buildingVerticalM(b);
   const overlapM = Math.min(aRange.topM, bRange.topM) - Math.max(aRange.baseM, bRange.baseM);
@@ -702,8 +726,8 @@ function makeConnector(
   const anchor = a.id < b.id ? a : b;
   const primary = anchor.masses[0]!;
   return {
-    id: `con_${fnv1a(pairKey).toString(16).padStart(8, "0")}`,
-    blockId: a.blockId,
+    id: `connector_${fnv1a(`${blockId}|${kind}|${pairKey}`).toString(16).padStart(8, "0")}`,
+    blockId,
     kind,
     aId: a.id,
     bId: b.id,
@@ -728,6 +752,7 @@ function makeConnector(
 function planConnectors(plan: CompleteCityPlan): readonly BlockConnector[] {
   const byBlock = new Map<string, BuildingPlan[]>();
   for (const building of plan.buildings) {
+    if (building.blockId === null || building.blockId === undefined) continue;
     const list = byBlock.get(building.blockId);
     if (list === undefined) byBlock.set(building.blockId, [building]);
     else list.push(building);
@@ -804,7 +829,7 @@ function connectorPrism(connector: BlockConnector, origin: Vec2, pixelsPerMetre:
 }
 
 export function buildCompleteCityChunk(
-  source: CitySourceV3,
+  source: CitySourceV4,
   plan: CompleteCityPlan,
   key: ChunkKey,
   sceneBoundsM: Rect,
@@ -859,19 +884,19 @@ export function buildCompleteCityChunk(
   }
   const { meshes: openSpaceMeshes_, triangles: openSpaceTriangles, count: openSpaceCount } = openSpaceMeshes(openSpaces, origin, pixelsPerMetre);
 
-  // Buildings are owned by their parcel's centroid, landmarks by their site's, never
-  // clipped: a lot straddling the seam has to be cut by the road, not by the chunk.
+  // Persistent buildings are owned by their source site's centroid; derived buildings
+  // retain parcel-centroid ownership. Neither kind is clipped: a site or lot straddling
+  // a seam is emitted in full by its one owner chunk. Places are compound objects and
+  // always use their site centroid, independent of parcel/fragment associations.
   const parcelByBuilding = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
   const ownedBuildings: BuildingPlan[] = [];
   const ownedLandmarks: LandmarkPlan[] = [];
   for (const building of plan.buildings) {
-    const parcel = parcelByBuilding.get(building.parcelId);
-    if (parcel !== undefined && ownsCentroid(boundsM, ringCentroid(parcel.polygon))) {
-      ownedBuildings.push(building);
-    }
+    const owner = buildingOwnershipPoint(building, parcelByBuilding);
+    if (owner !== null && ownsCentroid(boundsM, owner)) ownedBuildings.push(building);
   }
   for (const landmark of plan.landmarks) {
-    if (ownsCentroid(boundsM, ringCentroid(landmark.sitePolygon))) ownedLandmarks.push(landmark);
+    if (ownsCentroid(boundsM, ringCentroid(landmark.sitePolygon!))) ownedLandmarks.push(landmark);
   }
 
   const buildingSpecs = ownedBuildings.flatMap((building) => {
@@ -1034,7 +1059,7 @@ export interface CompleteChunkBatch {
 }
 
 export function openCompleteCityChunkBatch(
-  source: CitySourceV3,
+  source: CitySourceV4,
   plan: CompleteCityPlan,
   keys: ChunkKey[],
   sceneBoundsM: Rect,
@@ -1078,7 +1103,7 @@ export function openCompleteCityChunkBatch(
 }
 
 export function buildCompleteCityChunks(
-  source: CitySourceV3,
+  source: CitySourceV4,
   plan: CompleteCityPlan,
   keys: ChunkKey[],
   sceneBoundsM: Rect,

@@ -30,8 +30,8 @@ import {
   type WorkerRequest,
   type WorkerSuccess
 } from "./protocol.js";
-import type { CitySourceV2 as CitySourceV2Roads, CitySourceV3 } from "../core/gen/city.js";
-import { validateCitySourceV3 } from "../core/gen/city.js";
+import type { CitySourceV2 as CitySourceV2Roads, CitySourceV4 } from "../core/gen/city.js";
+import { validateCitySourceV4 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictCompatibilityTag } from "../core/gen/district-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarId } from "../core/gen/landmark-registry.js";
 import { buildDistrictPlan } from "../core/gen/district-plan.js";
@@ -82,7 +82,7 @@ const CITY_SOURCE: CitySourceV2Roads = {
   }
 };
 
-const DISTRICT_SOURCE: CitySourceV3 = {
+const DISTRICT_SOURCE: CitySourceV4 = {
   origin: { x: 5000, y: 4000 },
   citySeed: "protocol-district-fixture",
   generation: {
@@ -91,14 +91,15 @@ const DISTRICT_SOURCE: CitySourceV3 = {
   },
   terrain: { land: rectangleLand({ x: -96, y: -96, width: 192, height: 192 }), urbanFootprint: null },
   roads: structuredClone(CITY_SOURCE.roads),
-  districts: []
+  districts: [],
+  architecture: { buildings: [], places: [], overrides: [] }
 };
 
 /**
  * A 200×200 grid-cross city with two district halves — the canonical small fixture that
  * validates as a complete plan (landmarks skip because the reserved sites are too small).
  */
-const COMPLETE_SOURCE: CitySourceV3 = {
+const COMPLETE_SOURCE: CitySourceV4 = {
   origin: { x: 700, y: 300 },
   citySeed: "protocol-complete-cross",
   generation: {
@@ -125,7 +126,45 @@ const COMPLETE_SOURCE: CitySourceV3 = {
   districts: [
     { id: "west", polygon: rectRing({ x: 0, y: 0, width: 100, height: 200 }), seed: "west-seed", typeId: "mixed-use-centre", paletteId: DISTRICT_PALETTE_IDS[2]!, origin: "generated", locked: false, openSpaceOverride: null },
     { id: "east", polygon: rectRing({ x: 100, y: 0, width: 100, height: 200 }), seed: "east-seed", typeId: "dense-residential", paletteId: DISTRICT_PALETTE_IDS[4]!, origin: "generated", locked: false, openSpaceOverride: null }
-  ]
+  ],
+  architecture: { buildings: [], places: [], overrides: [] }
+};
+
+const ARCHITECTURE_SOURCE: CitySourceV4 = {
+  ...structuredClone(COMPLETE_SOURCE),
+  architecture: {
+    buildings: [{
+      id: "worker-building",
+      lineage: "worker/architecture/building",
+      origin: "generated",
+      protection: "manual-edit",
+      seed: "worker-building-geometry",
+      appearanceSeed: "worker-building-appearance",
+      grammarId: "corporate-setback-tower",
+      visualUse: "commercial",
+      heightM: 96,
+      paletteId: null,
+      sitePolygon: rectRing({ x: 10, y: 10, width: 80, height: 80 }),
+      placement: { centre: { x: 50, y: 50 }, rotationRad: 0, widthM: 60, depthM: 60 },
+      districtId: "west",
+      blockId: null
+    }],
+    places: [{
+      id: "worker-place",
+      lineage: "worker/architecture/place",
+      origin: "authored",
+      protection: "explicit",
+      seed: "worker-place-geometry",
+      appearanceSeed: "worker-place-appearance",
+      landmarkGrammarId: "hero-tower-plaza",
+      paletteId: null,
+      sitePolygon: rectRing({ x: 110, y: 110, width: 80, height: 80 }),
+      placement: { centre: { x: 150, y: 150 }, rotationRad: 0, widthM: 60, depthM: 60 },
+      districtId: "east",
+      blockId: null
+    }],
+    overrides: []
+  }
 };
 
 describe("handleRequest", () => {
@@ -400,6 +439,7 @@ describe("handleRequest generateCompleteCityPlan", () => {
     expect(result.epoch).toBe(request.epoch);
     expect(result.candidate.citySeed).toBe(staging.citySeed);
     expect(result.candidate.origin).toEqual(staging.origin);
+    expect(result.candidate.architecture).toEqual({ buildings: [], places: [], overrides: [] });
     expect(result.candidate.roads.edges.length).toBeGreaterThan(0);
     expect(result.candidate.districts.length).toBeGreaterThan(0);
     expect(result.plan.sourceRevision).toBe(1);
@@ -423,7 +463,7 @@ describe("handleRequest generateCompleteCityPlan", () => {
     expect(result.plan).toEqual(expectedPlan);
     expect(validateCompleteCityPlan(result.plan)).toEqual([]);
     expect(result.plan.diagnostics.explicitReservationCount).toBe(replayReservations.length > 0 ? replayReservations.length : undefined);
-    expect(validateCitySourceV3(result.candidate)).toEqual([]);
+    expect(validateCitySourceV4(result.candidate)).toEqual([]);
     expect(result.validation).toEqual([]);
     expect(result.counts.districtCount).toBe(result.candidate.districts.length);
     expect(result.counts.blockCount).toBeGreaterThan(0);
@@ -498,7 +538,40 @@ describe("handleRequest buildCompleteCityPlan", () => {
     expect(result.validation).toEqual([]);
     expect(response.transfer).toBeUndefined();
   }, 120_000);
-
+  it("retains persistent architecture while preserving request and plan identity", () => {
+    const architectureRequest: BuildCompleteCityPlanRequest = {
+      ...request,
+      id: 106,
+      source: ARCHITECTURE_SOURCE,
+      sourceRevision: 73,
+      actionToken: "architecture-action-7",
+      buildToken: "architecture-build-7",
+      epoch: 19
+    };
+    const response = handleRequest(architectureRequest) as WorkerSuccess;
+    expect(response.ok).toBe(true);
+    expect(response.id).toBe(architectureRequest.id);
+    const result = response.result as BuildCompleteCityPlanResult;
+    expect(result.sourceRevision).toBe(architectureRequest.sourceRevision);
+    expect(result.actionToken).toBe(architectureRequest.actionToken);
+    expect(result.buildToken).toBe(architectureRequest.buildToken);
+    expect(result.epoch).toBe(architectureRequest.epoch);
+    expect(result.plan.sourceRevision).toBe(architectureRequest.sourceRevision);
+    expect(result.plan.epoch).toBe(architectureRequest.epoch);
+    expect(result.plan.buildings.find((building) => building.sourceId === "worker-building")).toMatchObject({
+      id: "worker-building",
+      lineage: "worker/architecture/building",
+      origin: "generated",
+      protection: "manual-edit"
+    });
+    expect(result.plan.landmarks.find((landmark) => landmark.sourceId === "worker-place")).toMatchObject({
+      id: "worker-place",
+      lineage: "worker/architecture/place",
+      origin: "authored",
+      protection: "explicit"
+    });
+    expect(result.validation).toEqual([]);
+  }, 120_000);
   it("carries revision, token and epoch identity on a failure response", () => {
     const response = handleRequest({ ...request, id: 105, sourceRevision: 0 });
     expect(response).toEqual({

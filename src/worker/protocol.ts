@@ -13,8 +13,8 @@ import type { Rect, Vec2 } from "../core/geom/types.js";
 import type { CitySourceV2 } from "../core/gen/terrain.js";
 import { coastalLand, normalizeCitySeed, rectangleLand, type CoastEdge } from "../core/gen/terrain.js";
 import type { CitySourceV2 as CitySourceV2Roads, RoadLayout, HubMode, RoadSource } from "../core/gen/city.js";
-import type { CitySourceV3, DistrictOpenSpaceProfile, DistrictSource } from "../core/gen/city.js";
-import { validateCitySourceV3 } from "../core/gen/city.js";
+import type { CitySourceV4, DistrictOpenSpaceProfile, DistrictSource } from "../core/gen/city.js";
+import { validateCitySourceV4 } from "../core/gen/city.js";
 import type { DistrictTypeId } from "../core/gen/district-registry.js";
 import { buildDistrictPlan, type DistrictPlan } from "../core/gen/district-plan.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "../core/gen/district-generator.js";
@@ -71,7 +71,7 @@ export interface GenerateInitialRoadNetworkRequest {
 export interface BuildDistrictPlanRequest {
   id: number;
   type: "buildDistrictPlan";
-  source: CitySourceV3;
+  source: CitySourceV4;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -80,7 +80,7 @@ export interface BuildDistrictPlanRequest {
 export interface GenerateInitialDistrictsRequest {
   id: number;
   type: "generateInitialDistricts";
-  source: CitySourceV3;
+  source: CitySourceV4;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -117,7 +117,7 @@ export interface GenerateCompleteCityPlanRequest {
 export interface BuildCompleteCityPlanRequest {
   id: number;
   type: "buildCompleteCityPlan";
-  source: CitySourceV3;
+  source: CitySourceV4;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -127,7 +127,7 @@ export interface BuildCompleteCityPlanRequest {
 export interface BuildCompleteCityChunksRequest {
   id: number;
   type: "buildCompleteCityChunks";
-  source: CitySourceV3;
+  source: CitySourceV4;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -215,7 +215,7 @@ export interface GenerateCompleteCityPlanResult {
   actionToken: number | string;
   buildToken: number | string;
   epoch: number;
-  candidate: CitySourceV3;
+  candidate: CitySourceV4;
   plan: CompleteCityPlan;
   counts: CompleteCityPlanCounts;
   validation: string[];
@@ -456,7 +456,7 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           staging.terrainMode === "coastal"
             ? coastalLand(staging.sceneBoundsM, citySeed, staging.coastEdge!)
             : rectangleLand(staging.sceneBoundsM);
-        const source: CitySourceV3 = {
+        const source: CitySourceV4 = {
           origin: staging.origin,
           citySeed,
           generation: {
@@ -469,7 +469,8 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           },
           terrain: { land, urbanFootprint: null },
           roads: { nodes: [], routes: [], edges: [] },
-          districts: []
+          districts: [],
+          architecture: { buildings: [], places: [], overrides: [] }
         };
         // Major landmark sites are reserved before local roads so ordinary road occupancy
         // never claims them; the same reservations feed the plan verbatim.
@@ -516,7 +517,7 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
             massCount: plan.diagnostics.massCount,
             landmarkCount: plan.diagnostics.landmarkCount
           },
-          validation: [...validateCitySourceV3(source), ...validateCompleteCityPlan(plan)]
+          validation: [...validateCitySourceV4(source), ...validateCompleteCityPlan(plan)]
         };
         return { id: request.id, ok: true, result };
       }

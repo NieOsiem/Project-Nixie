@@ -1,6 +1,6 @@
 import { union, ringAsMulti } from "../geom/boolean.js";
 import { ringArea, ringBounds, ringCentroid, type Ring, type Vec2 } from "../geom/types.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictSource } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV4, type DistrictSource } from "./city.js";
 import { validateDistrictCandidates } from "./district-edit.js";
 import { buildDistrictPlan, type DerivedBlock } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "./district-registry.js";
@@ -22,11 +22,11 @@ function stableId(prefix: string, material: string): string {
   return `${prefix}_${fnv1a(material).toString(16).padStart(8, "0")}`;
 }
 
-function vehicleRoadCount(source: CitySourceV3): number {
+function vehicleRoadCount(source: CitySourceV4): number {
   return source.roads.edges.filter((edge) => ROUTE_CLASS_REGISTRY.get(edge.classId)?.vehicle).length;
 }
 
-export function districtGenerationAvailability(source: CitySourceV3): DistrictGenerationAvailability {
+export function districtGenerationAvailability(source: CitySourceV4): DistrictGenerationAvailability {
   if (source.districts.length > 0) return { available: false, reason: "Initial district generation requires an empty district source." };
   if (source.generation.districtPool.length === 0) return { available: false, reason: "Initial district generation requires a non-empty district pool." };
   if (vehicleRoadCount(source) === 0) return { available: false, reason: "Initial district generation requires a vehicle-road network." };
@@ -70,7 +70,7 @@ function components(blocks: readonly DerivedBlock[], adjacent: ReadonlyMap<strin
 function seedBlocks(
   blocks: readonly DerivedBlock[],
   component: readonly string[],
-  source: CitySourceV3
+  source: CitySourceV4
 ): string[] {
   const preferred = component.length >= 4 ? Math.max(2, Math.ceil(component.length / 4)) : 1;
   const count = Math.max(1, Math.min(component.length, preferred, 8));
@@ -164,7 +164,7 @@ function growRegions(
   component: readonly string[],
   adjacent: ReadonlyMap<string, readonly string[]>,
   citySeed: string,
-  source: CitySourceV3
+  source: CitySourceV4
 ): string[][] {
   const seeds = seedBlocks(blocks, component, source);
   const owner = new Map<string, string>();
@@ -223,7 +223,7 @@ export function resolveGeneratedRegions(
   return regions;
 }
 
-function enabledPool(source: CitySourceV3): DistrictTypeId[] {
+function enabledPool(source: CitySourceV4): DistrictTypeId[] {
   const seen = new Set<DistrictTypeId>();
   const pool: DistrictTypeId[] = [];
   for (const id of source.generation.districtPool) {
@@ -249,7 +249,7 @@ function distance(a: Vec2, b: Vec2): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function hubs(source: CitySourceV3, bounds: ReturnType<typeof ringBounds>): Vec2[] {
+function hubs(source: CitySourceV4, bounds: ReturnType<typeof ringBounds>): Vec2[] {
   if (source.generation.hubMode === "single-centre") return [{ x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }];
   return Array.from({ length: 3 }, (_, index) => ({
     x: bounds.x + bounds.width * (0.2 + hashUnit(`${source.citySeed}/districts/v3/hub/${index}/x`) * 0.6),
@@ -261,7 +261,7 @@ function hashUnit(text: string): number {
   return fnv1a(text) / 0x1_0000_0000;
 }
 
-export function districtRegionContext(source: CitySourceV3, blocks: readonly DerivedBlock[], polygon: Ring): DistrictRegionContext {
+export function districtRegionContext(source: CitySourceV4, blocks: readonly DerivedBlock[], polygon: Ring): DistrictRegionContext {
   const mask = source.terrain.urbanFootprint ?? source.terrain.land;
   const maskBounds = ringBounds(mask);
   const regionBounds = ringBounds(polygon);
@@ -643,7 +643,7 @@ const INDUSTRIAL_TYPES = new Set<DistrictTypeId>([
   "utility-infrastructure"
 ]);
 
-export function generateInitialDistricts(source: CitySourceV3): DistrictSource[] {
+export function generateInitialDistricts(source: CitySourceV4): DistrictSource[] {
   const availability = districtGenerationAvailability(source);
   if (!availability.available) throw new Error(availability.reason ?? "Initial district generation is unavailable.");
   const plan = buildDistrictPlan(source);

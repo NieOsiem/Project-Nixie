@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GeneratePresetId, TerrainMode } from "./editor-state.js";
 import {
   applyGeneratePreset,
+  beginPendingOperation,
   canvasTool,
   clearEditorActionError,
+  clearObjectSelection,
   closeEditor,
   currentCoastEdge,
   currentCurvePreset,
@@ -12,7 +14,9 @@ import {
   currentEditorActionError,
   currentHubMode,
   currentObjectCategory,
+  currentObjectSelection,
   currentOpenSpaceProfile,
+  currentPendingOperation,
   currentRoadClass,
   currentRoadLayout,
   currentSeed,
@@ -23,9 +27,13 @@ import {
   DISTRICT_TOOL,
   editorLayerActivated,
   editorLayerDeactivated,
+  endPendingOperation,
   GENERATE_PRESETS,
+  getObjectSelection,
   isEditorOpen,
+  LAYER_OBJECTS,
   notifyEditorInteraction,
+  OBJECT_TOOL,
   openEditor,
   ownedLayerName,
   ROAD_TOOL,
@@ -37,8 +45,12 @@ import {
   setDistrictType,
   setEditorActionError,
   setEditorController,
-  setHubMode,
   setObjectCategory,
+  setObjectDraftCancelListener,
+  setObjectSelection,
+  setObjectSelectionListener,
+  setObjectStagingClearListener,
+  setHubMode,
   setOpenSpaceProfile,
   setRoadLayout,
   setSeed,
@@ -66,12 +78,14 @@ function stubCanvas(): { nixieActivate: ReturnType<typeof vi.fn>; tokensActivate
   const nixieActivate = vi.fn();
   const roadsActivate = vi.fn();
   const districtsActivate = vi.fn();
+  const objectsActivate = vi.fn();
   const tokensActivate = vi.fn();
   vi.stubGlobal("canvas", {
     ready: true,
     nixie: { active: false, activate: nixieActivate, refresh: vi.fn() },
     "nixie-roads": { active: false, activate: roadsActivate, refresh: vi.fn() },
     "nixie-districts": { active: false, activate: districtsActivate, refresh: vi.fn() },
+    "nixie-objects": { active: false, activate: objectsActivate, refresh: vi.fn() },
     tokens: { active: false, activate: tokensActivate }
   });
   return { nixieActivate, tokensActivate };
@@ -88,6 +102,12 @@ beforeEach(() => {
 
 afterEach(() => {
   if (isEditorOpen()) closeEditor({ restoreDefaultLayer: false });
+  setObjectSelectionListener(null);
+  setObjectDraftCancelListener(null);
+  setObjectStagingClearListener(null);
+  clearObjectSelection();
+  endPendingOperation();
+  setObjectCategory("buildings");
   setDistrictSnapOptions({ districtVertices: true, roadJunctions: true, blockBoundaries: true, foundryGrid: false });
   setDistrictType(DISTRICT_TYPE_IDS[0]);
   setTerrainMode("rectangle");
@@ -100,7 +120,6 @@ afterEach(() => {
   setEditorController(null);
   vi.unstubAllGlobals();
 });
-
 describe("editor open/close lifecycle", () => {
   it("opens at the Terrain workspace, activates its layer, and notifies the controller", () => {
     openEditor();
@@ -145,6 +164,74 @@ describe("workspace switching", () => {
     expect(canvasTool()).toBe(DISTRICT_TOOL.SELECT);
   });
 
+  it("activates the Objects layer with the selection tool", () => {
+    openEditor();
+    setWorkspace("objects");
+    expect(currentWorkspace()).toBe("objects");
+    expect(ownedLayerName()).toBe(LAYER_OBJECTS);
+    expect(canvasTool()).toBe(OBJECT_TOOL.SELECT);
+  });
+
+  it("accepts only same-kind additive object selection snapshots", () => {
+    setObjectSelection("building", ["b-1", "b-1", "b-2"]);
+    expect(getObjectSelection()).toEqual({ kind: "building", ids: ["b-1", "b-2"] });
+    setObjectSelection("place", ["p-1"]);
+    expect(currentObjectSelection()).toEqual({ kind: "place", ids: ["p-1"] });
+    clearObjectSelection();
+    expect(getObjectSelection()).toEqual({ kind: null, ids: [] });
+  });
+
+  it("cleans object drafts, staging, and selection on category/workspace transitions", () => {
+    const cancel = vi.fn();
+    const clearStaging = vi.fn();
+    const selectionChanged = vi.fn();
+    setObjectDraftCancelListener(cancel);
+    setObjectStagingClearListener(clearStaging);
+    setObjectSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("objects");
+    setObjectSelection("building", ["b-1"]);
+    setObjectCategory("places");
+    expect(cancel).toHaveBeenCalled();
+    expect(clearStaging).toHaveBeenCalled();
+    expect(getObjectSelection()).toEqual({ kind: null, ids: [] });
+    setWorkspace("terrain");
+    expect(ownedLayerName()).toBe("nixie");
+    expect(selectionChanged).toHaveBeenCalled();
+  });
+
+  it("cancels object drafts and clears staging when switching object tools while retaining selection", () => {
+    const cancel = vi.fn();
+    const clearStaging = vi.fn();
+    setObjectDraftCancelListener(cancel);
+    setObjectStagingClearListener(clearStaging);
+    openEditor();
+    setWorkspace("objects");
+    setObjectSelection("building", ["b-1"]);
+    setCanvasTool(OBJECT_TOOL.PLACE);
+    expect(cancel).toHaveBeenCalled();
+    expect(clearStaging).toHaveBeenCalled();
+    expect(getObjectSelection()).toEqual({ kind: "building", ids: ["b-1"] });
+  });
+
+  it("clears object drafts, staging, and selection when the editor closes", () => {
+    const cancel = vi.fn();
+    const clearStaging = vi.fn();
+    const selectionChanged = vi.fn();
+    setObjectDraftCancelListener(cancel);
+    setObjectStagingClearListener(clearStaging);
+    setObjectSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("objects");
+    setObjectSelection("place", ["p-1"]);
+    closeEditor({ restoreDefaultLayer: false });
+    expect(cancel).toHaveBeenCalled();
+    expect(clearStaging).toHaveBeenCalled();
+    expect(getObjectSelection()).toEqual({ kind: null, ids: [] });
+    expect(selectionChanged).toHaveBeenCalledWith({ kind: null, ids: [] });
+  });
+
+
   it("keeps district snapping preferences session-scoped and independent", () => {
     openEditor();
     setDistrictSnapOptions({ foundryGrid: true, roadJunctions: false });
@@ -164,6 +251,13 @@ describe("workspace switching", () => {
     expect(currentDistrictPalette()).toBe("waterfront");
   });
 
+
+  it("adopts the Objects workspace when the Objects layer activates", () => {
+    openEditor();
+    editorLayerActivated(LAYER_OBJECTS);
+    expect(currentWorkspace()).toBe("objects");
+    expect(ownedLayerName()).toBe(LAYER_OBJECTS);
+  });
   it("resets an incompatible tool when switching workspace", () => {
     openEditor();
     setCanvasTool(TOOL.LAND_DRAW);
@@ -199,6 +293,13 @@ describe("layer activation hooks", () => {
     editorLayerActivated("nixie");
     expect(currentWorkspace()).toBe("terrain");
     expect(ownedLayerName()).toBe("nixie");
+  });
+
+  it("opens directly to Objects when its layer is activated while closed", () => {
+    editorLayerActivated(LAYER_OBJECTS);
+    expect(isEditorOpen()).toBe(true);
+    expect(currentWorkspace()).toBe("objects");
+    expect(canvasTool()).toBe(OBJECT_TOOL.SELECT);
   });
 
   it("closes the editor when its owned layer is deactivated externally", async () => {
@@ -267,6 +368,31 @@ describe("session preferences", () => {
     expect(currentEditorActionError()).toEqual({ label: "district edit", message: "Locked district", affectedIds: ["d-1"] });
     clearEditorActionError();
     expect(currentEditorActionError()).toBeNull();
+  });
+
+  it("tracks one pending operation and rejects concurrent starts", () => {
+    expect(currentPendingOperation()).toBeNull();
+    expect(beginPendingOperation("object placement")).toBe(true);
+    expect(currentPendingOperation()).toBe("object placement");
+    expect(beginPendingOperation("second operation")).toBe(false);
+    endPendingOperation();
+    expect(currentPendingOperation()).toBeNull();
+  });
+
+  it("retains identifiable object and site ids in durable errors", () => {
+    setEditorActionError("site polygon", {
+      message: "Polygon intersects a road",
+      objectId: "building-1",
+      siteIds: ["site-1", "site-2"]
+    });
+    expect(currentEditorActionError()).toEqual({
+      label: "site polygon",
+      message: "Polygon intersects a road",
+      affectedIds: ["building-1", "site-1", "site-2"]
+    });
+    setEditorActionError("object transform", Object.assign(new Error("stale revision"), { targetId: "place-1" }));
+    expect(currentEditorActionError()?.message).toContain("Reopen or refresh");
+    expect(currentEditorActionError()?.affectedIds).toEqual(["place-1"]);
   });
 });
 

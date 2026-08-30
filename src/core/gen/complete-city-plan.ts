@@ -1,8 +1,9 @@
+import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import { difference, intersectMultiWithRing, intersection, isSnapNoise, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
-import { isRecord, ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
+import { isRecord, ROUTE_CLASS_REGISTRY, type ArchitectureOrigin, type ArchitectureOverrideSource, type ArchitectureProtection, type CitySourceV4, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type PersistentBuildingSource, type PersistentPlaceSource, type PlacementFrame, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, DEVELOPMENT_SPACE_CATEGORIES, districtStructuralInputSignature, type DevelopmentCellPlan, type DevelopmentSpaceRole, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type DistrictTypeId, type HeightBand } from "./district-registry.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
@@ -155,6 +156,143 @@ function rotatePoint(point: Vec2, origin: Vec2, angle: number): Vec2 {
   const x = point.x - origin.x;
   const y = point.y - origin.y;
   return { x: origin.x + x * cosine - y * sine, y: origin.y + x * sine + y * cosine };
+}
+
+function placementRing(frame: PlacementFrame): Ring {
+  return rectAt(frame.centre, frame.widthM, frame.depthM, frame.rotationRad);
+}
+function hasValidPlacementFrame(frame: unknown): frame is PlacementFrame {
+  if (!isRecord(frame) || !isRecord(frame.centre)) return false;
+  return typeof frame.centre.x === "number"
+    && Number.isFinite(frame.centre.x)
+    && typeof frame.centre.y === "number"
+    && Number.isFinite(frame.centre.y)
+    && typeof frame.rotationRad === "number"
+    && Number.isFinite(frame.rotationRad)
+    && typeof frame.widthM === "number"
+    && Number.isFinite(frame.widthM)
+    && frame.widthM > 0
+    && typeof frame.depthM === "number"
+    && Number.isFinite(frame.depthM)
+    && frame.depthM > 0;
+}
+/**
+ * Source validation uses the overlap-area tolerance below. Keep derived frame fitting
+ * on the same strict gate instead of accepting a frame solely because the boolean
+ * difference was classified as snap noise.
+ */
+function placementFrameContainedBySite(frame: PlacementFrame, site: Ring): boolean {
+  const footprintArea = frame.widthM * frame.depthM;
+  if (!Number.isFinite(footprintArea) || footprintArea <= 0) return false;
+  try {
+    const overlap = intersection(ringAsMulti(placementRing(frame)), ringAsMulti(site));
+    let overlapArea = 0;
+    for (const polygon of overlap) {
+      if (polygon.length === 0) continue;
+      overlapArea += Math.abs(ringArea(polygon[0]!));
+      for (const hole of polygon.slice(1)) overlapArea -= Math.abs(ringArea(hole));
+    }
+    return overlapArea + Math.max(1e-4, footprintArea * 1e-6) >= footprintArea;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stable frame metadata for derived plans; persistent plans copy their source frame
+ * verbatim. The first candidate deliberately preserves the established rectangular
+ * output. For concave sites, the candidate is replaced with an envelope of the
+ * actual derived footprints and then deterministically fitted inside the site.
+ */
+function placementFrameForRing(
+  ring: Ring,
+  rotationRad = longestEdgeAngle(ring),
+  actualFootprints: readonly Ring[] = []
+): PlacementFrame {
+  const centre = ringCentroid(ring);
+  const cosine = Math.cos(rotationRad);
+  const sine = Math.sin(rotationRad);
+  const boundsFor = (rings: readonly Ring[]): { minX: number; maxX: number; minY: number; maxY: number } => {
+    let minX = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const source of rings) {
+      for (const point of source) {
+        const dx = point.x - centre.x;
+        const dy = point.y - centre.y;
+        const localX = dx * cosine + dy * sine;
+        const localY = -dx * sine + dy * cosine;
+        minX = Math.min(minX, localX);
+        maxX = Math.max(maxX, localX);
+        minY = Math.min(minY, localY);
+        maxY = Math.max(maxY, localY);
+      }
+    }
+    return { minX, maxX, minY, maxY };
+  };
+  const toWorld = (localX: number, localY: number): Vec2 => ({
+    x: centre.x + localX * cosine - localY * sine,
+    y: centre.y + localX * sine + localY * cosine
+  });
+  const frameFromBounds = (
+    bounds: { minX: number; maxX: number; minY: number; maxY: number },
+    frameCentre = toWorld((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2)
+  ): PlacementFrame => ({
+    centre: frameCentre,
+    rotationRad,
+    widthM: Math.max(GEOMETRY_EPSILON, bounds.maxX - bounds.minX),
+    depthM: Math.max(GEOMETRY_EPSILON, bounds.maxY - bounds.minY)
+  });
+  const contains = (frame: PlacementFrame, includeFootprints: boolean): boolean => {
+    const frameRing = placementRing(frame);
+    if (!placementFrameContainedBySite(frame, ring)) return false;
+    return !includeFootprints || actualFootprints.every((footprint) => ringCountsAsContained(footprint, ringAsMulti(frameRing)));
+  };
+  const fitInside = (frame: PlacementFrame, anchor: Vec2): PlacementFrame | null => {
+    for (let attempt = 0; attempt < 48; attempt++) {
+      const scale = attempt === 0 ? 1 : Math.pow(0.82, attempt);
+      const candidate: PlacementFrame = {
+        centre: anchor,
+        rotationRad,
+        widthM: Math.max(GEOMETRY_EPSILON, frame.widthM * scale),
+        depthM: Math.max(GEOMETRY_EPSILON, frame.depthM * scale)
+      };
+      if (contains(candidate, false)) return candidate;
+    }
+    return null;
+  };
+
+  const siteBounds = boundsFor([ring]);
+  // Keep the established frame centre for ordinary rectangular sites. Concave
+  // sites fall through to the actual-footprint envelope below.
+  const siteFrame = frameFromBounds(siteBounds, centre);
+  if (contains(siteFrame, true)) return siteFrame;
+
+  if (actualFootprints.length > 0) {
+    const footprintFrame = frameFromBounds(boundsFor(actualFootprints));
+    if (contains(footprintFrame, true)) return footprintFrame;
+    // A concave site's centroid can sit in its notch. Try each actual footprint
+    // centroid as an anchor before falling back to the site centroid.
+    const anchors = actualFootprints.map((footprint) => ringCentroid(footprint));
+    anchors.push(ringCentroid(ring));
+    for (const anchor of anchors) {
+      const fitted = fitInside(footprintFrame, anchor);
+      if (fitted !== null) return fitted;
+    }
+  }
+
+  // This path is only reached before a generated landmark's masses are
+  // materialized. Keep a valid, deterministic metadata frame; the materializer
+  // replaces it with the actual-footprint frame before the plan is returned.
+  const fittedSite = fitInside(siteFrame, centre);
+  if (fittedSite !== null) return fittedSite;
+  return {
+    centre,
+    rotationRad,
+    widthM: Math.max(GEOMETRY_EPSILON, siteFrame.widthM * 0.5),
+    depthM: Math.max(GEOMETRY_EPSILON, siteFrame.depthM * 0.5)
+  };
 }
 
 function longestEdgeAngle(ring: Ring): number {
@@ -500,12 +638,12 @@ export interface PaletteBankEntry {
 }
 
 /** Deterministic palette-ID → bank mapping, sorted by palette id, never district order. */
-export function derivePaletteBanks(source: CitySourceV3): PaletteBankEntry[] {
+export function derivePaletteBanks(source: CitySourceV4): PaletteBankEntry[] {
   const ids = [...new Set(source.districts.map((district) => district.paletteId))].sort();
   return ids.map((paletteId, index) => ({ paletteId, bank: FIRST_ZONE_BANK + index }));
 }
 
-export function completeCityStructuralInput(source: CitySourceV3): StructuralInputSignature {
+export function completeCityStructuralInput(source: CitySourceV4): StructuralInputSignature {
   const base = districtStructuralInputSignature(source);
   const palettes = [...source.districts]
     .sort((a, b) => a.id.localeCompare(b.id))
@@ -536,7 +674,7 @@ export const GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN = 1.1;
  * passes the resulting polygons verbatim through road generation and city planning.
  */
 export function reserveMajorLandmarkSites(
-  source: CitySourceV3,
+  source: CitySourceV4,
   grammarIds: readonly LandmarkGrammarId[] = PRE_ROAD_LANDMARK_GRAMMAR_IDS
 ): MajorLandmarkSiteReservation[] {
   const seenGrammarIds = new Set<LandmarkGrammarId>();
@@ -681,18 +819,26 @@ export interface BuildingMassPlan {
 
 export interface BuildingPlan {
   id: string;
-  parcelId: string;
-  blockId: string;
-  fragmentId: string;
+  /** Null for a procedural building; persistent source identity otherwise. */
+  sourceId: string | null;
+  lineage: string;
+  origin?: ArchitectureOrigin;
+  protection?: ArchitectureProtection;
+  parcelId: string | null;
+  blockId: string | null;
+  fragmentId: string | null;
   districtId: string | null;
   grammarId: BuildingGrammarId;
   visualUse: BuildingUseId;
   archetype: FootprintArchetypeId;
   seed: string;
   appearanceSeed: string;
+  paletteId?: string | null;
   /** Deterministically chosen declared setback (m) the masses respect; plan-side record of the enforced contract. */
   setbackM?: number;
   heightM: number;
+  sitePolygon: Ring;
+  placement?: PlacementFrame;
   masses: BuildingMassPlan[];
   areaM2: number;
 }
@@ -724,16 +870,24 @@ export interface LandmarkMassPlan {
 
 export interface LandmarkPlan {
   id: string;
+  /** Null for a procedural landmark; persistent source identity otherwise. */
+  sourceId?: string | null;
+  lineage?: string;
+  origin?: ArchitectureOrigin;
+  protection?: ArchitectureProtection;
   landmarkGrammarId: LandmarkGrammarId;
   districtId: string | null;
   blockId: string | null;
   sitePolygon: Ring;
-  placementLineage: string;
+  placement?: PlacementFrame;
   seed: string;
   appearanceSeed: string;
+  paletteId?: string | null;
   masses: LandmarkMassPlan[];
   openSpaceIds: string[];
   areaM2: number;
+  /** Compatibility alias for pre-Phase-5 consumers; equal to lineage when present. */
+  placementLineage?: string;
 }
 
 export interface CompleteCityDiagnostics {
@@ -749,8 +903,10 @@ export interface CompleteCityDiagnostics {
   landmarkFailures?: string[];
   /** Set when explicit reservations were supplied: the validator requires this many landmarks. */
   explicitReservationCount?: number;
+  orphanedOverrides?: string[];
   warnings: string[];
 }
+
 
 export interface CompleteCityPlan extends CompleteCityPlanIdentity {
   openSpaceProfile: DistrictOpenSpaceProfile;
@@ -1301,6 +1457,7 @@ function landmarkMassSpecial(
     leftX + supportWidth,
     bounds.height * 0.36,
     rightX - leftX - supportWidth,
+
     bounds.height * 0.28
   ));
   if (!left || !right || !connector) return [];
@@ -1309,6 +1466,158 @@ function landmarkMassSpecial(
     { footprint: right, elevationM: 0, heightM: supportHeight, kind: "logo-gateway-support" },
     { footprint: connector, elevationM: connectorElevation, heightM: connectorHeight, kind: "elevated-logo-sign" }
   ];
+}
+function assertPersistentSite(
+  label: string,
+  site: Ring,
+  placement: PlacementFrame,
+  source: CitySourceV4,
+  districtPlan: DistrictPlan,
+  districtId: string | null,
+  blockId: string | null,
+  occupancyAll: MultiPolygon,
+  peerSites: readonly Ring[]
+): void {
+  if (!validRing(site)) throw new Error(`${label} sitePolygon is invalid.`);
+  const land = source.terrain.land;
+  const urban = source.terrain.urbanFootprint ?? land;
+  if (!ringCountsAsContained(site, ringAsMulti(land))) throw new Error(`${label} sitePolygon must be contained in land.`);
+  if (!ringCountsAsContained(site, ringAsMulti(urban))) throw new Error(`${label} sitePolygon must be contained in the urban footprint.`);
+  if (siteOverlapsOccupancy(site, occupancyAll)) throw new Error(`${label} sitePolygon overlaps road occupancy.`);
+  if (!hasValidPlacementFrame(placement)) throw new Error(`${label} placement frame is invalid.`);
+  const frame = placementRing(placement);
+  if (!ringCountsAsContained(frame, ringAsMulti(site))) throw new Error(`${label} placement frame exceeds sitePolygon.`);
+  if (districtId !== null && !districtPlan.blocks.some((block) => block.districtFragments.some((fragment) => fragment.districtId === districtId))) {
+    throw new Error(`${label} references unknown district "${districtId}".`);
+  }
+  if (blockId !== null) {
+    const block = districtPlan.blocks.find((candidate) => candidate.id === blockId);
+    if (!block) throw new Error(`${label} references unknown block "${blockId}".`);
+    if (!ringCountsAsContained(site, block.buildable)) throw new Error(`${label} sitePolygon exceeds its block buildable.`);
+  }
+  for (const peer of peerSites) {
+    if (ringOverlaps(site, peer)) throw new Error(`${label} sitePolygon overlaps another persistent architecture site.`);
+  }
+}
+
+function materializePersistentBuilding(
+  source: PersistentBuildingSource,
+  districtById: Map<string, DistrictSource>,
+  banks: Map<string, number>
+): BuildingPlan {
+  const grammar = BUILDING_GRAMMAR_REGISTRY.get(source.grammarId);
+  if (!grammar) throw new Error(`Persistent building "${source.id}" references unknown grammar "${source.grammarId}".`);
+  if (!grammar.compatibleUses.includes(source.visualUse)) throw new Error(`Persistent building "${source.id}" visual use is incompatible with grammar "${source.grammarId}".`);
+  if (!(source.heightM >= grammar.height.minM - GEOMETRY_EPSILON && source.heightM <= grammar.height.maxM + GEOMETRY_EPSILON)) {
+    throw new Error(`Persistent building "${source.id}" height is outside grammar "${source.grammarId}" bounds.`);
+  }
+  const frameRing = placementRing(source.placement);
+  const frameAreaM2 = source.placement.widthM * source.placement.depthM;
+  if (!grammarFitsParcel(grammar, {
+    polygon: frameRing,
+    frontageAngleRad: source.placement.rotationRad,
+    areaM2: frameAreaM2,
+    seed: source.seed
+  })) {
+    throw new Error(`Persistent building "${source.id}" placement frame does not fit grammar "${source.grammarId}".`);
+  }
+  const setbackM = range(`${source.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
+  const geometrySeed = `${source.seed}/geometry`;
+  const rawMasses = archetypeMasses(
+    { polygon: frameRing, frontageAngleRad: source.placement.rotationRad },
+    grammar,
+    geometrySeed,
+    source.heightM,
+    setbackM,
+    null
+  );
+  if (rawMasses.length < grammar.massing.minMasses || rawMasses.length > grammar.massing.maxMasses) {
+    throw new Error(`Persistent building "${source.id}" produced an invalid mass count.`);
+  }
+  if (rawMasses.some((mass) => !validRing(mass.footprint) || mass.elevationM < 0 || mass.heightM <= 0 || !ringCountsAsContained(mass.footprint, ringAsMulti(source.sitePolygon)))) {
+    throw new Error(`Persistent building "${source.id}" produced a mass outside its sitePolygon.`);
+  }
+  const district = source.districtId === null ? undefined : districtById.get(source.districtId);
+  const paletteId = source.paletteId;
+  const bank = paletteId === null ? parcelBank(district, banks) : (banks.get(paletteId) ?? BASE_BANK);
+  const buildingId = source.id;
+  const masses: BuildingMassPlan[] = rawMasses.map((raw, index) => {
+    const massSeed = `${geometrySeed}/mass/${index}`;
+    const appearanceMassSeed = `${source.appearanceSeed}/mass/${index}`;
+    const wallSlot = weightedIndex([...grammar.materialSlots.wall], `${appearanceMassSeed}/wall`);
+    const roofSlot = weightedIndex([...grammar.materialSlots.roof], `${appearanceMassSeed}/roof`);
+    return {
+      id: stableId("mass", `${buildingId}|m${index}`),
+      buildingId,
+      index,
+      footprint: raw.footprint,
+      archetype: grammar.archetype,
+      elevationM: raw.elevationM,
+      heightM: raw.heightM,
+      frontage: null,
+      roofline: grammar.rooflines[fnv1a(`${appearanceMassSeed}/roofline`) % grammar.rooflines.length]!,
+      facadeProfile: grammar.facadeProfiles[fnv1a(`${appearanceMassSeed}/facade`) % grammar.facadeProfiles.length]!,
+      massing: raw.kind,
+      wallSlots: grammar.materialSlots.wall,
+      roofSlots: grammar.materialSlots.roof,
+      neonSlots: grammar.materialSlots.neon,
+      wallMaterial: materialIndex(bank, wallSlot),
+      roofMaterial: materialIndex(bank, 3 + roofSlot),
+      facadeSeed: hashUnit(`${appearanceMassSeed}/facade-seed`),
+      signageRate: range(`${appearanceMassSeed}/signage`, grammar.signage.rateMin, grammar.signage.rateMax),
+      rooftopUtilityRate: range(`${appearanceMassSeed}/rooftop`, grammar.rooftopUtility.rateMin, grammar.rooftopUtility.rateMax),
+      wear: range(`${appearanceMassSeed}/wear`, grammar.wear.min, grammar.wear.max),
+      detailPolicy: grammar.geometryPolicy.detail === "none" ? "coarse" : grammar.geometryPolicy.neon ? "both" : "detail",
+      neonEnabled: grammar.geometryPolicy.neon,
+      seed: massSeed
+    };
+  });
+  return {
+    id: source.id,
+    sourceId: source.id,
+    lineage: source.lineage,
+    origin: source.origin,
+    protection: source.protection,
+    parcelId: null,
+    blockId: source.blockId,
+    fragmentId: null,
+    districtId: source.districtId,
+    grammarId: source.grammarId,
+    visualUse: source.visualUse,
+    archetype: grammar.archetype,
+    seed: source.seed,
+    appearanceSeed: source.appearanceSeed,
+    paletteId: source.paletteId,
+    setbackM,
+    heightM: source.heightM,
+    sitePolygon: source.sitePolygon,
+    placement: source.placement,
+    masses,
+    areaM2: masses.reduce((sum, mass) => sum + Math.abs(ringArea(mass.footprint)), 0)
+  };
+}
+
+function persistentLandmarkPlan(source: PersistentPlaceSource): InternalLandmarkPlan {
+  return {
+    id: source.id,
+    sourceId: source.id,
+    lineage: source.lineage,
+    origin: source.origin,
+    protection: source.protection,
+    landmarkGrammarId: source.landmarkGrammarId,
+    districtId: source.districtId,
+    blockId: source.blockId,
+    sitePolygon: source.sitePolygon,
+    placement: source.placement,
+    placementLineage: source.lineage,
+    seed: source.seed,
+    appearanceSeed: source.appearanceSeed,
+    paletteId: source.paletteId,
+    masses: [],
+    openSpaceIds: [],
+    areaM2: Math.abs(ringArea(source.sitePolygon)),
+    rawMasses: []
+  };
 }
 
 const EMPTY_COMPATIBILITY_TAGS: ReadonlySet<string> = new Set();
@@ -1325,18 +1634,20 @@ function landmarkFitsDistrict(grammar: LandmarkGrammarDefinition, tags: Readonly
 }
 
 function planLandmarks(
-  source: CitySourceV3,
+  source: CitySourceV4,
   districtPlan: DistrictPlan,
   reserved: readonly MajorLandmarkSiteReservation[],
   districtById: Map<string, DistrictSource>,
-  explicit: boolean
+  explicit: boolean,
+  occupiedSites: readonly Ring[] = [],
+  occupiedGrammars: ReadonlySet<LandmarkGrammarId> = new Set()
 ): { landmarks: InternalLandmarkPlan[]; skipped: string[]; failures: string[]; warnings: string[]; reservedLandmarkIds: ReadonlySet<string> } {
   const landmarks: InternalLandmarkPlan[] = [];
   const skipped: string[] = [];
   const failures: string[] = [];
   const warnings: string[] = [];
+  const placedGrammars = new Set<LandmarkGrammarId>(occupiedGrammars);
   const usedBlocks = new Set<string>();
-  const placedGrammars = new Set<LandmarkGrammarId>();
   const sitesByBlock = new Map<string, Ring[]>();
   const reservedLandmarkIds = new Set<string>();
   for (const reservation of reserved) {
@@ -1377,13 +1688,19 @@ function planLandmarks(
     const landmarkId = stableId("landmark", `${reservation.grammarId}|${reservation.lineage}|${pointKey(reservation.sitePolygon[0]!)}`);
     landmarks.push({
       id: landmarkId,
+      sourceId: null,
+      lineage: reservation.lineage,
+      origin: "generated",
+      protection: "none",
       landmarkGrammarId: reservation.grammarId,
       districtId,
       blockId,
       sitePolygon: reservation.sitePolygon,
+      placement: placementFrameForRing(reservation.sitePolygon),
       placementLineage: reservation.lineage,
       seed: reservation.seed,
       appearanceSeed: `${reservation.seed}/appearance`,
+      paletteId: districtId === null ? null : districtById.get(districtId)?.paletteId ?? null,
       masses: [],
       openSpaceIds: [],
       areaM2: Math.abs(ringArea(reservation.sitePolygon)),
@@ -1415,7 +1732,8 @@ function planLandmarks(
         landmarkFitsDistrict(definition, districtCompatibilityTags(fragment.districtId, districtById))
       );
       const compatibleArea = union(compatibleFragments.map((fragment) => fragment.buildable));
-      const available = existing.length > 0 ? difference(compatibleArea, [union(existing.map((ring) => ringAsMulti(ring)))]) : compatibleArea;
+      const occupied = [...occupiedSites, ...existing];
+      const available = occupied.length > 0 ? difference(compatibleArea, [union(occupied.map((ring) => ringAsMulti(ring)))]) : compatibleArea;
       if (multiArea(available) < definition.minSiteAreaM2) continue;
       const blockSeed = stableId("seed", `${source.citySeed}/landmarks/v3/fallback/${grammarId}/${block.id}`);
       const compactSite = compactFallbackLandmarkSite(available, definition, blockSeed);
@@ -1442,15 +1760,22 @@ function planLandmarks(
         .sort((a, b) => a.id.localeCompare(b.id));
       const compatible = fragments.find((fragment) => landmarkFitsDistrict(definition, districtCompatibilityTags(fragment.districtId, districtById)));
       if (!compatible) continue;
+      const lineage = `fallback:${grammarId}:${block.id}`;
       landmarks.push({
         id: stableId("landmark", `${grammarId}|fallback|${block.id}|${pointKey(site[0]!)}`),
+        sourceId: null,
+        lineage,
+        origin: "generated",
+        protection: "none",
         landmarkGrammarId: grammarId,
         districtId: compatible.districtId,
         blockId: block.id,
         sitePolygon: site,
-        placementLineage: `fallback:${grammarId}:${block.id}`,
+        placement: placementFrameForRing(site),
+        placementLineage: lineage,
         seed: blockSeed,
         appearanceSeed: `${blockSeed}/appearance`,
+        paletteId: compatible.districtId === null ? null : districtById.get(compatible.districtId)?.paletteId ?? null,
         masses: [],
         openSpaceIds: [],
         areaM2: Math.abs(ringArea(site)),
@@ -1463,7 +1788,6 @@ function planLandmarks(
     }
     if (!placed) {
       skipped.push(grammarId);
-      if (explicit) failures.push(`Landmark grammar "${grammarId}" could not be placed in any compatible block.`);
     }
   }
   landmarks.sort((a, b) => a.id.localeCompare(b.id));
@@ -1484,20 +1808,31 @@ function carveLandmarkOpenSpaces(
     const geometry = landmarkOpenSpaceGeometry(landmark.sitePolygon, definition, landmark.seed);
     if (!geometry) {
       const category = definition.requiredOpenSpace?.category ?? "open space";
-      failures.push(`Landmark "${landmark.landmarkGrammarId}" at "${landmark.placementLineage}" could not carve its required ${category} open space; the landmark is dropped and its site returns to parcel accounting.`);
+      failures.push(`Landmark "${landmark.landmarkGrammarId}" at "${landmark.lineage ?? landmark.placementLineage ?? landmark.id}" could not carve its required ${category} open space; the landmark is dropped and its site returns to parcel accounting.`);
       failedLandmarkIds.add(landmark.id);
       continue;
     }
+    let massRegion = geometry.massRegion;
+    if (landmark.sourceId !== null && landmark.sourceId !== undefined && landmark.placement !== undefined) {
+      massRegion = intersection(massRegion, ringAsMulti(placementRing(landmark.placement)));
+      if (multiArea(massRegion) <= GEOMETRY_EPSILON) {
+        failures.push(`Persistent landmark "${landmark.id}" placement frame leaves no materializable mass region.`);
+        failedLandmarkIds.add(landmark.id);
+        continue;
+      }
+    }
     if (!definition.requiredOpenSpace) {
-      regions.set(landmark.id, geometry.massRegion);
+      regions.set(landmark.id, massRegion);
       continue;
     }
     const category = definition.requiredOpenSpace.category;
     const piece = geometry.openSpace!;
     const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
-    const bank = district ? (banks.get(district.paletteId) ?? BASE_BANK) : BASE_BANK;
+    const paletteId = landmark.paletteId ?? district?.paletteId ?? null;
+    const bank = paletteId === null ? BASE_BANK : (banks.get(paletteId) ?? BASE_BANK);
+    const lineage = landmark.lineage ?? landmark.placementLineage ?? landmark.id;
     const openSpace: OpenSpacePlan = {
-      id: stableId("open", `${landmark.id}|${category}|${landmark.placementLineage}|${pointKey(piece[0]!)}`),
+      id: stableId("open", `${landmark.id}|${category}|${lineage}|${pointKey(piece[0]!)}`),
       parcelId: null,
       blockId: landmark.blockId ?? "",
       fragmentId: "",
@@ -1508,14 +1843,14 @@ function carveLandmarkOpenSpaces(
       polygon: piece,
       surfaceStyle: OPEN_SPACE_SURFACE_STYLES[category],
       detailStyle: OPEN_SPACE_DETAIL_STYLES[category],
-      lineage: landmark.placementLineage,
+      lineage,
       seed: `${landmark.seed}/open`,
       areaM2: Math.abs(ringArea(piece)),
       material: materialIndex(bank, OPEN_SPACE_SLOTS[category])
     };
     landmark.openSpaceIds.push(openSpace.id);
     openSpaces.push(openSpace);
-    regions.set(landmark.id, geometry.massRegion);
+    regions.set(landmark.id, massRegion);
   }
   return { openSpaces, regions, failedLandmarkIds, failures };
 }
@@ -2436,6 +2771,10 @@ export function planParcelBuilding(
   });
   return {
     id: buildingId,
+    sourceId: null,
+    lineage: `${parcel.id}/${grammarId}`,
+    origin: "generated",
+    protection: "none",
     parcelId: parcel.id,
     blockId: parcel.blockId,
     fragmentId: parcel.fragmentId,
@@ -2445,8 +2784,11 @@ export function planParcelBuilding(
     archetype: grammar.archetype,
     seed: geometrySeed,
     appearanceSeed,
+    paletteId: district?.paletteId ?? null,
     setbackM,
     heightM: Math.max(...masses.map((mass) => mass.elevationM + mass.heightM)),
+    sitePolygon: parcel.polygon,
+    placement: placementFrameForRing(parcel.polygon, parcel.frontageAngleRad, masses.map((mass) => mass.footprint)),
     masses,
     areaM2: masses.reduce((sum, mass) => sum + Math.abs(ringArea(mass.footprint)), 0)
   };
@@ -3013,11 +3355,22 @@ function materializeLandmarkMasses(
   for (const landmark of landmarks) {
     const definition = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId)!;
     const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
-    const bank = parcelBank(district, banks);
+    const paletteId = landmark.paletteId ?? district?.paletteId ?? null;
+    const bank = paletteId === null ? BASE_BANK : (banks.get(paletteId) ?? BASE_BANK);
     // Compound overview grammars own a dedicated arrangement branch; polygonal and
     // established rectangular grammars retain their prior paths and seed streams.
     const massRegion = regions.get(landmark.id) ?? ringAsMulti(landmark.sitePolygon);
     landmark.rawMasses = rawLandmarkMassesForSite(landmark.sitePolygon, definition, landmark.seed, massRegion);
+    if (landmark.sourceId !== null && landmark.sourceId !== undefined) {
+      if (landmark.rawMasses.length < definition.massTemplates.length || landmark.rawMasses.some((raw) =>
+        !validRing(raw.footprint)
+        || raw.elevationM < 0
+        || raw.heightM <= 0
+        || !ringCountsAsContained(raw.footprint, ringAsMulti(landmark.sitePolygon))
+      )) {
+        throw new Error(`Persistent landmark "${landmark.id}" produced an invalid mass arrangement.`);
+      }
+    }
     landmark.masses = landmark.rawMasses.map((raw, index) => {
       const massSeed = `${landmark.seed}/mass/${index}`;
       // WHY: landmark appearance changes must not move geometry or IDs.
@@ -3050,83 +3403,293 @@ function materializeLandmarkMasses(
         seed: massSeed
       };
     });
+    if (landmark.sourceId === null) {
+      const rotationRad = landmark.placement?.rotationRad ?? longestEdgeAngle(landmark.sitePolygon);
+      landmark.placement = placementFrameForRing(
+        landmark.sitePolygon,
+        rotationRad,
+        landmark.rawMasses.map((mass) => mass.footprint)
+      );
+    }
   }
 }
 
+function equivalentSitePolygon(a: Ring, b: Ring): boolean {
+  if (!validRing(a) || !validRing(b)) return false;
+  try {
+    return isSnapNoise(difference(ringAsMulti(a), [ringAsMulti(b)]))
+      && isSnapNoise(difference(ringAsMulti(b), [ringAsMulti(a)]));
+  } catch {
+    return false;
+  }
+}
+
+function refreshBuildingAppearance(building: BuildingPlan, districtById: Map<string, DistrictSource>, banks: Map<string, number>): void {
+  const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId);
+  if (!grammar) return;
+  const district = building.districtId ? districtById.get(building.districtId) : undefined;
+  const paletteId = building.paletteId ?? district?.paletteId ?? null;
+  const bank = paletteId === null ? BASE_BANK : (banks.get(paletteId) ?? BASE_BANK);
+  building.masses = building.masses.map((mass, index) => {
+    const appearanceMassSeed = `${building.appearanceSeed}/mass/${index}`;
+    const wallSlot = weightedIndex([...grammar.materialSlots.wall], `${appearanceMassSeed}/wall`);
+    const roofSlot = weightedIndex([...grammar.materialSlots.roof], `${appearanceMassSeed}/roof`);
+    return {
+      ...mass,
+      roofline: grammar.rooflines[fnv1a(`${appearanceMassSeed}/roofline`) % grammar.rooflines.length]!,
+      facadeProfile: grammar.facadeProfiles[fnv1a(`${appearanceMassSeed}/facade`) % grammar.facadeProfiles.length]!,
+      wallMaterial: materialIndex(bank, wallSlot),
+      roofMaterial: materialIndex(bank, 3 + roofSlot),
+      facadeSeed: hashUnit(`${appearanceMassSeed}/facade-seed`),
+      signageRate: range(`${appearanceMassSeed}/signage`, grammar.signage.rateMin, grammar.signage.rateMax),
+      rooftopUtilityRate: range(`${appearanceMassSeed}/rooftop`, grammar.rooftopUtility.rateMin, grammar.rooftopUtility.rateMax),
+      wear: range(`${appearanceMassSeed}/wear`, grammar.wear.min, grammar.wear.max)
+    };
+  });
+}
+
+function refreshLandmarkAppearance(landmark: LandmarkPlan, districtById: Map<string, DistrictSource>, banks: Map<string, number>): void {
+  const definition = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId);
+  if (!definition) return;
+  const district = landmark.districtId ? districtById.get(landmark.districtId) : undefined;
+  const paletteId = landmark.paletteId ?? district?.paletteId ?? null;
+  const bank = paletteId === null ? BASE_BANK : (banks.get(paletteId) ?? BASE_BANK);
+  landmark.masses = landmark.masses.map((mass, index) => {
+    const appearanceMassSeed = `${landmark.appearanceSeed}/mass/${index}`;
+    const wallSlot = weightedIndex([...definition.materialSlots.wall], `${appearanceMassSeed}/wall`);
+    const roofSlot = weightedIndex([...definition.materialSlots.roof], `${appearanceMassSeed}/roof`);
+    return {
+      ...mass,
+      wallMaterial: materialIndex(bank, wallSlot),
+      roofMaterial: materialIndex(bank, 3 + roofSlot),
+      facadeSeed: hashUnit(`${appearanceMassSeed}/facade-seed`),
+      facadeProfile: definition.facadeProfiles[fnv1a(`${appearanceMassSeed}/facade`) % definition.facadeProfiles.length]!,
+      roofline: definition.rooflines[fnv1a(`${appearanceMassSeed}/roofline`) % definition.rooflines.length]!,
+      signageRate: range(`${appearanceMassSeed}/signage`, definition.signage.rateMin, definition.signage.rateMax),
+      rooftopUtilityRate: range(`${appearanceMassSeed}/rooftop`, definition.rooftopUtility.rateMin, definition.rooftopUtility.rateMax),
+      wear: range(`${appearanceMassSeed}/wear`, definition.wear.min, definition.wear.max)
+    };
+  });
+}
+
+function applyArchitectureOverrides(
+  source: CitySourceV4,
+  buildings: BuildingPlan[],
+  landmarks: LandmarkPlan[],
+  districtById: Map<string, DistrictSource>,
+  banks: Map<string, number>
+): string[] {
+  const targets = new Map<string, BuildingPlan | LandmarkPlan>();
+  for (const building of buildings) targets.set(`building:${building.id}`, building);
+  for (const landmark of landmarks) targets.set(`place:${landmark.id}`, landmark);
+  const peers = [...buildings, ...landmarks];
+  const orphaned: string[] = [];
+  for (const override of source.architecture.overrides as ArchitectureOverrideSource[]) {
+    const key = `${override.targetKind}:${override.targetId}`;
+    const target = targets.get(key);
+    const targetIsDerived = target?.sourceId === null;
+    const targetLineage = target?.lineage;
+    const targetSite = target?.sitePolygon;
+    let compatible = targetIsDerived
+      && targetLineage === override.lineage
+      && targetSite !== undefined
+      && equivalentSitePolygon(targetSite, override.snapshotSitePolygon);
+    if (compatible && targetSite !== undefined) {
+      for (const peer of peers) {
+        if (peer === target || peer.sitePolygon === undefined) continue;
+        if (ringOverlaps(targetSite, peer.sitePolygon)) {
+          compatible = false;
+          break;
+        }
+      }
+    }
+    if (!compatible) {
+      if (override.protection !== "none") throw new Error(`Protected architecture override "${key}" no longer matches its target site or lineage.`);
+      orphaned.push(override.targetId);
+      continue;
+    }
+    if (override.appearanceSeed !== undefined) target!.appearanceSeed = override.appearanceSeed;
+    if (Object.prototype.hasOwnProperty.call(override, "paletteId")) target!.paletteId = override.paletteId ?? null;
+    if (target !== undefined && "grammarId" in target) refreshBuildingAppearance(target, districtById, banks);
+    else if (target !== undefined) refreshLandmarkAppearance(target, districtById, banks);
+  }
+  return orphaned;
+}
+
+
 export function buildCompleteCityPlan(
-  source: CitySourceV3,
+  source: CitySourceV4,
   revision = 1,
   epoch = 0,
   reservedSites?: readonly MajorLandmarkSiteReservation[]
 ): CompleteCityPlan {
   if (!Number.isInteger(revision) || revision < 1) throw new Error("Complete plan source revision must be a positive integer.");
   if (!Number.isInteger(epoch) || epoch < 0) throw new Error("Complete plan epoch must be a non-negative integer.");
+  if (!source.architecture || !Array.isArray(source.architecture.buildings) || !Array.isArray(source.architecture.places) || !Array.isArray(source.architecture.overrides)) {
+    throw new Error("Complete plan architecture source is incomplete.");
+  }
   const districtPlan = buildDistrictPlan(source);
   const network = compileRouteNetwork(source.roads, ROUTE_CLASS_REGISTRY);
   const occupancy = compiledRouteOccupancy(network);
   const carriageway = carriagewayPolygons(network);
-  const banks = new Map(derivePaletteBanks(source).map((entry) => [entry.paletteId, entry.bank]));
+  const paletteEntries = derivePaletteBanks(source);
+  const banks = new Map(paletteEntries.map((entry) => [entry.paletteId, entry.bank]));
   const districtById = new Map(source.districts.map((district) => [district.id, district]));
+  const peerSites: Ring[] = [];
+  const architectureIds = new Set<string>();
+  const architectureLineages = new Set<string>();
+  for (const record of [...source.architecture.buildings, ...source.architecture.places]) {
+    if (architectureIds.has(record.id)) throw new Error(`Duplicate architecture object id "${record.id}".`);
+    architectureIds.add(record.id);
+    if (architectureLineages.has(record.lineage)) throw new Error(`Duplicate architecture lineage "${record.lineage}".`);
+    architectureLineages.add(record.lineage);
+  }
+  const persistentBuildings: BuildingPlan[] = [];
+  const persistentLandmarks: InternalLandmarkPlan[] = [];
+  for (const building of source.architecture.buildings) {
+    assertPersistentSite(
+      `Persistent building "${building.id}"`,
+      building.sitePolygon,
+      building.placement,
+      source,
+      districtPlan,
+      building.districtId,
+      building.blockId,
+      occupancy.all,
+      peerSites
+    );
+    peerSites.push(building.sitePolygon);
+  }
+  for (const place of source.architecture.places) {
+    assertPersistentSite(
+      `Persistent place "${place.id}"`,
+      place.sitePolygon,
+      place.placement,
+      source,
+      districtPlan,
+      place.districtId,
+      place.blockId,
+      occupancy.all,
+      peerSites
+    );
+    peerSites.push(place.sitePolygon);
+  }
+  // Materialize persistent sources only after every site has passed the shared
+  // land/urban/road/peer gates, so a later failure cannot leave a partial carve.
+  for (const building of source.architecture.buildings) {
+    persistentBuildings.push(materializePersistentBuilding(building, districtById, banks));
+  }
+  for (const place of source.architecture.places) {
+    if (!LANDMARK_GRAMMAR_REGISTRY.has(place.landmarkGrammarId)) {
+      throw new Error(`Persistent place "${place.id}" references unknown landmark grammar "${place.landmarkGrammarId}".`);
+    }
+    const definition = LANDMARK_GRAMMAR_REGISTRY.get(place.landmarkGrammarId)!;
+    const siteAreaM2 = Math.abs(ringArea(place.sitePolygon));
+    if (siteAreaM2 + 0.5 < definition.minSiteAreaM2 || siteAreaM2 > definition.maxSiteAreaM2 + 0.5) {
+      throw new Error(`Persistent place "${place.id}" site area is outside grammar "${place.landmarkGrammarId}" bounds.`);
+    }
+    persistentLandmarks.push(persistentLandmarkPlan(place));
+  }
+
   const reserved = reservedSites ?? reserveMajorLandmarkSites(source);
-  // EXPLICIT reservations (the Worker's full-generation flow) are honored verbatim and
-  // any road overlap is structural failure — never filtered here. Only INTERNALLY
-  // derived reservations (ordinary planning without reservedSites) may be dropped when
-  // the roads did not leave their site road-free; the grammar then falls back to a
-  // legal block-inscribed site instead of failing the city.
   const explicitReservations = reservedSites !== undefined;
   const honored: MajorLandmarkSiteReservation[] = [];
   const droppedReservations: string[] = [];
   for (const reservation of reserved) {
-    if (!explicitReservations && siteOverlapsOccupancy(reservation.sitePolygon, occupancy.all)) {
+    if (!validRing(reservation.sitePolygon)) {
+      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" has an invalid site polygon.`);
       droppedReservations.push(reservation.grammarId);
-    } else {
-      honored.push(reservation);
+      continue;
     }
+    const land = source.terrain.land;
+    const urban = source.terrain.urbanFootprint ?? land;
+    if (!ringCountsAsContained(reservation.sitePolygon, ringAsMulti(land)) || !ringCountsAsContained(reservation.sitePolygon, ringAsMulti(urban))) {
+      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" lies outside the active urban land.`);
+      droppedReservations.push(reservation.grammarId);
+      continue;
+    }
+    if (siteOverlapsOccupancy(reservation.sitePolygon, occupancy.all)) {
+      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps road occupancy.`);
+      droppedReservations.push(reservation.grammarId);
+      continue;
+    }
+    if (peerSites.some((peer) => ringOverlaps(reservation.sitePolygon, peer))) {
+      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps persistent architecture.`);
+      droppedReservations.push(reservation.grammarId);
+      continue;
+    }
+    if (honored.some((peer) => ringOverlaps(reservation.sitePolygon, peer.sitePolygon))) {
+      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps another landmark reservation.`);
+      droppedReservations.push(reservation.grammarId);
+      continue;
+    }
+    honored.push(reservation);
   }
-  const { landmarks: internalLandmarks, skipped, failures: associationFailures, warnings: landmarkWarnings, reservedLandmarkIds } = planLandmarks(source, districtPlan, honored, districtById, explicitReservations);
+
+  const persistentSiteRings = [
+    ...source.architecture.buildings.map((building) => building.sitePolygon),
+    ...source.architecture.places.map((place) => place.sitePolygon)
+  ];
+  const occupiedGrammars = new Set<LandmarkGrammarId>(source.architecture.places.map((place) => place.landmarkGrammarId));
+  const generatedLandmarks = planLandmarks(
+    source,
+    districtPlan,
+    honored,
+    districtById,
+    explicitReservations,
+    persistentSiteRings,
+    occupiedGrammars
+  );
+  const internalLandmarks = [...persistentLandmarks, ...generatedLandmarks.landmarks];
   const { openSpaces: landmarkOpenSpaces, regions, failedLandmarkIds, failures: carveFailures } = carveLandmarkOpenSpaces(internalLandmarks, districtById, banks);
-  // Explicit full-generation reservation sites must always materialize: an un-carveable
-  // required open space or empty masses is a structural error, never a silent drop.
-  // Fallback (reselect) sites are ordinary planning and drop with accounting instead.
-  if ([...failedLandmarkIds].some((id) => reservedLandmarkIds.has(id))) {
+  const failedPersistent = internalLandmarks.find((landmark) => landmark.sourceId !== null && landmark.sourceId !== undefined && failedLandmarkIds.has(landmark.id));
+  if (failedPersistent) throw new Error(`Persistent landmark "${failedPersistent.id}" could not materialize: ${carveFailures[0] ?? "invalid compound geometry"}`);
+  if ([...failedLandmarkIds].some((id) => generatedLandmarks.reservedLandmarkIds.has(id))) {
     throw new Error(`Explicit landmark reservation could not materialize: ${carveFailures[0]!}`);
   }
   const carvedLandmarks = internalLandmarks.filter((landmark) => !failedLandmarkIds.has(landmark.id));
   materializeLandmarkMasses(carvedLandmarks, regions, districtById, banks);
+  const emptyPersistent = carvedLandmarks.find((landmark) => landmark.sourceId !== null && landmark.sourceId !== undefined && landmark.masses.length === 0);
+  if (emptyPersistent) throw new Error(`Persistent landmark "${emptyPersistent.id}" produced no masses.`);
   const emptyLandmarks = carvedLandmarks.filter((landmark) => landmark.masses.length === 0);
-  const emptyReservation = emptyLandmarks.find((landmark) => reservedLandmarkIds.has(landmark.id));
+  const emptyReservation = emptyLandmarks.find((landmark) => generatedLandmarks.reservedLandmarkIds.has(landmark.id));
   if (emptyReservation) {
     throw new Error(`Explicit landmark reservation "${emptyReservation.landmarkGrammarId}" produced no masses; full-generation sites must materialize.`);
   }
   const landmarks = carvedLandmarks
     .filter((landmark) => landmark.masses.length > 0)
-    .map(({ rawMasses: _rawMasses, ...landmark }) => landmark);
-  const allSkipped = [...skipped, ...emptyLandmarks.map((landmark) => landmark.landmarkGrammarId)];
-  // Only kept landmark sites are carved from fragments: a dropped landmark's reserved
-  // region returns to explicit parcel/open-space/remainder accounting instead of
-  // leaving an unexplained void in the city.
-  const landmarkSites = new Map(landmarks.map((landmark) => [landmark.id, landmark.sitePolygon]));
-  const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, landmarkSites, districtById, banks);
-  const { parcels, buildings, openSpaces: unbuiltOpenSpaces, warnings: buildingWarnings } = planBuildings(
+    .map(({ rawMasses: _rawMasses, ...landmark }) => landmark)
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  // Every persistent site (buildings and places), plus every retained generated
+  // landmark site, is excluded before the procedural cell/parcel pass.
+  const architectureSites = new Map<string, Ring>();
+  for (const building of source.architecture.buildings) architectureSites.set(`building:${building.id}`, building.sitePolygon);
+  for (const siteLandmark of landmarks) architectureSites.set(`place:${siteLandmark.id}`, siteLandmark.sitePolygon);
+  const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, architectureSites, districtById, banks);
+  const procedural = planBuildings(
     planningParcels,
     districtById,
     banks,
     occupancy.all,
     ringCentroid(source.terrain.land)
   );
+  const buildings = [...persistentBuildings, ...procedural.buildings].sort((a, b) => a.id.localeCompare(b.id));
+  const orphanedOverrides = applyArchitectureOverrides(source, buildings, landmarks, districtById, banks);
   const placedLandmarkIds = new Set(landmarks.map((landmark) => landmark.id));
   const keptLandmarkOpenSpaces = landmarkOpenSpaces.filter((openSpace) => openSpace.landmarkId === null || placedLandmarkIds.has(openSpace.landmarkId));
-  const allOpenSpaces = [...keptLandmarkOpenSpaces, ...openSpaces, ...unbuiltOpenSpaces].sort((a, b) => a.id.localeCompare(b.id));
+  const allOpenSpaces = [...keptLandmarkOpenSpaces, ...openSpaces, ...procedural.openSpaces].sort((a, b) => a.id.localeCompare(b.id));
+  const allSkipped = [...generatedLandmarks.skipped, ...emptyLandmarks.map((landmark) => landmark.landmarkGrammarId)];
   const landmarkFailures = [
-    ...associationFailures,
+    ...generatedLandmarks.failures,
     ...carveFailures,
-    ...emptyLandmarks.map((landmark) => `Landmark "${landmark.landmarkGrammarId}" at "${landmark.placementLineage}" produced no masses and was dropped.`)
+    ...emptyLandmarks.map((landmark) => `Landmark "${landmark.landmarkGrammarId}" at "${landmark.lineage ?? landmark.placementLineage ?? landmark.id}" produced no masses and was dropped.`)
   ];
   const structuralInput = completeCityStructuralInput(source);
   const fragmentCount = districtPlan.blocks.reduce((sum, block) => sum + block.districtFragments.length, 0);
   const contentSignature = JSON.stringify({
     structuralInput,
-    parcelIds: parcels.map((parcel) => parcel.id),
+    parcelIds: procedural.parcels.map((parcel) => parcel.id),
     openSpaceIds: allOpenSpaces.map((openSpace) => openSpace.id),
     buildingIds: buildings.map((building) => building.id),
     landmarkIds: landmarks.map((landmark) => landmark.id)
@@ -3134,7 +3697,7 @@ export function buildCompleteCityPlan(
   const diagnostics: CompleteCityDiagnostics = {
     blockCount: districtPlan.blocks.length,
     fragmentCount,
-    parcelCount: parcels.length,
+    parcelCount: procedural.parcels.length,
     openSpaceCount: allOpenSpaces.length,
     buildingCount: buildings.length,
     massCount: buildings.reduce((sum, building) => sum + building.masses.length, 0) + landmarks.reduce((sum, landmark) => sum + landmark.masses.length, 0),
@@ -3142,12 +3705,14 @@ export function buildCompleteCityPlan(
     landmarkSkipped: allSkipped,
     landmarkFailures,
     explicitReservationCount: explicitReservations && honored.length > 0 ? honored.length : undefined,
+    orphanedOverrides: orphanedOverrides.length > 0 ? orphanedOverrides : undefined,
     warnings: [
       ...districtPlan.diagnostics.warnings,
-      ...landmarkWarnings,
-      ...droppedReservations.map((grammarId) => `Major landmark reservation for "${grammarId}" overlaps road occupancy and was dropped; the grammar falls back to a legal block-inscribed site.`),
+      ...generatedLandmarks.warnings,
+      ...droppedReservations.map((grammarId) => `Major landmark reservation for "${grammarId}" was dropped before procedural planning.`),
       ...warnings,
-      ...buildingWarnings
+      ...procedural.warnings,
+      ...orphanedOverrides.map((id) => `Architecture override "${id}" is orphaned, stale, or incompatible and was not remapped.`)
     ]
   };
   return {
@@ -3160,8 +3725,8 @@ export function buildCompleteCityPlan(
     districtPlan,
     routeOccupancy: occupancy,
     carriageway,
-    paletteBanks: derivePaletteBanks(source),
-    parcels,
+    paletteBanks: paletteEntries,
+    parcels: procedural.parcels,
     openSpaces: allOpenSpaces,
     buildings,
     landmarks,
@@ -3200,8 +3765,20 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
   if (typeof plan.actionToken !== "string" || plan.actionToken.length === 0) problems.push("Plan actionToken must be non-empty text.");
   if (typeof plan.buildToken !== "string" || plan.buildToken.length === 0) problems.push("Plan buildToken must be non-empty text.");
   const structuralInput = plan.structuralInput;
-  if (!isRecord(structuralInput) || typeof structuralInput.terrain !== "string" || typeof structuralInput.roads !== "string" || typeof structuralInput.districts !== "string" || typeof structuralInput.generation !== "string") {
-    problems.push("Plan structuralInput signature is incomplete.");
+  if (!isRecord(structuralInput) ||
+    typeof structuralInput.terrain !== "string" ||
+    structuralInput.terrain.trim().length === 0 ||
+    typeof structuralInput.roads !== "string" ||
+    structuralInput.roads.trim().length === 0 ||
+    typeof structuralInput.districts !== "string" ||
+    structuralInput.districts.trim().length === 0 ||
+    typeof structuralInput.generation !== "string" ||
+    structuralInput.generation.trim().length === 0 ||
+    typeof structuralInput.architecture !== "string" ||
+    structuralInput.architecture.trim().length === 0 ||
+    structuralInput.schemaVersion !== CITY_SCHEMA_VERSION ||
+    structuralInput.generatorVersion !== GENERATOR_VERSION) {
+    problems.push("Plan structuralInput signature is incomplete or unsupported.");
   }
   if (!isRecord(plan.districtPlan) || !Array.isArray(plan.districtPlan.blocks) || !Array.isArray(plan.districtPlan.developmentCells) || !Array.isArray(plan.districtPlan.openSpaceIntents)) {
     return [...problems, "Plan districtPlan is incomplete."];
@@ -3255,6 +3832,9 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
     if (diagnostics.landmarkCount !== landmarks.length) problems.push("Diagnostics landmarkCount does not match the landmarks array.");
     if (typeof diagnostics.explicitReservationCount === "number" && landmarks.length < diagnostics.explicitReservationCount) {
       problems.push(`Plan has ${landmarks.length} landmarks but ${diagnostics.explicitReservationCount} explicit reservations were required.`);
+    }
+    if (diagnostics.orphanedOverrides !== undefined && (!Array.isArray(diagnostics.orphanedOverrides) || diagnostics.orphanedOverrides.some((id) => typeof id !== "string" || id.trim().length === 0))) {
+      problems.push("Diagnostics orphanedOverrides must be an array of non-empty ids.");
     }
   }
   const fragmentById = new Map<string, DistrictBlockFragment>();
@@ -3317,10 +3897,28 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
   for (const building of buildings) {
     if (buildingIds.has(building.id)) problems.push(`Duplicate building id "${building.id}".`);
     buildingIds.add(building.id);
-    if (!parcelIds.has(building.parcelId)) problems.push(`Building "${building.id}" references unknown parcel "${building.parcelId}".`);
+    const sourceId = building.sourceId;
+    const persistent = typeof sourceId === "string";
+    if (!(sourceId === null || typeof sourceId === "string")) problems.push(`Building "${building.id}" has an invalid sourceId.`);
+    if (!persistent) {
+      if (building.parcelId === null || !parcelIds.has(building.parcelId)) problems.push(`Building "${building.id}" references unknown parcel "${building.parcelId}".`);
+      if (building.blockId === null || !blockById.has(building.blockId)) problems.push(`Derived building "${building.id}" references unknown block "${building.blockId}".`);
+      if (building.fragmentId === null || !fragmentById.has(building.fragmentId)) problems.push(`Derived building "${building.id}" references unknown fragment "${building.fragmentId}".`);
+    } else {
+      if (building.parcelId !== null) problems.push(`Persistent building "${building.id}" must not reference a parcel.`);
+      if (building.blockId !== null && !blockById.has(building.blockId)) problems.push(`Persistent building "${building.id}" references unknown block "${building.blockId}".`);
+      if (building.fragmentId !== null) problems.push(`Persistent building "${building.id}" must not reference a fragment.`);
+    }
+    if (typeof building.lineage !== "string" || building.lineage.trim().length === 0) {
+      problems.push(`Building "${building.id}" has an invalid lineage.`);
+    }
+    if (persistent && building.origin === undefined) problems.push(`Persistent building "${building.id}" is missing its origin.`);
+    if (persistent && building.protection === undefined) problems.push(`Persistent building "${building.id}" is missing its protection.`);
+    if (building.origin !== undefined && !["generated", "authored"].includes(building.origin)) problems.push(`Building "${building.id}" has an invalid origin.`);
+    if (building.protection !== undefined && !["none", "explicit", "manual-edit"].includes(building.protection)) problems.push(`Building "${building.id}" has an invalid protection.`);
     if (!BUILDING_GRAMMAR_REGISTRY.has(building.grammarId)) problems.push(`Building "${building.id}" references unknown grammar "${building.grammarId}".`);
     if (!Array.isArray(building.masses) || building.masses.length === 0) problems.push(`Building "${building.id}" has no masses.`);
-    const parcel = parcels.find((candidate) => candidate.id === building.parcelId);
+    const parcel = building.parcelId === null ? undefined : parcels.find((candidate) => candidate.id === building.parcelId);
     const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId);
     if (grammar && parcel && !grammarFitsParcel(grammar, parcel)) {
       problems.push(`Building "${building.id}" grammar "${building.grammarId}" does not fit its parcel "${parcel.id}".`);
@@ -3328,65 +3926,69 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
     if (grammar && Array.isArray(building.masses) && !(building.masses.length >= grammar.massing.minMasses && building.masses.length <= grammar.massing.maxMasses)) {
       problems.push(`Building "${building.id}" has ${building.masses.length} masses outside grammar "${building.grammarId}" declared range ${grammar.massing.minMasses}-${grammar.massing.maxMasses}.`);
     }
-    // WHY: grammar height describes the whole building, not each stacked mass independently.
     if (grammar && Number.isFinite(building.heightM) && Array.isArray(building.masses) && building.masses.length > 0) {
       const peak = Math.max(...building.masses.map((mass) => mass.elevationM + mass.heightM));
-      if (Math.abs(peak - building.heightM) > GEOMETRY_EPSILON) {
-        problems.push(`Building "${building.id}" total height ${building.heightM} does not match its masses' peak ${peak}.`);
-      }
+      if (Math.abs(peak - building.heightM) > GEOMETRY_EPSILON) problems.push(`Building "${building.id}" total height ${building.heightM} does not match its masses' peak ${peak}.`);
     }
     if (grammar && Number.isFinite(building.heightM) && !(building.heightM >= grammar.height.minM - GEOMETRY_EPSILON && building.heightM <= grammar.height.maxM + GEOMETRY_EPSILON)) {
       problems.push(`Building "${building.id}" total height ${building.heightM} is outside grammar "${building.grammarId}" declared range ${grammar.height.minM}-${grammar.height.maxM}.`);
     }
+    const buildingSite = persistent ? building.sitePolygon : parcel?.polygon;
+    if (persistent) {
+      if (!validRing(building.sitePolygon)) problems.push(`Persistent building "${building.id}" has an invalid site polygon.`);
+      if (!hasValidPlacementFrame(building.placement)) problems.push(`Persistent building "${building.id}" has an invalid placement frame.`);
+      else if (validRing(building.sitePolygon) && !ringCountsAsContained(placementRing(building.placement), ringAsMulti(building.sitePolygon))) {
+        problems.push(`Persistent building "${building.id}" placement frame exceeds its site polygon.`);
+      }
+    }
     for (const mass of building.masses) {
       if (!validRing(mass.footprint)) problems.push(`Building "${building.id}" mass ${mass.index} has an invalid footprint.`);
       if (!Number.isFinite(mass.elevationM) || mass.elevationM < 0 || !(mass.heightM > 0)) problems.push(`Building "${building.id}" mass ${mass.index} has invalid elevation or height.`);
-      if (grammar && mass.elevationM + mass.heightM > grammar.height.maxM + GEOMETRY_EPSILON) {
-        problems.push(`Building "${building.id}" mass ${mass.index} top exceeds grammar "${building.grammarId}" declared maximum height.`);
+      if (grammar && mass.elevationM + mass.heightM > grammar.height.maxM + GEOMETRY_EPSILON) problems.push(`Building "${building.id}" mass ${mass.index} top exceeds grammar "${building.grammarId}" declared maximum height.`);
+      if (buildingSite && validRing(mass.footprint) && !ringContained(mass.footprint, buildingSite)) {
+        problems.push(`Building "${building.id}" mass ${mass.index} is not contained in its ${persistent ? "site" : "parcel"}.`);
       }
-      if (parcel && validRing(mass.footprint) && !ringContained(mass.footprint, parcel.polygon)) problems.push(`Building "${building.id}" mass ${mass.index} is not contained in its parcel.`);
       if (typeof mass.neonEnabled !== "boolean") problems.push(`Building "${building.id}" mass ${mass.index} has an invalid neon flag.`);
       const frontageDescriptor: unknown = mass.frontage;
-      if (frontageDescriptor === undefined) {
-        problems.push(`Building "${building.id}" mass ${mass.index} is missing its frontage descriptor.`);
-      } else if (frontageDescriptor !== null) {
+      if (frontageDescriptor === undefined) problems.push(`Building "${building.id}" mass ${mass.index} is missing its frontage descriptor.`);
+      else if (frontageDescriptor !== null) {
         const candidate = isRecord(frontageDescriptor) ? frontageDescriptor : null;
         const outward = candidate !== null && isRecord(candidate.outward) ? candidate.outward : null;
         const angleRad = candidate !== null && typeof candidate.angleRad === "number" ? candidate.angleRad : NaN;
         const outwardX = outward !== null && typeof outward.x === "number" ? outward.x : NaN;
         const outwardY = outward !== null && typeof outward.y === "number" ? outward.y : NaN;
         const length = Math.hypot(outwardX, outwardY);
-        if (!Number.isFinite(angleRad) || !Number.isFinite(length) || Math.abs(length - 1) > GEOMETRY_EPSILON) {
-          problems.push(`Building "${building.id}" mass ${mass.index} has an invalid frontage descriptor.`);
-        }
+        if (!Number.isFinite(angleRad) || !Number.isFinite(length) || Math.abs(length - 1) > GEOMETRY_EPSILON) problems.push(`Building "${building.id}" mass ${mass.index} has an invalid frontage descriptor.`);
       }
       const firstFrontage = building.masses[0]?.frontage ?? null;
-      if (JSON.stringify(mass.frontage) !== JSON.stringify(firstFrontage)) {
-        problems.push(`Building "${building.id}" masses do not share one frontage descriptor.`);
-      }
+      if (JSON.stringify(mass.frontage) !== JSON.stringify(firstFrontage)) problems.push(`Building "${building.id}" masses do not share one frontage descriptor.`);
     }
     for (let left = 0; left < building.masses.length; left++) {
       for (let right = left + 1; right < building.masses.length; right++) {
         const a = building.masses[left]!;
         const b = building.masses[right]!;
-        // Stacked volumes may share footprint only when their elevation spans do not
-        // overlap. This invariant is universal: bridge connectors meet their supports
-        // face-to-face rather than penetrating them.
         const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
-        if (spansOverlap && ringOverlaps(a.footprint, b.footprint)) {
-          problems.push(`Building "${building.id}" masses ${left} and ${right} overlap.`);
-        }
+        if (spansOverlap && ringOverlaps(a.footprint, b.footprint)) problems.push(`Building "${building.id}" masses ${left} and ${right} overlap.`);
       }
     }
   }
   for (const landmark of landmarks) {
+    const persistent = landmark.sourceId !== null && landmark.sourceId !== undefined;
+    if (landmark.sourceId !== null && landmark.sourceId !== undefined && typeof landmark.sourceId !== "string") problems.push(`Landmark "${landmark.id}" has an invalid sourceId.`);
+    if (persistent && (typeof landmark.lineage !== "string" || landmark.lineage.trim().length === 0)) problems.push(`Persistent landmark "${landmark.id}" has an invalid lineage.`);
+    if (persistent && landmark.origin === undefined) problems.push(`Persistent landmark "${landmark.id}" is missing its origin.`);
+    if (persistent && landmark.protection === undefined) problems.push(`Persistent landmark "${landmark.id}" is missing its protection.`);
+    if (landmark.origin !== undefined && !["generated", "authored"].includes(landmark.origin)) problems.push(`Landmark "${landmark.id}" has an invalid origin.`);
+    if (landmark.protection !== undefined && !["none", "explicit", "manual-edit"].includes(landmark.protection)) problems.push(`Landmark "${landmark.id}" has an invalid protection.`);
     if (!LANDMARK_GRAMMAR_REGISTRY.has(landmark.landmarkGrammarId)) problems.push(`Landmark "${landmark.id}" references unknown grammar "${landmark.landmarkGrammarId}".`);
     if (!validRing(landmark.sitePolygon)) problems.push(`Landmark "${landmark.id}" has an invalid site polygon.`);
     if (!Array.isArray(landmark.masses) || landmark.masses.length === 0) problems.push(`Landmark "${landmark.id}" has no masses.`);
     const block = landmark.blockId ? blockById.get(landmark.blockId) : undefined;
     if (landmark.blockId && !block) problems.push(`Landmark "${landmark.id}" references unknown block "${landmark.blockId}".`);
-    if (block && validRing(landmark.sitePolygon) && !ringCountsAsContained(landmark.sitePolygon, block.buildable)) {
-      problems.push(`Landmark "${landmark.id}" site is not contained in its block buildable.`);
+    if (block && validRing(landmark.sitePolygon) && !ringCountsAsContained(landmark.sitePolygon, block.buildable)) problems.push(`Landmark "${landmark.id}" site is not contained in its block buildable.`);
+    if (persistent) {
+      if (!hasValidPlacementFrame(landmark.placement)) problems.push(`Persistent landmark "${landmark.id}" has an invalid placement frame.`);
+      else if (validRing(landmark.sitePolygon) && !ringCountsAsContained(placementRing(landmark.placement), ringAsMulti(landmark.sitePolygon))) problems.push(`Persistent landmark "${landmark.id}" placement frame exceeds its site polygon.`);
     }
     for (const mass of landmark.masses) {
       if (!validRing(mass.footprint)) problems.push(`Landmark "${landmark.id}" mass ${mass.index} has an invalid footprint.`);
@@ -3398,41 +4000,38 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
         const a = landmark.masses[left]!;
         const b = landmark.masses[right]!;
         const spansOverlap = a.elevationM < b.elevationM + b.heightM && b.elevationM < a.elevationM + a.heightM;
-        if (spansOverlap && validRing(a.footprint) && validRing(b.footprint) && ringOverlaps(a.footprint, b.footprint)) {
-          problems.push(`Landmark "${landmark.id}" masses ${left} and ${right} overlap.`);
-        }
+        if (spansOverlap && validRing(a.footprint) && validRing(b.footprint) && ringOverlaps(a.footprint, b.footprint)) problems.push(`Landmark "${landmark.id}" masses ${left} and ${right} overlap.`);
       }
     }
-    for (const openSpaceId of landmark.openSpaceIds) {
-      if (!openSpaceIds.has(openSpaceId)) problems.push(`Landmark "${landmark.id}" references unknown open space "${openSpaceId}".`);
-    }
-    if (validRing(landmark.sitePolygon) && occupancyAll !== null && siteOverlapsOccupancy(landmark.sitePolygon, occupancyAll)) {
-      problems.push(`Landmark "${landmark.id}" site overlaps road occupancy; the reservation is not legal.`);
-    }
+    for (const openSpaceId of landmark.openSpaceIds) if (!openSpaceIds.has(openSpaceId)) problems.push(`Landmark "${landmark.id}" references unknown open space "${openSpaceId}".`);
+    if (validRing(landmark.sitePolygon) && occupancyAll !== null && siteOverlapsOccupancy(landmark.sitePolygon, occupancyAll)) problems.push(`Landmark "${landmark.id}" site overlaps road occupancy; the reservation is not legal.`);
     const landmarkGrammar = LANDMARK_GRAMMAR_REGISTRY.get(landmark.landmarkGrammarId);
-    if (landmarkGrammar && validRing(landmark.sitePolygon) && Math.abs(ringArea(landmark.sitePolygon)) > landmarkGrammar.maxSiteAreaM2 + 0.5) {
-      problems.push(`Landmark "${landmark.id}" site exceeds the declared maximum area of its grammar.`);
-    }
-    // Required open space is enforced for sites meeting the grammar's declared minimum;
-    // a below-minimum site (hand-built fixtures) is already outside the grammar contract.
+    if (landmarkGrammar && validRing(landmark.sitePolygon) && Math.abs(ringArea(landmark.sitePolygon)) > landmarkGrammar.maxSiteAreaM2 + 0.5) problems.push(`Landmark "${landmark.id}" site exceeds the declared maximum area of its grammar.`);
     const requirement = landmarkGrammar?.requiredOpenSpace;
     if (requirement) {
       const siteArea = validRing(landmark.sitePolygon) ? Math.abs(ringArea(landmark.sitePolygon)) : 0;
       if (siteArea >= (landmarkGrammar?.minSiteAreaM2 ?? 0)) {
-        const owned = (landmark.openSpaceIds ?? [])
-          .map((id) => openSpaces.find((openSpace) => openSpace.id === id))
-          .filter((openSpace): openSpace is OpenSpacePlan => openSpace !== undefined);
+        const owned = (landmark.openSpaceIds ?? []).map((id) => openSpaces.find((openSpace) => openSpace.id === id)).filter((openSpace): openSpace is OpenSpacePlan => openSpace !== undefined);
         const matching = owned.filter((openSpace) => openSpace.category === requirement.category);
-        if (matching.length === 0) {
-          problems.push(`Landmark "${landmark.id}" grammar "${landmark.landmarkGrammarId}" requires ${requirement.category} open space but has none.`);
-        } else {
-          const covered = matching.reduce((sum, openSpace) => sum + openSpace.areaM2, 0);
-          if (covered + 0.5 < requirement.minShare * siteArea) {
-            problems.push(`Landmark "${landmark.id}" required ${requirement.category} open space covers too little of its site.`);
-          }
-        }
+        if (matching.length === 0) problems.push(`Landmark "${landmark.id}" grammar "${landmark.landmarkGrammarId}" requires ${requirement.category} open space but has none.`);
+        else if (matching.reduce((sum, openSpace) => sum + openSpace.areaM2, 0) + 0.5 < requirement.minShare * siteArea) problems.push(`Landmark "${landmark.id}" required ${requirement.category} open space covers too little of its site.`);
       }
     }
+  }
+  const architectureSites = [
+    ...buildings.filter((building) => typeof building.sourceId === "string" && validRing(building.sitePolygon)).map((building) => ({ id: building.id, site: building.sitePolygon })),
+    ...landmarks.filter((landmark) => validRing(landmark.sitePolygon)).map((landmark) => ({ id: landmark.id, site: landmark.sitePolygon }))
+  ];
+  for (let left = 0; left < architectureSites.length; left++) {
+    for (let right = left + 1; right < architectureSites.length; right++) {
+      if (ringOverlaps(architectureSites[left]!.site, architectureSites[right]!.site)) {
+        problems.push(`Architecture sites "${architectureSites[left]!.id}" and "${architectureSites[right]!.id}" overlap.`);
+      }
+    }
+  }
+  for (const building of buildings) {
+    if (typeof building.sourceId !== "string" || !validRing(building.sitePolygon) || occupancyAll === null) continue;
+    if (siteOverlapsOccupancy(building.sitePolygon, occupancyAll)) problems.push(`Persistent building "${building.id}" site overlaps road occupancy; the site is not legal.`);
   }
   for (const openSpace of openSpaces) {
     if (openSpace.landmarkId === null) continue;

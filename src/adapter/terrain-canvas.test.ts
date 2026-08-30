@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
-import type { CityStateV3, DistrictSource } from "../core/gen/city.js";
+import { allocateManualId, allocateManualLineage, type CityStateV4, type DistrictSource, type PlacementFrame } from "../core/gen/city.js";
 import { buildCompleteCityPlan, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import type { CityCacheManifestV1 } from "../core/gen/city-cache.js";
 import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
 import { BANK_SIZE, BASE_BANK, builtinPalette, packPalette, paletteBanks } from "../core/palette.js";
 import { rectangleLand } from "../core/gen/terrain.js";
-import type { Ring } from "../core/geom/types.js";
+import { ringArea, type Ring } from "../core/geom/types.js";
 import { TerrainSession } from "./terrain-session.js";
 import {
   handleWorkerMessage,
@@ -16,29 +16,39 @@ import {
 } from "../worker/protocol.js";
 import {
   addCityListener,
+  commitArchitectureCandidate,
   clearConfirmationFor,
   configuredPixelsPerMetre,
   cancelTerrainDraft,
   createDistrict,
+  deleteObject,
   deleteRoadJunction,
   deleteRoads,
   districtDiagnostics,
+  editObjectProperties,
+  editSitePolygon,
   enabledFlagChanged,
   fillDistrict,
   generateDistricts,
   generateNewSeed,
   generationPreflight,
   generationState,
+  getArchitectureSource,
   getCity,
   getDistrictPlanView,
   getDistrictSelection,
   getRoadSelection,
   mergeDistricts,
   mount,
+  placeBuilding,
+  placePlace,
   randomizeEntireCity,
+  redo,
   reclassifyRoad,
   rebuildGeometry,
+  replaceUrbanFootprint,
   renameRoad,
+  rerollObjectAppearance,
   retryDistrictPlan,
   retryFullGeneration,
   retryGeneratedWalls,
@@ -49,16 +59,20 @@ import {
   selectRoad,
   selectRoadNode,
   setDistrictDraftCancelListener,
+  setObjectLocked,
   setRoadCurvePreset,
   setRoadDraftCancelListener,
   setRoadLocked,
   splitDistrict,
   startFullGeneration,
   stats,
+  transformObject,
   undo,
   unmount,
   updateDistricts,
-  type ClearConfirmation
+  type BuildingPlacementInput,
+  type ClearConfirmation,
+  type PlacePlacementInput
 } from "./terrain-canvas.js";
 
 /** Every CityRenderer the adapter constructs, with the palettes it was handed. */
@@ -68,10 +82,10 @@ const rendererState = vi.hoisted(() => ({
 }));
 
 const cacheState = vi.hoisted(() => ({
-  load: vi.fn<(city: CityStateV3) => Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null>>(),
-  publish: vi.fn<(city: CityStateV3, plan: CompleteCityPlan) => Promise<CityCacheManifestV1>>(),
+  load: vi.fn<(city: CityStateV4) => Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null>>(),
+  publish: vi.fn<(city: CityStateV4, plan: CompleteCityPlan) => Promise<CityCacheManifestV1>>(),
   loadChunks: vi.fn<(
-    city: CityStateV3,
+    city: CityStateV4,
     plan: CompleteCityPlan,
     boundsM: { x: number; y: number; width: number; height: number },
     pixelsPerMetre: number,
@@ -79,7 +93,7 @@ const cacheState = vi.hoisted(() => ({
     onRecord?: (record: CachedCompleteChunkRecord) => void
   ) => Promise<{ records: CachedCompleteChunkRecord[]; missingChunkIds: string[]; manifest: CityCacheManifestV1 } | null>>(),
   publishChunks: vi.fn<(
-    city: CityStateV3,
+    city: CityStateV4,
     plan: CompleteCityPlan,
     boundsM: { x: number; y: number; width: number; height: number },
     pixelsPerMetre: number,
@@ -185,11 +199,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function cacheManifest(city: CityStateV3, plan: CompleteCityPlan, byteLength = 321): CityCacheManifestV1 {
+function cacheManifest(city: CityStateV4, plan: CompleteCityPlan, byteLength = 321): CityCacheManifestV1 {
   return {
     kind: "project-nixie-city-cache",
     cacheSchemaVersion: 1,
-    generatorVersion: 11,
+    generatorVersion: 12,
     cityRevision: city.revision,
     structuralInput: plan.structuralInput,
     slot: 0,
@@ -237,11 +251,11 @@ beforeEach(() => {
   rendererState.setChunkError = null;
 });
 
-function state(): CityStateV3 {
+function state(): CityStateV4 {
   return {
     kind: "city-generator-2",
-    schemaVersion: 3,
-    generatorVersion: 11,
+    schemaVersion: 4,
+    generatorVersion: 12,
     revision: 1,
     source: {
       origin: { x: 500, y: 400 },
@@ -257,13 +271,14 @@ function state(): CityStateV3 {
         urbanFootprint: null
       },
       roads: { nodes: [], routes: [], edges: [] },
-      districts: []
+      districts: [],
+      architecture: { buildings: [], places: [], overrides: [] }
     }
   };
 }
 
 describe("complete plan cache pipeline", () => {
-  let saved: CityStateV3;
+  let saved: CityStateV4;
   let worker: FakeWorker;
 
   function workerFactory(): FakeWorker {
@@ -275,7 +290,7 @@ describe("complete plan cache pipeline", () => {
       get walls(): unknown[] { return []; },
       getFlag: (_module: string, flag: string): unknown =>
         flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
         saved = structuredClone(value);
         return saved;
       }),
@@ -723,7 +738,7 @@ describe("road clearance containment", () => {
   });
 });
 
-function bulkRoadState(): CityStateV3 {
+function bulkRoadState(): CityStateV4 {
   const city = state();
   city.source.roads = {
     nodes: [
@@ -749,7 +764,7 @@ function bulkRoadState(): CityStateV3 {
 }
 
 describe("road bulk mutation selection", () => {
-  let saved: CityStateV3 | undefined;
+  let saved: CityStateV4 | undefined;
   let saveError: Error | null;
   let wallCreateError: Error | null;
   let wallDocuments: Array<{ id: string }>;
@@ -761,9 +776,9 @@ describe("road bulk mutation selection", () => {
     return worker;
   }
 
-  function setupScene(initial: CityStateV3 | undefined): void {
+  function setupScene(initial: unknown): void {
     unmount();
-    saved = initial;
+    saved = initial as CityStateV4 | undefined;
     mount();
   }
 
@@ -777,7 +792,7 @@ describe("road bulk mutation selection", () => {
     const scene = {
       get walls(): Array<{ id: string }> { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
         if (saveError !== null) throw saveError;
         saved = structuredClone(value);
         return saved;
@@ -824,7 +839,7 @@ describe("road bulk mutation selection", () => {
     await reclassifyRoad("arterial", true, ["edge-a", "edge-c"]);
     await renameRoad("Boulevard", true, ["edge-a", "edge-c"]);
     expect(saved?.revision).toBe(3);
-    expect(saved!.source.roads.edges.map((edge: CityStateV3["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
+    expect(saved!.source.roads.edges.map((edge: CityStateV4["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
       ["edge-a", "arterial", "Boulevard"],
       ["edge-b", "street", "A"],
       ["edge-c", "arterial", "Boulevard"],
@@ -1123,10 +1138,10 @@ describe("full generation", () => {
     const scene = {
       get walls(): Array<{ id: string }> { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
         if (saveError !== null) throw saveError;
         saved = structuredClone(value);
-        return saved as CityStateV3;
+        return saved as CityStateV4;
       }),
       unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
         saved = undefined;
@@ -1556,10 +1571,661 @@ describe("full generation", () => {
     expect(stats()?.completePlan).toEqual(expect.objectContaining({ revision: 3 }));
     expect(worker.planBuilds).toBeGreaterThan(buildsAfterGeneration);
   }, 120_000);
+  describe("architecture actions", () => {
+    const buildingSite: Ring = [
+      { x: -12, y: -12 },
+      { x: 12, y: -12 },
+      { x: 12, y: 12 },
+      { x: -12, y: 12 }
+    ];
+    const buildingPlacement: PlacementFrame = {
+      centre: { x: 0, y: 0 },
+      rotationRad: 0,
+      widthM: 12,
+      depthM: 12
+    };
+    const placeSite: Ring = [
+      { x: -95, y: 15 },
+      { x: -25, y: 15 },
+      { x: -25, y: 65 },
+      { x: -95, y: 65 }
+    ];
+    const placePlacement: PlacementFrame = {
+      centre: { x: -60, y: 40 },
+      rotationRad: 0,
+      widthM: 30,
+      depthM: 20
+    };
+
+    function buildingInput(overrides: Partial<BuildingPlacementInput> = {}): BuildingPlacementInput {
+      return {
+        grammarId: "narrow-shopfront",
+        visualUse: "commercial",
+        heightM: 30,
+        paletteId: "corporate",
+        placement: structuredClone(buildingPlacement),
+        sitePolygon: structuredClone(buildingSite),
+        ...overrides
+      };
+    }
+
+    function placeInput(overrides: Partial<PlacePlacementInput> = {}): PlacePlacementInput {
+      return {
+        landmarkGrammarId: "hero-tower-plaza",
+        paletteId: "corporate",
+        placement: structuredClone(placePlacement),
+        sitePolygon: structuredClone(placeSite),
+        ...overrides
+      };
+    }
+
+    async function settleMountedPlan(): Promise<void> {
+      await vi.waitFor(() => {
+        if (!isRecord(stats()?.completePlan)) throw new Error("expected a complete plan after mount");
+      }, { timeout: 15_000 });
+    }
+
+    async function generatedCity(seed = "architecture-generated"): Promise<CityStateV4> {
+      const result = await startFullGeneration(staging(seed));
+      expect(result.ok).toBe(true);
+      const city = getCity();
+      if (city === null) throw new Error("expected generated city");
+      return city;
+    }
+
+    function generatedBuilding(): {
+      city: CityStateV4;
+      plan: CompleteCityPlan;
+      building: CompleteCityPlan["buildings"][number];
+    } {
+      const city = getCity();
+      if (city === null) throw new Error("expected current city");
+      const plan = buildCompleteCityPlan(city.source, city.revision);
+      const building = plan.buildings.find((candidate) => {
+        if (candidate.sourceId !== null || candidate.placement === undefined || candidate.sitePolygon.length !== 4) return false;
+        const footprintArea = candidate.placement.widthM * candidate.placement.depthM;
+        return Math.abs(ringArea(candidate.sitePolygon)) + footprintArea * 1e-6 >= footprintArea;
+      });
+      if (building === undefined) throw new Error("expected a generated building with a placement frame");
+      return { city, plan, building };
+    }
+
+    it("places authored buildings and places with deterministic identities and manual-edit protection", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+
+      await placeBuilding(buildingInput());
+      const afterBuilding = getArchitectureSource();
+      expect(afterBuilding).not.toBeNull();
+      const building = afterBuilding!.buildings[0]!;
+      expect(building).toMatchObject({
+        origin: "authored",
+        protection: "manual-edit",
+        grammarId: "narrow-shopfront",
+        visualUse: "commercial",
+        heightM: 30,
+        paletteId: "corporate",
+        sitePolygon: buildingSite,
+        placement: buildingPlacement,
+        districtId: null,
+        blockId: null
+      });
+      expect(building.id).toMatch(/^m_bldg_[0-9a-f]{8}$/);
+      expect(building.lineage).toMatch(/^manual\/bldg\/1\/0\/[0-9a-f]{8}$/);
+      expect(building.lineage).toBe(allocateManualLineage(
+        "bldg",
+        1,
+        0,
+        "narrow-shopfront",
+        "commercial",
+        30,
+        "corporate",
+        buildingPlacement,
+        buildingSite
+      ));
+      expect(building.id).toBe(allocateManualId("bldg", 1, 0, building.lineage));
+      expect(building.seed).toBe(`adapter-fixture/architecture/${building.lineage}/geometry`);
+      expect(building.appearanceSeed).toBe(`adapter-fixture/architecture/${building.lineage}/appearance`);
+
+      await placePlace(placeInput());
+      const afterPlace = getArchitectureSource();
+      expect(afterPlace).not.toBeNull();
+      const place = afterPlace!.places[0]!;
+      expect(place).toMatchObject({
+        origin: "authored",
+        protection: "manual-edit",
+        landmarkGrammarId: "hero-tower-plaza",
+        paletteId: "corporate",
+        sitePolygon: placeSite,
+        placement: placePlacement,
+        districtId: null,
+        blockId: null
+      });
+      expect(place.id).toMatch(/^m_plc_[0-9a-f]{8}$/);
+      expect(place.lineage).toMatch(/^manual\/plc\/2\/0\/[0-9a-f]{8}$/);
+      expect(place.lineage).toBe(allocateManualLineage(
+        "plc",
+        2,
+        0,
+        "hero-tower-plaza",
+        "corporate",
+        placePlacement,
+        placeSite
+      ));
+      expect(place.id).toBe(allocateManualId("plc", 2, 0, place.lineage));
+      expect(place.seed).toBe(`adapter-fixture/architecture/${place.lineage}/geometry`);
+      expect(place.appearanceSeed).toBe(`adapter-fixture/architecture/${place.lineage}/appearance`);
+    }, 120_000);
+
+    it("rejects invalid authored placement before writing the Scene flag", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      const before = structuredClone(getCity());
+      const setFlag = vi.mocked(canvas.scene.setFlag);
+
+      await expect(placeBuilding(buildingInput({
+        placement: { ...buildingPlacement, widthM: 0 }
+      }))).rejects.toThrow(/placement widthM/i);
+      expect(setFlag).not.toHaveBeenCalled();
+      expect(getCity()).toEqual(before);
+    }, 30_000);
+    it("keeps manual identity deterministic across failed actions, rerolls, and reload", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      const firstInput = buildingInput();
+      const firstLineage = allocateManualLineage(
+        "bldg",
+        1,
+        0,
+        firstInput.grammarId,
+        firstInput.visualUse,
+        firstInput.heightM,
+        firstInput.paletteId,
+        firstInput.placement,
+        firstInput.sitePolygon
+      );
+      await expect(placeBuilding(buildingInput({
+        placement: { ...buildingPlacement, widthM: 0 }
+      }))).rejects.toThrow(/placement widthM/i);
+      await placeBuilding(firstInput);
+      const first = getArchitectureSource()!.buildings[0]!;
+      expect(first.lineage).toBe(firstLineage);
+      expect(first.id).toBe(allocateManualId("bldg", 1, 0, firstLineage));
+
+      await rerollObjectAppearance(first.id);
+      const reloaded = structuredClone(saved) as CityStateV4;
+      setupScene(reloaded);
+      await settleMountedPlan();
+      expect(getArchitectureSource()).toEqual(reloaded.source.architecture);
+
+      const secondSite: Ring = [
+        { x: 38, y: -20 },
+        { x: 62, y: -20 },
+        { x: 62, y: 4 },
+        { x: 38, y: 4 }
+      ];
+      const secondPlacement: PlacementFrame = {
+        centre: { x: 50, y: -8 },
+        rotationRad: 0,
+        widthM: 12,
+        depthM: 12
+      };
+      const secondInput = buildingInput({ placement: secondPlacement, sitePolygon: secondSite });
+      await placeBuilding(secondInput);
+      const current = getCity()!;
+      const second = getArchitectureSource()!.buildings.find((candidate) => candidate.id !== first.id)!;
+      const secondLineage = allocateManualLineage(
+        "bldg",
+        current.revision - 1,
+        1,
+        secondInput.grammarId,
+        secondInput.visualUse,
+        secondInput.heightM,
+        secondInput.paletteId,
+        secondInput.placement,
+        secondInput.sitePolygon
+      );
+      expect(second.lineage).toBe(secondLineage);
+      expect(second.id).toBe(allocateManualId("bldg", current.revision - 1, 1, secondLineage, new Set([first.id])));
+    }, 120_000);
+
+    it("promotes substantial generated edits while preserving identity, seeds, palette, and consuming overrides", async () => {
+      await generatedCity();
+      const { building } = generatedBuilding();
+
+      await editObjectProperties(building.id, { paletteId: "corporate" });
+      const cosmetic = getArchitectureSource();
+      expect(cosmetic).not.toBeNull();
+      expect(cosmetic!.buildings).toHaveLength(0);
+      expect(cosmetic!.overrides).toHaveLength(1);
+
+      await editObjectProperties(building.id, { grammarId: building.grammarId });
+      const promoted = getArchitectureSource();
+      expect(promoted).not.toBeNull();
+      expect(promoted!.overrides).toHaveLength(0);
+      const persistent = promoted!.buildings.find((candidate) => candidate.id === building.id);
+      expect(persistent).toMatchObject({
+        id: building.id,
+        lineage: building.lineage,
+        origin: "generated",
+        protection: "manual-edit",
+        seed: building.seed,
+        appearanceSeed: building.appearanceSeed,
+        grammarId: building.grammarId,
+        visualUse: building.visualUse,
+        heightM: building.heightM,
+        paletteId: "corporate",
+        sitePolygon: building.sitePolygon,
+        placement: building.placement,
+        districtId: building.districtId,
+        blockId: building.blockId
+      });
+    }, 120_000);
+    it("clears stale associations when spatially promoting a derived object", async () => {
+      await generatedCity("architecture-spatial-promotion");
+      const { building } = generatedBuilding();
+
+      await editSitePolygon(building.id, structuredClone(building.sitePolygon));
+      const persistent = getArchitectureSource()!.buildings.find((candidate) => candidate.id === building.id);
+      expect(persistent).toMatchObject({
+        districtId: null,
+        blockId: null,
+        protection: "manual-edit",
+        sitePolygon: building.sitePolygon,
+        placement: building.placement
+      });
+    }, 120_000);
+
+    it("stores a sparse derived palette override without promotion", async () => {
+      await generatedCity("architecture-palette");
+      const { building } = generatedBuilding();
+
+      await editObjectProperties(building.id, { paletteId: "corporate" });
+      const architecture = getArchitectureSource();
+      expect(architecture).not.toBeNull();
+      expect(architecture!.buildings).toHaveLength(0);
+      expect(architecture!.places).toHaveLength(0);
+      expect(architecture!.overrides).toHaveLength(1);
+      const override = architecture!.overrides[0]!;
+      expect(override).toMatchObject({
+        targetKind: "building",
+        targetId: building.id,
+        lineage: building.lineage,
+        protection: "manual-edit",
+        snapshotSitePolygon: building.sitePolygon,
+        paletteId: "corporate"
+      });
+      expect(override.appearanceSeed).toBeUndefined();
+      expect(Object.keys(override).sort()).toEqual([
+        "lineage",
+        "paletteId",
+        "protection",
+        "snapshotSitePolygon",
+        "targetId",
+        "targetKind"
+      ]);
+    }, 120_000);
+    it("rejects overrides targeting persistent architecture objects", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const architecture = getArchitectureSource()!;
+      const before = structuredClone(architecture);
+      const authored = architecture.buildings[0]!;
+      await expect(commitArchitectureCandidate({
+        ...architecture,
+        overrides: [{
+          targetKind: "building",
+          targetId: authored.id,
+          lineage: authored.lineage,
+          protection: "manual-edit",
+          snapshotSitePolygon: structuredClone(authored.sitePolygon)
+        }]
+      })).rejects.toThrow(/derived objects only/i);
+      expect(getArchitectureSource()).toEqual(before);
+    }, 120_000);
+    it("rejects a protected override whose target site no longer matches before saving", async () => {
+      await generatedCity("architecture-protected-override");
+      const { building } = generatedBuilding();
+      await rerollObjectAppearance(building.id);
+      await setObjectLocked(building.id, true);
+
+      const before = structuredClone(getCity());
+      const beforePlan = stats()?.completePlan;
+      const beforeDepth = stats()?.undoDepth;
+      const setFlag = vi.mocked(canvas.scene.setFlag);
+      const writesBefore = setFlag.mock.calls.length;
+      const architecture = getArchitectureSource()!;
+      expect(architecture.overrides).toHaveLength(1);
+      expect(architecture.overrides[0]).toMatchObject({
+        targetId: building.id,
+        protection: "explicit",
+        lineage: building.lineage
+      });
+      const stale = structuredClone(architecture);
+      stale.overrides[0]!.snapshotSitePolygon = stale.overrides[0]!.snapshotSitePolygon.map((point) => ({
+        x: point.x + 1,
+        y: point.y
+      }));
+
+      await expect(commitArchitectureCandidate(stale)).rejects.toThrow(/Protected architecture override/i);
+      expect(setFlag).toHaveBeenCalledTimes(writesBefore);
+      expect(getCity()).toEqual(before);
+      expect(saved).toEqual(before);
+      expect(getArchitectureSource()).toEqual(architecture);
+      expect(stats()).toEqual(expect.objectContaining({
+        revision: before!.revision,
+        undoDepth: beforeDepth,
+        completePlan: beforePlan
+      }));
+    }, 120_000);
+
+    it("updates a persistent palette in its source without masking it with an override", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const building = getArchitectureSource()!.buildings[0]!;
+      const beforeRevision = getCity()!.revision;
+
+      await editObjectProperties(building.id, { paletteId: "commercial" });
+
+      const architecture = getArchitectureSource()!;
+      expect(architecture.buildings).toHaveLength(1);
+      expect(architecture.buildings[0]).toMatchObject({
+        id: building.id,
+        paletteId: "commercial",
+        protection: "manual-edit"
+      });
+      expect(architecture.overrides).toEqual([]);
+      expect(getCity()!.revision).toBe(beforeRevision + 1);
+    }, 120_000);
+
+    it("rejects a terrain candidate that invalidates an unlocked persistent site before saving", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const before = structuredClone(getCity());
+      const beforePlan = stats()?.completePlan;
+      const setFlag = vi.mocked(canvas.scene.setFlag);
+      const writesBefore = setFlag.mock.calls.length;
+
+      await expect(replaceUrbanFootprint([
+        { x: -100, y: -80 },
+        { x: -20, y: -80 },
+        { x: -20, y: 80 },
+        { x: -100, y: 80 }
+      ])).rejects.toThrow(/urban footprint/i);
+      expect(setFlag).toHaveBeenCalledTimes(writesBefore);
+      expect(getCity()).toEqual(before);
+      expect(saved).toEqual(before);
+      expect(getArchitectureSource()!.buildings).toHaveLength(1);
+      expect(stats()).toEqual(expect.objectContaining({
+        revision: before!.revision,
+        undoDepth: 1,
+        completePlan: beforePlan
+      }));
+    }, 120_000);
+
+    it("rolls back an invalid transform without changing source, history, selection, or render state", async () => {
+      setupScene(bulkRoadState());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      selectRoad("edge-a");
+      const id = getArchitectureSource()!.buildings[0]!.id;
+      const before = structuredClone(getCity())!;
+      const beforePlan = structuredClone(stats()?.completePlan);
+      const beforeBuild = structuredClone(stats()?.lastBuild);
+      const beforeSelection = getRoadSelection();
+      const buildsBefore = worker.planBuilds;
+      const setFlag = vi.mocked(canvas.scene.setFlag);
+      const writesBefore = setFlag.mock.calls.length;
+
+      await expect(transformObject(id, {
+        placement: { ...buildingPlacement, widthM: 0 }
+      })).rejects.toThrow(/placement widthM/i);
+
+      expect(setFlag).toHaveBeenCalledTimes(writesBefore);
+      expect(getCity()).toEqual(before);
+      expect(saved).toEqual(before);
+      expect(getRoadSelection()).toEqual(beforeSelection);
+      expect(worker.planBuilds).toBe(buildsBefore);
+      expect(stats()).toEqual(expect.objectContaining({
+        revision: before.revision,
+        undoDepth: 1,
+        completePlan: beforePlan,
+        lastBuild: beforeBuild,
+        roadSelection: beforeSelection
+      }));
+    }, 120_000);
+
+
+    it("rerolls appearance without changing derived geometry", async () => {
+      await generatedCity("architecture-reroll");
+      const before = generatedBuilding();
+
+      await rerollObjectAppearance(before.building.id);
+      const architecture = getArchitectureSource();
+      expect(architecture).not.toBeNull();
+      expect(architecture!.buildings).toHaveLength(0);
+      expect(architecture!.overrides).toHaveLength(1);
+      const override = architecture!.overrides[0]!;
+      expect(override).toMatchObject({
+        targetKind: "building",
+        targetId: before.building.id,
+        lineage: before.building.lineage,
+        protection: "manual-edit",
+        snapshotSitePolygon: before.building.sitePolygon
+      });
+      expect(override.appearanceSeed).toEqual(expect.any(String));
+
+      const after = generatedBuilding();
+      expect(after.building.sitePolygon).toEqual(before.building.sitePolygon);
+      expect(after.building.placement).toEqual(before.building.placement);
+      expect(after.building.seed).toBe(before.building.seed);
+      expect(after.building.appearanceSeed).not.toBe(before.building.appearanceSeed);
+    }, 120_000);
+
+    it("retains derived and persistent locks until explicitly unlocked", async () => {
+      await generatedCity("architecture-locks");
+      const { building } = generatedBuilding();
+
+      await setObjectLocked(building.id, true);
+      let architecture = getArchitectureSource();
+      expect(architecture!.overrides).toHaveLength(1);
+      expect(architecture!.overrides[0]).toMatchObject({
+        targetId: building.id,
+        protection: "explicit",
+        lineage: building.lineage
+      });
+      await expect(editObjectProperties(building.id, { paletteId: "corporate" })).rejects.toThrow(/locked/i);
+      expect(getArchitectureSource()).toEqual(architecture);
+
+      await setObjectLocked(building.id, false);
+      architecture = getArchitectureSource();
+      expect(architecture!.overrides[0]).toMatchObject({ targetId: building.id, protection: "none" });
+      await editObjectProperties(building.id, { paletteId: "corporate" });
+      expect(getArchitectureSource()!.overrides[0]).toMatchObject({ targetId: building.id, protection: "manual-edit", paletteId: "corporate" });
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const authored = getArchitectureSource()!.buildings[0]!;
+      await setObjectLocked(authored.id, true);
+      architecture = getArchitectureSource();
+      expect(architecture!.buildings.find((candidate) => candidate.id === authored.id)).toMatchObject({ protection: "explicit" });
+      await expect(rerollObjectAppearance(authored.id)).rejects.toThrow(/locked/i);
+      await setObjectLocked(authored.id, false);
+      await editObjectProperties(authored.id, { heightM: 31 });
+      expect(getArchitectureSource()!.buildings.find((candidate) => candidate.id === authored.id)).toMatchObject({
+        protection: "manual-edit",
+        heightM: 31
+      });
+      await rerollObjectAppearance(authored.id);
+      expect(getArchitectureSource()!.buildings.find((candidate) => candidate.id === authored.id)).toMatchObject({
+        protection: "manual-edit",
+        heightM: 31
+      });
+    }, 120_000);
+
+    it("validates site edits before saving and applies valid persistent site edits", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const id = getArchitectureSource()!.buildings[0]!.id;
+      const setFlag = vi.mocked(canvas.scene.setFlag);
+      const writesBefore = setFlag.mock.calls.length;
+      const before = structuredClone(getArchitectureSource());
+
+      await expect(editSitePolygon(id, [
+        { x: -1, y: -1 },
+        { x: 1, y: -1 },
+        { x: 0, y: 1 }
+      ])).rejects.toThrow(/sitePolygon|ring/i);
+      expect(setFlag).toHaveBeenCalledTimes(writesBefore);
+      expect(getArchitectureSource()).toEqual(before);
+
+      const nextSite: Ring = [
+        { x: -14, y: -14 },
+        { x: 14, y: -14 },
+        { x: 14, y: 14 },
+        { x: -14, y: 14 }
+      ];
+      await editSitePolygon(id, nextSite);
+      expect(getArchitectureSource()!.buildings.find((building) => building.id === id)).toMatchObject({
+        sitePolygon: nextSite,
+        protection: "manual-edit"
+      });
+    }, 120_000);
+
+    it("transforms an authored object and updates its site geometry", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placeBuilding(buildingInput());
+      const id = getArchitectureSource()!.buildings[0]!.id;
+      const nextPlacement: PlacementFrame = {
+        centre: { x: 4, y: 3 },
+        rotationRad: 0,
+        widthM: 10,
+        depthM: 12
+      };
+
+      await transformObject(id, { placement: nextPlacement });
+      const transformed = getArchitectureSource()!.buildings.find((building) => building.id === id);
+      expect(transformed).toMatchObject({ protection: "manual-edit", placement: nextPlacement });
+      expect(transformed?.sitePolygon).not.toEqual(buildingSite);
+      expect(transformed?.sitePolygon).toHaveLength(buildingSite.length);
+    }, 120_000);
+
+    it("deletes persistent objects while rejecting deletion of derived objects", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      await placePlace(placeInput());
+      const placeId = getArchitectureSource()!.places[0]!.id;
+      await deleteObject(placeId);
+      expect(getArchitectureSource()!.places).toHaveLength(0);
+
+      await generatedCity("architecture-delete");
+      const { building } = generatedBuilding();
+      await expect(deleteObject(building.id)).rejects.toThrow(/cannot be deleted/i);
+      expect(getArchitectureSource()!.buildings).toHaveLength(0);
+    }, 120_000);
+
+    it("undoes and redoes exactly one architecture placement action", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      const baseline = structuredClone(getArchitectureSource());
+      await placeBuilding(buildingInput());
+      const placed = structuredClone(getArchitectureSource());
+
+      await expect(undo()).resolves.toBe(true);
+      expect(getArchitectureSource()).toEqual(baseline);
+      await expect(undo()).resolves.toBe(false);
+      await expect(redo()).resolves.toBe(true);
+      expect(getArchitectureSource()).toEqual(placed);
+      await expect(redo()).resolves.toBe(false);
+    }, 120_000);
+
+    it("clears architecture, overrides, history, caches, and stale epochs on full randomize", async () => {
+      await generatedCity("architecture-randomize-source");
+      const generated = generatedBuilding();
+      const persistentBefore = generated.building;
+      const overrideBefore = generated.plan.buildings.find((candidate) =>
+        candidate.id !== persistentBefore.id && candidate.sourceId === null
+      );
+      if (overrideBefore === undefined) throw new Error("expected a second generated building for the randomize fixture");
+      await editObjectProperties(persistentBefore.id, { heightM: persistentBefore.heightM });
+      await editObjectProperties(overrideBefore.id, { paletteId: "corporate" });
+
+      const before = getCity()!;
+      expect(before.source.architecture.buildings).toHaveLength(1);
+      expect(before.source.architecture.overrides[0]).toMatchObject({
+        targetKind: "building",
+        targetId: overrideBefore.id,
+        protection: "manual-edit"
+      });
+      const beforeDepth = stats()?.undoDepth;
+      expect(beforeDepth).toBeGreaterThan(0);
+      await vi.waitFor(() => {
+        const current = stats();
+        if (!isRecord(current) || !isRecord(current.planCache) || current.planCache.revision !== before.revision) {
+          throw new Error("expected the pre-randomize plan cache to be published");
+        }
+        if (!isRecord(current.chunkCache) || current.chunkCache.revision !== before.revision) {
+          throw new Error("expected the pre-randomize chunk cache to be published");
+        }
+      }, { timeout: 15_000 });
+      const beforeEpoch = stats()!.buildEpoch as number;
+
+      const firstConfirmation = clearConfirmationFor(generationPreflight());
+      const first = await randomizeEntireCity(staging("architecture-randomize", firstConfirmation));
+      expect(first.ok).toBe(true);
+      expect(first.state.epoch).toBeGreaterThan(beforeEpoch);
+      const randomized = getCity()!;
+      expect(randomized.revision).toBe(1);
+      expect(randomized.source.architecture).toEqual({ buildings: [], places: [], overrides: [] });
+      expect(saved).toEqual(randomized);
+      expect(stats()).toEqual(expect.objectContaining({
+        revision: 1,
+        undoDepth: 0,
+        canRedo: false,
+        buildEpoch: first.state.epoch,
+        completePlan: expect.objectContaining({ revision: 1 }),
+        planCache: expect.objectContaining({ revision: 1 }),
+        chunkCache: expect.objectContaining({ revision: 1 })
+      }));
+      await expect(undo()).resolves.toBe(false);
+      await expect(redo()).resolves.toBe(false);
+
+      const target = generatedBuilding().building;
+      await editObjectProperties(target.id, { paletteId: "corporate" });
+      await vi.waitFor(() => {
+        const current = stats();
+        if (!isRecord(current) || !isRecord(current.chunkCache) || current.chunkCache.revision !== getCity()?.revision) {
+          throw new Error("expected the post-randomize override cache to be published");
+        }
+      }, { timeout: 15_000 });
+      const planPublishesBeforeStale = cacheState.publish.mock.calls.length;
+      const chunkPublishesBeforeStale = cacheState.publishChunks.mock.calls.length;
+      worker.tamper = (request, message) => {
+        if (request.type === "generateCompleteCityPlan" && message.ok && isRecord(message.result)) {
+          message.result.sourceRevision = -1;
+        }
+      };
+      const staleConfirmation = clearConfirmationFor(generationPreflight());
+      const stale = await randomizeEntireCity(staging("architecture-stale", staleConfirmation));
+      expect(stale.ok).toBe(false);
+      expect(stale.state.epoch).toBeGreaterThan(first.state.epoch);
+      expect(generationState().epoch).toBe(stale.state.epoch);
+      expect(getCity()).toBeNull();
+      expect(saved).toBeUndefined();
+      expect(stats()).toBeNull();
+      expect(cacheState.publish.mock.calls.length).toBe(planPublishesBeforeStale);
+      expect(cacheState.publishChunks.mock.calls.length).toBe(chunkPublishesBeforeStale);
+    }, 120_000);
+  });
 });
 
 describe("district palette texture", () => {
-  let saved: CityStateV3 | undefined;
+  let saved: CityStateV4 | undefined;
   let saveError: Error | null;
   let wallDocuments: Array<{ id: string }>;
   let worker: FakeWorker;
@@ -1588,7 +2254,7 @@ describe("district palette texture", () => {
 
   // Commercial, entertainment, industrial-heavy/light, night-market, residential-mega:
   // six 60 x 40 m districts in two rows, all inside the 200 x 160 m land mask.
-  function paletteState(): CityStateV3 {
+  function paletteState(): CityStateV4 {
     const city = state();
     city.source.districts = [
       zone("commercial", -90, -70, "commercial-highrise"),
@@ -1601,7 +2267,7 @@ describe("district palette texture", () => {
     return city;
   }
 
-  function setupMountedScene(initial: CityStateV3): void {
+  function setupMountedScene(initial: CityStateV4): void {
     rendererState.instances.length = 0;
     saved = initial;
     vi.stubGlobal("PIXI", { UPDATE_PRIORITY: { HIGH: 2 } });
@@ -1612,10 +2278,10 @@ describe("district palette texture", () => {
         get walls(): Array<{ id: string }> { return wallDocuments; },
         getFlag: (_module: string, flag: string): unknown =>
           flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-        setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV3): Promise<CityStateV3> => {
+        setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
           if (saveError !== null) throw saveError;
           saved = structuredClone(value);
-          return saved as CityStateV3;
+          return saved as CityStateV4;
         }),
         unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
           saved = undefined;

@@ -2,12 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { rectRing } from "../core/geom/types.js";
 import { buildCompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CitySourceV3 } from "../core/gen/city.js";
+import type { CitySourceV4 } from "../core/gen/city.js";
 import { WorkerClient } from "./client.js";
 import { handleRequest, type BuildCompleteCityChunksSummary, type CompleteCityChunkProgress, type WorkerMessage, type WorkerRequest } from "./protocol.js";
 
 /** Compact 200×200 grid-cross city: cheap to plan and enough for transfer-shaped fixtures. */
-const SOURCE: CitySourceV3 = {
+const SOURCE: CitySourceV4 = {
   origin: { x: 700, y: 300 },
   citySeed: "client-complete-fixture",
   generation: {
@@ -38,7 +38,12 @@ const SOURCE: CitySourceV3 = {
   districts: [
     { id: "west", polygon: rectRing({ x: 0, y: 0, width: 100, height: 200 }), seed: "west-seed", typeId: "mixed-use-centre", paletteId: DISTRICT_PALETTE_IDS[2]!, origin: "generated", locked: false, openSpaceOverride: null },
     { id: "east", polygon: rectRing({ x: 100, y: 0, width: 100, height: 200 }), seed: "east-seed", typeId: "dense-residential", paletteId: DISTRICT_PALETTE_IDS[4]!, origin: "generated", locked: false, openSpaceOverride: null }
-  ]
+  ],
+  architecture: {
+    buildings: [],
+    places: [],
+    overrides: []
+  }
 };
 const PLAN = buildCompleteCityPlan(SOURCE, 12, 5);
 

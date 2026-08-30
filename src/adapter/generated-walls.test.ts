@@ -4,7 +4,7 @@ import type { DistrictPlan } from "../core/gen/district-plan.js";
 
 function plan(): DistrictPlan {
   return {
-    revisionInputs: { terrain: "terrain", roads: "roads", districts: "districts", generation: "generation" },
+    revisionInputs: { terrain: "terrain", roads: "roads", districts: "districts", generation: "generation", architecture: "architecture_606b75c9", schemaVersion: 4, generatorVersion: 12 },
     blocks: [],
     developmentCells: [],
     openSpaceIntents: [],

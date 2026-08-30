@@ -24,7 +24,7 @@ import {
   type CompleteCityPlan
 } from "../core/gen/complete-city-plan.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3 } from "../core/gen/city.js";
+import type { CityStateV4 } from "../core/gen/city.js";
 
 const storage = vi.hoisted(() => ({
   fetchCacheAsset: vi.fn(),
@@ -61,7 +61,7 @@ let scene: MockScene;
 let setFlag: Mock;
 let unsetFlag: Mock;
 
-function city(revision = 7): CityStateV3 {
+function city(revision = 7): CityStateV4 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -88,12 +88,88 @@ function city(revision = 7): CityStateV3 {
         urbanFootprint: null
       },
       roads: { nodes: [], routes: [], edges: [] },
-      districts: []
+      districts: [],
+      architecture: {
+        buildings: [],
+        places: [],
+        overrides: []
+      }
     }
   };
 }
+function persistentBuilding(
+  id: string,
+  lineage: string
+): CityStateV4["source"]["architecture"]["buildings"][number] {
+  return {
+    id,
+    lineage,
+    origin: "authored",
+    protection: "none",
+    seed: `${id}-seed`,
+    appearanceSeed: `${id}-appearance`,
+    grammarId: "residential-slab",
+    visualUse: "residential",
+    heightM: 24,
+    paletteId: null,
+    sitePolygon: [
+      { x: -30, y: -20 },
+      { x: -10, y: -20 },
+      { x: -10, y: 0 },
+      { x: -30, y: 0 }
+    ],
+    placement: { centre: { x: -20, y: -10 }, rotationRad: 0, widthM: 20, depthM: 20 },
+    districtId: null,
+    blockId: null
+  };
+}
 
-function planFor(source: CityStateV3): CompleteCityPlan {
+function persistentPlace(
+  id: string,
+  lineage: string
+): CityStateV4["source"]["architecture"]["places"][number] {
+  return {
+    id,
+    lineage,
+    origin: "authored",
+    protection: "none",
+    seed: `${id}-seed`,
+    appearanceSeed: `${id}-appearance`,
+    landmarkGrammarId: "hero-tower-plaza",
+    paletteId: null,
+    sitePolygon: [
+      { x: 10, y: 10 },
+      { x: 30, y: 10 },
+      { x: 30, y: 30 },
+      { x: 10, y: 30 }
+    ],
+    placement: { centre: { x: 20, y: 20 }, rotationRad: 0, widthM: 20, depthM: 20 },
+    districtId: null,
+    blockId: null
+  };
+}
+
+function architectureOverride(
+  targetId: string,
+  lineage: string
+): CityStateV4["source"]["architecture"]["overrides"][number] {
+  return {
+    targetKind: "building",
+    targetId,
+    lineage,
+    protection: "manual-edit",
+    snapshotSitePolygon: [
+      { x: -30, y: -20 },
+      { x: -10, y: -20 },
+      { x: -10, y: 0 },
+      { x: -30, y: 0 }
+    ],
+    appearanceSeed: `${targetId}-override`,
+    paletteId: null
+  };
+}
+
+function planFor(source: CityStateV4): CompleteCityPlan {
   const structuralInput = completeCityStructuralInput(source.source);
   return {
     sourceRevision: source.revision,
@@ -140,19 +216,22 @@ function planFor(source: CityStateV3): CompleteCityPlan {
   };
 }
 
-function planFilenameFor(source: CityStateV3, compressed: Uint8Array): string {
+function planFilenameFor(source: CityStateV4, compressed: Uint8Array): string {
   const structuralInput = completeCityStructuralInput(source.source);
   const sourceSignature = checksumBytes(new TextEncoder().encode(JSON.stringify([
     structuralInput.terrain,
     structuralInput.roads,
     structuralInput.districts,
-    structuralInput.generation
+    structuralInput.generation,
+    structuralInput.architecture,
+    structuralInput.schemaVersion,
+    structuralInput.generatorVersion
   ])));
   return `plan-r${source.revision}-${sourceSignature}-${checksumBytes(compressed)}.plan-cache.json`;
 }
 
 function manifestFor(
-  source: CityStateV3,
+  source: CityStateV4,
   compressed: Uint8Array,
   slot: CacheSlot = 0
 ): CityCacheManifestV1 {
@@ -215,7 +294,7 @@ function chunkRecord(id: string, x: number): CachedCompleteChunkRecord {
 }
 
 function manifestWithChunks(
-  source: CityStateV3,
+  source: CityStateV4,
   plan: CompleteCityPlan,
   planBytes: Uint8Array,
   records: readonly CachedCompleteChunkRecord[]
@@ -258,7 +337,7 @@ function manifestWithChunks(
   };
 }
 
-function install(currentCity: CityStateV3 = city(), manifest: unknown = undefined): void {
+function install(currentCity: CityStateV4 = city(), manifest: unknown = undefined): void {
   cityFlag = currentCity;
   cacheFlag = manifest;
   setFlag = vi.fn(async (_moduleId: string, flag: string, value: unknown): Promise<unknown> => {
@@ -337,9 +416,22 @@ describe("complete plan cache loading", () => {
     cacheFlag = { ...manifestFor(source, bytes), cityRevision: source.revision + 1 };
     await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
 
-    for (const key of ["terrain", "roads", "districts", "generation"] as const) {
+    for (const key of ["terrain", "roads", "districts", "generation", "architecture"] as const) {
       const stale = manifestFor(source, bytes);
       stale.structuralInput[key] = `${stale.structuralInput[key]}-stale`;
+      cacheFlag = stale;
+      await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
+    }
+    for (const mutate of [
+      (manifest: CityCacheManifestV1): void => {
+        (manifest.structuralInput as unknown as Record<string, unknown>).schemaVersion = 3;
+      },
+      (manifest: CityCacheManifestV1): void => {
+        (manifest.structuralInput as unknown as Record<string, unknown>).generatorVersion = 11;
+      }
+    ]) {
+      const stale = manifestFor(source, bytes);
+      mutate(stale);
       cacheFlag = stale;
       await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
     }
@@ -358,7 +450,68 @@ describe("complete plan cache loading", () => {
     expect(storage.fetchCacheAsset).toHaveBeenCalledWith(manifest.plan.artifact.path, bytes.byteLength);
     expect(storage.gunzipBytes).toHaveBeenCalledWith(bytes);
   });
+  it("keeps architecture signatures canonical across array and site-ring ordering", () => {
+    const source = city();
+    source.source.architecture.buildings = [
+      persistentBuilding("building-a", "building-lineage-a"),
+      persistentBuilding("building-b", "building-lineage-b")
+    ];
+    source.source.architecture.places = [
+      persistentPlace("place-a", "place-lineage-a"),
+      persistentPlace("place-b", "place-lineage-b")
+    ];
+    source.source.architecture.overrides = [
+      architectureOverride("target-a", "lineage-a"),
+      architectureOverride("target-b", "lineage-b")
+    ];
+    const canonical = completeCityStructuralInput(source.source);
 
+    const reordered = structuredClone(source);
+    reordered.source.architecture.buildings.reverse();
+    reordered.source.architecture.places.reverse();
+    reordered.source.architecture.overrides.reverse();
+    for (const building of reordered.source.architecture.buildings) building.sitePolygon.reverse();
+    for (const place of reordered.source.architecture.places) place.sitePolygon.reverse();
+    for (const override of reordered.source.architecture.overrides) override.snapshotSitePolygon.reverse();
+
+    expect(completeCityStructuralInput(reordered.source)).toEqual(canonical);
+
+    const changedLineage = structuredClone(source);
+    changedLineage.source.architecture.overrides[0]!.lineage = "lineage-changed";
+    expect(completeCityStructuralInput(changedLineage.source)).not.toEqual(canonical);
+  });
+
+  it("treats a persisted architecture lineage change as a cache miss", async () => {
+    const source = city();
+    source.source.architecture.overrides = [architectureOverride("target-a", "lineage-a")];
+    const bytes = encodeCompleteCityPlan(planFor(source));
+    const manifest = manifestFor(source, bytes);
+    const changed = structuredClone(source);
+    changed.source.architecture.overrides[0]!.lineage = "lineage-changed";
+    install(changed, manifest);
+
+    await expect(loadCachedCompletePlan(changed)).resolves.toBeNull();
+    expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
+  });
+
+  it("safely misses a legacy four-field V1 signature without fetching", async () => {
+    const source = city();
+    const bytes = encodeCompleteCityPlan(planFor(source));
+    const current = manifestFor(source, bytes);
+    const legacy = {
+      ...current,
+      structuralInput: {
+        terrain: current.structuralInput.terrain,
+        roads: current.structuralInput.roads,
+        districts: current.structuralInput.districts,
+        generation: current.structuralInput.generation
+      }
+    };
+    install(source, legacy);
+
+    await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
+    expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
+  });
   it("rejects legacy shared and cross-scene plan refs before fetch", async () => {
     const source = city();
     const bytes = encodeCompleteCityPlan(planFor(source));
@@ -589,9 +742,9 @@ describe("complete plan cache publication", () => {
   });
 
   it.each([
-    ["terrain", (current: CityStateV3): void => { current.source.terrain.land[0]!.x += 1; }],
-    ["roads", (current: CityStateV3): void => { current.source.roads.routes.push({ id: "route-new", curvePreset: "standard" }); }],
-    ["districts", (current: CityStateV3): void => {
+    ["terrain", (current: CityStateV4): void => { current.source.terrain.land[0]!.x += 1; }],
+    ["roads", (current: CityStateV4): void => { current.source.roads.routes.push({ id: "route-new", curvePreset: "standard" }); }],
+    ["districts", (current: CityStateV4): void => {
       current.source.districts.push({
         id: "district-new",
         polygon: [{ x: -90, y: -70 }, { x: -10, y: -70 }, { x: -10, y: 70 }, { x: -90, y: 70 }],
@@ -603,7 +756,10 @@ describe("complete plan cache publication", () => {
         openSpaceOverride: null
       });
     }],
-    ["generation", (current: CityStateV3): void => { current.source.generation.openSpaceProfile = "high"; }]
+    ["architecture", (current: CityStateV4): void => {
+      current.source.architecture.buildings.push(persistentBuilding("persistent-b", "lineage-b"));
+    }],
+    ["generation", (current: CityStateV4): void => { current.source.generation.openSpaceProfile = "high"; }]
   ] as const)("rejects a stale %s signature after upload and before setFlag", async (_key, mutate) => {
     const source = city();
     const plan = planFor(source);
@@ -705,6 +861,15 @@ describe("complete chunk cache signatures and loading", () => {
       source,
       plan,
       { ...SCENE_BOUNDS_M, width: 101 },
+      PIXELS_PER_METRE,
+      ["0,0", "1,0"]
+    )).not.toBe(first);
+    const changedSource = city();
+    changedSource.source.architecture.overrides = [architectureOverride("target-a", "lineage-a")];
+    expect(chunkSceneGeometrySignature(
+      changedSource,
+      planFor(changedSource),
+      SCENE_BOUNDS_M,
       PIXELS_PER_METRE,
       ["0,0", "1,0"]
     )).not.toBe(first);

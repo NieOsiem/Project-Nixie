@@ -10,14 +10,25 @@ import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import {
   OPEN_SPACE_CATEGORIES,
   OPEN_SPACE_SIZES,
+  type ArchitectureOverrideSource,
+  type ArchitectureOrigin,
+  type ArchitectureProtection,
   type CitySourceV3,
+  type CitySourceV4,
   type CityStateV3,
+  type CityStateV4,
   type DistrictOpenSpaceOverride,
   type DistrictSource,
   type OpenSpaceCategory,
-  type OpenSpaceSize
+  type OpenSpaceSize,
+  type PersistentBuildingSource,
+  type PersistentPlaceSource,
+  type PlacementFrame,
+  validateCityStateV4
 } from "../core/gen/city.js";
 import { validateCitySourceV3 } from "../core/gen/city.js";
+import type { BuildingGrammarId, BuildingUseId } from "../core/gen/building-registry.js";
+import type { LandmarkGrammarId } from "../core/gen/landmark-registry.js";
 import type { TerrainSource } from "../core/gen/terrain.js";
 import type { WallSegment } from "../core/gen/walls.js";
 import { validateRouteTopology } from "../core/graph/topology.js";
@@ -25,7 +36,7 @@ import { validateRouteTopology } from "../core/graph/topology.js";
 export type CityLoadResult =
   | { kind: "absent" }
   | { kind: "legacy"; raw: unknown }
-  | { kind: "supported"; state: CityStateV3; raw?: unknown }
+  | { kind: "supported"; state: CityStateV4; raw?: unknown }
   | {
       kind: "obsolete-precomplete";
       raw: unknown;
@@ -265,6 +276,186 @@ function decodeDistrict(value: unknown): DistrictSource | null {
     openSpaceOverride
   };
 }
+function decodeNullableText(value: unknown): string | null {
+  return value === null ? null : nonEmptyText(value) ? value : null;
+}
+
+function decodePlacement(value: unknown): PlacementFrame | null {
+  if (!isRecord(value) || !has(value, "centre") || !has(value, "rotationRad") || !has(value, "widthM") || !has(value, "depthM")) return null;
+  const centre = decodePoint(value.centre);
+  if (centre === null || !finiteNumber(value.rotationRad) || !finiteNumber(value.widthM) || !finiteNumber(value.depthM)) return null;
+  return { centre, rotationRad: value.rotationRad, widthM: value.widthM, depthM: value.depthM };
+}
+
+
+function decodeArchitectureProtection(value: unknown): ArchitectureProtection | null {
+  return value === "none" || value === "explicit" || value === "manual-edit" ? value : null;
+}
+
+function decodePalette(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (nonEmptyText(value)) return value;
+  return undefined;
+}
+
+function decodePersistentBuilding(value: unknown): PersistentBuildingSource | null {
+  if (
+    !isRecord(value) ||
+    !has(value, "id") ||
+    !has(value, "lineage") ||
+    !has(value, "origin") ||
+    !has(value, "protection") ||
+    !has(value, "seed") ||
+    !has(value, "appearanceSeed") ||
+    !has(value, "grammarId") ||
+    !has(value, "visualUse") ||
+    !has(value, "heightM") ||
+    !has(value, "paletteId") ||
+    !has(value, "sitePolygon") ||
+    !has(value, "placement") ||
+    !has(value, "districtId") ||
+    !has(value, "blockId")
+  ) return null;
+  const origin: ArchitectureOrigin | null = value.origin === "generated" || value.origin === "authored" ? value.origin : null;
+  const protection = decodeArchitectureProtection(value.protection);
+  const paletteId = decodePalette(value.paletteId);
+  const sitePolygon = decodeRing(value.sitePolygon);
+  const placement = decodePlacement(value.placement);
+  const districtId = decodeNullableText(value.districtId);
+  const blockId = decodeNullableText(value.blockId);
+  if (
+    !nonEmptyText(value.id) ||
+    !nonEmptyText(value.lineage) ||
+    origin === null ||
+    protection === null ||
+    !nonEmptyText(value.seed) ||
+    !nonEmptyText(value.appearanceSeed) ||
+    !finiteNumber(value.heightM) ||
+    paletteId === undefined ||
+    sitePolygon === null ||
+    placement === null ||
+    districtId === null && value.districtId !== null ||
+    blockId === null && value.blockId !== null
+  ) return null;
+  return {
+    id: value.id,
+    lineage: value.lineage,
+    origin,
+    protection,
+    seed: value.seed,
+    appearanceSeed: value.appearanceSeed,
+    grammarId: value.grammarId as BuildingGrammarId,
+    visualUse: value.visualUse as BuildingUseId,
+    heightM: value.heightM,
+    paletteId,
+    sitePolygon,
+    placement,
+    districtId,
+    blockId
+  };
+}
+function decodePersistentPlace(value: unknown): PersistentPlaceSource | null {
+  if (
+    !isRecord(value) ||
+    !has(value, "id") ||
+    !has(value, "lineage") ||
+    !has(value, "origin") ||
+    !has(value, "protection") ||
+    !has(value, "seed") ||
+    !has(value, "appearanceSeed") ||
+    !has(value, "landmarkGrammarId") ||
+    !has(value, "paletteId") ||
+    !has(value, "sitePolygon") ||
+    !has(value, "placement") ||
+    !has(value, "districtId") ||
+    !has(value, "blockId")
+  ) return null;
+  const origin: ArchitectureOrigin | null = value.origin === "generated" || value.origin === "authored" ? value.origin : null;
+  const protection = decodeArchitectureProtection(value.protection);
+  const paletteId = decodePalette(value.paletteId);
+  const sitePolygon = decodeRing(value.sitePolygon);
+  const placement = decodePlacement(value.placement);
+  const districtId = decodeNullableText(value.districtId);
+  const blockId = decodeNullableText(value.blockId);
+  if (
+    !nonEmptyText(value.id) ||
+    !nonEmptyText(value.lineage) ||
+    origin === null ||
+    protection === null ||
+    !nonEmptyText(value.seed) ||
+    !nonEmptyText(value.appearanceSeed) ||
+    paletteId === undefined ||
+    sitePolygon === null ||
+    placement === null ||
+    districtId === null && value.districtId !== null ||
+    blockId === null && value.blockId !== null
+  ) return null;
+  return {
+    id: value.id,
+    lineage: value.lineage,
+    origin,
+    protection,
+    seed: value.seed,
+    appearanceSeed: value.appearanceSeed,
+    landmarkGrammarId: value.landmarkGrammarId as LandmarkGrammarId,
+    paletteId,
+    sitePolygon,
+    placement,
+    districtId,
+    blockId
+  };
+}
+
+function decodeArchitectureOverride(value: unknown): ArchitectureOverrideSource | null {
+  if (
+    !isRecord(value) ||
+    !has(value, "targetKind") ||
+    !has(value, "targetId") ||
+    !has(value, "lineage") ||
+    !has(value, "protection") ||
+    !has(value, "snapshotSitePolygon")
+  ) return null;
+  const protection = decodeArchitectureProtection(value.protection);
+  const snapshotSitePolygon = decodeRing(value.snapshotSitePolygon);
+  const appearanceSeed = has(value, "appearanceSeed") ? value.appearanceSeed : undefined;
+  const paletteId = has(value, "paletteId") ? decodePalette(value.paletteId) : undefined;
+  if (
+    (value.targetKind !== "building" && value.targetKind !== "place") ||
+    !nonEmptyText(value.targetId) ||
+    !nonEmptyText(value.lineage) ||
+    protection === null ||
+    snapshotSitePolygon === null ||
+    (appearanceSeed !== undefined && !nonEmptyText(appearanceSeed)) ||
+    (has(value, "paletteId") && paletteId === undefined)
+  ) return null;
+  return {
+    targetKind: value.targetKind,
+    targetId: value.targetId,
+    lineage: value.lineage,
+    protection,
+    snapshotSitePolygon,
+    ...(appearanceSeed === undefined ? {} : { appearanceSeed }),
+    ...(has(value, "paletteId") ? { paletteId } : {})
+  };
+}
+
+function decodeArchitecture(value: unknown): CitySourceV4["architecture"] | null {
+  if (!isRecord(value) || !has(value, "buildings") || !has(value, "places") || !has(value, "overrides")) return null;
+  if (!Array.isArray(value.buildings) || !Array.isArray(value.places) || !Array.isArray(value.overrides)) return null;
+  const buildings = value.buildings.map(decodePersistentBuilding);
+  const places = value.places.map(decodePersistentPlace);
+  const overrides = value.overrides.map(decodeArchitectureOverride);
+  if (
+    buildings.some((building): building is null => building === null) ||
+    places.some((place): place is null => place === null) ||
+    overrides.some((override): override is null => override === null)
+  ) return null;
+  return {
+    buildings: buildings as PersistentBuildingSource[],
+    places: places as PersistentPlaceSource[],
+    overrides: overrides as ArchitectureOverrideSource[]
+  };
+}
 
 function decodeV3Generation(value: unknown): CitySourceV3["generation"] | null {
   if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge") || !has(value, "roadLayout") || !has(value, "hubMode") || !has(value, "districtPool") || !has(value, "openSpaceProfile")) return null;
@@ -306,13 +497,44 @@ function decodeV3Source(value: unknown): CitySourceV3 | null {
     districts: districts as DistrictSource[]
   };
 }
+function decodeV4Source(value: unknown): CitySourceV4 | null {
+  if (!isRecord(value)) return null;
+  const sourceProblems = validateCityStateV4({
+    kind: "city-generator-2",
+    schemaVersion: 4,
+    generatorVersion: 12,
+    revision: 1,
+    source: value
+  });
+  if (sourceProblems.length > 0) return null;
+  const source = decodeV3Source(value);
+  if (source === null || !has(value, "architecture")) return null;
+  const architecture = decodeArchitecture(value.architecture);
+  if (architecture === null) return null;
+  return { ...source, architecture };
+}
+export function migrateCityStateV3ToV4(stateV3: CityStateV3): CityStateV4 {
+  return {
+    kind: "city-generator-2",
+    schemaVersion: 4,
+    generatorVersion: 12,
+    revision: stateV3.revision,
+    source: {
+      ...stateV3.source,
+      architecture: {
+        buildings: [],
+        places: [],
+        overrides: []
+      }
+    }
+  };
+}
 
-function decodeSupported(raw: unknown): { state: CityStateV3 } | { reason: string } {
+function decodeV3Supported(raw: unknown): { state: CityStateV3 } | { reason: string } {
   if (!isRecord(raw)) return { reason: "state is not an object" };
   if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
-  if (!has(raw, "schemaVersion") || raw.schemaVersion !== CITY_SCHEMA_VERSION) return { reason: "invalid schema version" };
-  if (!has(raw, "generatorVersion") || !positiveInteger(raw.generatorVersion)) return { reason: "invalid generator version" };
-  if (raw.generatorVersion !== GENERATOR_VERSION) return { reason: "unsupported generator version" };
+  if (raw.schemaVersion !== 3) return { reason: "invalid schema version" };
+  if (raw.generatorVersion !== 11) return { reason: "unsupported generator version" };
   if (!has(raw, "revision") || !positiveInteger(raw.revision)) return { reason: "invalid city revision" };
   if (!has(raw, "source")) return { reason: "missing city source" };
   const source = decodeV3Source(raw.source);
@@ -328,66 +550,101 @@ function decodeSupported(raw: unknown): { state: CityStateV3 } | { reason: strin
   return {
     state: {
       kind: "city-generator-2",
-      schemaVersion: CITY_SCHEMA_VERSION,
-      generatorVersion: GENERATOR_VERSION,
+      schemaVersion: 3,
+      generatorVersion: 11,
       revision: raw.revision,
       source
     }
   };
 }
 
-// WHY: Schema 1/gen 8, schema 2/gen 9, and schema 3/gen 10 are the known pre-complete
-// generations. They are read-only: raw data and version evidence are preserved so the
-// campaign can be recovered, but nothing is migrated or rewritten at open time.
-const OBSOLETE_PRECOMPLETE_GENERATOR = new Map<number, number>([
-  [1, 8],
-  [2, 9],
-  [3, 10]
-]);
+function decodeSupported(raw: unknown): { state: CityStateV4 } | { reason: string } {
+  if (!isRecord(raw)) return { reason: "state is not an object" };
+  if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
+  if (!has(raw, "schemaVersion") || raw.schemaVersion !== CITY_SCHEMA_VERSION) return { reason: "invalid schema version" };
+  if (!has(raw, "generatorVersion") || !positiveInteger(raw.generatorVersion)) return { reason: "invalid generator version" };
+  if (raw.generatorVersion !== GENERATOR_VERSION) return { reason: "unsupported generator version" };
+  if (!has(raw, "revision") || !positiveInteger(raw.revision)) return { reason: "invalid city revision" };
+  if (!has(raw, "source")) return { reason: "missing city source" };
+  const source = decodeV4Source(raw.source);
+  if (source === null) return { reason: "invalid city source" };
+  const state: CityStateV4 = {
+    kind: "city-generator-2",
+    schemaVersion: CITY_SCHEMA_VERSION,
+    generatorVersion: GENERATOR_VERSION,
+    revision: raw.revision,
+    source
+  };
+  const problems = validateCityStateV4(state);
+  if (problems.length > 0) return { reason: problems.join(" ") };
+  try {
+    const topology = validateRouteTopology(source.roads);
+    if (!topology.ok) return { reason: topology.problems.join(" ") };
+  } catch (error) {
+    return { reason: error instanceof Error ? error.message : String(error) };
+  }
+  return { state };
+}
+
+// WHY: Schema 1/gen 8, schema 2/gen 9, and schema 3/gen 10 are known pre-complete
+// generations. They remain read-only; schema 3/gen 11 is the sole migration input.
+// Migration is in-memory and never writes the Scene until a later guarded edit.
+const OBSOLETE_PRECOMPLETE_GENERATOR: Record<number, number> = {
+  1: 8,
+  2: 9,
+  3: 10
+};
 
 function classify(raw: unknown): CityLoadResult {
   if (raw === undefined) return { kind: "absent" };
   if (!isRecord(raw) || !has(raw, "kind") || raw.kind !== "city-generator-2") {
     return { kind: "legacy", raw };
   }
-  if (!Number.isInteger(raw.schemaVersion)) {
+  const schemaVersion = raw.schemaVersion;
+  const generatorVersion = raw.generatorVersion;
+  if (!Number.isInteger(schemaVersion)) {
     return { kind: "malformed", raw, reason: "schemaVersion must be an integer" };
   }
-  if (!positiveInteger(raw.generatorVersion)) {
+  if (!positiveInteger(generatorVersion)) {
     return { kind: "malformed", raw, reason: "invalid generator version" };
   }
-  // WHY: schema 3 is the CURRENT schema and is shared by the obsolete generator 10 and the
-  // current generator 11, so the obsolete entry only applies when the generator version
-  // matches it; a current-schema/current-generator state must fall through to supported.
-  const obsoleteGenerator = OBSOLETE_PRECOMPLETE_GENERATOR.get(raw.schemaVersion as number);
-  if (obsoleteGenerator !== undefined && raw.generatorVersion === obsoleteGenerator) {
+  const schema = schemaVersion as number;
+  const generator = generatorVersion as number;
+  const obsoleteGenerator = OBSOLETE_PRECOMPLETE_GENERATOR[schema];
+  if (obsoleteGenerator !== undefined && generator === obsoleteGenerator) {
     if (!positiveInteger(raw.revision)) return { kind: "malformed", raw, reason: "invalid city revision" };
     return {
       kind: "obsolete-precomplete",
       raw,
-      schemaVersion: raw.schemaVersion as 1 | 2 | 3,
-      generatorVersion: raw.generatorVersion as 8 | 9 | 10,
-      revision: raw.revision as number
+      schemaVersion: schema as 1 | 2 | 3,
+      generatorVersion: generator as 8 | 9 | 10,
+      revision: raw.revision
     };
   }
-  if (raw.schemaVersion !== CITY_SCHEMA_VERSION) {
-    // Known pre-complete schemas (1/2) carry their generator version as evidence of
-    // the unknown variant; future schemas only expose the schema version.
+  if (schema === 3 && generator === 11) {
+    const decoded = decodeV3Supported(raw);
+    return "state" in decoded
+      ? { kind: "supported", state: migrateCityStateV3ToV4(decoded.state), raw }
+      : { kind: "malformed", raw, reason: decoded.reason };
+  }
+  if (schema !== CITY_SCHEMA_VERSION) {
+    // Known pre-complete schemas carry their generator version as evidence of the
+    // unknown variant; future schemas only expose the schema version.
     return obsoleteGenerator !== undefined
       ? {
           kind: "unsupported",
           raw,
-          schemaVersion: raw.schemaVersion as number,
-          generatorVersion: raw.generatorVersion as number
+          schemaVersion: schema,
+          generatorVersion: generator
         }
-      : { kind: "unsupported", raw, schemaVersion: raw.schemaVersion as number };
+      : { kind: "unsupported", raw, schemaVersion: schema };
   }
-  if (raw.generatorVersion !== GENERATOR_VERSION) {
+  if (generator !== GENERATOR_VERSION) {
     return {
       kind: "unsupported",
       raw,
-      schemaVersion: raw.schemaVersion as number,
-      generatorVersion: raw.generatorVersion
+      schemaVersion: schema,
+      generatorVersion: generator
     };
   }
   const decoded = decodeSupported(raw);
@@ -400,7 +657,7 @@ export function loadCityState(): CityLoadResult {
   return classify(canvas?.scene?.getFlag(MODULE_ID, FLAG_CITY));
 }
 
-function validateCandidate(candidate: CityStateV3): CityStateV3 {
+function validateCandidate(candidate: CityStateV4): CityStateV4 {
   const decoded = decodeSupported(candidate);
   if (!("state" in decoded)) throw new Error(`Invalid City Generator 2.0 state: ${decoded.reason}`);
   if (decoded.state.generatorVersion !== GENERATOR_VERSION) {
@@ -410,9 +667,9 @@ function validateCandidate(candidate: CityStateV3): CityStateV3 {
 }
 
 export async function saveCityState(
-  candidate: CityStateV3,
+  candidate: CityStateV4,
   expectation: SaveExpectation
-): Promise<CityStateV3> {
+): Promise<CityStateV4> {
   requireGM();
   const state = validateCandidate(candidate);
   const scene = requireScene();

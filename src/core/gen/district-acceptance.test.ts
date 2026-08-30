@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, type Ring } from "../geom/types.js";
-import { validateCitySourceV3, type CitySourceV3 } from "./city.js";
+import { validateCitySourceV4, type CitySourceV4 } from "./city.js";
 import { generateInitialDistricts } from "./district-generator.js";
 import { buildDistrictPlan, districtBreadthGallery, planDistrictFragmentWithGrammar, type DevelopmentCellPlan, type DistrictBlockFragment } from "./district-plan.js";
 import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPES, DISTRICT_TYPE_REGISTRY, type BlockGrammarId, type DistrictTypeDefinition } from "./district-registry.js";
@@ -19,7 +19,7 @@ const multiArea = (multi: ReturnType<typeof ringAsMulti>): number => multi.reduc
   0
 );
 
-function acceptanceSource(): CitySourceV3 {
+function acceptanceSource(): CitySourceV4 {
   const land = rectRing({ x: 0, y: 0, width: CITY_SIDE_M, height: CITY_SIDE_M });
   const roads = generateInitialRoadNetwork({ citySeed: CITY_SEED, mask: land, land, layout: "grid", hubMode: "single-centre" }).roads;
   return {
@@ -35,11 +35,12 @@ function acceptanceSource(): CitySourceV3 {
     },
     terrain: { land, urbanFootprint: null },
     roads,
-    districts: []
+    districts: [],
+    architecture: { buildings: [], places: [], overrides: [] }
   };
 }
 
-function permuteSource(source: CitySourceV3): CitySourceV3 {
+function permuteSource(source: CitySourceV4): CitySourceV4 {
   return {
     ...source,
     roads: {
@@ -51,7 +52,7 @@ function permuteSource(source: CitySourceV3): CitySourceV3 {
   };
 }
 
-function withAcceptanceOverride(districts: CitySourceV3["districts"]): CitySourceV3["districts"] {
+function withAcceptanceOverride(districts: CitySourceV4["districts"]): CitySourceV4["districts"] {
   return districts.map((district, index) => index === 0 ? {
     ...district,
     openSpaceOverride: {
@@ -191,12 +192,12 @@ describe("Phase 3 district acceptance fixtures", () => {
   it("serializes only authoritative source fields and round-trips validation", () => {
     const source = acceptanceSource();
     const districts = withAcceptanceOverride(generateInitialDistricts(source));
-    const state = { kind: "city-generator-2" as const, schemaVersion: 3 as const, generatorVersion: 10 as const, revision: 7, source: { ...source, districts } };
+    const state = { kind: "city-generator-2" as const, schemaVersion: 4 as const, generatorVersion: 12 as const, revision: 7, source: { ...source, districts } };
     const encoded = JSON.stringify(state);
     const decoded = JSON.parse(encoded) as typeof state;
 
     expect(decoded).toEqual(state);
-    expect(validateCitySourceV3(decoded.source)).toEqual([]);
+    expect(validateCitySourceV4(decoded.source)).toEqual([]);
     for (const derivedKey of ["blocks", "developmentCells", "openSpaceIntents", "wallCells", "diagnostics"]) {
       expect(encoded).not.toContain(`"${derivedKey}"`);
     }

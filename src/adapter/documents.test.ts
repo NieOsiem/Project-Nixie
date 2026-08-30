@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3 } from "../core/gen/city.js";
+import type { CityStateV3, CityStateV4 } from "../core/gen/city.js";
 import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import { cityFlagIdentity, clearCityState, loadCityState, saveCityState } from "./documents.js";
 
@@ -91,7 +91,7 @@ function schemaTwo(revision = 4): Record<string, unknown> {
   };
 }
 
-function state(revision = 1, roads: CityStateV3["source"]["roads"] = { nodes: [], routes: [], edges: [] }): CityStateV3 {
+function state(revision = 1, roads: CityStateV4["source"]["roads"] = { nodes: [], routes: [], edges: [] }): CityStateV4 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -118,8 +118,79 @@ function state(revision = 1, roads: CityStateV3["source"]["roads"] = { nodes: []
         urbanFootprint: null
       },
       roads: structuredClone(roads),
-      districts: []
+      districts: [],
+      architecture: { buildings: [], places: [], overrides: [] }
     }
+  };
+}
+
+const architectureSite = [
+  { x: -10, y: -10 },
+  { x: 10, y: -10 },
+  { x: 10, y: 10 },
+  { x: -10, y: 10 }
+];
+
+function stateWithArchitecture(revision = 1): CityStateV4 {
+  const current = state(revision);
+  current.source.architecture = {
+    buildings: [{
+      id: "building-1",
+      lineage: "lineage/building-1",
+      origin: "generated",
+      protection: "none",
+      seed: "seed/building-1",
+      appearanceSeed: "appearance/building-1",
+      grammarId: "residential-slab",
+      visualUse: "residential",
+      heightM: 32,
+      paletteId: "corporate",
+      sitePolygon: architectureSite.map((point) => ({ ...point })),
+      placement: { centre: { x: 0, y: 0 }, rotationRad: 0, widthM: 10, depthM: 10 },
+      districtId: null,
+      blockId: null
+    }],
+    places: [{
+      id: "place-1",
+      lineage: "lineage/place-1",
+      origin: "authored",
+      protection: "explicit",
+      seed: "seed/place-1",
+      appearanceSeed: "appearance/place-1",
+      landmarkGrammarId: "hero-tower-plaza",
+      paletteId: "corporate",
+      sitePolygon: architectureSite.map((point) => ({ ...point })),
+      placement: { centre: { x: 0, y: 0 }, rotationRad: 0, widthM: 10, depthM: 10 },
+      districtId: null,
+      blockId: null
+    }],
+    overrides: [{
+      targetKind: "building",
+      targetId: "building-1",
+      lineage: "lineage/override-1",
+      protection: "manual-edit",
+      snapshotSitePolygon: architectureSite.map((point) => ({ ...point }))
+    }]
+  };
+  return current;
+}
+
+function setRecordField(target: object, field: string, value: unknown): void {
+  (target as Record<string, unknown>)[field] = value;
+}
+
+function removeRecordField(target: object, field: string): void {
+  delete (target as Record<string, unknown>)[field];
+}
+
+function stateV3(revision = 1, roads: CityStateV3["source"]["roads"] = { nodes: [], routes: [], edges: [] }): CityStateV3 {
+  const current = state(revision, roads);
+  const { architecture: _architecture, ...source } = current.source;
+  return {
+    ...current,
+    schemaVersion: 3,
+    generatorVersion: 11,
+    source
   };
 }
 
@@ -142,6 +213,243 @@ const roads = {
     }
   ]
 };
+
+const malformedArchitectureCases = [
+  {
+    name: "invalid building origin",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "origin", "imported")
+  },
+  {
+    name: "invalid place protection",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "protection", "locked")
+  },
+  {
+    name: "missing building lineage",
+    mutate: (raw: CityStateV4) => removeRecordField(raw.source.architecture.buildings[0]!, "lineage")
+  },
+  {
+    name: "empty place lineage",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "lineage", "")
+  },
+  {
+    name: "missing override lineage",
+    mutate: (raw: CityStateV4) => removeRecordField(raw.source.architecture.overrides[0]!, "lineage")
+  },
+  {
+    name: "unknown building grammar",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "grammarId", "unknown-grammar")
+  },
+  {
+    name: "unknown building visual use",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "visualUse", "unknown-use")
+  },
+  {
+    name: "unknown place grammar",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "landmarkGrammarId", "unknown-landmark")
+  },
+  {
+    name: "unknown override palette",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "paletteId", "unknown-palette")
+  },
+  {
+    name: "degenerate building site",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "sitePolygon", [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 2, y: 0 }])
+  },
+  {
+    name: "disconnected place site",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "sitePolygon", [
+      [{ x: 0, y: 0 }, { x: 5, y: 0 }, { x: 5, y: 5 }],
+      [{ x: 20, y: 20 }, { x: 25, y: 20 }, { x: 25, y: 25 }],
+      [{ x: 40, y: 40 }, { x: 45, y: 40 }, { x: 45, y: 45 }]
+    ])
+  },
+  {
+    name: "hole-like override snapshot",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "snapshotSitePolygon", [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 20 },
+      { x: 10, y: 10 },
+      { x: 0, y: 20 },
+      { x: 10, y: 10 }
+    ])
+  },
+  {
+    name: "nonfinite building height",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "heightM", Number.NaN)
+  },
+  {
+    name: "negative place frame width",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!.placement, "widthM", -1)
+  },
+  {
+    name: "malformed override target",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "targetKind", "district")
+  },
+  {
+    name: "malformed override snapshot",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "snapshotSitePolygon", "not-a-ring")
+  },
+  {
+    name: "override non-whitelisted field",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "notes", "not persisted")
+  },
+  {
+    name: "invalid place origin",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "origin", "imported")
+  },
+  {
+    name: "invalid building protection",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "protection", "locked")
+  },
+  {
+    name: "empty building lineage",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "lineage", "")
+  },
+  {
+    name: "missing place lineage",
+    mutate: (raw: CityStateV4) => removeRecordField(raw.source.architecture.places[0]!, "lineage")
+  },
+  {
+    name: "empty override lineage",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "lineage", "")
+  },
+  {
+    name: "unknown building palette",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "paletteId", "unknown-palette")
+  },
+  {
+    name: "unknown place palette",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "paletteId", "unknown-palette")
+  },
+  {
+    name: "invalid override protection",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "protection", "locked")
+  },
+  {
+    name: "malformed override target id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "targetId", "")
+  },
+  {
+    name: "nonfinite building frame centre",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!.placement.centre, "x", Number.POSITIVE_INFINITY)
+  },
+  {
+    name: "nonfinite place frame rotation",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!.placement, "rotationRad", Number.POSITIVE_INFINITY)
+  },
+  {
+    name: "zero building frame depth",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!.placement, "depthM", 0)
+  },
+  {
+    name: "negative building height",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "heightM", -1)
+  },
+  {
+    name: "empty building appearance seed",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "appearanceSeed", "")
+  },
+  {
+    name: "empty place seed",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "seed", "")
+  },
+  {
+    name: "zero building frame width",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!.placement, "widthM", 0)
+  },
+  {
+    name: "nonfinite building frame rotation",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!.placement, "rotationRad", Number.NEGATIVE_INFINITY)
+  },
+  {
+    name: "nonfinite place frame centre",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!.placement.centre, "y", Number.NaN)
+  },
+  {
+    name: "empty override appearance seed",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.overrides[0]!, "appearanceSeed", "")
+  },
+  {
+    name: "empty building id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "id", "")
+  },
+  {
+    name: "empty place id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "id", "")
+  },
+  {
+    name: "empty building seed",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "seed", "")
+  },
+  {
+    name: "missing place appearance seed",
+    mutate: (raw: CityStateV4) => removeRecordField(raw.source.architecture.places[0]!, "appearanceSeed")
+  },
+  {
+    name: "unknown building field",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "notes", "not persisted")
+  },
+  {
+    name: "unknown place field",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "notes", "not persisted")
+  },
+  {
+    name: "incompatible building grammar and visual use",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "visualUse", "industrial")
+  },
+  {
+    name: "invalid building district id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "districtId", "")
+  },
+  {
+    name: "invalid place block id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "blockId", "")
+  },
+  {
+    name: "duplicate architecture object id",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "id", "building-1")
+  },
+  {
+    name: "duplicate architecture lineage",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "lineage", "lineage/building-1")
+  },
+  {
+    name: "duplicate architecture override target",
+    mutate: (raw: CityStateV4) => raw.source.architecture.overrides.push({
+      targetKind: "building",
+      targetId: "building-1",
+      lineage: "lineage/override-2",
+      protection: "manual-edit",
+      snapshotSitePolygon: architectureSite.map((point) => ({ ...point }))
+    })
+  },
+  {
+    name: "finite building frame extending beyond its site",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.buildings[0]!, "placement", {
+      centre: { x: 8, y: 0 },
+      rotationRad: 0,
+      widthM: 10,
+      depthM: 10
+    })
+  },
+  {
+    name: "finite place frame extending beyond its site",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture.places[0]!, "placement", {
+      centre: { x: 8, y: 0 },
+      rotationRad: 0,
+      widthM: 10,
+      depthM: 10
+    })
+  },
+  {
+    name: "unknown architecture source field",
+    mutate: (raw: CityStateV4) => setRecordField(raw.source.architecture, "notes", "not persisted")
+  },
+] satisfies ReadonlyArray<{
+  name: string;
+  mutate: (raw: CityStateV4) => void;
+}>;
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -189,7 +497,7 @@ describe("loadCityState", () => {
   });
 
   it("classifies schema 3 / generator 10 as obsolete-precomplete and preserves raw data", () => {
-    const raw = { ...state(3, roads), generatorVersion: 10 };
+    const raw = { ...stateV3(3, roads), generatorVersion: 10 };
     installScene(raw);
     const result = loadCityState();
     expect(setFlag).not.toHaveBeenCalled();
@@ -216,24 +524,73 @@ describe("loadCityState", () => {
   });
 
   it("round-trips schema 3 road fields and IDs", () => {
-    const raw = state(3, roads);
+    const raw = stateV3(3, roads);
     installScene(raw);
     const result = loadCityState();
-    expect(result).toEqual({ kind: "supported", state: raw, raw });
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(result).toEqual({ kind: "supported", state: state(3, roads), raw });
+  });
+  it("persists a migrated V4 state only after a successful guarded edit", async () => {
+    const raw = stateV3(4, roads);
+    installScene(raw);
+    const loaded = loadCityState();
+    expect(setFlag).not.toHaveBeenCalled();
+    if (loaded.kind !== "supported") throw new Error("expected supported migrated state");
+    const candidate = {
+      ...loaded.state,
+      revision: 5,
+      source: { ...loaded.state.source, citySeed: "edited-after-migration" }
+    };
+    await expect(saveCityState(candidate, 4)).resolves.toEqual(candidate);
+    expect(setFlag).toHaveBeenCalledOnce();
+    expect(stored).toEqual(candidate);
+    expect(candidate.schemaVersion).toBe(4);
+    expect(candidate.generatorVersion).toBe(12);
+  });
+  it("loads native schema 4 / generator 12 states with mandatory architecture arrays", () => {
+    const raw = state(3, roads);
+    installScene(raw);
+    expect(loadCityState()).toEqual({ kind: "supported", state: raw, raw });
+    expect(setFlag).not.toHaveBeenCalled();
+  });
+
+  it.each(["buildings", "places", "overrides"] as const)("refuses a native architecture envelope missing the %s array without writing", (missing) => {
+    const raw = state(3, roads);
+    delete (raw.source.architecture as unknown as Record<string, unknown>)[missing];
+    installScene(raw);
+    expect(loadCityState()).toMatchObject({ kind: "malformed", raw });
+    expect(setFlag).not.toHaveBeenCalled();
+  });
+
+  it("loads valid building, place, and override records before applying rejection cases", () => {
+    const raw = stateWithArchitecture(3);
+    installScene(raw);
+    expect(loadCityState()).toEqual({ kind: "supported", state: raw, raw });
+    expect(setFlag).not.toHaveBeenCalled();
+  });
+
+  it.each(malformedArchitectureCases)("refuses malformed architecture $name without writing", ({ mutate }) => {
+    const raw = stateWithArchitecture(3);
+    mutate(raw);
+    installScene(raw);
+    expect(loadCityState()).toMatchObject({ kind: "malformed", raw });
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBe(raw);
   });
 
   it("rejects future schemas and unknown generator versions without writing", () => {
-    const future = { ...state(), schemaVersion: 4 };
+    const future = { ...state(), schemaVersion: 5 };
     installScene(future);
-    expect(loadCityState()).toEqual({ kind: "unsupported", raw: future, schemaVersion: 4 });
+    expect(loadCityState()).toEqual({ kind: "unsupported", raw: future, schemaVersion: 5 });
 
-    const futureGenerator = { ...state(), generatorVersion: 12 };
+    const futureGenerator = { ...state(), generatorVersion: 13 };
     installScene(futureGenerator);
     expect(loadCityState()).toEqual({
       kind: "unsupported",
       raw: futureGenerator,
       schemaVersion: CITY_SCHEMA_VERSION,
-      generatorVersion: 12
+      generatorVersion: 13
     });
 
     const unknownSchemaOneGenerator = { ...schemaOne(), generatorVersion: 7 };
@@ -369,7 +726,7 @@ describe("saveCityState", () => {
     expect(rawSchemaTwo.schemaVersion).toBe(2);
     expect(rawSchemaTwo.generatorVersion).toBe(9);
 
-    const rawSchemaThree = { ...state(4), generatorVersion: 10 };
+    const rawSchemaThree = { ...stateV3(4), generatorVersion: 10 };
     installScene(rawSchemaThree);
     await expect(saveCityState(state(5), 4)).rejects.toThrow(/revision/i);
     expect(setFlag).not.toHaveBeenCalled();
@@ -384,6 +741,26 @@ describe("saveCityState", () => {
       expect(setFlag).not.toHaveBeenCalled();
       expect(stored).toBe(raw);
     }
+  });
+
+  it.each(malformedArchitectureCases)("refuses malformed architecture saveCandidate $name without writing", async ({ mutate }) => {
+    const candidate = stateWithArchitecture();
+    mutate(candidate);
+    installScene(undefined);
+    await expect(saveCityState(candidate, "absent")).rejects.toThrow(/invalid city/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBeUndefined();
+  });
+
+  it.each(["buildings", "places", "overrides"] as const)("refuses saveCandidate with a missing architecture %s array without writing", async (missing) => {
+    const candidate = stateWithArchitecture();
+    delete (candidate.source.architecture as unknown as Record<string, unknown>)[missing];
+    installScene(undefined);
+    await expect(saveCityState(candidate, "absent")).rejects.toThrow(/invalid city/i);
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(unsetFlag).not.toHaveBeenCalled();
+    expect(stored).toBeUndefined();
   });
 
   it("does not hide a failed Scene write", async () => {
@@ -490,7 +867,7 @@ describe("clearCityState", () => {
 
   it("never clears caches alongside unsupported or malformed city flags", async () => {
     const cache = { slot: 1 };
-    const unsupported = { ...state(), generatorVersion: 12 };
+    const unsupported = { ...state(), generatorVersion: 13 };
     installScene(unsupported, undefined, cache);
     await expect(clearCityState({ kind: "legacy", identity: "x" })).rejects.toThrow(/changed/i);
     await expect(clearCityState({ kind: "supported", revision: 1, identity: "x" })).rejects.toThrow(/changed/i);

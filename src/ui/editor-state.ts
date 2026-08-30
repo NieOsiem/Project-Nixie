@@ -11,6 +11,7 @@ import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type D
 export const LAYER_NIXIE = "nixie";
 export const LAYER_ROADS = "nixie-roads";
 export const LAYER_DISTRICTS = "nixie-districts";
+export const LAYER_OBJECTS = "nixie-objects";
 
 export const TOOL = {
   LAND_DRAW: "land-draw",
@@ -36,6 +37,13 @@ export const DISTRICT_TOOL = {
 } as const;
 export type DistrictTool = (typeof DISTRICT_TOOL)[keyof typeof DISTRICT_TOOL];
 
+export const OBJECT_TOOL = {
+  SELECT: "select",
+  PLACE: "place",
+  SITE: "site"
+} as const;
+export type ObjectTool = (typeof OBJECT_TOOL)[keyof typeof OBJECT_TOOL];
+
 export interface DistrictSnapOptions {
   districtVertices: boolean;
   roadJunctions: boolean;
@@ -59,7 +67,7 @@ export const WORKSPACE_META: Record<WorkspaceId, { label: string; icon: string; 
   terrain: { label: "Terrain", icon: "fa-solid fa-water", phase: null },
   roads: { label: "Roads", icon: "fa-solid fa-road", phase: null },
   districts: { label: "Districts", icon: "fa-solid fa-shapes", phase: null },
-  objects: { label: "Objects", icon: "fa-solid fa-boxes-stacked", phase: "Phases 5–8" },
+  objects: { label: "Objects", icon: "fa-solid fa-boxes-stacked", phase: null },
   regenerate: { label: "Regenerate", icon: "fa-solid fa-arrows-rotate", phase: "Phase 6" },
   diagnostics: { label: "Diagnostics", icon: "fa-solid fa-triangle-exclamation", phase: null }
 };
@@ -70,7 +78,7 @@ const WORKSPACE_LAYER: Record<WorkspaceId, string | null> = {
   terrain: LAYER_NIXIE,
   roads: LAYER_ROADS,
   districts: LAYER_DISTRICTS,
-  objects: null,
+  objects: LAYER_OBJECTS,
   regenerate: null,
   diagnostics: null
 };
@@ -80,10 +88,14 @@ const DEFAULT_TOOL: Record<WorkspaceId, string | null> = {
   terrain: TOOL.LAND_EDIT,
   roads: ROAD_TOOL.SELECT,
   districts: DISTRICT_TOOL.SELECT,
-  objects: null,
+  objects: OBJECT_TOOL.SELECT,
   regenerate: null,
   diagnostics: null
 };
+
+export function isObjectTool(tool: string | null): tool is ObjectTool {
+  return Object.values(OBJECT_TOOL).includes(tool as ObjectTool);
+}
 
 function isToolForWorkspace(tool: string | null, workspace: WorkspaceId): boolean {
   if (workspace === "terrain") {
@@ -93,6 +105,7 @@ function isToolForWorkspace(tool: string | null, workspace: WorkspaceId): boolea
     return tool === ROAD_TOOL.DRAW || tool === ROAD_TOOL.SELECT || tool === ROAD_TOOL.EDIT;
   }
   if (workspace === "districts") return Object.values(DISTRICT_TOOL).includes(tool as DistrictTool);
+  if (workspace === "objects") return isObjectTool(tool);
   return tool === null;
 }
 
@@ -216,6 +229,130 @@ let hubMode: HubMode = DEFAULT_PREFS.hubMode;
 let terrainMode: TerrainMode = "rectangle";
 let districtSnap: DistrictSnapOptions = { ...DEFAULT_DISTRICT_SNAP };
 let districtType: DistrictTypeId = DISTRICT_TYPE_IDS[0];
+export type ObjectSelectionKind = "building" | "place";
+
+export interface ObjectSelection {
+  kind: ObjectSelectionKind | null;
+  ids: string[];
+}
+
+let objectSelection: ObjectSelection = { kind: null, ids: [] };
+let objectSelectionListener: ((selection: ObjectSelection) => void) | null = null;
+let objectDraftCancelListener: (() => void) | null = null;
+let objectStagingClearListener: (() => void) | null = null;
+let pendingOperationLabel: string | null = null;
+
+function cleanupObjectInteraction(clearSelection: boolean): void {
+  objectDraftCancelListener?.();
+  objectStagingClearListener?.();
+  if (!clearSelection || (objectSelection.kind === null && objectSelection.ids.length === 0)) return;
+  objectSelection = { kind: null, ids: [] };
+  objectSelectionListener?.({ kind: null, ids: [] });
+}
+
+export function getObjectSelection(): ObjectSelection {
+  return { kind: objectSelection.kind, ids: [...objectSelection.ids] };
+}
+
+export function currentObjectSelection(): ObjectSelection {
+  return getObjectSelection();
+}
+
+export function setObjectSelection(next: ObjectSelection): ObjectSelection;
+export function setObjectSelection(kind: ObjectSelectionKind | null, ids: readonly string[], additive?: boolean): ObjectSelection;
+export function setObjectSelection(
+  nextOrKind: ObjectSelection | ObjectSelectionKind | null,
+  ids?: readonly string[],
+  additive = false
+): ObjectSelection {
+  const next = typeof nextOrKind === "object" && nextOrKind !== null
+    ? nextOrKind
+    : { kind: nextOrKind, ids: ids ?? [] };
+  const kind = next.kind === "building" || next.kind === "place" ? next.kind : null;
+  const selectedIds = kind === null
+    ? []
+    : [...new Set(next.ids)].filter((id): id is string => typeof id === "string" && id.length > 0);
+  const combinedIds = additive && kind !== null && objectSelection.kind === kind
+    ? [...new Set([...objectSelection.ids, ...selectedIds])]
+    : selectedIds;
+  if (objectSelection.kind === (combinedIds.length === 0 ? null : kind)
+    && objectSelection.ids.length === combinedIds.length
+    && objectSelection.ids.every((id, index) => id === combinedIds[index])) return getObjectSelection();
+  objectSelection = combinedIds.length === 0 ? { kind: null, ids: [] } : { kind, ids: combinedIds };
+  const snapshot = getObjectSelection();
+  objectSelectionListener?.(snapshot);
+  controller?.onStateChanged();
+  return snapshot;
+}
+
+export function selectObject(kind: ObjectSelectionKind, id: string, additive = false): ObjectSelection {
+  if (id.length === 0) return getObjectSelection();
+  if (!additive || objectSelection.kind !== kind) return setObjectSelection(kind, [id]);
+  const ids = new Set(objectSelection.ids);
+  if (ids.has(id)) ids.delete(id);
+  else ids.add(id);
+  return setObjectSelection(ids.size === 0 ? { kind: null, ids: [] } : { kind, ids: [...ids] });
+}
+
+export function clearObjectSelection(): void {
+  if (objectSelection.kind === null && objectSelection.ids.length === 0) return;
+  objectSelection = { kind: null, ids: [] };
+  objectSelectionListener?.({ kind: null, ids: [] });
+  controller?.onStateChanged();
+}
+
+export function setObjectSelectionListener(listener: ((selection: ObjectSelection) => void) | null): void {
+  objectSelectionListener = listener;
+}
+
+export function setObjectDraftCancelListener(listener: (() => void) | null): void {
+  objectDraftCancelListener = listener;
+}
+
+export function cancelObjectDraft(): void {
+  objectDraftCancelListener?.();
+}
+
+export function setObjectStagingClearListener(listener: (() => void) | null): void {
+  objectStagingClearListener = listener;
+}
+
+export function clearObjectStaging(): void {
+  objectStagingClearListener?.();
+}
+
+export function clearObjectInteraction(): void {
+  cleanupObjectInteraction(true);
+}
+
+export function pendingOperation(): string | null {
+  return pendingOperationLabel;
+}
+
+export function currentPendingOperation(): string | null {
+  return pendingOperation();
+}
+
+export function isPendingOperation(): boolean {
+  return pendingOperationLabel !== null;
+}
+
+export function setPendingOperation(label: string | null): void {
+  const next = typeof label === "string" && label.trim().length > 0 ? label : null;
+  if (pendingOperationLabel === next) return;
+  pendingOperationLabel = next;
+  controller?.onStateChanged();
+}
+
+export function beginPendingOperation(label: string): boolean {
+  if (pendingOperationLabel !== null) return false;
+  setPendingOperation(label);
+  return true;
+}
+
+export function endPendingOperation(): void {
+  setPendingOperation(null);
+}
 let districtPalette = DISTRICT_TYPE_REGISTRY.get(districtType)!.defaultPaletteId;
 let districtPool: DistrictTypeId[] = [...DISTRICT_TYPE_IDS];
 let openSpaceProfile: DistrictOpenSpaceProfile = "medium";
@@ -277,8 +414,11 @@ export function openEditor(): void {
     ui.notifications?.warn("Nixie: the canvas must be ready before opening the editor.");
     return;
   }
+  cleanupObjectInteraction(true);
+  pendingOperationLabel = null;
   editorOpen = true;
   restorePrefs();
+  if (workspace === "objects" && objectCategory !== "buildings" && objectCategory !== "places") objectCategory = "buildings";
   if (!isToolForWorkspace(tool, workspace)) tool = DEFAULT_TOOL[workspace];
   ownedLayer = WORKSPACE_LAYER[workspace];
   activateLayer(ownedLayer);
@@ -286,6 +426,8 @@ export function openEditor(): void {
 }
 
 export function closeEditor(options: { restoreDefaultLayer?: boolean } = {}): void {
+  cleanupObjectInteraction(true);
+  pendingOperationLabel = null;
   if (!editorOpen) return;
   editorOpen = false;
   writePrefs();
@@ -307,14 +449,15 @@ export function closeEditor(options: { restoreDefaultLayer?: boolean } = {}): vo
  * Opening the editor by clicking the Nixie control flows through here.
  */
 export function editorLayerActivated(layer: string): void {
-  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS && layer !== LAYER_DISTRICTS) return;
+  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS && layer !== LAYER_DISTRICTS && layer !== LAYER_OBJECTS) return;
   if (!editorOpen) {
     openEditor();
+    if (editorOpen && layer === LAYER_OBJECTS) setWorkspace("objects");
     return;
   }
   if (ownedLayer === layer) return;
   // The control icon clicked while editing on the other layer: adopt that layer's workspace.
-  setWorkspace(layer === LAYER_ROADS ? "roads" : layer === LAYER_DISTRICTS ? "districts" : "terrain");
+  setWorkspace(layer === LAYER_ROADS ? "roads" : layer === LAYER_DISTRICTS ? "districts" : layer === LAYER_OBJECTS ? "objects" : "terrain");
 }
 
 /**
@@ -334,25 +477,27 @@ export function editorLayerDeactivated(layer: string): void {
 
 export function setWorkspace(next: WorkspaceId): void {
   if (next === workspace) return;
+  const previousWorkspace = workspace;
   const previousLayer = WORKSPACE_LAYER[workspace];
+  if (previousWorkspace === "objects" || next === "objects") cleanupObjectInteraction(true);
   workspace = next;
+  if (next === "objects" && objectCategory !== "buildings" && objectCategory !== "places") objectCategory = "buildings";
   if (!isToolForWorkspace(tool, next)) tool = DEFAULT_TOOL[next];
   if (editorOpen) {
     ownedLayer = WORKSPACE_LAYER[next];
-    if (ownedLayer === null && previousLayer !== null) {
-      // Moving to a workspace with no canvas tools: clear the planning overlay.
+    if (previousLayer !== null && previousLayer !== ownedLayer) {
+      // Explicitly release the prior interaction layer before acquiring the next one.
       const previous = canvas?.[previousLayer];
       if (previous?.active === true) previous.deactivate();
-    } else {
-      activateLayer(ownedLayer);
     }
+    activateLayer(ownedLayer);
   }
   writePrefs();
   controller?.onStateChanged();
 }
-
 export function setCanvasTool(next: string | null): void {
   if (tool === next) return;
+  if (workspace === "objects") cleanupObjectInteraction(false);
   tool = next;
   writePrefs();
   controller?.onStateChanged();
@@ -378,16 +523,37 @@ export function clearEditorActionError(): void {
 }
 
 export function setEditorActionError(label: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  const affectedIds = Array.isArray((error as any)?.affectedIds)
-    ? (error as any).affectedIds.filter((id: unknown): id is string => typeof id === "string")
-    : [];
-  actionError = { label, message, affectedIds };
+  const value = error as Record<string, unknown> | null;
+  const rawMessage = error instanceof Error
+    ? error.message
+    : typeof value?.message === "string"
+      ? value.message
+      : String(error);
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const collect = (candidate: unknown): void => {
+    const values = Array.isArray(candidate) ? candidate : [candidate];
+    for (const id of values) {
+      if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+  };
+  for (const key of ["affectedIds", "objectId", "objectIds", "siteId", "siteIds", "targetId", "targetIds"]) {
+    collect(value?.[key]);
+  }
+  const stale = value?.code === "STALE" || /\bstale\b|revision mismatch|concurrent scene/i.test(rawMessage);
+  const message = stale && !/reopen|refresh|retry/i.test(rawMessage)
+    ? `${rawMessage} Reopen or refresh the editor, then retry.`
+    : rawMessage;
+  actionError = { label, message, affectedIds: ids };
   controller?.onStateChanged();
 }
 
 export function setObjectCategory(next: ObjectCategory): void {
+  if (workspace === "objects" && next !== "buildings" && next !== "places") return;
   if (objectCategory === next) return;
+  if (workspace === "objects") cleanupObjectInteraction(true);
   objectCategory = next;
   writePrefs();
   controller?.onStateChanged();

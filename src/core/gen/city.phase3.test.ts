@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { DISTRICT_TYPE_IDS } from "./district-registry.js";
 import {
   normalizeDistrictOpenSpaceOverride,
-  validateCitySourceV3,
-  validateCityStateV3,
-  type CityStateV3,
+  validateCitySourceV4,
+  validateCityStateV4,
+  type CityStateV4,
   type RoadSource
 } from "./city.js";
 import { rectangleLand } from "./terrain.js";
@@ -19,10 +19,10 @@ const roads: RoadSource = {
   edges: [{ id: "e-a", a: "n-a", b: "n-b", routeId: "r-a", classId: "street", name: null, locked: false, origin: "authored" }]
 };
 
-const schema3 = (): CityStateV3 => ({
+const schema4 = (): CityStateV4 => ({
   kind: "city-generator-2",
-  schemaVersion: 3,
-  generatorVersion: 11,
+  schemaVersion: 4,
+  generatorVersion: 12,
   revision: 1,
   source: {
     origin: { x: 5000, y: 4000 },
@@ -37,18 +37,24 @@ const schema3 = (): CityStateV3 => ({
     },
     terrain,
     roads,
-    districts: []
+    districts: [],
+    architecture: {
+      buildings: [],
+      places: [],
+      overrides: []
+    }
   }
 });
 
 describe("City Generator 2.0 Phase 3 model", () => {
-  it("validates a generator-11 state carrying district defaults", () => {
-    const state = schema3();
-    expect(state.generatorVersion).toBe(11);
-    expect(validateCityStateV3(state)).toEqual([]);
+  it("validates a generator-12 state carrying district defaults and empty architecture", () => {
+    const state = schema4();
+    expect(state.generatorVersion).toBe(12);
+    expect(validateCityStateV4(state)).toEqual([]);
     expect(state.source.generation.districtPool).toEqual(DISTRICT_TYPE_IDS);
     expect(state.source.generation.openSpaceProfile).toBe("medium");
     expect(state.source.districts).toEqual([]);
+    expect(state.source.architecture).toEqual({ buildings: [], places: [], overrides: [] });
   });
 
   it("normalizes explicit open-space weights while rejecting all-zero tables", () => {
@@ -67,20 +73,20 @@ describe("City Generator 2.0 Phase 3 model", () => {
   });
 
   it("rejects overlapping persisted district polygons atomically", () => {
-    const source = schema3().source;
+    const source = schema4().source;
     source.districts = [
       { id: "d-a", polygon: [{ x: -80, y: -40 }, { x: 10, y: -40 }, { x: 10, y: 40 }, { x: -80, y: 40 }], seed: "a", typeId: "corporate-core", paletteId: "corporate", origin: "authored", locked: false, openSpaceOverride: null },
       { id: "d-b", polygon: [{ x: -10, y: -40 }, { x: 80, y: -40 }, { x: 80, y: 40 }, { x: -10, y: 40 }], seed: "b", typeId: "night-market", paletteId: "market", origin: "authored", locked: false, openSpaceOverride: null }
     ];
-    expect(validateCitySourceV3(source).some((problem) => /overlap/i.test(problem))).toBe(true);
+    expect(validateCitySourceV4(source).some((problem) => /overlap/i.test(problem))).toBe(true);
   });
 
   it("accepts sub-snap slivers between adjacent persisted districts", () => {
-    const source = schema3().source;
+    const source = schema4().source;
     source.districts = [
       { id: "d-a", polygon: [{ x: -80, y: -40 }, { x: 40, y: -40 }, { x: 40, y: 40 }, { x: -80, y: 40 }], seed: "a", typeId: "corporate-core", paletteId: "corporate", origin: "authored", locked: false, openSpaceOverride: null },
       { id: "d-b", polygon: [{ x: 40.0001, y: -40 }, { x: 120, y: -40 }, { x: 120, y: 40 }, { x: 40.0001, y: 40 }], seed: "b", typeId: "night-market", paletteId: "night-market", origin: "authored", locked: false, openSpaceOverride: null }
     ];
-    expect(validateCitySourceV3(source)).toEqual([]);
+    expect(validateCitySourceV4(source)).toEqual([]);
   });
 });

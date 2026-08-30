@@ -7,12 +7,14 @@ import {
 } from "./complete-city-plan-cache.js";
 import type { CompleteCityPlan } from "./complete-city-plan.js";
 import type { StructuralInputSignature } from "./district-plan.js";
-
 const STRUCTURAL_INPUT: StructuralInputSignature = {
   terrain: "terrain-signature",
   roads: "roads-signature",
   districts: "districts-signature",
-  generation: "generation-signature"
+  generation: "generation-signature",
+  architecture: "architecture-signature",
+  schemaVersion: 4,
+  generatorVersion: 12
 };
 
 function smallPlan(): CompleteCityPlan {
@@ -105,7 +107,15 @@ describe("complete city plan cache codec", () => {
     const malformed = { ...smallPlan(), [field]: value };
     expectArtifactError(() => decodeCompleteCityPlan(jsonBytes(malformed)));
   });
+  it("rejects a pre-architecture plan artifact as a safe cache miss", () => {
+    const legacy = structuredClone(smallPlan());
+    const structuralInput = legacy.structuralInput as unknown as Record<string, unknown>;
+    delete structuralInput.architecture;
+    delete structuralInput.schemaVersion;
+    delete structuralInput.generatorVersion;
 
+    expectArtifactError(() => decodeCompleteCityPlan(jsonBytes(legacy)));
+  });
   it("accepts an exact stable identity without comparing transient fields", () => {
     const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
     const expected = {
@@ -124,7 +134,7 @@ describe("complete city plan cache codec", () => {
     }));
   });
 
-  it.each(["terrain", "roads", "districts", "generation"] as const)(
+  it.each(["terrain", "roads", "districts", "generation", "architecture"] as const)(
     "rejects a %s structural-signature mismatch",
     (field) => {
       const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
@@ -139,4 +149,21 @@ describe("complete city plan cache codec", () => {
       }));
     }
   );
+
+  it.each([
+    ["schemaVersion", (value: StructuralInputSignature): StructuralInputSignature => ({
+      ...value,
+      schemaVersion: (value.schemaVersion + 1) as unknown as StructuralInputSignature["schemaVersion"]
+    })],
+    ["generatorVersion", (value: StructuralInputSignature): StructuralInputSignature => ({
+      ...value,
+      generatorVersion: (value.generatorVersion + 1) as unknown as StructuralInputSignature["generatorVersion"]
+    })]
+  ] as const)("rejects a %s discriminator mismatch", (_field, mutate) => {
+    const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
+    expectArtifactError(() => assertCompleteCityPlanCacheIdentity(decoded, {
+      sourceRevision: decoded.sourceRevision,
+      structuralInput: mutate(decoded.structuralInput)
+    }));
+  });
 });

@@ -7,9 +7,9 @@ import {
 } from "./terrain-session.js";
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3 } from "../core/gen/city.js";
+import type { CityStateV4 } from "../core/gen/city.js";
 
-function state(revision: number, seed = "session-seed"): CityStateV3 {
+function state(revision: number, seed = "session-seed"): CityStateV4 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -36,12 +36,68 @@ function state(revision: number, seed = "session-seed"): CityStateV3 {
         urbanFootprint: null
       },
       roads: { nodes: [], routes: [], edges: [] },
-      districts: []
+      districts: [],
+      architecture: {
+        buildings: [{
+          id: "bldg-session",
+          lineage: "lineage-session-building",
+          origin: "authored",
+          protection: "manual-edit",
+          seed: "building-structural-seed",
+          appearanceSeed: "building-appearance-seed",
+          grammarId: "narrow-shopfront",
+          visualUse: "commercial",
+          heightM: 30,
+          paletteId: null,
+          sitePolygon: [
+            { x: -8, y: -8 },
+            { x: 0, y: -8 },
+            { x: 0, y: 0 },
+            { x: -8, y: 0 }
+          ],
+          placement: { centre: { x: -4, y: -4 }, rotationRad: 0, widthM: 8, depthM: 8 },
+          districtId: null,
+          blockId: null
+        }],
+        places: [{
+          id: "place-session",
+          lineage: "lineage-session-place",
+          origin: "generated",
+          protection: "none",
+          seed: "place-structural-seed",
+          appearanceSeed: "place-appearance-seed",
+          landmarkGrammarId: "hero-tower-plaza",
+          paletteId: null,
+          sitePolygon: [
+            { x: 0, y: 0 },
+            { x: 8, y: 0 },
+            { x: 8, y: 8 },
+            { x: 0, y: 8 }
+          ],
+          placement: { centre: { x: 4, y: 4 }, rotationRad: 0, widthM: 8, depthM: 8 },
+          districtId: null,
+          blockId: null
+        }],
+        overrides: [{
+          targetKind: "building",
+          targetId: "bldg-session",
+          lineage: "lineage-session-building",
+          protection: "manual-edit",
+          snapshotSitePolygon: [
+            { x: -8, y: -8 },
+            { x: 0, y: -8 },
+            { x: 0, y: 0 },
+            { x: -8, y: 0 }
+          ],
+          appearanceSeed: "override-appearance-seed",
+          paletteId: "corporate"
+        }]
+      }
     }
   };
 }
 
-function supported(value: CityStateV3): CityLoadResult {
+function supported(value: CityStateV4): CityLoadResult {
   return { kind: "supported", state: value };
 }
 
@@ -123,8 +179,35 @@ describe("TerrainSession", () => {
     expect(session.draftVersion).toBe(before.draft + 1);
 
     candidate.source.citySeed = "mutated-after-publication";
+    candidate.source.architecture.buildings[0]!.heightM = 999;
+    candidate.source.architecture.places[0]!.appearanceSeed = "mutated-after-publication";
+    candidate.source.architecture.overrides[0]!.paletteId = "mutated-after-publication";
     expect(session.current?.source.citySeed).toBe("session-seed");
+    expect(session.current?.source.architecture.buildings[0]!.heightM).toBe(30);
+    expect(session.current?.source.architecture.places[0]!.appearanceSeed).toBe("place-appearance-seed");
+    expect(session.current?.source.architecture.overrides[0]!.paletteId).toBe("corporate");
   });
+  it("preserves architecture snapshots across commit, undo, and redo", () => {
+    const session = createSession();
+    const committed = state(2, "committed-session-seed");
+    committed.source.architecture.buildings[0]!.heightM = 42;
+    committed.source.architecture.places[0]!.appearanceSeed = "committed-place-appearance";
+    committed.source.architecture.overrides[0]!.paletteId = "market";
+    const initialArchitecture = state(1).source.architecture;
+    const committedArchitecture = structuredClone(committed.source.architecture);
+
+    session.publishCommit(committed);
+    expect(session.current?.source.architecture).toEqual(committedArchitecture);
+    expect(session.undoTarget?.source.architecture).toEqual(initialArchitecture);
+
+    session.publishUndo(session.undoTarget!);
+    expect(session.current?.source.architecture).toEqual(initialArchitecture);
+    expect(session.redoTarget?.source.architecture).toEqual(committedArchitecture);
+
+    session.publishRedo(session.redoTarget!);
+    expect(session.current?.source.architecture).toEqual(committedArchitecture);
+  });
+
 
   it("leaves state, history, and epochs unchanged when a failed save is not published", () => {
     const session = createSession();

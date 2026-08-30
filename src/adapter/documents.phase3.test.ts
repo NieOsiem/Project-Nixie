@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3 } from "../core/gen/city.js";
+import type { CityStateV3, CityStateV4 } from "../core/gen/city.js";
 import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { loadCityState, replaceGeneratedWalls, saveCityState } from "./documents.js";
@@ -55,7 +55,7 @@ function schema2(revision = 3): Record<string, unknown> {
   };
 }
 
-function schema3(revision = 1): CityStateV3 {
+function schema3(revision = 1): CityStateV4 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -74,8 +74,20 @@ function schema3(revision = 1): CityStateV3 {
       },
       terrain: { land: rectangleLand({ x: -100, y: -80, width: 200, height: 160 }), urbanFootprint: null },
       roads: { nodes: [], routes: [], edges: [] },
-      districts: []
+      districts: [],
+      architecture: { buildings: [], places: [], overrides: [] }
     }
+  };
+}
+
+function schema3Legacy(revision = 1): CityStateV3 {
+  const current = schema3(revision);
+  const { architecture: _architecture, ...source } = current.source;
+  return {
+    ...current,
+    schemaVersion: 3,
+    generatorVersion: 11,
+    source
   };
 }
 
@@ -114,6 +126,13 @@ describe("Phase 3 Scene persistence", () => {
       generatorVersion: 9,
       revision: 7
     });
+  });
+  it("migrates schema 3 / generator 11 in memory without an open-time write", () => {
+    const raw = schema3Legacy(7);
+    installScene(raw);
+    const result = loadCityState();
+    expect(setFlag).not.toHaveBeenCalled();
+    expect(result).toEqual({ kind: "supported", state: schema3(7), raw });
   });
 
   it("refuses a schema-3 save over an obsolete schema-2 flag and leaves it untouched", async () => {

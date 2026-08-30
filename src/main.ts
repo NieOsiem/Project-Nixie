@@ -16,6 +16,16 @@ import {
   generationPreflight,
   generationState,
   getCity,
+  getArchitectureSource,
+  commitArchitectureCandidate,
+  placeBuilding,
+  placePlace,
+  transformObject,
+  editObjectProperties,
+  rerollObjectAppearance,
+  deleteObject,
+  setObjectLocked,
+  editSitePolygon,
   getLeanCalibrationReport,
   getRoadSelection,
   getDistrictPlan,
@@ -76,11 +86,12 @@ import {
 import { WEATHER_PRESETS } from "./render/look-dials.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerEditorSceneControls } from "./ui/editor-controls.js";
-import { installEditorShellController, openDistrictApp, openRoadApp, openTerrainApp } from "./ui/editor-shell.js";
+import { installEditorShellController, openDistrictApp, openObjectsApp, openRoadApp, openTerrainApp } from "./ui/editor-shell.js";
 import { isEditorOpen } from "./ui/editor-state.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
 import { ROAD_LAYER_NAME, roadLayerClass } from "./ui/road-layer.js";
 import { DISTRICT_LAYER_NAME, districtLayerClass } from "./ui/district-layer.js";
+import { OBJECT_LAYER_NAME, objectsLayerClass } from "./ui/objects-layer.js";
 
 const CONTROL = "Control";
 const SHIFT = "Shift";
@@ -108,6 +119,7 @@ function registerKeybindings(): void {
 Hooks.once("init", () => {
   CONFIG.Canvas.layers[LAYER_NAME] = { layerClass: nixieLayerClass(), group: "interface" };
   CONFIG.Canvas.layers[ROAD_LAYER_NAME] = { layerClass: roadLayerClass(), group: "interface" };
+  CONFIG.Canvas.layers[OBJECT_LAYER_NAME] = { layerClass: objectsLayerClass(), group: "interface" };
   CONFIG.Canvas.layers[DISTRICT_LAYER_NAME] = { layerClass: districtLayerClass(), group: "interface" };
   registerSettings();
   installEditorShellController();
@@ -123,6 +135,16 @@ Hooks.once("init", () => {
     cityStatus: cityLoadStatus,
     stats,
     getCity,
+    getArchitectureSource,
+    commitArchitectureCandidate,
+    placeBuilding,
+    placePlace,
+    transformObject,
+    editObjectProperties,
+    rerollObjectAppearance,
+    deleteObject,
+    setObjectLocked,
+    editSitePolygon,
     rebuild: rebuildGeometry,
     generationPreflight,
     generationState,
@@ -177,6 +199,7 @@ Hooks.once("init", () => {
     openTerrainApp,
     openRoadApp,
     openDistrictApp,
+    openObjectsApp,
     setRenderScale: async (value: number) => {
       await setSettingValue(SETTING_RENDER_SCALE, value);
       return settingValue<number>(SETTING_RENDER_SCALE);

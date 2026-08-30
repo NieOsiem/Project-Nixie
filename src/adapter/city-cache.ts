@@ -28,8 +28,8 @@ import {
 import { CHUNK_SIZE_M } from "../core/gen/chunks.js";
 import type { Rect } from "../core/geom/types.js";
 import {
-  validateCityStateV3,
-  type CityStateV3
+  validateCityStateV4,
+  type CityStateV4
 } from "../core/gen/city.js";
 import type { StructuralInputSignature } from "../core/gen/district-plan.js";
 import {
@@ -40,7 +40,7 @@ import {
   uploadCacheAsset
 } from "./cache-storage.js";
 
-const SIGNATURE_KEYS = ["terrain", "roads", "districts", "generation"] as const;
+const SIGNATURE_KEYS = ["terrain", "roads", "districts", "generation", "architecture", "schemaVersion", "generatorVersion"] as const;
 const CHUNK_IO_CONCURRENCY = 6;
 const SIGNATURE_ENCODER = new TextEncoder();
 
@@ -90,7 +90,7 @@ function readManifest(scene: CacheScene): CityCacheManifestV1 | null {
 
 function assertCurrentCity(
   scene: CacheScene,
-  expectedCity: CityStateV3,
+  expectedCity: CityStateV4,
   expectedStructuralInput: StructuralInputSignature
 ): void {
   if (canvas?.scene !== scene) throw new Error("The active Scene changed during city cache publication.");
@@ -98,7 +98,7 @@ function assertCurrentCity(
   const currentRaw = scene.getFlag(MODULE_ID, FLAG_CITY);
   let problems: string[];
   try {
-    problems = validateCityStateV3(currentRaw);
+    problems = validateCityStateV4(currentRaw);
   } catch {
     throw new Error("The active Scene city is not a supported City Generator state.");
   }
@@ -106,7 +106,7 @@ function assertCurrentCity(
     throw new Error("The active Scene city is not a supported City Generator state.");
   }
 
-  const current = currentRaw as CityStateV3;
+  const current = currentRaw as CityStateV4;
   if (current.revision !== expectedCity.revision) {
     throw new Error("The authoritative city revision changed during city cache publication.");
   }
@@ -133,7 +133,7 @@ function planAssetFilename(
 function expectedPlanPath(
   sceneId: string,
   slot: CacheSlot,
-  city: CityStateV3,
+  city: CityStateV4,
   structuralInput: StructuralInputSignature,
   checksum: string
 ): string {
@@ -143,7 +143,7 @@ function expectedPlanPath(
 function manifestMatchesPlan(
   manifest: CityCacheManifestV1,
   sceneId: string,
-  city: CityStateV3,
+  city: CityStateV4,
   structuralInput: StructuralInputSignature
 ): boolean {
   return manifest.cityRevision === city.revision &&
@@ -276,7 +276,7 @@ function chunkEntryPathMatches(
 function currentManifestMatches(
   scene: CacheScene,
   expected: CityCacheManifestV1,
-  city: CityStateV3,
+  city: CityStateV4,
   structuralInput: StructuralInputSignature,
   expectedGeometrySignature?: string
 ): boolean {
@@ -292,7 +292,7 @@ function currentManifestMatches(
 }
 
 export function chunkSceneGeometrySignature(
-  city: CityStateV3,
+  city: CityStateV4,
   plan: CompleteCityPlan,
   boundsM: Rect,
   pixelsPerMetre: number,
@@ -314,6 +314,7 @@ export function chunkSceneGeometrySignature(
   const material = JSON.stringify([
     CHUNK_CACHE_FORMAT_VERSION,
     CHUNK_SIZE_M,
+    SIGNATURE_KEYS.map((key) => plan.structuralInput[key]),
     typeof plan.buildToken,
     plan.buildToken,
     city.source.origin.x,
@@ -339,7 +340,7 @@ export function loadCityCacheManifest(): CityCacheManifestV1 | null {
 }
 
 export async function loadCachedCompletePlan(
-  city: CityStateV3
+  city: CityStateV4
 ): Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null> {
   try {
     const scene = activeScene();
@@ -372,11 +373,11 @@ export async function loadCachedCompletePlan(
 }
 
 export async function publishCompletePlanCache(
-  city: CityStateV3,
+  city: CityStateV4,
   plan: CompleteCityPlan
 ): Promise<CityCacheManifestV1> {
   const scene = requireWritableScene();
-  const cityProblems = validateCityStateV3(city);
+  const cityProblems = validateCityStateV4(city);
   if (cityProblems.length > 0) throw new Error(`Cannot cache an unsupported city: ${cityProblems.join(" ")}`);
 
   const structuralInput = completeCityStructuralInput(city.source);
@@ -457,7 +458,7 @@ export async function publishCompletePlanCache(
 }
 
 export async function loadCachedCompleteChunks(
-  city: CityStateV3,
+  city: CityStateV4,
   plan: CompleteCityPlan,
   boundsM: Rect,
   pixelsPerMetre: number,
@@ -469,15 +470,15 @@ export async function loadCachedCompleteChunks(
   manifest: CityCacheManifestV1;
 } | null> {
   const uniqueChunkIds = sortedUniqueChunkIds(expectedChunkIds);
-  const geometrySignature = chunkSceneGeometrySignature(
-    city,
-    plan,
-    boundsM,
-    pixelsPerMetre,
-    uniqueChunkIds
-  );
 
   try {
+    const geometrySignature = chunkSceneGeometrySignature(
+      city,
+      plan,
+      boundsM,
+      pixelsPerMetre,
+      uniqueChunkIds
+    );
     const scene = activeScene();
     const structuralInput = completeCityStructuralInput(city.source);
     assertCompleteCityPlanCacheIdentity(plan, {
@@ -541,14 +542,14 @@ export async function loadCachedCompleteChunks(
 }
 
 export async function publishCompleteChunkCache(
-  city: CityStateV3,
+  city: CityStateV4,
   plan: CompleteCityPlan,
   boundsM: Rect,
   pixelsPerMetre: number,
   records: readonly CachedCompleteChunkRecord[]
 ): Promise<CityCacheManifestV1> {
   const scene = requireWritableScene();
-  const cityProblems = validateCityStateV3(city);
+  const cityProblems = validateCityStateV4(city);
   if (cityProblems.length > 0) throw new Error(`Cannot cache an unsupported city: ${cityProblems.join(" ")}`);
 
   const structuralInput = completeCityStructuralInput(city.source);

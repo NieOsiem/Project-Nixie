@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GENERATOR_VERSION } from "../../constants.js";
+import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import {
   CHUNK_CACHE_FORMAT_VERSION,
   CITY_CACHE_FLAG,
@@ -35,7 +35,15 @@ function manifest(): CityCacheManifestV1 {
     cacheSchemaVersion: CITY_CACHE_SCHEMA_VERSION,
     generatorVersion: GENERATOR_VERSION,
     cityRevision: 7,
-    structuralInput: { terrain: "terrain-signature", roads: "roads-signature", districts: "districts-signature", generation: "generation-signature" },
+    structuralInput: {
+      terrain: "terrain-signature",
+      roads: "roads-signature",
+      districts: "districts-signature",
+      generation: "generation-signature",
+      architecture: "architecture-signature",
+      schemaVersion: CITY_SCHEMA_VERSION,
+      generatorVersion: GENERATOR_VERSION
+    },
     slot: 0,
     plan: { formatVersion: PLAN_CACHE_FORMAT_VERSION, artifact: artifact() }
   };
@@ -63,6 +71,21 @@ describe("city cache manifest", () => {
     expect(decoded).not.toBe(raw);
     expect(decoded?.structuralInput).not.toBe(raw.structuralInput);
     expect(decoded?.plan.artifact).not.toBe(raw.plan.artifact);
+  });
+  it("safely misses a legacy V1 manifest with the pre-architecture signature", () => {
+    const raw = manifest();
+    const legacy = {
+      ...raw,
+      structuralInput: {
+        terrain: raw.structuralInput.terrain,
+        roads: raw.structuralInput.roads,
+        districts: raw.structuralInput.districts,
+        generation: raw.structuralInput.generation
+      }
+    };
+
+    expect(validateCityCacheManifest(legacy)).not.toEqual([]);
+    expect(decodeCityCacheManifest(legacy)).toBeNull();
   });
 
   it.each([
@@ -101,12 +124,22 @@ describe("city cache manifest", () => {
     expectInvalid({ ...manifest(), structuralInput: [] });
     expectInvalid({ ...manifest(), structuralInput: { ...manifest().structuralInput, extra: "signature" } });
 
-    for (const key of ["terrain", "roads", "districts", "generation"] as const) {
+    for (const key of ["terrain", "roads", "districts", "generation", "architecture"] as const) {
       const missing = { ...manifest().structuralInput } as Record<string, unknown>;
       delete missing[key];
       expectInvalid({ ...manifest(), structuralInput: missing });
       expectInvalid({ ...manifest(), structuralInput: { ...manifest().structuralInput, [key]: "   " } });
       expectInvalid({ ...manifest(), structuralInput: { ...manifest().structuralInput, [key]: 12 } });
+    }
+    for (const key of ["schemaVersion", "generatorVersion"] as const) {
+      const missing = { ...manifest().structuralInput } as Record<string, unknown>;
+      delete missing[key];
+      expectInvalid({ ...manifest(), structuralInput: missing });
+      expectInvalid({
+        ...manifest(),
+        structuralInput: { ...manifest().structuralInput, [key]: key === "schemaVersion" ? CITY_SCHEMA_VERSION + 1 : GENERATOR_VERSION + 1 }
+      });
+      expectInvalid({ ...manifest(), structuralInput: { ...manifest().structuralInput, [key]: "4" } });
     }
   });
 

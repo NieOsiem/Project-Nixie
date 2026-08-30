@@ -1,8 +1,9 @@
+import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { difference, intersection, intersectMultiWithRing, isSnapNoise, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
 import { triangulate } from "../geom/tessellate.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV4, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import {
   BLOCK_GRAMMAR_IDS,
   DISTRICT_TYPE_REGISTRY,
@@ -61,6 +62,9 @@ export interface StructuralInputSignature {
   roads: string;
   districts: string;
   generation: string;
+  architecture: string;
+  schemaVersion: typeof CITY_SCHEMA_VERSION;
+  generatorVersion: typeof GENERATOR_VERSION;
 }
 
 export interface DistrictBlockFragment {
@@ -705,7 +709,66 @@ export function compiledRouteOccupancy(network: CompiledRouteNetwork): RouteOccu
   return { vehicle: vehicleUnion, nonVehicle: nonVehicleUnion, all: union([vehicleUnion, nonVehicleUnion]) };
 }
 
-export function districtStructuralInputSignature(source: CitySourceV3): StructuralInputSignature {
+function canonicalArchitectureSignature(source: CitySourceV4): string {
+  const architecture = source.architecture;
+  const canonicalPlacement = (placement: { centre: Vec2; rotationRad: number; widthM: number; depthM: number }) => ({
+    centre: { x: placement.centre.x, y: placement.centre.y },
+    rotationRad: placement.rotationRad,
+    widthM: placement.widthM,
+    depthM: placement.depthM
+  });
+  const canonicalBuildings = architecture.buildings.map((building) => ({
+    id: building.id,
+    lineage: building.lineage,
+    origin: building.origin,
+    protection: building.protection,
+    seed: building.seed,
+    appearanceSeed: building.appearanceSeed,
+    grammarId: building.grammarId,
+    visualUse: building.visualUse,
+    heightM: building.heightM,
+    paletteId: building.paletteId,
+    sitePolygon: canonicalRing(building.sitePolygon),
+    placement: canonicalPlacement(building.placement),
+    districtId: building.districtId,
+    blockId: building.blockId
+  }));
+  const canonicalPlaces = architecture.places.map((place) => ({
+    id: place.id,
+    lineage: place.lineage,
+    origin: place.origin,
+    protection: place.protection,
+    seed: place.seed,
+    appearanceSeed: place.appearanceSeed,
+    landmarkGrammarId: place.landmarkGrammarId,
+    paletteId: place.paletteId,
+    sitePolygon: canonicalRing(place.sitePolygon),
+    placement: canonicalPlacement(place.placement),
+    districtId: place.districtId,
+    blockId: place.blockId
+  }));
+  const canonicalOverrides = architecture.overrides.map((override) => ({
+    targetKind: override.targetKind,
+    targetId: override.targetId,
+    lineage: override.lineage,
+    protection: override.protection,
+    snapshotSitePolygon: canonicalRing(override.snapshotSitePolygon),
+    ...(override.appearanceSeed === undefined ? {} : { appearanceSeed: override.appearanceSeed }),
+    ...(override.paletteId === undefined ? {} : { paletteId: override.paletteId })
+  }));
+  const canonicalSort = <T>(values: T[]): T[] => values.sort((a, b) => {
+    const left = JSON.stringify(a);
+    const right = JSON.stringify(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return JSON.stringify({
+    buildings: canonicalSort(canonicalBuildings),
+    places: canonicalSort(canonicalPlaces),
+    overrides: canonicalSort(canonicalOverrides)
+  });
+}
+
+export function districtStructuralInputSignature(source: CitySourceV4): StructuralInputSignature {
   const nodes = [...source.roads.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const routes = [...source.roads.routes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...source.roads.edges].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, a, b, routeId, classId }) => ({ id, a, b, routeId, classId }));
@@ -714,11 +777,14 @@ export function districtStructuralInputSignature(source: CitySourceV3): Structur
     terrain: stableId("terrain", `${ringSignature(source.terrain.land)}|${source.terrain.urbanFootprint ? ringSignature(source.terrain.urbanFootprint) : ""}`),
     roads: stableId("roads", JSON.stringify({ nodes, routes, edges })),
     districts: stableId("districts", JSON.stringify(districts)),
-    generation: stableId("generation", JSON.stringify({ districtPool: [...source.generation.districtPool].sort(), openSpaceProfile: source.generation.openSpaceProfile }))
+    generation: stableId("generation", JSON.stringify({ districtPool: [...source.generation.districtPool].sort(), openSpaceProfile: source.generation.openSpaceProfile })),
+    architecture: stableId("architecture", canonicalArchitectureSignature(source)),
+    schemaVersion: CITY_SCHEMA_VERSION,
+    generatorVersion: GENERATOR_VERSION
   };
 }
 
-function blockCandidates(source: CitySourceV3, network: CompiledRouteNetwork, wallCells: MultiPolygon): { blocks: DerivedBlock[]; discarded: number; warnings: string[] } {
+function blockCandidates(source: CitySourceV4, network: CompiledRouteNetwork, wallCells: MultiPolygon): { blocks: DerivedBlock[]; discarded: number; warnings: string[] } {
   const mask = normalizeRing(source.terrain.urbanFootprint ?? source.terrain.land);
   const extracted = extractFaces(network, mask);
   const rejected = new Set<number>();
@@ -1134,9 +1200,9 @@ function weightedChoice<T extends string>(weights: Readonly<Record<T, number>>, 
     if (cursor < 0) return value;
   }
   return values[0]!;
-}
 
-function openSpaceIntent(source: CitySourceV3, block: DerivedBlock, fragment: DistrictBlockFragment, district: DistrictSource | undefined, definition: DistrictTypeDefinition | undefined): BlockOpenSpaceIntent {
+}
+function openSpaceIntent(source: CitySourceV4, block: DerivedBlock, fragment: DistrictBlockFragment, district: DistrictSource | undefined, definition: DistrictTypeDefinition | undefined): BlockOpenSpaceIntent {
   const seed = `${district?.seed ?? source.citySeed}/districts/v3/open-space/${fragment.id}`;
   if (!district || !definition) return { blockId: block.id, fragmentId: fragment.id, districtId: null, category: null, size: null, targetShare: 0, seed };
   const override = district.openSpaceOverride;
@@ -1175,7 +1241,7 @@ function openSpaceIntent(source: CitySourceV3, block: DerivedBlock, fragment: Di
   };
 }
 
-function planFragments(source: CitySourceV3, blocks: DerivedBlock[]): { cells: DevelopmentCellPlan[]; intents: BlockOpenSpaceIntent[] } {
+function planFragments(source: CitySourceV4, blocks: DerivedBlock[]): { cells: DevelopmentCellPlan[]; intents: BlockOpenSpaceIntent[] } {
   const districtById = new Map(source.districts.map((district) => [district.id, district]));
   const cells: DevelopmentCellPlan[] = [];
   const intents: BlockOpenSpaceIntent[] = [];
@@ -1197,7 +1263,7 @@ function planFragments(source: CitySourceV3, blocks: DerivedBlock[]): { cells: D
   return { cells: cells.sort((a, b) => a.id.localeCompare(b.id)), intents: intents.sort((a, b) => a.fragmentId.localeCompare(b.fragmentId)) };
 }
 
-export function buildDistrictPlan(source: CitySourceV3): DistrictPlan {
+export function buildDistrictPlan(source: CitySourceV4): DistrictPlan {
   const network = compileRouteNetwork(source.roads, ROUTE_CLASS_REGISTRY);
   const mask = ringAsMulti(normalizeRing(source.terrain.urbanFootprint ?? source.terrain.land));
   const land = ringAsMulti(normalizeRing(source.terrain.land));

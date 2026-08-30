@@ -99,6 +99,77 @@ describe("Diagnostics workspace", () => {
     expect(sanitizeDiagnosticEntry({ epoch: 3 })).toBeNull();
     expect(sanitizeDiagnosticEntry("nope" as unknown as Record<string, unknown>)).toBeNull();
   });
+  it("summarizes orphaned architecture overrides and keeps affected identity", () => {
+    const entries = [
+      {
+        subsystem: "architecture",
+        kind: "orphaned-override",
+        orphanedOverrides: ["override-a", "override-b"],
+        message: "Two architecture overrides could not be matched.",
+        revision: 9,
+        epoch: 4,
+        workerTrace: "hidden"
+      }
+    ];
+    expect(sanitizeDiagnosticEntry(entries[0])).toEqual({
+      severity: "warning",
+      message: "Two architecture overrides could not be matched.",
+      subsystem: "architecture",
+      retry: null,
+      affectedIds: ["override-a", "override-b"],
+      orphanedCount: 2
+    });
+    const html = diagnosticsTrayHTML(entries);
+    expect(html).toContain('data-status="architecture-orphans"');
+    expect(html).toContain("2 orphaned overrides");
+    expect(html).toContain("Affected objects/sites: override-a, override-b");
+    expect(html).not.toContain("workerTrace");
+    expect(sanitizeDiagnosticEntry({
+      subsystem: "districts",
+      message: 'Architecture override "override-c" is orphaned, stale, or incompatible and was not remapped.',
+      revision: 10
+    })).toEqual({
+      severity: "warning",
+      message: 'Architecture override "override-c" is orphaned, stale, or incompatible and was not remapped.',
+      subsystem: "architecture",
+      retry: null,
+      affectedId: "override-c",
+      orphanedCount: 1
+    });
+  });
+
+  it("retains durable geometry and stale errors with a sanitized affected identity", () => {
+    const geometry = sanitizeDiagnosticEntry({
+      subsystem: "objects",
+      kind: "geometry-error",
+      message: "Building geometry intersects a road.",
+      objectId: "building-7",
+      revision: 12,
+      epoch: 3,
+      actionToken: "secret"
+    });
+    expect(geometry).toEqual({
+      severity: "error",
+      message: "Building geometry intersects a road.",
+      subsystem: "objects",
+      retry: null,
+      affectedId: "building-7"
+    });
+    const staleHTML = diagnosticsTrayHTML([{
+      kind: "stale-editor",
+      affectedId: "building-7",
+      revision: 13
+    }]);
+    expect(staleHTML).toContain("This edit is stale because the city changed");
+    expect(staleHTML).toContain("Affected object/site: building-7");
+    expect(staleHTML).not.toContain("revision");
+  });
+  it("disables diagnostic retry actions while generation is busy", () => {
+    const html = diagnosticsTrayHTML([
+      { subsystem: "walls", retry: "walls", message: "Walls degraded." }
+    ], state({ active: true, phase: "installing" }));
+    expect(html).toMatch(/data-action="diagnostics-retry-walls" disabled/);
+  });
 
   it("maps plan entries to district-planning retries and marks actionable views", () => {
     const views = diagnosticViews([

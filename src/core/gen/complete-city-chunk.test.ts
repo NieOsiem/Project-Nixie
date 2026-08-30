@@ -13,7 +13,12 @@ import {
 import { BANK_SIZE, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, OPEN_SPACE_SURFACE_SHADES, materialIndex } from "../palette.js";
 import { compileRouteNetwork } from "../graph/compiler.js";
 import { compiledRouteOccupancy } from "./district-plan.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV3, type OpenSpaceCategory } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV4, type OpenSpaceCategory, type PersistentBuildingSource, type PersistentPlaceSource } from "./city.js";
+import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "./district-generator.js";
+import { DISTRICT_TYPE_IDS } from "./district-registry.js";
+import { generateInitialRoadNetwork } from "./road-generator.js";
+import { rectangleLand } from "./terrain.js";
+import { PRE_ROAD_LANDMARK_GRAMMAR_IDS } from "./landmark-registry.js";
 import type { BuildingGrammarId, BuildingUseId } from "./building-registry.js";
 import { citySurfaces, type CitySurfacePartitions } from "./city-chunk.js";
 import { chunkId, chunkKeyAt, chunkRect, chunksCovering } from "./chunks.js";
@@ -30,13 +35,15 @@ vi.mock("./city-chunk.js", async (importOriginal) => {
   return { ...actual, citySurfaces: vi.fn(actual.citySurfaces) };
 });
 import { visibleChunkIds, type ChunkGeometry } from "../../render/chunk-culling.js";
+import { buildCompleteCityPlan, reserveMajorLandmarkSites, validateCompleteCityPlan } from "./complete-city-plan.js";
 import type {
   BuildingMassPlan,
   BuildingPlan,
   CompleteCityPlan,
   LandmarkPlan,
   OpenSpacePlan,
-  ParcelPlan
+  ParcelPlan,
+  MajorLandmarkSiteReservation
 } from "./complete-city-plan.js";
 
 /**
@@ -49,7 +56,7 @@ const SCENE: Rect = { x: -256, y: -256, width: 512, height: 512 };
 const PPM = 25;
 const BANK = FIRST_ZONE_BANK;
 
-const SOURCE: CitySourceV3 = {
+const SOURCE: CitySourceV4 = {
   origin: { x: 1000, y: 800 },
   citySeed: "complete-chunk-fixture",
   generation: {
@@ -77,7 +84,8 @@ const SOURCE: CitySourceV3 = {
       { id: "path", a: "path-west", b: "path-east", routeId: "path-route", classId: "cycleway", name: null, locked: false, origin: "authored" }
     ]
   },
-  districts: []
+  districts: [],
+  architecture: { buildings: [], places: [], overrides: [] }
 };
 
 const WALL_A = materialIndex(BANK, DISTRICT_SLOT.WALL_A);
@@ -141,6 +149,10 @@ const parcelC = parcel("parcel-c", rectRing({ x: 10, y: 10, width: 20, height: 2
 
 const buildingA: BuildingPlan = {
   id: "building-a",
+  sourceId: null,
+  lineage: "generated:building-a",
+  origin: "generated",
+  protection: "none",
   parcelId: "parcel-a",
   blockId: "block-0",
   fragmentId: "frag-0",
@@ -150,6 +162,9 @@ const buildingA: BuildingPlan = {
   archetype: "rectangle",
   seed: "building-a-seed",
   appearanceSeed: "building-a-appearance",
+  paletteId: "corporate",
+  sitePolygon: parcelA.polygon,
+  placement: { centre: ringCentroid(parcelA.polygon), rotationRad: 0, widthM: 20, depthM: 20 },
   heightM: 48,
   masses: [
     mass("building-a-podium", "building-a", 0, rectRing({ x: 60, y: 10, width: 20, height: 11 }), 0, 8, "coarse"),
@@ -169,6 +184,10 @@ const buildingA: BuildingPlan = {
 
 const buildingB: BuildingPlan = {
   id: "building-b",
+  sourceId: null,
+  lineage: "generated:building-b",
+  origin: "generated",
+  protection: "none",
   parcelId: "parcel-b",
   blockId: "block-0",
   fragmentId: "frag-0",
@@ -178,6 +197,9 @@ const buildingB: BuildingPlan = {
   archetype: "rectangle",
   seed: "building-b-seed",
   appearanceSeed: "building-b-appearance",
+  paletteId: "corporate",
+  sitePolygon: parcelB.polygon,
+  placement: { centre: ringCentroid(parcelB.polygon), rotationRad: 0, widthM: 20, depthM: 20 },
   heightM: 30,
   masses: [
     mass("building-b-mass", "building-b", 0, rectRing({ x: 118, y: 10, width: 20, height: 20 }), 0, 30, "detail", { facadeSeed: 0.5 })
@@ -187,6 +209,10 @@ const buildingB: BuildingPlan = {
 
 const buildingC: BuildingPlan = {
   id: "building-c",
+  sourceId: null,
+  lineage: "generated:building-c",
+  origin: "generated",
+  protection: "none",
   parcelId: "parcel-c",
   blockId: "block-0",
   fragmentId: "frag-0",
@@ -196,6 +222,9 @@ const buildingC: BuildingPlan = {
   archetype: "rectangle",
   seed: "building-c-seed",
   appearanceSeed: "building-c-appearance",
+  paletteId: "corporate",
+  sitePolygon: parcelC.polygon,
+  placement: { centre: ringCentroid(parcelC.polygon), rotationRad: 0, widthM: 20, depthM: 20 },
   heightM: 60,
   masses: [
     mass("building-c-mass", "building-c", 0, rectRing({ x: 10, y: 10, width: 20, height: 20 }), 0, 60, "coarse")
@@ -205,11 +234,17 @@ const buildingC: BuildingPlan = {
 
 const landmark: LandmarkPlan = {
   id: "landmark-l",
+  sourceId: null,
+  lineage: "generated:landmark-l",
+  origin: "generated",
+  protection: "none",
   landmarkGrammarId: "monument-open-space",
   districtId: "corporate-core",
   blockId: "block-0",
   sitePolygon: rectRing({ x: 10, y: 60, width: 16, height: 16 }),
+  placement: { centre: { x: 18, y: 68 }, rotationRad: 0, widthM: 16, depthM: 16 },
   placementLineage: "test",
+  paletteId: "corporate",
   seed: "landmark-l-seed",
   appearanceSeed: "landmark-l-appearance",
   masses: [
@@ -283,9 +318,9 @@ const PLAN: CompleteCityPlan = {
   buildToken: "build-1",
   epoch: 0,
   openSpaceProfile: "medium",
-  structuralInput: { terrain: "t", roads: "r", districts: "d", generation: "g" },
+  structuralInput: { terrain: "t", roads: "r", districts: "d", generation: "g", architecture: "architecture_606b75c9", schemaVersion: 4, generatorVersion: 12 },
   districtPlan: {
-    revisionInputs: { terrain: "t", roads: "r", districts: "d", generation: "g" },
+    revisionInputs: { terrain: "t", roads: "r", districts: "d", generation: "g", architecture: "architecture_606b75c9", schemaVersion: 4, generatorVersion: 12 },
     blocks: [
       {
         id: "block-0",
@@ -388,6 +423,114 @@ function geometryOf(build: {
   };
 }
 
+const DIAGONAL_SCENE: Rect = { x: -600, y: -450, width: 1200, height: 900 };
+const DIAGONAL_PPM = 25;
+
+interface DiagonalChunkFixture {
+  source: CitySourceV4;
+  plan: CompleteCityPlan;
+  reservations: MajorLandmarkSiteReservation[];
+}
+
+let diagonalChunkFixtureCache: DiagonalChunkFixture | undefined;
+function diagonalChunkFixture(): DiagonalChunkFixture {
+  if (diagonalChunkFixtureCache !== undefined) return diagonalChunkFixtureCache;
+  const land = rectangleLand(DIAGONAL_SCENE);
+  const stagedSource: CitySourceV4 = {
+    origin: { x: 0, y: 0 },
+    citySeed: "phase5-diagonal-acceptance",
+    generation: {
+      terrainMode: "rectangle",
+      coastEdge: null,
+      roadLayout: "european",
+      hubMode: "multiple-hubs",
+      districtPool: [...DISTRICT_TYPE_IDS],
+      openSpaceProfile: "medium"
+    },
+    terrain: { land, urbanFootprint: null },
+    roads: { nodes: [], routes: [], edges: [] },
+    districts: [],
+    architecture: { buildings: [], places: [], overrides: [] }
+  };
+  const reservations = reserveMajorLandmarkSites(stagedSource, PRE_ROAD_LANDMARK_GRAMMAR_IDS);
+  stagedSource.roads = generateInitialRoadNetwork({
+    citySeed: stagedSource.citySeed,
+    mask: land,
+    land,
+    layout: stagedSource.generation.roadLayout,
+    hubMode: stagedSource.generation.hubMode,
+    sceneBounds: DIAGONAL_SCENE,
+    reservedSites: reservations.map((reservation) => reservation.sitePolygon)
+  }).roads;
+  stagedSource.districts = generateInitialDistricts(stagedSource);
+  const assignment = assignLandmarkCompatibleDistrictTypes(
+    stagedSource.districts,
+    reservations.map((reservation) => ({ grammarId: reservation.grammarId, sitePolygon: reservation.sitePolygon })),
+    stagedSource.generation.districtPool,
+    `${stagedSource.citySeed}/landmarks/v3/district-assignment`
+  );
+  stagedSource.districts = assignment.districts;
+  const stagedPlan = buildCompleteCityPlan(stagedSource, 1, 0, reservations);
+  const promotedBuilding = stagedPlan.buildings.find((candidate) =>
+    candidate.sourceId === null
+    && candidate.placement !== undefined
+    && candidate.masses.length > 0
+    && Math.abs(ringArea(candidate.sitePolygon)) + candidate.placement.widthM * candidate.placement.depthM * 1e-6
+      >= candidate.placement.widthM * candidate.placement.depthM
+  );
+  if (promotedBuilding === undefined || promotedBuilding.placement === undefined) {
+    throw new Error("The diagonal chunk fixture needs a derived building with a placement frame.");
+  }
+  const reservedGrammars = new Set(reservations.map((reservation) => reservation.grammarId));
+  const promotedPlace = stagedPlan.landmarks.find((candidate) =>
+    (candidate.sourceId === null || candidate.sourceId === undefined)
+    && candidate.placement !== undefined
+    && candidate.masses.length > 1
+    && !reservedGrammars.has(candidate.landmarkGrammarId)
+    && area(intersection(ringAsMulti(candidate.sitePolygon), ringAsMulti(promotedBuilding.sitePolygon))) < 0.5
+  );
+  if (promotedPlace === undefined || promotedPlace.placement === undefined) {
+    throw new Error("The diagonal chunk fixture needs a derived non-reserved compound place.");
+  }
+  const architecture: CitySourceV4["architecture"] = {
+    buildings: [{
+      id: promotedBuilding.id,
+      lineage: promotedBuilding.lineage,
+      origin: "generated",
+      protection: "manual-edit",
+      seed: promotedBuilding.seed,
+      appearanceSeed: promotedBuilding.appearanceSeed,
+      grammarId: promotedBuilding.grammarId,
+      visualUse: promotedBuilding.visualUse,
+      heightM: promotedBuilding.heightM,
+      paletteId: promotedBuilding.paletteId ?? null,
+      sitePolygon: promotedBuilding.sitePolygon.map((point) => ({ ...point })),
+      placement: { ...promotedBuilding.placement },
+      districtId: promotedBuilding.districtId,
+      blockId: promotedBuilding.blockId
+    } satisfies PersistentBuildingSource],
+    places: [{
+      id: promotedPlace.id,
+      lineage: promotedPlace.lineage ?? promotedPlace.placementLineage ?? promotedPlace.id,
+      origin: "authored",
+      protection: "explicit",
+      seed: promotedPlace.seed,
+      appearanceSeed: promotedPlace.appearanceSeed,
+      landmarkGrammarId: promotedPlace.landmarkGrammarId,
+      paletteId: promotedPlace.paletteId ?? null,
+      sitePolygon: promotedPlace.sitePolygon.map((point) => ({ ...point })),
+      placement: { ...promotedPlace.placement },
+      districtId: promotedPlace.districtId,
+      blockId: promotedPlace.blockId
+    } satisfies PersistentPlaceSource],
+    overrides: []
+  };
+  const source = { ...stagedSource, architecture };
+  const plan = buildCompleteCityPlan(source, 1, 0, reservations);
+  diagonalChunkFixtureCache = { source, plan, reservations };
+  return diagonalChunkFixtureCache;
+}
+
 describe("buildCompleteCityChunk", () => {
   it("owns each building and landmark in exactly one deterministic chunk", () => {
     const batch = buildCompleteCityChunks(SOURCE, PLAN, chunksCovering(SCENE), SCENE, PPM);
@@ -401,7 +544,10 @@ describe("buildCompleteCityChunk", () => {
 
     const byId = new Map(PLAN.parcels.map((p) => [p.id, p]));
     for (const building of PLAN.buildings) {
-      const centroid = ringCentroid(byId.get(building.parcelId)!.polygon);
+      const centroid =
+        building.sourceId !== null && building.sourceId !== undefined
+          ? ringCentroid(building.sitePolygon!)
+          : ringCentroid(byId.get(building.parcelId!)!.polygon);
       const owners = batch.chunks.filter((chunk) => chunk.buildingIds.includes(building.id));
       expect(owners).toHaveLength(1);
       expect(owners[0]!.key).toEqual(chunkKeyAt(centroid));
@@ -409,6 +555,108 @@ describe("buildCompleteCityChunk", () => {
     expect(
       batch.chunks.filter((chunk) => chunk.landmarkIds.includes("landmark-l"))
     ).toHaveLength(1);
+  });
+
+  it("owns persistent buildings and compound places by site centroid across a chunk seam", () => {
+    const persistentBuildingSite = rectRing({ x: 112, y: 10, width: 32, height: 20 });
+    const persistentBuilding: BuildingPlan = {
+      ...buildingB,
+      id: "persistent-building",
+      sourceId: "source-building",
+      lineage: "authored:persistent-building",
+      origin: "authored",
+      protection: "explicit",
+      parcelId: null,
+      blockId: null,
+      fragmentId: null,
+      districtId: null,
+      sitePolygon: persistentBuildingSite,
+      placement: { centre: { x: 128, y: 20 }, rotationRad: 0, widthM: 32, depthM: 20 },
+      masses: [
+        mass(
+          "persistent-building-mass",
+          "persistent-building",
+          0,
+          rectRing({ x: 120, y: 12, width: 24, height: 16 }),
+          0,
+          30,
+          "detail"
+        )
+      ]
+    };
+    const placeSite = rectRing({ x: 112, y: 40, width: 32, height: 40 });
+    const persistentPlace: LandmarkPlan = {
+      ...landmark,
+      id: "persistent-place",
+      sourceId: "source-place",
+      lineage: "authored:persistent-place",
+      origin: "authored",
+      protection: "manual-edit",
+      districtId: null,
+      blockId: null,
+      sitePolygon: placeSite,
+      placement: { centre: { x: 128, y: 60 }, rotationRad: 0, widthM: 32, depthM: 40 },
+      openSpaceIds: ["persistent-place-open-space"],
+      masses: [
+        {
+          ...landmark.masses[0]!,
+          id: "persistent-place-west-mass",
+          landmarkId: "persistent-place",
+          footprint: rectRing({ x: 118, y: 58, width: 18, height: 12 })
+        },
+        {
+          ...landmark.masses[0]!,
+          id: "persistent-place-east-mass",
+          landmarkId: "persistent-place",
+          footprint: rectRing({ x: 132, y: 48, width: 8, height: 8 }),
+          elevationM: 4,
+          heightM: 24
+        }
+      ]
+    };
+    const placeOpenSpace: OpenSpacePlan = {
+      ...openA,
+      id: "persistent-place-open-space",
+      parcelId: null,
+      landmarkId: "persistent-place",
+      polygon: rectRing({ x: 112, y: 40, width: 32, height: 12 }),
+      areaM2: 384
+    };
+    const persistentPlan: CompleteCityPlan = {
+      ...PLAN,
+      parcels: [],
+      buildings: [persistentBuilding],
+      landmarks: [persistentPlace],
+      openSpaces: [placeOpenSpace]
+    };
+    const chunks = chunksCovering(SCENE).map((key) =>
+      buildCompleteCityChunk(SOURCE, persistentPlan, key, SCENE, PPM)
+    );
+    const buildingOwners = chunks.filter((chunk) => chunk.buildingIds.includes(persistentBuilding.id));
+    const placeOwners = chunks.filter((chunk) => chunk.landmarkIds.includes(persistentPlace.id));
+    expect(buildingOwners).toHaveLength(1);
+    expect(placeOwners).toHaveLength(1);
+    expect(buildingOwners[0]!.key).toEqual({ cx: 1, cy: 0 });
+    expect(placeOwners[0]!.key).toEqual({ cx: 1, cy: 0 });
+    // Both masses stay together in the owner chunk; the neighbouring chunk receives no
+    // duplicate place geometry even though the site and one mass cross x = 128 m.
+    expect(placeOwners[0]!.landmarkCount).toBe(1);
+    expect(placeOwners[0]!.mesh.vertexCount).toBeGreaterThan(0);
+    expect(placeOwners[0]!.detail.vertexCount).toBeGreaterThan(0);
+    expect(chunks.find((chunk) => chunk.key.cx === 0 && chunk.key.cy === 0)!.landmarkIds).toEqual([]);
+    // The associated open-space ground remains clipped into disjoint pieces, so its
+    // presentation crosses the boundary without a duplicate or a visible seam.
+    const openSpaceTriangles = chunks.reduce((sum, chunk) => sum + chunk.openSpaceTriangleCount, 0);
+    expect(openSpaceTriangles).toBeGreaterThan(0);
+    expect(chunks.filter((chunk) => chunk.openSpaceTriangleCount > 0)).toHaveLength(2);
+    const clippedPlaceArea = chunks.reduce((sum, chunk) => {
+      const piece = intersection(
+        ringAsMulti(placeOpenSpace.polygon),
+        ringAsMulti(rectRing(chunkRect(chunk.key)))
+      );
+      return sum + area(piece);
+    }, 0);
+    expect(clippedPlaceArea).toBeCloseTo(area(ringAsMulti(placeOpenSpace.polygon)), 4);
   });
 
   it("clips surfaces and open spaces at seams without gaps or overlaps", () => {
@@ -878,6 +1126,10 @@ describe("buildCompleteCityChunk", () => {
       buildings: [
         {
           id: "s",
+          sourceId: null,
+          lineage: "generated:s",
+          origin: "generated",
+          protection: "none",
           parcelId: "parcel-a",
           blockId: "block-0",
           fragmentId: "frag-0",
@@ -887,6 +1139,9 @@ describe("buildCompleteCityChunk", () => {
           archetype: "rectangle",
           seed: "s-seed",
           appearanceSeed: "s-appearance",
+          paletteId: "corporate",
+          sitePolygon: parcelA.polygon,
+          placement: { centre: ringCentroid(parcelA.polygon), rotationRad: 0, widthM: 20, depthM: 20 },
           heightM,
           masses: [podium, tower],
           areaM2: 220 + 72
@@ -970,7 +1225,101 @@ describe("buildCompleteCityChunks", () => {
     };
     expect(() => buildCompleteCityChunks(SOURCE, broken, KEYS, SCENE, PPM)).toThrow(/invalid/i);
   });
+  it("locks all 128 m chunks for the fixed diagonal mixed-architecture fixture", () => {
+    const fixture = diagonalChunkFixture();
+    const { source, plan } = fixture;
+    const keys = chunksCovering(DIAGONAL_SCENE);
+    const batch = buildCompleteCityChunks(source, plan, keys, DIAGONAL_SCENE, DIAGONAL_PPM);
+    const coarseOpaque = {
+      triangles: batch.chunks.reduce((sum, chunk) => sum + chunk.mesh.triangleCount, 0),
+      vertices: batch.chunks.reduce((sum, chunk) => sum + chunk.mesh.vertexCount, 0),
+      chunks: batch.chunks.filter((chunk) => chunk.mesh.vertexCount > 0).length
+    };
+    const detail = {
+      triangles: batch.chunks.reduce((sum, chunk) => sum + chunk.detail.triangleCount, 0),
+      vertices: batch.chunks.reduce((sum, chunk) => sum + chunk.detail.vertexCount, 0),
+      chunks: batch.chunks.filter((chunk) => chunk.detail.vertexCount > 0).length
+    };
+    const neon = {
+      triangles: batch.chunks.reduce((sum, chunk) => sum + chunk.neon.triangleCount, 0),
+      vertices: batch.chunks.reduce((sum, chunk) => sum + chunk.neon.vertexCount, 0),
+      chunks: batch.chunks.filter((chunk) => chunk.neon.vertexCount > 0).length
+    };
+    const viewRect: Rect = {
+      x: DIAGONAL_SCENE.x * DIAGONAL_PPM,
+      y: DIAGONAL_SCENE.y * DIAGONAL_PPM,
+      width: DIAGONAL_SCENE.width * DIAGONAL_PPM,
+      height: DIAGONAL_SCENE.height * DIAGONAL_PPM
+    };
+    const visibleIds = new Set(visibleChunkIds(batch.chunks.map(geometryOf), viewRect));
+    const visibleMotionTriangles = batch.chunks
+      .filter((chunk) => visibleIds.has(chunk.id))
+      .reduce((sum, chunk) => sum + chunk.mesh.triangleCount, 0);
+    const geometryCounts = {
+      chunkCount: batch.chunks.length,
+      coarseOpaque,
+      detail,
+      neon,
+      totalVertexCount: batch.vertexCount,
+      totalTriangleCount: batch.triangleCount,
+      visibleChunkCount: visibleIds.size,
+      visibleMotionTriangles
+    };
+    expect(geometryCounts).toEqual({
+      chunkCount: 80,
+      coarseOpaque: { triangles: 61_934, vertices: 104_476, chunks: 80 },
+      detail: { triangles: 346_546, vertices: 693_090, chunks: 76 },
+      neon: { triangles: 622, vertices: 1_244, chunks: 38 },
+      totalVertexCount: 798_810,
+      totalTriangleCount: 409_102,
+      visibleChunkCount: 80,
+      visibleMotionTriangles: 61_934
+    });
+    expect(batch.chunks.map((chunk) => chunk.id)).toEqual(keys.map(chunkId));
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    expect(batch.buildingCount).toBe(plan.buildings.length);
+    expect(batch.landmarkCount).toBe(plan.landmarks.length);
+    expect(new Set(batch.chunks.flatMap((chunk) => chunk.buildingIds)).size).toBe(plan.buildings.length);
+    expect(new Set(batch.chunks.flatMap((chunk) => chunk.landmarkIds)).size).toBe(plan.landmarks.length);
+    for (const object of [...plan.buildings.filter((building) => building.sourceId !== null), ...plan.landmarks.filter((landmark) => landmark.sourceId !== null)]) {
+      const owners = batch.chunks.filter((chunk) =>
+        chunk.buildingIds.includes(object.id) || chunk.landmarkIds.includes(object.id)
+      );
+      expect(owners, object.id).toHaveLength(1);
+    }
+    const entities = source as CitySourceV4 & { props?: readonly unknown[]; vehicles?: readonly unknown[] };
+    // Phase 7 props/vehicles are entity streams, not the road surface triangle counters.
+    expect(entities.props ?? []).toHaveLength(0);
+    expect(entities.vehicles ?? []).toHaveLength(0);
+
+    const repeated = buildCompleteCityChunks(source, plan, keys, DIAGONAL_SCENE, DIAGONAL_PPM);
+    expect(repeated.chunks.map((chunk) => ({
+      id: chunk.id,
+      key: chunk.key,
+      buildingIds: chunk.buildingIds,
+      landmarkIds: chunk.landmarkIds,
+      mesh: [chunk.mesh.vertexCount, chunk.mesh.triangleCount],
+      detail: [chunk.detail.vertexCount, chunk.detail.triangleCount],
+      neon: [chunk.neon.vertexCount, chunk.neon.triangleCount]
+    }))).toEqual(batch.chunks.map((chunk) => ({
+      id: chunk.id,
+      key: chunk.key,
+      buildingIds: chunk.buildingIds,
+      landmarkIds: chunk.landmarkIds,
+      mesh: [chunk.mesh.vertexCount, chunk.mesh.triangleCount],
+      detail: [chunk.detail.vertexCount, chunk.detail.triangleCount],
+      neon: [chunk.neon.vertexCount, chunk.neon.triangleCount]
+    })));
+    expect(repeated.vertexCount).toBe(batch.vertexCount);
+    expect(repeated.triangleCount).toBe(batch.triangleCount);
+    expect(repeated.bytes).toBe(batch.bytes);
+    expect(repeated.buildingCount).toBe(batch.buildingCount);
+    expect(repeated.landmarkCount).toBe(batch.landmarkCount);
+    expect(repeated.connectorCount).toBe(batch.connectorCount);
+    expect(repeated.openSpaceCount).toBe(batch.openSpaceCount);
+  }, 600_000);
 });
+
 
 describe("openCompleteCityChunkBatch", () => {
   const KEYS = chunksCovering(SCENE);
@@ -1031,6 +1380,10 @@ describe("connectors (block-scale infrastructure)", () => {
     over: Partial<BuildingPlan> = {}
   ): BuildingPlan => ({
     id,
+    sourceId: null,
+    lineage: `generated:${id}`,
+    origin: "generated",
+    protection: "none",
     parcelId: `parcel-${id}`,
     blockId: "block-0",
     fragmentId: "frag-0",
@@ -1040,6 +1393,9 @@ describe("connectors (block-scale infrastructure)", () => {
     archetype: "rectangle",
     seed: `${id}-seed`,
     appearanceSeed: `${id}-appearance`,
+    paletteId: "corporate",
+    sitePolygon: rectRing(rect),
+    placement: { centre: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }, rotationRad: 0, widthM: rect.width, depthM: rect.height },
     heightM,
     masses: [mass(`${id}-mass`, id, 0, rectRing(rect), 0, heightM, "both")],
     areaM2: rect.width * rect.height,
@@ -1094,6 +1450,24 @@ describe("connectors (block-scale infrastructure)", () => {
     // The owner chunk is the one holding the midpoint.
     expect(chunkKeyAt(connector.midpoint)).toEqual({ cx: 0, cy: 0 });
     expect(build.connectorCount).toBe(1);
+  });
+
+  it("ignores nullable block associations when grouping connectors", () => {
+    const nullBlock = (id: string): BuildingPlan =>
+      connectorBuilding(id, { x: id.endsWith("a") ? 60 : 95, y: 10, width: 20, height: 20 }, 60, "commercial", "corporate-core", {
+        blockId: null,
+        parcelId: null,
+        fragmentId: null
+      });
+    const build = buildCompleteCityChunk(
+      SOURCE,
+      connectorPlan([nullBlock("null-a"), nullBlock("null-b")]),
+      { cx: 0, cy: 0 },
+      SCENE,
+      PPM
+    );
+    expect(build.connectors).toEqual([]);
+    expect(build.connectorCount).toBe(0);
   });
 
   it("rejects ineligible pairs: wrong use, unzoned land, micro grammar, other block, or span over the bound", () => {

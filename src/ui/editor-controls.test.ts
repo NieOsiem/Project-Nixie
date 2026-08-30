@@ -28,6 +28,10 @@ describe("Nixie editor scene control", () => {
     expect(controls[0].tools.map((tool: any) => tool.name)).toEqual(["editor-mode"]);
     expect(controls[0].tools[0].toggle).toBe(true);
     expect(controls[0].tools[0].active).toBe(false);
+    expect(controls[0].ariaLabel).toBe("Nixie Editor");
+    expect(controls[0].disabled).toBe(false);
+    expect(controls[0].tools[0].ariaLabel).toBe("Toggle Nixie Editor Mode");
+    expect(controls[0].tools[0].disabled).toBe(false);
   });
 
   it("registers one control group in v14", () => {
@@ -35,8 +39,9 @@ describe("Nixie editor scene control", () => {
     for (const register of registrations()) register(controls);
 
     expect(Object.keys(controls)).toEqual(["nixie-editor"]);
-    expect(controls["nixie-editor"].layer).toBe("nixie");
-    expect(controls["nixie-editor"].tools["editor-mode"].toggle).toBe(true);
-    expect(controls["nixie-editor"].tools["editor-mode"].active).toBe(false);
+    expect(controls["nixie-editor"].ariaLabel).toBe("Nixie Editor");
+    expect(controls["nixie-editor"].disabled).toBe(false);
+    expect(controls["nixie-editor"].tools["editor-mode"].ariaLabel).toBe("Toggle Nixie Editor Mode");
+    expect(controls["nixie-editor"].tools["editor-mode"].disabled).toBe(false);
   });
 });

@@ -68,7 +68,7 @@ export function assertCompleteCityPlanCacheIdentity(
     throw new CompleteCityPlanCacheArtifactError("source revision does not match the expected city revision");
   }
 
-  const signatureKeys = ["terrain", "roads", "districts", "generation"] as const;
+  const signatureKeys = ["terrain", "roads", "districts", "generation", "architecture", "schemaVersion", "generatorVersion"] as const;
   for (const key of signatureKeys) {
     if (plan.structuralInput[key] !== expected.structuralInput[key]) {
       throw new CompleteCityPlanCacheArtifactError(`structural-input ${key} signature does not match`);

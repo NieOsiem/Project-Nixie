@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { validateRouteTopology } from "../graph/topology.js";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
-import type { CitySourceV3, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
+import type { CitySourceV4, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
 import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, splitSimpleFaceCycles, type DistrictBlockFragment } from "./district-plan.js";
 import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictPlanningBounds } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
@@ -12,7 +12,7 @@ const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y }
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
 const edge = (id: string, a: string, b: string, routeId: string, classId: RoadEdgeSource["classId"] = "street"): RoadEdgeSource => ({ id, a, b, routeId, classId, name: null, locked: false, origin: "authored" });
 
-const gridSource = (): CitySourceV3 => ({
+const gridSource = (): CitySourceV4 => ({
   origin: { x: 700, y: 300 },
   citySeed: "district-plan-fixture",
   generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
@@ -22,7 +22,8 @@ const gridSource = (): CitySourceV3 => ({
     routes: [route("horizontal"), route("vertical")],
     edges: [edge("north", "n", "c", "vertical"), edge("west", "w", "c", "horizontal"), edge("east", "c", "e", "horizontal"), edge("south", "c", "s", "vertical")]
   },
-  districts: []
+  districts: [],
+  architecture: { buildings: [], places: [], overrides: [] }
 });
 
 const override = (rate = 0.4): DistrictOpenSpaceOverride => ({
