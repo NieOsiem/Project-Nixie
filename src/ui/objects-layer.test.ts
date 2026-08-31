@@ -218,6 +218,24 @@ describe("object geometry and interaction", () => {
     expect(road).toMatchObject({ valid: false, reason: "The placement overlaps road occupancy." });
   });
 
+  it("allows placement in a buildable island enclosed by road occupancy", () => {
+    const config = { kind: "building" as const, grammarId: "narrow-shopfront" as const, visualUse: "commercial" as const, heightM: 30, widthM: 20, depthM: 20 };
+    const roadRing: MultiPolygon = [[
+      [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
+      [{ x: 30, y: 30 }, { x: 30, y: 70 }, { x: 70, y: 70 }, { x: 70, y: 30 }]
+    ]];
+    const enclosedPlan = { ...plan, buildings: [], landmarks: [], routeOccupancy: { all: roadRing } };
+
+    expect(objectPlacementPreview(config, { x: 50, y: 50 }, city, enclosedPlan)).toMatchObject({
+      valid: true,
+      reason: null
+    });
+    expect(objectPlacementPreview(config, { x: 20, y: 50 }, city, enclosedPlan)).toMatchObject({
+      valid: false,
+      reason: "The placement overlaps road occupancy."
+    });
+  });
+
   it("uses bounded site hit tests and never crosses object kinds", () => {
     expect(architectureObjectAt({ x: 20, y: 20 }, plan)).toEqual({ id: "building-a", kind: "building" });
     expect(architectureObjectAt({ x: 20, y: 20 }, plan, "place")).toBeNull();

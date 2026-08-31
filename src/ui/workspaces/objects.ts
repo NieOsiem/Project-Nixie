@@ -37,6 +37,7 @@ import {
   cancelObjectPlacement,
   clearObjectSelection,
   configureObjectPlacement,
+  finishObjectPlacement,
   getObjectError,
   getObjectSelection,
   objectInspector,
@@ -399,20 +400,19 @@ function defaultBuildingPlacement(definition: BuildingGrammarDefinition): { widt
   const limits = definition.siteLimits;
   return { widthM: Math.max(1, Math.min(60, (limits.minWidthM + limits.maxWidthM) * 0.5)), depthM: Math.max(1, Math.min(60, (limits.minDepthM + limits.maxDepthM) * 0.5)), heightM: Math.max(1, (definition.height.minM + definition.height.maxM) * 0.5) };
 }
-
 function beginPlacement(preset: ObjectsPreset): void {
   if (preset.kind === "building") {
     const definition = BUILDING_GRAMMAR_REGISTRY.get(preset.id);
     if (definition === undefined) return;
-    activePreset = preset;
     setCanvasTool(OBJECT_TOOL.PLACE);
+    activePreset = preset;
     const defaults = defaultBuildingPlacement(definition);
     configureObjectPlacement({ kind: "building", grammarId: preset.id, visualUse: definition.compatibleUses[0] ?? BUILDING_USE_IDS[0], paletteId: null, widthM: defaults.widthM, depthM: defaults.depthM, heightM: defaults.heightM, rotationRad: 0 });
     return;
   }
   if (!LANDMARK_GRAMMAR_REGISTRY.has(preset.id)) return;
-  activePreset = preset;
   setCanvasTool(OBJECT_TOOL.PLACE);
+  activePreset = preset;
   configureObjectPlacement({ kind: "place", landmarkGrammarId: preset.id, paletteId: null, widthM: 56, depthM: 56, rotationRad: 0 });
 }
 function normalizeStagedBuildingPreset(value: NormalizedObject, grammarId: BuildingGrammarId): void {
@@ -461,7 +461,7 @@ export function objectsWorkspace(): WorkspaceModule {
       const pending = actionPending || currentPendingOperation() !== null;
       const gate = enabled && !pending ? "" : " disabled";
       const active = (value: string): string => tool === value ? " active" : "";
-      return `<div class="nixie-shelf-row nixie-object-categories" role="group" aria-label="Object category"><button type="button" data-action="object-category" data-category="buildings" class="${category === "buildings" ? "active" : ""}"${gate} aria-pressed="${category === "buildings"}" title="Browse building grammars">Buildings</button><button type="button" data-action="object-category" data-category="places" class="${category === "places" ? "active" : ""}"${gate} aria-pressed="${category === "places"}" title="Browse place grammars">Places</button><button type="button" data-action="object-category" data-category="props" disabled aria-disabled="true" title="Props and Vehicles — Phase 7">Props &amp; Vehicles <small>Phase 7</small></button><button type="button" data-action="object-category" data-category="pois" disabled aria-disabled="true" title="Points of Interest — Phase 8">POIs <small>Phase 8</small></button></div><div class="nixie-shelf-row nixie-object-tools" role="group" aria-label="Object tools"><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.SELECT}" class="${active(OBJECT_TOOL.SELECT)}"${gate} aria-pressed="${tool === OBJECT_TOOL.SELECT}" title="Select architecture objects">Select</button><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.PLACE}" class="${active(OBJECT_TOOL.PLACE)}"${gate} aria-pressed="${tool === OBJECT_TOOL.PLACE}" title="Place the active architecture preset">Place</button><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.SITE}" class="${active(OBJECT_TOOL.SITE)}"${gate} aria-pressed="${tool === OBJECT_TOOL.SITE}" title="Move existing site polygon vertices">Site</button>${activePreset === null ? "" : `<span class="nixie-shelf-summary" role="status">Preset: ${escapeHTML(activePreset.id)}</span>`}${summary === "" ? "" : `<span class="nixie-shelf-summary" role="status">${escapeHTML(summary)}</span>`}</div><p class="nixie-shelf-hint">Click to select • Shift-click for same-kind summary • Right-click exits placement</p>`;
+      return `<div class="nixie-shelf-row nixie-object-categories" role="group" aria-label="Object category"><button type="button" data-action="object-category" data-category="buildings" class="${category === "buildings" ? "active" : ""}"${gate} aria-pressed="${category === "buildings"}" title="Browse building grammars">Buildings</button><button type="button" data-action="object-category" data-category="places" class="${category === "places" ? "active" : ""}"${gate} aria-pressed="${category === "places"}" title="Browse place grammars">Places</button><button type="button" data-action="object-category" data-category="props" disabled aria-disabled="true" title="Props and Vehicles — Phase 7">Props &amp; Vehicles <small>Phase 7</small></button><button type="button" data-action="object-category" data-category="pois" disabled aria-disabled="true" title="Points of Interest — Phase 8">POIs <small>Phase 8</small></button></div><div class="nixie-shelf-row nixie-object-tools" role="group" aria-label="Object tools"><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.SELECT}" class="${active(OBJECT_TOOL.SELECT)}"${gate} aria-pressed="${tool === OBJECT_TOOL.SELECT}" title="Select architecture objects">Select</button><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.PLACE}" class="${active(OBJECT_TOOL.PLACE)}"${gate} aria-pressed="${tool === OBJECT_TOOL.PLACE}" title="Place the active architecture preset">Place</button><button type="button" data-action="tool" data-tool="${OBJECT_TOOL.SITE}" class="${active(OBJECT_TOOL.SITE)}"${gate} aria-pressed="${tool === OBJECT_TOOL.SITE}" title="Move existing site polygon vertices">Site</button>${activePreset === null ? "" : `<span class="nixie-shelf-summary" role="status">Preset: ${escapeHTML(activePreset.id)}</span>`}${activePreset !== null && tool === OBJECT_TOOL.PLACE ? `<button type="button" data-action="object-place-confirm" class="nixie-object-place-confirm"${gate} title="Place the active preset at the visible preview">Place here</button>` : ""}${summary === "" ? "" : `<span class="nixie-shelf-summary" role="status">${escapeHTML(summary)}</span>`}</div><p class="nixie-shelf-hint">${tool === OBJECT_TOOL.PLACE && activePreset !== null ? "Move the preview until it turns green • Click the canvas or Place here to confirm • Right-click cancels" : "Click to select • Shift-click for same-kind summary • Right-click exits placement"}</p>`;
     },
     renderTray(): string {
       const category = currentObjectCategory();
@@ -505,6 +505,7 @@ export function objectsWorkspace(): WorkspaceModule {
         else if (kind === "place" && LANDMARK_GRAMMAR_REGISTRY.has(id as LandmarkGrammarId)) beginPlacement({ kind: "place", id: id as LandmarkGrammarId });
         return;
       }
+      if (action === "object-place-confirm") { void finishObjectPlacement(); return; }
       if (action === "tool") {
         const next = target.dataset.tool ?? null;
         if (next !== OBJECT_TOOL.PLACE) cancelObjectPlacement(false);

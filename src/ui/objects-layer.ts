@@ -12,7 +12,7 @@ import {
   type BuildingPlacementInput,
   type PlacePlacementInput
 } from "../adapter/canvas.js";
-import type { Ring, Rect, Vec2 } from "../core/geom/types.js";
+import type { MultiPolygon, Ring, Rect, Vec2 } from "../core/geom/types.js";
 import { ringArea, ringBounds } from "../core/geom/types.js";
 import { BUILDING_GRAMMAR_REGISTRY, type BuildingGrammarId, type BuildingGrammarDefinition, type BuildingUseId } from "../core/gen/building-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarId, type LandmarkGrammarDefinition } from "../core/gen/landmark-registry.js";
@@ -266,8 +266,7 @@ function segmentsIntersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2): boolean {
     || (Math.abs(cdB) <= 1e-8 && onSegment(c, d, b));
 }
 
-function ringsOverlap(a: Ring, b: Ring): boolean {
-  if (!validRing(a) || !validRing(b)) return false;
+function ringBoundariesIntersect(a: Ring, b: Ring): boolean {
   const aBounds = ringBounds(a);
   const bBounds = ringBounds(b);
   if (aBounds.x > bBounds.x + bBounds.width || bBounds.x > aBounds.x + aBounds.width
@@ -279,7 +278,28 @@ function ringsOverlap(a: Ring, b: Ring): boolean {
       if (segmentsIntersect(a0, a1, b[bi]!, b[(bi + 1) % b.length]!)) return true;
     }
   }
-  return pointInRing(a[0]!, b) || pointInRing(b[0]!, a);
+  return false;
+}
+
+function ringsOverlap(a: Ring, b: Ring): boolean {
+  if (!validRing(a) || !validRing(b)) return false;
+  return ringBoundariesIntersect(a, b) || pointInRing(a[0]!, b) || pointInRing(b[0]!, a);
+}
+
+function validMultiPolygon(value: unknown): value is MultiPolygon {
+  return Array.isArray(value)
+    && value.every((polygon) => Array.isArray(polygon) && polygon.length > 0 && polygon.every(validRing));
+}
+
+function overlapsOccupancy(site: Ring, occupancy: unknown): boolean {
+  if (!validMultiPolygon(occupancy)) return false;
+  for (const polygon of occupancy) {
+    if (polygon.some((boundary) => ringBoundariesIntersect(site, boundary))) return true;
+    const siteInsideRoad = pointInRing(site[0]!, polygon[0]!)
+      && !polygon.slice(1).some((hole) => pointInRing(site[0]!, hole));
+    if (siteInsideRoad || pointInRing(polygon[0]![0]!, site)) return true;
+  }
+  return false;
 }
 
 function frameRing(frame: PlacementFrame): Ring {
@@ -402,14 +422,8 @@ function placementValidity(
     const area = Math.abs(ringArea(site));
     if (area < grammar.minSiteAreaM2 || area > grammar.maxSiteAreaM2) return { valid: false, reason: "The site area is outside this place grammar's limits." };
   }
-  const routeOccupancy = record(field(plan, "routeOccupancy"));
-  const occupancy = routeOccupancy?.all;
-  if (Array.isArray(occupancy)) {
-    for (const polygon of occupancy) {
-      if (!Array.isArray(polygon) || !validRing(polygon[0])) continue;
-      if (ringsOverlap(site, polygon[0])) return { valid: false, reason: "The placement overlaps road occupancy." };
-    }
-  }
+  const occupancy = record(field(plan, "routeOccupancy"))?.all;
+  if (overlapsOccupancy(site, occupancy)) return { valid: false, reason: "The placement overlaps road occupancy." };
   for (const object of architectureObjects(plan)) {
     if (object.id === excludeId || !placementPeerBlocks(object)) continue;
     if (ringsOverlap(site, object.sitePolygon)) return { valid: false, reason: `The placement overlaps ${object.kind} "${object.id}".` };
@@ -444,7 +458,7 @@ function sitePreview(site: Ring, kind: ObjectKind, city: unknown, plan: unknown,
     reason = "The site must lie inside land.";
   }
   const urbanFootprint = terrain?.urbanFootprint;
-  if (valid && urbanFootprint !== undefined) {
+  if (valid && urbanFootprint !== undefined && urbanFootprint !== null) {
     for (const point of site) {
       if (!pointInShape(point, urbanFootprint)) {
         valid = false;
@@ -463,14 +477,9 @@ function sitePreview(site: Ring, kind: ObjectKind, city: unknown, plan: unknown,
     }
   }
   const routeOccupancy = record(field(plan, "routeOccupancy"))?.all;
-  if (valid && Array.isArray(routeOccupancy)) {
-    for (const polygon of routeOccupancy) {
-      if (Array.isArray(polygon) && validRing(polygon[0]) && ringsOverlap(site, polygon[0])) {
-        valid = false;
-        reason = "The site overlaps road occupancy.";
-        break;
-      }
-    }
+  if (valid && overlapsOccupancy(site, routeOccupancy)) {
+    valid = false;
+    reason = "The site overlaps road occupancy.";
   }
   if (valid) {
     for (const object of architectureObjects(plan)) {

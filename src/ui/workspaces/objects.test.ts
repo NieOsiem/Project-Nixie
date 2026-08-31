@@ -38,6 +38,7 @@ const objectLayerMocks = vi.hoisted(() => ({
   cancelObjectPlacement: vi.fn(),
   clearObjectSelection: vi.fn(),
   configureObjectPlacement: vi.fn(),
+  finishObjectPlacement: vi.fn(() => Promise.resolve(true)),
   getObjectError: vi.fn<() => ObjectErrorFixture | null>(() => null),
   getObjectSelection: vi.fn<() => ObjectSelectionFixture>(() => ({ ids: [], kind: null })),
   objectInspector: vi.fn<() => unknown>(() => null),
@@ -208,16 +209,23 @@ describe("Objects workspace catalogue", () => {
     expect(module.renderTray()).toContain(`data-catalogue-group="${buildingGroups[1]}"`);
   });
 
-  it("marks the selected catalogue preset active while retaining the preview cache", () => {
+  it("marks the selected catalogue preset active and exposes an explicit placement confirmation", () => {
     const entry = objectCatalogueEntries("buildings")[0]!;
     const module = objectsWorkspace();
     const ctx = fakeContext();
     module.onAction("object-preset", { dataset: { objectKind: entry.kind, objectId: entry.id } } as unknown as HTMLElement, ctx);
-    const html = module.renderTray();
+    stateMocks.canvasTool.mockReturnValue("place");
+    const html = module.renderShelf() + module.renderTray();
     expect(html).toContain(`data-object-id="${entry.id}"`);
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("Preset active:");
+    expect(html).toContain('data-action="object-place-confirm"');
+    expect(html).toContain("Click the canvas or Place here to confirm");
     expect(objectLayerMocks.configureObjectPlacement).toHaveBeenCalled();
+    expect(stateMocks.setCanvasTool.mock.invocationCallOrder[0]).toBeLessThan(objectLayerMocks.configureObjectPlacement.mock.invocationCallOrder[0]!);
+
+    module.onAction("object-place-confirm", {} as HTMLElement, ctx);
+    expect(objectLayerMocks.finishObjectPlacement).toHaveBeenCalledOnce();
   });
 
   it("renders active and disabled category controls accessibly", () => {
