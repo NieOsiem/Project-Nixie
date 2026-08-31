@@ -5,7 +5,7 @@ import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compile
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
 import { isRecord, ROUTE_CLASS_REGISTRY, type ArchitectureOrigin, type ArchitectureOverrideSource, type ArchitectureProtection, type CitySourceV4, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type PersistentBuildingSource, type PersistentPlaceSource, type PlacementFrame, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, DEVELOPMENT_SPACE_CATEGORIES, districtStructuralInputSignature, type DevelopmentCellPlan, type DevelopmentSpaceRole, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
-import { DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type DistrictTypeId, type HeightBand } from "./district-registry.js";
+import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type DistrictTypeId, type HeightBand } from "./district-registry.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
 import { normalizeRing, validateRing } from "./terrain.js";
@@ -637,10 +637,11 @@ export interface PaletteBankEntry {
   bank: number;
 }
 
-/** Deterministic palette-ID → bank mapping, sorted by palette id, never district order. */
-export function derivePaletteBanks(source: CitySourceV4): PaletteBankEntry[] {
-  const ids = [...new Set(source.districts.map((district) => district.paletteId))].sort();
-  return ids.map((paletteId, index) => ({ paletteId, bank: FIRST_ZONE_BANK + index }));
+/** Stable palette-ID → bank mapping; object palette edits never renumber existing banks. */
+export function derivePaletteBanks(): PaletteBankEntry[] {
+  return [...DISTRICT_PALETTE_IDS]
+    .sort()
+    .map((paletteId, index) => ({ paletteId, bank: FIRST_ZONE_BANK + index }));
 }
 
 export function completeCityStructuralInput(source: CitySourceV4): StructuralInputSignature {
@@ -3471,6 +3472,37 @@ function refreshLandmarkAppearance(landmark: LandmarkPlan, districtById: Map<str
     };
   });
 }
+/**
+ * Recomputes one object's palette-derived material slots without replanning topology.
+ * The caller supplies the complete candidate source so the returned structural
+ * signature remains suitable for an atomic metadata commit.
+ */
+export function restyleCompleteCityPlanObjectPalette(
+  plan: CompleteCityPlan,
+  source: CitySourceV4,
+  kind: "building" | "place",
+  id: string,
+  paletteId: string | null
+): CompleteCityPlan {
+  const next = structuredClone(plan);
+  const paletteEntries = derivePaletteBanks();
+  const banks = new Map(paletteEntries.map((entry) => [entry.paletteId, entry.bank]));
+  const districtById = new Map(source.districts.map((district) => [district.id, district]));
+  if (kind === "building") {
+    const target = next.buildings.find((building) => building.id === id);
+    if (target === undefined) throw new Error(`Unknown architecture object "${id}".`);
+    target.paletteId = paletteId;
+    refreshBuildingAppearance(target, districtById, banks);
+  } else {
+    const target = next.landmarks.find((landmark) => landmark.id === id);
+    if (target === undefined) throw new Error(`Unknown architecture object "${id}".`);
+    target.paletteId = paletteId;
+    refreshLandmarkAppearance(target, districtById, banks);
+  }
+  next.paletteBanks = paletteEntries;
+  next.structuralInput = completeCityStructuralInput(source);
+  return next;
+}
 
 function applyArchitectureOverrides(
   source: CitySourceV4,
@@ -3532,7 +3564,7 @@ export function buildCompleteCityPlan(
   const network = compileRouteNetwork(source.roads, ROUTE_CLASS_REGISTRY);
   const occupancy = compiledRouteOccupancy(network);
   const carriageway = carriagewayPolygons(network);
-  const paletteEntries = derivePaletteBanks(source);
+  const paletteEntries = derivePaletteBanks();
   const banks = new Map(paletteEntries.map((entry) => [entry.paletteId, entry.bank]));
   const districtById = new Map(source.districts.map((district) => [district.id, district]));
   const peerSites: Ring[] = [];

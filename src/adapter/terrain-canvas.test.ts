@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
 import { allocateManualId, allocateManualLineage, type CityStateV4, type DistrictSource, type PlacementFrame } from "../core/gen/city.js";
-import { buildCompleteCityPlan, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
-import type { CityCacheManifestV1 } from "../core/gen/city-cache.js";
+import { buildCompleteCityPlan, derivePaletteBanks, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
+import { PLAN_CACHE_FORMAT_VERSION, type CityCacheManifestV1 } from "../core/gen/city-cache.js";
 import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
-import { BANK_SIZE, BASE_BANK, builtinPalette, packPalette, paletteBanks } from "../core/palette.js";
+import { BANK_SIZE, BASE_BANK, builtinPalette, packPalette } from "../core/palette.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { ringArea, type Ring } from "../core/geom/types.js";
 import { TerrainSession } from "./terrain-session.js";
@@ -208,7 +208,7 @@ function cacheManifest(city: CityStateV4, plan: CompleteCityPlan, byteLength = 3
     structuralInput: plan.structuralInput,
     slot: 0,
     plan: {
-      formatVersion: 1,
+      formatVersion: PLAN_CACHE_FORMAT_VERSION,
       artifact: {
         path: `complete-city-plan/${city.revision}/slot-0/plan.json.gz`,
         byteLength,
@@ -1839,8 +1839,16 @@ describe("full generation", () => {
     it("stores a sparse derived palette override without promotion", async () => {
       await generatedCity("architecture-palette");
       const { building } = generatedBuilding();
+      const planBuilds = worker.planBuilds;
+      const chunkBuilds = worker.chunkBuilds;
+      const fullChunkCount = Math.max(...worker.chunkRequests.map((request) => request.length));
 
-      await editObjectProperties(building.id, { paletteId: "corporate" });
+      const result = await editObjectProperties(building.id, { paletteId: "corporate" });
+      expect(worker.planBuilds).toBe(planBuilds);
+      expect(worker.chunkBuilds).toBe(chunkBuilds + 1);
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThan(fullChunkCount);
+      expect(result.chunks).toBe(worker.chunkRequests.at(-1)!.length);
       const architecture = getArchitectureSource();
       expect(architecture).not.toBeNull();
       expect(architecture!.buildings).toHaveLength(0);
@@ -2336,27 +2344,26 @@ describe("district palette texture", () => {
     expect(new Set(ids())).toEqual(
       new Set(["commercial", "entertainment", "industrial-heavy", "industrial-light", "night-market", "residential-mega"])
     );
-    const zoneBanks = [...paletteBanks(ids()).values()].sort((a, b) => a - b);
-    expect(zoneBanks).toEqual([2, 3, 4, 5, 6, 7]);
+    const bankByPalette = new Map(derivePaletteBanks().map((entry) => [entry.paletteId, entry.bank]));
+    const zoneBanks = ids().map((id) => bankByPalette.get(id)!).sort((a, b) => a - b);
+    expect(new Set(zoneBanks).size).toBe(6);
     const initialRegions = zoneBanks.map((bank) => bankRegion(initial, bank));
     expect(new Set(initialRegions).size).toBe(6);
-    // The sorted rule puts residential-mega at bank 7.
-    expect(bankRegion(initial, 7)).toBe(bankRegion(packPalette([builtinPalette("residential-mega").materials]), 0));
+    const residentialBank = bankByPalette.get("residential-mega")!;
+    expect(bankRegion(initial, residentialBank)).toBe(bankRegion(packPalette([builtinPalette("residential-mega").materials]), 0));
 
-    // A structural edit swapping residential-mega for corporate must refresh the SAME texture.
+    // A structural district edit changes material-bank references, not the stable texture layout.
     await updateDistricts(["mega"], { paletteId: "corporate" });
     expect(rendererState.instances).toHaveLength(1);
     expect(renderer.paletteUpdates.length).toBeGreaterThanOrEqual(2);
     const latest = renderer.paletteUpdates[renderer.paletteUpdates.length - 1]!;
-    expect(latest).not.toEqual(initial);
+    expect(latest).toEqual(initial);
 
-    // Sorted ids are now commercial, corporate, entertainment, industrial-heavy, industrial-light,
-    // night-market, so corporate owns bank 3 and night-market moves to bank 7.
-    expect(bankRegion(latest, 3)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
-    expect(bankRegion(latest, 7)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
-    const latestRegions = [...paletteBanks(getCity()!.source.districts.map((district) => district.paletteId)).values()].map(
-      (bank) => bankRegion(latest, bank)
-    );
+    const corporateBank = bankByPalette.get("corporate")!;
+    const nightMarketBank = bankByPalette.get("night-market")!;
+    expect(bankRegion(latest, corporateBank)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
+    expect(bankRegion(latest, nightMarketBank)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
+    const latestRegions = getCity()!.source.districts.map((district) => bankRegion(latest, bankByPalette.get(district.paletteId)!));
     expect(new Set(latestRegions).size).toBe(6);
     // The shared city bank and the unzoned bank 1 survive the refresh untouched.
     expect(latest.slice(0, BANK_SIZE * 4)).toEqual(initial.slice(0, BANK_SIZE * 4));
@@ -2392,15 +2399,14 @@ describe("district palette texture", () => {
     expect(isRecord(publishedSignature)).toBe(true);
     expect((publishedSignature as Record<string, unknown>).districts).not.toBe(baselineDistricts);
 
-    // Palette texture: one shared texture refreshed so its bank mapping matches the
-    // sorted source palettes (corporate owns bank 3, night-market moves to bank 7).
+    // Palette texture: the registry-wide bank mapping remains fixed while rebuilt
+    // chunks switch the edited district's material references to the corporate bank.
     expect(renderer.paletteUpdates.length).toBeGreaterThanOrEqual(2);
     const latest = renderer.paletteUpdates[renderer.paletteUpdates.length - 1]!;
-    expect(bankRegion(latest, 3)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
-    expect(bankRegion(latest, 7)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
-    const latestRegions = [...paletteBanks(getCity()!.source.districts.map((district) => district.paletteId)).values()].map(
-      (bank) => bankRegion(latest, bank)
-    );
+    const bankByPalette = new Map(derivePaletteBanks().map((entry) => [entry.paletteId, entry.bank]));
+    expect(bankRegion(latest, bankByPalette.get("corporate")!)).toBe(bankRegion(packPalette([builtinPalette("corporate").materials]), 0));
+    expect(bankRegion(latest, bankByPalette.get("night-market")!)).toBe(bankRegion(packPalette([builtinPalette("night-market").materials]), 0));
+    const latestRegions = getCity()!.source.districts.map((district) => bankRegion(latest, bankByPalette.get(district.paletteId)!));
     expect(new Set(latestRegions).size).toBe(6);
   }, 120_000);
 });

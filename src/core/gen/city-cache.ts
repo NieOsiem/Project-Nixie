@@ -2,7 +2,7 @@ import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import type { StructuralInputSignature } from "./district-plan.js";
 
 export const CITY_CACHE_SCHEMA_VERSION = 1;
-export const PLAN_CACHE_FORMAT_VERSION = 1;
+export const PLAN_CACHE_FORMAT_VERSION = 2;
 export const CHUNK_CACHE_FORMAT_VERSION = 1;
 export const CITY_CACHE_FLAG = "city-cache";
 

@@ -57,7 +57,7 @@ function expectInvalid(value: unknown): void {
 describe("city cache manifest", () => {
   it("exports the stable shared constants", () => {
     expect(CITY_CACHE_SCHEMA_VERSION).toBe(1);
-    expect(PLAN_CACHE_FORMAT_VERSION).toBe(1);
+    expect(PLAN_CACHE_FORMAT_VERSION).toBe(2);
     expect(CHUNK_CACHE_FORMAT_VERSION).toBe(1);
     expect(CITY_CACHE_FLAG).toBe("city-cache");
   });

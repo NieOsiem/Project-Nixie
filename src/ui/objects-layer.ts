@@ -381,10 +381,10 @@ function placementValidity(
   const land = terrain?.land;
   const urbanFootprint = terrain?.urbanFootprint;
   if (!pointInShape(frame.centre, land)) return { valid: false, reason: "The placement must lie inside land." };
-  if (urbanFootprint !== undefined && !pointInShape(frame.centre, urbanFootprint)) return { valid: false, reason: "The placement must lie inside the urban footprint." };
+  if (urbanFootprint !== undefined && urbanFootprint !== null && !pointInShape(frame.centre, urbanFootprint)) return { valid: false, reason: "The placement must lie inside the urban footprint." };
   for (const point of site) {
     if (!pointInShape(point, land)) return { valid: false, reason: "The placement frame exceeds land." };
-    if (urbanFootprint !== undefined && !pointInShape(point, urbanFootprint)) return { valid: false, reason: "The placement frame exceeds the urban footprint." };
+    if (urbanFootprint !== undefined && urbanFootprint !== null && !pointInShape(point, urbanFootprint)) return { valid: false, reason: "The placement frame exceeds the urban footprint." };
   }
   if (config.kind === "building") {
     const grammar: BuildingGrammarDefinition | undefined = config.grammarId === undefined ? undefined : BUILDING_GRAMMAR_REGISTRY.get(config.grammarId);

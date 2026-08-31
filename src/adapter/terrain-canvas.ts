@@ -42,7 +42,7 @@ import {
   type RouteClassId
 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
-import { completeCityStructuralInput, type BuildingPlan, type CompleteCityPlan, type LandmarkPlan } from "../core/gen/complete-city-plan.js";
+import { completeCityStructuralInput, derivePaletteBanks, restyleCompleteCityPlanObjectPalette, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type LandmarkPlan } from "../core/gen/complete-city-plan.js";
 import type { DistrictPlan } from "../core/gen/district-plan.js";
 import type { CompleteChunkBuild } from "../core/gen/complete-city-chunk.js";
 import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
@@ -75,7 +75,7 @@ import {
 import { compileRouteNetwork } from "../core/graph/compiler.js";
 import { difference, intersection, ringAsMulti } from "../core/geom/boolean.js";
 import { emptyMesh, type MeshBuffers } from "../core/geom/mesh.js";
-import { rectRing, ringArea, type Rect, type Ring, type Vec2 } from "../core/geom/types.js";
+import { rectRing, ringArea, ringBounds, type Rect, type Ring, type Vec2 } from "../core/geom/types.js";
 import {
   BANK_COUNT,
   CITY_BANK,
@@ -84,7 +84,6 @@ import {
   FIRST_ZONE_BANK,
   builtinPalette,
   packPalette,
-  paletteBanks,
   type Material
 } from "../core/palette.js";
 import { WEATHER_PRESETS, type LookDials } from "../render/look-dials.js";
@@ -559,7 +558,7 @@ function terrainPalette(): Uint8Array {
   banks[CITY_BANK] = CITY_SURFACES;
   const source = session.current?.source;
   if (source !== null && source !== undefined) {
-    for (const [paletteId, bank] of paletteBanks(source.districts.map((district) => district.paletteId))) {
+    for (const { paletteId, bank } of derivePaletteBanks()) {
       if (bank < FIRST_ZONE_BANK) continue;
       banks[bank] = builtinPalette(paletteId).materials;
     }
@@ -1588,6 +1587,100 @@ async function installCompleteChunks(
   }
   return result;
 }
+async function installCompleteChunkSubset(
+  city: CityStateV4,
+  plan: CompleteCityPlan,
+  keys: readonly ChunkKey[],
+  epoch: number
+): Promise<RebuildResult> {
+  const uniqueKeys = [...new Map(keys.map((key) => [chunkId(key), key])).values()];
+  const client = ensureWorker();
+  if (client === null) throw new Error("The city worker is unavailable; changed city geometry cannot be built.");
+  mountRenderer();
+  const renderer = cityRenderer;
+  const started = performance.now();
+  const identity: CompleteIdentity = {
+    sourceRevision: plan.sourceRevision,
+    actionToken: plan.actionToken,
+    buildToken: plan.buildToken,
+    epoch: plan.epoch
+  };
+  const expectedIds = new Set(uniqueKeys.map(chunkId));
+  const generatedIds = new Set<string>();
+  const summary = await client.buildCompleteCityChunks(
+    {
+      source: city.source,
+      plan,
+      sceneBoundsM: sceneBoundsM(city.source.origin),
+      pixelsPerMetre: pixelsPerMetre(),
+      keys: uniqueKeys,
+      ...identity
+    },
+    (progress: CompleteCityChunkProgress) => {
+      if (!completeIdentityMatches(progress, identity)) return;
+      const current = session.current;
+      if (!terrainBuildIsCurrent(city.revision, epoch, current?.revision ?? null, session.buildEpoch)) return;
+      const record = completeRecordFrom(progress.chunk);
+      if (!expectedIds.has(record.id) || generatedIds.has(record.id)) return;
+      chunks.set(record.id, record);
+      generatedIds.add(record.id);
+      if (renderer !== null) {
+        renderer.setChunk(completeChunkGeometry(record));
+        frameQuality.reset();
+      }
+    }
+  );
+  if (
+    !completeIdentityMatches(summary, identity)
+    || generatedIds.size !== uniqueKeys.length
+    || summary.counters.requested !== uniqueKeys.length
+    || summary.counters.built !== uniqueKeys.length
+  ) throw new Error("Worker posted an incomplete changed-chunk batch.");
+
+  const completeRecords = [...chunks.values()].map(cachedRecordFor);
+  const totalBytes = completeRecords.reduce((sum, record) => sum + record.bytes, 0);
+  const totalTriangles = completeRecords.reduce(
+    (sum, record) => sum + record.mesh.triangleCount + record.detail.triangleCount + record.neon.triangleCount,
+    0
+  );
+  const operation = ++chunkCacheOperationSequence;
+  const result: RebuildResult = {
+    full: true,
+    chunks: generatedIds.size,
+    triangles: totalTriangles,
+    bytes: totalBytes,
+    ms: performance.now() - started,
+    stale: !terrainBuildIsCurrent(city.revision, epoch, session.current?.revision ?? null, session.buildEpoch)
+  };
+  lastBuild = result;
+  lastRoadBuild = {
+    requested: uniqueKeys.length,
+    built: generatedIds.size,
+    compiledRoutes: 0,
+    compiledSegments: 0,
+    markingTriangleCount: 0,
+    totalTriangles,
+    totalBytes,
+    roundTripMs: result.ms,
+    workerMode: "worker",
+    dirty: false,
+    scope: "none"
+  };
+  if (!result.stale) {
+    scheduleCompleteChunkCachePublish(
+      operation,
+      city,
+      plan,
+      epoch,
+      sceneBoundsM(city.source.origin),
+      pixelsPerMetre(),
+      completeRecords,
+      chunks.size - generatedIds.size,
+      generatedIds.size
+    );
+  }
+  return result;
+}
 
 /**
  * Shared commit path for every generator 12 structural or metadata edit. Structural
@@ -1718,6 +1811,68 @@ function architectureSourceCommit(source: CitySourceV4["architecture"]): Promise
     revision: current.revision + 1,
     source: { ...current.source, architecture: structuredClone(source) }
   });
+}
+async function architecturePaletteSourceCommit(
+  architecture: CitySourceV4["architecture"],
+  kind: "building" | "place",
+  id: string,
+  paletteId: string | null
+): Promise<RebuildResult> {
+  const current = session.current;
+  if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
+  const problems = validateArchitectureSource(architecture);
+  if (problems.length > 0) throw new Error(problems.join(" "));
+  const targetProblems = architectureOverrideTargetProblems(architecture);
+  if (targetProblems.length > 0) throw new Error(targetProblems.join(" "));
+
+  const sceneKeys = chunksCovering(sceneBoundsM(current.source.origin));
+  if (!sceneKeys.every((key) => chunks.has(chunkId(key)))) return architectureSourceCommit(architecture);
+  const currentPlan = await requireCompletePlan(current);
+  const target = architecturePlanTarget(currentPlan, id);
+  if (target === null || target.kind !== kind) throw new Error(`Unknown architecture object "${id}".`);
+  const candidate: CityStateV4 = {
+    ...current,
+    revision: current.revision + 1,
+    source: { ...current.source, architecture: structuredClone(architecture) }
+  };
+  const actionToken = nextCompleteSequence();
+  const epoch = session.buildEpoch;
+  const restyled = restyleCompleteCityPlanObjectPalette(currentPlan, candidate.source, kind, id, paletteId);
+  const candidatePlan: CompleteCityPlan = {
+    ...restyled,
+    sourceRevision: candidate.revision,
+    actionToken: `palette:${candidate.revision}:${actionToken}:${id}`,
+    buildToken: `palette:${String(currentPlan.buildToken)}:${candidate.revision}:${id}`,
+    epoch
+  };
+  const planProblems = validateCompleteCityPlan(candidatePlan);
+  if (planProblems.length > 0) throw new Error(`The palette-adjusted city plan is invalid: ${planProblems.join(" ")}`);
+
+  const saved = await guardedSave(candidate, current.revision);
+  session.publishCommit(saved);
+  const committedEpoch = session.buildEpoch;
+  const committedPlan: CompleteCityPlan = { ...candidatePlan, epoch: committedEpoch };
+  publishCompletePlan(committedPlan, saved.revision, committedEpoch, false, 0, "restamped");
+  cancelTerrainDraft();
+  const keys = chunksCovering(ringBounds(target.plan.sitePolygon));
+  try {
+    const result = await installCompleteChunkSubset(saved, committedPlan, keys, committedEpoch);
+    if (geometryDiagnostic !== null && geometryDiagnostic.revision <= saved.revision) geometryDiagnostic = null;
+    return result;
+  } catch (error) {
+    console.error(`${MODULE_ID} | committed object palette presentation failed`, error);
+    ui.notifications?.error(`Nixie: the palette was saved, but presentation failed — ${error instanceof Error ? error.message : String(error)}`);
+    geometryDiagnostic = { kind: "degraded", reason: renderFailureReason(error), revision: saved.revision };
+    return {
+      full: true,
+      chunks: 0,
+      triangles: [...chunks.values()].reduce((sum, chunk) => sum + chunk.mesh.triangleCount, 0),
+      bytes: [...chunks.values()].reduce((sum, chunk) => sum + chunk.bytes, 0),
+      ms: 0,
+      stale: false,
+      degraded: true
+    };
+  }
 }
 
 
@@ -2087,6 +2242,9 @@ export function editObjectProperties(id: string, patch: ObjectPropertiesPatch): 
           ...(hasOwn(patch, "paletteId") ? { paletteId: patch.paletteId } : {})
         })
       );
+    }
+    if (Object.keys(patch).length === 1 && hasOwn(patch, "paletteId")) {
+      return architecturePaletteSourceCommit(architecture, kind, id, patch.paletteId ?? null);
     }
     return architectureSourceCommit(architecture);
   });

@@ -171,6 +171,22 @@ describe("object geometry and interaction", () => {
     expect(invalid.valid).toBe(false);
     expect(invalid.color).toBe(0xff6b75);
   });
+  it("treats a null urban footprint as no placement restriction", () => {
+    const unrestricted = {
+      ...city,
+      source: {
+        ...city.source,
+        terrain: { ...city.source.terrain, urbanFootprint: null }
+      }
+    };
+    const preview = objectPlacementPreview(
+      { kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 },
+      { x: 50, y: 50 },
+      unrestricted,
+      { ...plan, buildings: [], landmarks: [] }
+    );
+    expect(preview.valid).toBe(true);
+  });
   it("allows replaceable derived overlap but rejects persistent, protected, and road occupancy overlap", () => {
     const config = { kind: "building" as const, grammarId: "narrow-shopfront" as const, visualUse: "commercial" as const, heightM: 30, widthM: 20, depthM: 20 };
     const derived = objectPlacementPreview(config, { x: 60, y: 20 }, city, plan);

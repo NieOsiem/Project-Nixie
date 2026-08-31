@@ -1177,7 +1177,7 @@ describe("buildCompleteCityPlan", () => {
       expect(landmark.sitePolygon).toEqual(reservation.sitePolygon);
       expect(landmark.placementLineage).toBe(reservation.lineage);
     }
-    expect(derivePaletteBanks(source)).toEqual(plan.paletteBanks);
+    expect(derivePaletteBanks()).toEqual(plan.paletteBanks);
   }, 600_000);
 
   it.concurrent("honors explicit full-generation sites verbatim when their districts are compatible", () => {
