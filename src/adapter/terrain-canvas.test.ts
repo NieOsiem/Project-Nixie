@@ -1653,8 +1653,15 @@ describe("full generation", () => {
     it("places authored buildings and places with deterministic identities and manual-edit protection", async () => {
       setupScene(state());
       await settleMountedPlan();
+      const planBuildsBeforeBuilding = worker.planBuilds;
+      const chunkBuildsBeforeBuilding = worker.chunkBuilds;
+      const fullChunkCount = Math.max(...worker.chunkRequests.map((request) => request.length));
 
       await placeBuilding(buildingInput());
+      expect(worker.planBuilds).toBe(planBuildsBeforeBuilding);
+      expect(worker.chunkBuilds).toBe(chunkBuildsBeforeBuilding + 1);
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThanOrEqual(fullChunkCount);
       const afterBuilding = getArchitectureSource();
       expect(afterBuilding).not.toBeNull();
       const building = afterBuilding!.buildings[0]!;
@@ -1688,6 +1695,8 @@ describe("full generation", () => {
       expect(building.appearanceSeed).toBe(`adapter-fixture/architecture/${building.lineage}/appearance`);
 
       await placePlace(placeInput());
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThanOrEqual(fullChunkCount);
       const afterPlace = getArchitectureSource();
       expect(afterPlace).not.toBeNull();
       const place = afterPlace!.places[0]!;
@@ -1714,7 +1723,47 @@ describe("full generation", () => {
       ));
       expect(place.id).toBe(allocateManualId("plc", 2, 0, place.lineage));
       expect(place.seed).toBe(`adapter-fixture/architecture/${place.lineage}/geometry`);
+
       expect(place.appearanceSeed).toBe(`adapter-fixture/architecture/${place.lineage}/appearance`);
+    }, 120_000);
+    it("rebuilds only affected block chunks for authored placement and type edits", async () => {
+      Object.assign(canvas.dimensions.sceneRect, { x: 200, y: 100, width: 600, height: 600 });
+      setupScene(state());
+      await settleMountedPlan();
+      await vi.waitFor(() => {
+        expect(cacheState.publishChunks).toHaveBeenCalled();
+      }, { timeout: 15_000 });
+      const fullChunkCount = Math.max(...worker.chunkRequests.map((request) => request.length));
+      const planBuilds = worker.planBuilds;
+      const chunkBuilds = worker.chunkBuilds;
+      cacheState.publishChunks.mockClear();
+      const site: Ring = [
+        { x: 28, y: 28 },
+        { x: 52, y: 28 },
+        { x: 52, y: 52 },
+        { x: 28, y: 52 }
+      ];
+      const placement: PlacementFrame = {
+        ...buildingPlacement,
+        centre: { x: 40, y: 40 }
+      };
+
+      const placed = await placeBuilding(buildingInput({ placement, sitePolygon: site }));
+      expect(worker.planBuilds).toBe(planBuilds);
+      expect(worker.chunkBuilds).toBe(chunkBuilds + 1);
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThan(fullChunkCount);
+      expect(placed.chunks).toBe(worker.chunkRequests.at(-1)!.length);
+
+      const id = getArchitectureSource()!.buildings[0]!.id;
+      const chunksBeforeTypeEdit = worker.chunkBuilds;
+      const edited = await editObjectProperties(id, { grammarId: "residential-slab", visualUse: "residential", heightM: 30 });
+      expect(worker.planBuilds).toBe(planBuilds);
+      expect(worker.chunkBuilds).toBe(chunksBeforeTypeEdit + 1);
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThan(fullChunkCount);
+      expect(edited.chunks).toBe(worker.chunkRequests.at(-1)!.length);
+      expect(cacheState.publishChunks).not.toHaveBeenCalled();
     }, 120_000);
 
     it("rejects invalid authored placement before writing the Scene flag", async () => {
@@ -1799,7 +1848,14 @@ describe("full generation", () => {
       expect(cosmetic!.buildings).toHaveLength(0);
       expect(cosmetic!.overrides).toHaveLength(1);
 
-      await editObjectProperties(building.id, { grammarId: building.grammarId });
+      const planBuildsBeforeType = worker.planBuilds;
+      const chunkBuildsBeforeType = worker.chunkBuilds;
+      const fullChunkCount = Math.max(...worker.chunkRequests.map((request) => request.length));
+      await editObjectProperties(building.id, { grammarId: building.grammarId, visualUse: building.visualUse, heightM: building.heightM });
+      expect(worker.planBuilds).toBe(planBuildsBeforeType);
+      expect(worker.chunkBuilds).toBe(chunkBuildsBeforeType + 1);
+      expect(worker.chunkRequests.at(-1)!.length).toBeGreaterThan(0);
+      expect(worker.chunkRequests.at(-1)!.length).toBeLessThanOrEqual(fullChunkCount);
       const promoted = getArchitectureSource();
       expect(promoted).not.toBeNull();
       expect(promoted!.overrides).toHaveLength(0);
@@ -1872,6 +1928,40 @@ describe("full generation", () => {
         "targetId",
         "targetKind"
       ]);
+    }, 120_000);
+    it("promotes protected derived overrides before structural placement can orphan them", async () => {
+      setupScene(state());
+      await settleMountedPlan();
+      const cityBefore = getCity()!;
+      const plan = buildCompleteCityPlan(cityBefore.source, cityBefore.revision);
+      const building = plan.buildings.find((candidate) =>
+        candidate.sourceId === null
+        && candidate.placement !== undefined
+        && candidate.sitePolygon.length === 4
+        && Math.hypot(candidate.placement.centre.x, candidate.placement.centre.y) > 100
+      );
+      if (building?.placement === undefined) throw new Error("expected a distant generated building");
+      await editObjectProperties(building.id, { paletteId: "corporate" });
+
+      await placeBuilding(buildingInput());
+
+      const city = getCity()!;
+      const architecture = city.source.architecture;
+      expect(architecture.overrides).toEqual([]);
+      expect(architecture.buildings).toHaveLength(2);
+      expect(architecture.buildings.find((candidate) => candidate.id === building.id)).toMatchObject({
+        lineage: building.lineage,
+        origin: "generated",
+        protection: "manual-edit",
+        paletteId: "corporate",
+        sitePolygon: building.sitePolygon,
+        placement: building.placement
+      });
+      const rebuilt = buildCompleteCityPlan(city.source, city.revision);
+      expect(rebuilt.buildings.find((candidate) => candidate.id === building.id)).toMatchObject({
+        paletteId: "corporate",
+        protection: "manual-edit"
+      });
     }, 120_000);
     it("rejects overrides targeting persistent architecture objects", async () => {
       setupScene(state());

@@ -75,6 +75,7 @@ import {
   clearObjectError,
   clearObjectSelection,
   configureObjectPlacement,
+  finishObjectPlacement,
   getObjectError,
   getObjectSelection,
   hasObjectDraft,
@@ -106,16 +107,18 @@ class Graphics {
   static instances: Graphics[] = [];
   readonly fills: Array<{ color: number; alpha?: number }> = [];
   readonly lineStyles: unknown[] = [];
+  moveCalls = 0;
   eventMode = "none";
   constructor() { Graphics.instances.push(this); }
   clear(): void {
     this.fills.length = 0;
     this.lineStyles.length = 0;
+    this.moveCalls = 0;
   }
   beginFill(color: number, alpha?: number): void { this.fills.push({ color, alpha }); }
   endFill(): void {}
   lineStyle(style: unknown): void { this.lineStyles.push(style); }
-  moveTo(): void {}
+  moveTo(): void { this.moveCalls += 1; }
   lineTo(): void {}
 }
 class InteractionLayer {
@@ -191,6 +194,13 @@ describe("object geometry and interaction", () => {
     const config = { kind: "building" as const, grammarId: "narrow-shopfront" as const, visualUse: "commercial" as const, heightM: 30, widthM: 20, depthM: 20 };
     const derived = objectPlacementPreview(config, { x: 60, y: 20 }, city, plan);
     expect(derived.valid).toBe(true);
+
+    const derivedLandmark = objectPlacementPreview(config, { x: 20, y: 60 }, city, {
+      ...plan,
+      buildings: [],
+      landmarks: [{ ...plan.landmarks[0]!, sourceId: null }]
+    });
+    expect(derivedLandmark).toMatchObject({ valid: false, reason: 'The placement overlaps place "place-a".' });
 
     const persistent = objectPlacementPreview(config, { x: 60, y: 20 }, city, {
       ...plan,
@@ -313,7 +323,7 @@ describe("object geometry and interaction", () => {
     expect(adapterMocks.placeBuilding).not.toHaveBeenCalled();
     await layer._tearDown({});
   });
-  it("keeps base sites cached while selection changes only redraw highlights", async () => {
+  it("batches authored base sites and redraws only highlights for selection changes", async () => {
     const Layer = objectsLayerClass();
     const layer = new Layer();
     await layer._draw({});
@@ -346,7 +356,8 @@ describe("object geometry and interaction", () => {
     layer.refresh();
     expect(baseClear).toHaveBeenCalledOnce();
     expect(highlightsClear).toHaveBeenCalledOnce();
-    expect(base.fills).toHaveLength(baseFills.length + 1);
+    expect(base.fills).toHaveLength(2);
+    expect(base.moveCalls).toBe(4);
     expect(highlights.fills.some((fill) => fill.color === 0x74ffa8)).toBe(true);
     await layer._tearDown({});
   });
@@ -410,7 +421,7 @@ describe("object geometry and interaction", () => {
     stateMocks.canvasTool.mockReturnValue("place");
     configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
 
-    layer._onClickLeft(event(50, 50));
+    layer._onClickLeft2(event(50, 50));
     expect(adapterMocks.placeBuilding).toHaveBeenCalledWith(expect.objectContaining({
       grammarId: "narrow-shopfront",
       placement: expect.objectContaining({ centre: { x: 50, y: 50 } })
@@ -421,7 +432,7 @@ describe("object geometry and interaction", () => {
     firstRun[2]();
     expect(hasObjectDraft()).toBe(true);
 
-    layer._onClickLeft(event(80, 80));
+    layer._onClickLeft2(event(80, 80));
     expect(adapterMocks.placeBuilding).toHaveBeenCalledTimes(2);
     expect(adapterMocks.placeBuilding).toHaveBeenLastCalledWith(expect.objectContaining({
       grammarId: "narrow-shopfront",
@@ -430,6 +441,28 @@ describe("object geometry and interaction", () => {
     expect(hasObjectDraft()).toBe(true);
     await layer._tearDown({});
   });
+  it("allows button and canvas placement retries after an adapter rejection", async () => {
+    const run = vi.fn();
+    setObjectsWorkspaceBridge({ run });
+    adapterMocks.placeBuilding.mockRejectedValueOnce(new Error("Semantic placement conflict"));
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    stateMocks.canvasTool.mockReturnValue("place");
+    configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
+    layer._onMouseMove(event(85, 85));
+
+    expect(await finishObjectPlacement()).toBe(true);
+    const rejected = run.mock.calls[0]!;
+    await expect(rejected[1]).rejects.toThrow("Semantic placement conflict");
+    expect(getObjectError()).toMatchObject({ label: "object placement", message: "Semantic placement conflict" });
+
+    expect(await finishObjectPlacement()).toBe(true);
+    expect(adapterMocks.placeBuilding).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledTimes(2);
+    await layer._tearDown({});
+  });
+
 
   it("uses the world-to-metre path for placement and metre-to-world drawing", async () => {
     adapterMocks.worldToMetres.mockImplementation((point: { x: number; y: number }) => ({ x: point.x / 10, y: point.y / 10 }));
@@ -442,11 +475,33 @@ describe("object geometry and interaction", () => {
     stateMocks.canvasTool.mockReturnValue("place");
     configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
     layer._onMouseMove(event(500, 500));
-    layer._onClickLeft(event(500, 500));
+    layer._onClickLeft2(event(500, 500));
     expect(adapterMocks.worldToMetres).toHaveBeenCalledWith({ x: 500, y: 500 });
     expect(adapterMocks.metresToWorld).toHaveBeenCalled();
     expect(adapterMocks.placeBuilding).toHaveBeenCalledWith(expect.objectContaining({
       placement: expect.objectContaining({ centre: { x: 50, y: 50 } })
+    }));
+    await layer._tearDown({});
+  });
+
+  it("moves a placement preview through drag without committing the origin", async () => {
+    const run = vi.fn();
+    setObjectsWorkspaceBridge({ run });
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    stateMocks.canvasTool.mockReturnValue("place");
+    configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
+
+    layer._onClickLeft(event(40, 40));
+    layer._onDragLeftStart(event(40, 40));
+    layer._onDragLeftMove(event(85, 85));
+    layer._onDragLeftDrop(event(85, 85));
+    expect(adapterMocks.placeBuilding).not.toHaveBeenCalled();
+
+    expect(await finishObjectPlacement()).toBe(true);
+    expect(adapterMocks.placeBuilding).toHaveBeenCalledWith(expect.objectContaining({
+      placement: expect.objectContaining({ centre: { x: 85, y: 85 } })
     }));
     await layer._tearDown({});
   });
@@ -516,7 +571,7 @@ describe("object geometry and interaction", () => {
     stateMocks.canvasTool.mockReturnValue("place");
     configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
 
-    layer._onClickLeft(event(-10, -10));
+    layer._onClickLeft2(event(-10, -10));
     expect(adapterMocks.placeBuilding).not.toHaveBeenCalled();
     expect(getObjectError()).toEqual({
       label: "object placement",
@@ -526,7 +581,7 @@ describe("object geometry and interaction", () => {
 
     layer._onMouseMove(event(50, 50));
     expect(getObjectError()).toBeNull();
-    layer._onClickLeft(event(-10, -10));
+    layer._onClickLeft2(event(-10, -10));
     expect(getObjectError()).not.toBeNull();
     layer._onClickRight(event(-10, -10));
     expect(getObjectError()).toBeNull();
@@ -539,7 +594,7 @@ describe("object geometry and interaction", () => {
     await layer._draw({});
     stateMocks.canvasTool.mockReturnValue("place");
     configureObjectPlacement({ kind: "building", grammarId: "narrow-shopfront", visualUse: "commercial", heightM: 30, widthM: 20, depthM: 20 });
-    layer._onClickLeft(event(-10, -10));
+    layer._onClickLeft2(event(-10, -10));
     expect(getObjectError()).not.toBeNull();
 
     adapterMocks.getCity.mockReturnValue({ ...city, revision: 2 });

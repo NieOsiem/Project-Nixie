@@ -220,7 +220,7 @@ describe("Objects workspace catalogue", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("Preset active:");
     expect(html).toContain('data-action="object-place-confirm"');
-    expect(html).toContain("Click the canvas or Place here to confirm");
+    expect(html).toContain("Double-click the canvas or Place here to confirm");
     expect(objectLayerMocks.configureObjectPlacement).toHaveBeenCalled();
     expect(stateMocks.setCanvasTool.mock.invocationCallOrder[0]).toBeLessThan(objectLayerMocks.configureObjectPlacement.mock.invocationCallOrder[0]!);
 

@@ -3504,6 +3504,77 @@ export function restyleCompleteCityPlanObjectPalette(
   return next;
 }
 
+/**
+ * Updates one persistent building without replanning terrain, roads, districts, or
+ * unrelated parcels. New authored sites suppress derived buildings/open spaces whose
+ * parcels genuinely overlap the site; the retained parcel records remain harmless
+ * semantic ownership data and are reconciled by the next full plan build.
+ */
+export function patchCompleteCityPlanPersistentBuilding(
+  plan: CompleteCityPlan,
+  source: CitySourceV4,
+  id: string
+): CompleteCityPlan {
+  const record = source.architecture.buildings.find((building) => building.id === id);
+  if (record === undefined) throw new Error(`Unknown persistent building "${id}".`);
+  const peerSites = [
+    ...source.architecture.buildings.filter((building) => building.id !== id).map((building) => building.sitePolygon),
+    ...source.architecture.places.map((place) => place.sitePolygon)
+  ];
+  assertPersistentSite(
+    `Persistent building "${id}"`,
+    record.sitePolygon,
+    record.placement,
+    source,
+    plan.districtPlan,
+    record.districtId,
+    record.blockId,
+    plan.routeOccupancy.all,
+    peerSites
+  );
+  const paletteEntries = derivePaletteBanks();
+  const banks = new Map(paletteEntries.map((entry) => [entry.paletteId, entry.bank]));
+  const districtById = new Map(source.districts.map((district) => [district.id, district]));
+  const replacement = materializePersistentBuilding(record, districtById, banks);
+  const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
+  const overlapsSite = (ring: Ring): boolean => !isSnapNoise(intersection(ringAsMulti(record.sitePolygon), ringAsMulti(ring)));
+  const buildings = plan.buildings.filter((building) => {
+    if (building.id === id) return false;
+    if (building.sourceId !== null) return true;
+    const parcel = building.parcelId === null ? undefined : parcelById.get(building.parcelId);
+    return !overlapsSite(parcel?.polygon ?? building.sitePolygon);
+  });
+  buildings.push(replacement);
+  buildings.sort((left, right) => left.id.localeCompare(right.id));
+  const openSpaces = plan.openSpaces.filter((openSpace) => openSpace.landmarkId !== null || !overlapsSite(openSpace.polygon));
+  const retainedIds = new Set([
+    ...buildings.map((building) => `building:${building.id}`),
+    ...plan.landmarks.map((landmark) => `place:${landmark.id}`)
+  ]);
+  const orphanedOverrides = source.architecture.overrides.flatMap((override) => {
+    if (retainedIds.has(`${override.targetKind}:${override.targetId}`)) return [];
+    if (override.protection !== "none") {
+      throw new Error(`Protected architecture override "${override.targetKind}:${override.targetId}" no longer matches its target site or lineage.`);
+    }
+    return [override.targetId];
+  });
+  return {
+    ...plan,
+    structuralInput: completeCityStructuralInput(source),
+    paletteBanks: paletteEntries,
+    openSpaces,
+    buildings,
+    diagnostics: {
+      ...plan.diagnostics,
+      openSpaceCount: openSpaces.length,
+      buildingCount: buildings.length,
+      massCount: buildings.reduce((sum, building) => sum + building.masses.length, 0)
+        + plan.landmarks.reduce((sum, landmark) => sum + landmark.masses.length, 0),
+      orphanedOverrides
+    }
+  };
+}
+
 function applyArchitectureOverrides(
   source: CitySourceV4,
   buildings: BuildingPlan[],

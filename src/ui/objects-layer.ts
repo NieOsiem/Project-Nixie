@@ -50,6 +50,7 @@ interface ObjectLayerInstance extends InteractionLayerLike {
   _onDragLeftDrop(event: unknown): void;
   _onDragLeftCancel(): void;
   _onClickLeft(event: unknown): void;
+  _onClickLeft2(event: unknown): void;
   _onClickRight(event: unknown): void;
   _onDragRightCancel(): void;
 }
@@ -369,9 +370,13 @@ function architectureObjects(plan: unknown): ArchitectureEntry[] {
 function placementPeerBlocks(object: ArchitectureEntry): boolean {
   const sourceId = field(object.plan, "sourceId");
   const protection = field(object.plan, "protection");
-  // A fully-derived object is replaceable by authored placement unless an override
-  // explicitly made it manual or protected. Persistent sources always block.
-  return sourceId !== null || protection === "manual-edit" || protection === "explicit";
+  // Procedural buildings may be replaced by authored placement. Places reserve their
+  // landmark sites even when derived; the incremental building plan cannot silently
+  // remove a landmark that the preview presented as usable space.
+  return object.kind === "place"
+    || sourceId !== null
+    || protection === "manual-edit"
+    || protection === "explicit";
 }
 
 function cityRevision(city: unknown): number | null {
@@ -538,11 +543,17 @@ function rememberError(label: string, error: unknown, affectedIds: readonly stri
 }
 
 
-function runMutation(label: string, work: Promise<unknown>, affectedIds: readonly string[], then?: () => void): void {
+function runMutation(
+  label: string,
+  work: Promise<unknown>,
+  affectedIds: readonly string[],
+  then?: () => void,
+  settled?: () => void
+): void {
   const guarded = work.catch((error: unknown) => {
     rememberError(label, error, affectedIds);
     throw error;
-  });
+  }).finally(settled);
   const success = () => {
     clearRememberedError();
     then?.();
@@ -869,9 +880,10 @@ export function objectsLayerClass(): LayerConstructor {
       this.#siteDraft = null;
       const operation = editSitePolygon(draft.id, site);
       runMutation("site edit", operation, [draft.id], () => {
-        this.#finishing = false;
         this.#ghostCentreWorld = null;
         this.refresh();
+      }, () => {
+        this.#finishing = false;
       });
       // `ctx.run` owns the completion/error delivery; this return value is the
       // accepted gesture rather than the eventual adapter result.
@@ -907,9 +919,10 @@ export function objectsLayerClass(): LayerConstructor {
             sitePolygon: preview.sitePolygon
           } satisfies PlacePlacementInput);
       runMutation("object placement", operation, [], () => {
-        this.#finishing = false;
         // Keep the catalogue selection and ghost for repeated placement.
         this.refresh();
+      }, () => {
+        this.#finishing = false;
       });
       return Promise.resolve(true);
     }
@@ -924,7 +937,12 @@ export function objectsLayerClass(): LayerConstructor {
       this._onMouseMove(event);
     }
     _onDragLeftStart(event: unknown): void {
-      if (!isSceneEnabled() || getCity() === null || canvasTool() !== OBJECT_TOOL.SITE) return;
+      if (!isSceneEnabled() || getCity() === null) return;
+      if (canvasTool() === OBJECT_TOOL.PLACE && this.#config !== null) {
+        this.#setGhost(event);
+        return;
+      }
+      if (canvasTool() !== OBJECT_TOOL.SITE) return;
       const pointWorld = eventOrigin(event) ?? this.#pointer(event);
       const hit = architectureObjectAt(worldToMetres(pointWorld));
       if (hit === null) return;
@@ -943,6 +961,10 @@ export function objectsLayerClass(): LayerConstructor {
       }
     }
     _onDragLeftDrop(event: unknown): void {
+      if (canvasTool() === OBJECT_TOOL.PLACE && this.#config !== null) {
+        this.#setGhost(event);
+        return;
+      }
       if (this.#siteDraft === null) return;
       this.#siteDraft.current = this.#pointer(event);
       void this.#finishSiteDraft();
@@ -956,8 +978,7 @@ export function objectsLayerClass(): LayerConstructor {
       if (!isSceneEnabled() || getCity() === null) return;
       const tool = canvasTool();
       if (tool === OBJECT_TOOL.PLACE && this.#config !== null) {
-        const pointWorld = this.#setGhost(event);
-        void this.#placeAt(pointWorld);
+        this.#setGhost(event);
         return;
       }
       if (tool === OBJECT_TOOL.SELECT || tool === OBJECT_TOOL.SITE) {
@@ -965,6 +986,11 @@ export function objectsLayerClass(): LayerConstructor {
         selectObjectHit(architectureObjectAt(worldToMetres(pointWorld)), shiftKey(event));
       }
     }
+    _onClickLeft2(event: unknown): void {
+      if (!isSceneEnabled() || getCity() === null || canvasTool() !== OBJECT_TOOL.PLACE || this.#config === null) return;
+      void this.#placeAt(this.#setGhost(event));
+    }
+
     #cancelToSelect(): void {
       // Transition first so the shell owns one synchronous cancellation path.
       // The direct cancel is a no-controller fallback for canvas/unit callers.
@@ -990,24 +1016,27 @@ export function objectsLayerClass(): LayerConstructor {
       }
       this.cancelDraft(true);
     }
-    #drawRing(g: GraphicsLike, ring: Ring, color: number, fillAlpha: number, lineWidth: number, lineAlpha: number): void {
-      if (!validRing(ring)) return;
+    #traceRing(g: GraphicsLike, ring: Ring): void {
       const first = metresToWorld(ring[0]!);
-      g.beginFill(color, fillAlpha);
       g.moveTo(first.x, first.y);
       for (const point of ring.slice(1)) {
         const world = metresToWorld(point);
         g.lineTo(world.x, world.y);
       }
       g.lineTo(first.x, first.y);
+    }
+
+    #drawRings(g: GraphicsLike, rings: readonly Ring[], color: number, fillAlpha: number, lineWidth: number, lineAlpha: number): void {
+      if (rings.length === 0) return;
+      g.beginFill(color, fillAlpha);
+      for (const ring of rings) this.#traceRing(g, ring);
       g.endFill();
       g.lineStyle({ width: lineWidth, color, alpha: lineAlpha });
-      g.moveTo(first.x, first.y);
-      for (const point of ring.slice(1)) {
-        const world = metresToWorld(point);
-        g.lineTo(world.x, world.y);
-      }
-      g.lineTo(first.x, first.y);
+      for (const ring of rings) this.#traceRing(g, ring);
+    }
+
+    #drawRing(g: GraphicsLike, ring: Ring, color: number, fillAlpha: number, lineWidth: number, lineAlpha: number): void {
+      this.#drawRings(g, [ring], color, fillAlpha, lineWidth, lineAlpha);
     }
 
     refresh(): void {
@@ -1039,11 +1068,10 @@ export function objectsLayerClass(): LayerConstructor {
       let objects: ArchitectureEntry[] | null = null;
       if (redrawBase) {
         objects = architectureObjects(plan);
+        const authored = objects.filter(placementPeerBlocks);
         overlay.clear();
-        for (const object of objects) {
-          const color = object.kind === "building" ? COLOR_SITE_BUILDING : COLOR_SITE_PLACE;
-          this.#drawRing(overlay, object.sitePolygon, color, 0.09, lineWidth, 0.85);
-        }
+        this.#drawRings(overlay, authored.filter((object) => object.kind === "building").map((object) => object.sitePolygon), COLOR_SITE_BUILDING, 0.09, lineWidth, 0.85);
+        this.#drawRings(overlay, authored.filter((object) => object.kind === "place").map((object) => object.sitePolygon), COLOR_SITE_PLACE, 0.09, lineWidth, 0.85);
         this.#baseOverlayCache = { plan, lineWidth };
       }
       if (redrawHighlights) {
