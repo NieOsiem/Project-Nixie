@@ -91,7 +91,6 @@ export interface GenerateFormModel {
   districtPool: readonly DistrictTypeId[];
   openSpaceProfile: DistrictOpenSpaceProfile;
   busy: boolean;
-  blocked: boolean;
   /** Cheap staged-settings problem that disables the action, or null when ready to run. */
   stagedProblem: string | null;
   wallWarning: boolean;
@@ -266,9 +265,12 @@ export function generateRecoveryHTML(state: GenerationState, failure: Generation
 
 export function generateFormHTML(model: GenerateFormModel): string {
   const { preflight } = model;
-  const blocked = model.blocked || !preflight.sceneEnabled;
   const busyDisabled = model.busy ? " disabled" : "";
-  const blockedDisabled = blocked ? " disabled" : "";
+  // WHY: enable-control eligibility is separate from generation-action eligibility. A GM
+  // must be able to toggle Nixie on in any replaceable Scene state (absent, disabled
+  // supported, legacy, obsolete) while busy generation and unsupported/malformed data
+  // keep the control disabled. Destructive generation stays gated on sceneEnabled below.
+  const enableDisabled = preflight.gm && preflight.replaceable && !model.busy ? "" : " disabled";
   const terrainMode = model.terrainMode === "coastal" ? "coastal" : "rectangle";
   const coastDisabled = terrainMode !== "coastal" || model.busy ? " disabled" : "";
   const canRandomize = preflight.gm && preflight.replaceable && preflight.sceneEnabled && !model.busy && model.stagedProblem === null;
@@ -313,7 +315,7 @@ export function generateFormHTML(model: GenerateFormModel): string {
       : "";
   return `<section data-panel="generate" class="nixie-tray-generate">
     <div data-status="scene" data-status-kind="${preflight.kind}"><p>${escapeHTML(generateStatusMessage(preflight))}</p></div>
-    <div class="form-group"><label><input type="checkbox" data-field="enable"${preflight.sceneEnabled ? " checked" : ""}${blockedDisabled}${busyDisabled}> Enable Nixie on this Scene</label></div>
+    <div class="form-group"><label><input type="checkbox" data-field="enable"${preflight.sceneEnabled ? " checked" : ""}${enableDisabled}> Enable Nixie on this Scene</label></div>
     ${completion}
     <h3>Generate city</h3>
     <p class="nixie-note">Settings are staged in this browser session. They do not modify the current city until Randomize Entire City runs.</p>
@@ -422,7 +424,6 @@ export function generateWorkspace(deps: Partial<GenerateWorkspaceDeps> = {}): Wo
       districtPool: currentDistrictPool(),
       openSpaceProfile: currentOpenSpaceProfile(),
       busy: isBusy(),
-      blocked: preflight.kind === "unsupported" || preflight.kind === "malformed",
       stagedProblem: validateGenerationStaging(stagingFrom(currentStaged())),
       wallWarning: wallRetryWarningActive(),
       completedSeed: state.phase === "complete" && typeof state.seed === "string" ? state.seed : null

@@ -16,12 +16,24 @@ type PlanViewFixture = {
     id: string;
     sourceId: string | null;
     protection?: "none" | "manual-edit" | "explicit";
+    placement: {
+      centre: { x: number; y: number };
+      rotationRad: number;
+      widthM: number;
+      depthM: number;
+    };
     sitePolygon: Ring;
   }>;
   landmarks: Array<{
     id: string;
     sourceId: string | null;
     protection?: "none" | "manual-edit" | "explicit";
+    placement: {
+      centre: { x: number; y: number };
+      rotationRad: number;
+      widthM: number;
+      depthM: number;
+    };
     sitePolygon: Ring;
   }>;
   routeOccupancy: {
@@ -71,6 +83,7 @@ vi.mock("./editor-state.js", async (importOriginal) => ({
 }));
 
 import {
+  activeTransformGizmo,
   architectureObjectAt,
   clearObjectError,
   clearObjectSelection,
@@ -96,10 +109,25 @@ const city: CityViewFixture = {
 };
 const plan: PlanViewFixture = {
   buildings: [
-    { id: "building-a", sourceId: "building-a", sitePolygon: [{ x: 10, y: 10 }, { x: 30, y: 10 }, { x: 30, y: 30 }, { x: 10, y: 30 }] },
-    { id: "building-b", sourceId: null, sitePolygon: [{ x: 50, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 30 }, { x: 50, y: 30 }] }
+    {
+      id: "building-a",
+      sourceId: "building-a",
+      placement: { centre: { x: 20, y: 20 }, rotationRad: 0, widthM: 20, depthM: 20 },
+      sitePolygon: [{ x: 10, y: 10 }, { x: 30, y: 10 }, { x: 30, y: 30 }, { x: 10, y: 30 }]
+    },
+    {
+      id: "building-b",
+      sourceId: null,
+      placement: { centre: { x: 60, y: 20 }, rotationRad: 0, widthM: 20, depthM: 20 },
+      sitePolygon: [{ x: 50, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 30 }, { x: 50, y: 30 }]
+    }
   ],
-  landmarks: [{ id: "place-a", sourceId: "place-a", sitePolygon: [{ x: 10, y: 50 }, { x: 30, y: 50 }, { x: 30, y: 70 }, { x: 10, y: 70 }] }],
+  landmarks: [{
+    id: "place-a",
+    sourceId: "place-a",
+    placement: { centre: { x: 20, y: 60 }, rotationRad: 0, widthM: 20, depthM: 20 },
+    sitePolygon: [{ x: 10, y: 50 }, { x: 30, y: 50 }, { x: 30, y: 70 }, { x: 10, y: 70 }]
+  }],
   routeOccupancy: { all: [] }
 };
 
@@ -348,7 +376,12 @@ describe("object geometry and interaction", () => {
 
     const nextPlan: PlanViewFixture = {
       ...plan,
-      buildings: [...plan.buildings, { id: "building-c", sourceId: null, sitePolygon: [{ x: 80, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 20 }, { x: 80, y: 20 }] }]
+      buildings: [...plan.buildings, {
+        id: "building-c",
+        sourceId: null,
+        placement: { centre: { x: 85, y: 15 }, rotationRad: 0, widthM: 10, depthM: 10 },
+        sitePolygon: [{ x: 80, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 20 }, { x: 80, y: 20 }]
+      }]
     };
     adapterMocks.getArchitecturePlanView.mockReturnValue(nextPlan);
     baseClear.mockClear();
@@ -524,9 +557,143 @@ describe("object geometry and interaction", () => {
     stateMocks.canvasTool.mockReturnValue("site");
     layer._onDragLeftStart(event(20, 20));
     expect(hasObjectDraft()).toBe(true);
+
     layer._onDragRightCancel();
     expect(hasObjectDraft()).toBe(false);
     await layer._tearDown({});
+  });
+
+  it("clears the provisional overlay on every drag frame instead of accumulating trails", async () => {
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    layer._onClickLeft(event(20, 20));
+    const preview = Graphics.instances[2]!;
+    const clear = vi.spyOn(preview, "clear");
+    clear.mockClear();
+    const gizmo = activeTransformGizmo();
+    expect(gizmo?.beginDrag("translate", { x: 20, y: 20 })).toBe(true);
+    gizmo?.updateDrag({ x: 21, y: 20 });
+    gizmo?.updateDrag({ x: 22, y: 20 });
+    expect(clear).toHaveBeenCalledTimes(2);
+    gizmo?.cancel();
+    await layer._tearDown({});
+  });
+
+  it("creates production transform controls and commits metre-space move, rotation, and resize once each", async () => {
+    const cases = [
+      {
+        action: "translate" as const,
+        start: { x: 20, y: 20 },
+        end: { x: 22, y: 23 },
+        expected: { centre: { x: 22, y: 23 } }
+      },
+      {
+        action: "rotate" as const,
+        start: { x: 30, y: 20 },
+        end: { x: 20, y: 30 },
+        expected: { rotationRad: Math.PI / 2 }
+      },
+      {
+        action: "resize-width" as const,
+        start: { x: 30, y: 20 },
+        end: { x: 35, y: 20 },
+        expected: { widthM: 30 }
+      }
+    ];
+
+    for (const candidate of cases) {
+      const Layer = objectsLayerClass();
+      const layer = new Layer();
+      await layer._draw({});
+      layer._onClickLeft(event(20, 20));
+      const gizmo = activeTransformGizmo();
+      expect(gizmo?.getControl("translate")?.accessibleTitle).toBe("Move object");
+      expect(gizmo?.getControl("rotate")).toBeDefined();
+      expect(gizmo?.getControl("resize-width")).toBeDefined();
+      expect(gizmo?.beginDrag(candidate.action, candidate.start)).toBe(true);
+      expect(gizmo?.updateDrag(candidate.end)).toBe(true);
+      expect(adapterMocks.transformObject).not.toHaveBeenCalled();
+      gizmo?.endDrag();
+      expect(adapterMocks.transformObject).toHaveBeenCalledTimes(1);
+      expect(adapterMocks.transformObject).toHaveBeenCalledWith(
+        "building-a",
+        { placement: expect.objectContaining(candidate.expected) }
+      );
+      await layer._tearDown({});
+      adapterMocks.transformObject.mockClear();
+      clearObjectSelection();
+    }
+  });
+
+  it("converts transformed canvas pixels back to metres before committing", async () => {
+    adapterMocks.metresToWorld.mockImplementation((point: { x: number; y: number }) => ({
+      x: 100 + point.x * 10,
+      y: 200 + point.y * 10
+    }));
+    adapterMocks.worldToMetres.mockImplementation((point: { x: number; y: number }) => ({
+      x: (point.x - 100) / 10,
+      y: (point.y - 200) / 10
+    }));
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    layer._onClickLeft(event(300, 400));
+    const gizmo = activeTransformGizmo();
+    expect(gizmo?.state.placement).toMatchObject({
+      centre: { x: 300, y: 400 },
+      widthM: 200,
+      depthM: 200
+    });
+    expect(gizmo?.beginDrag("translate", { x: 300, y: 400 })).toBe(true);
+    gizmo?.updateDrag({ x: 320, y: 430 });
+    gizmo?.endDrag();
+    expect(adapterMocks.transformObject).toHaveBeenCalledWith("building-a", {
+      placement: expect.objectContaining({ centre: { x: 22, y: 23 }, widthM: 20, depthM: 20 })
+    });
+    await layer._tearDown({});
+  });
+
+  it("uses vertex-only site controls, omits place resize, cancels drags, and hides for multi-selection", async () => {
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    layer._onClickLeft(event(20, 20));
+    const buildingGizmo = activeTransformGizmo();
+    expect(buildingGizmo?.beginDrag("translate", { x: 20, y: 20 })).toBe(true);
+    buildingGizmo?.updateDrag({ x: 24, y: 20 });
+    layer._onDragRightCancel();
+    expect(adapterMocks.transformObject).not.toHaveBeenCalled();
+    expect(buildingGizmo?.state.placement.centre).toEqual({ x: 20, y: 20 });
+
+    stateMocks.canvasTool.mockReturnValue("site");
+    layer.refresh();
+    const siteGizmo = activeTransformGizmo();
+    expect(siteGizmo?.getControl("translate")).toBeUndefined();
+    expect(siteGizmo?.getVertexControl(0)).toBeDefined();
+    expect(siteGizmo?.beginDrag("vertex", { x: 10, y: 10 }, 0)).toBe(true);
+    siteGizmo?.updateDrag({ x: 8, y: 9 });
+    expect(adapterMocks.editSitePolygon).not.toHaveBeenCalled();
+    siteGizmo?.endDrag();
+    expect(adapterMocks.editSitePolygon).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.editSitePolygon).toHaveBeenCalledWith(
+      "building-a",
+      [{ x: 8, y: 9 }, { x: 30, y: 10 }, { x: 30, y: 30 }, { x: 10, y: 30 }]
+    );
+
+    await layer._tearDown({});
+    clearObjectSelection();
+    const placeLayer = new Layer();
+    await placeLayer._draw({});
+    stateMocks.canvasTool.mockReturnValue("select");
+    placeLayer._onClickLeft(event(20, 60));
+    expect(activeTransformGizmo()?.getControl("resize-width")).toBeUndefined();
+    clearObjectSelection();
+    placeLayer._onClickLeft(event(20, 20));
+    placeLayer._onClickLeft(event(60, 20, true));
+    expect(activeTransformGizmo()).toBeNull();
+    await placeLayer._tearDown({});
+    expect(activeTransformGizmo()).toBeNull();
   });
 
   it("rejects transforms for multi-selection instead of mutating a single object", async () => {

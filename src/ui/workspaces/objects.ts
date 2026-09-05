@@ -231,9 +231,14 @@ function buildingInspectorState(value: NormalizedObject, staged: StagedObject): 
   const requestedGrammarId = staged.grammarId ?? value.grammarId;
   const requestedUse = staged.visualUse ?? value.visualUse ?? null;
   const requestedHeight = staged.heightM ?? value.heightM ?? null;
-  const options = BUILDING_GRAMMARS.filter((definition) => grammarFitsObject(definition, value));
+  const compatible = BUILDING_GRAMMARS.filter((definition) => grammarFitsObject(definition, value));
   const requestedGrammar = requestedGrammarId === undefined ? undefined : BUILDING_GRAMMAR_REGISTRY.get(requestedGrammarId);
-  const grammar = options.find((definition) => definition.id === requestedGrammarId) ?? options[0] ?? requestedGrammar ?? null;
+  // The draft anchors on the selected plan target's actual grammar: compatible presets
+  // are switch targets, never a silent substitution for the object's real preset.
+  const grammar = requestedGrammar ?? compatible[0] ?? null;
+  const options = grammar !== null && !compatible.some((definition) => definition.id === grammar.id)
+    ? [grammar, ...compatible]
+    : compatible;
   const visualUse = grammar === null
     ? requestedUse
     : grammar.compatibleUses.includes(requestedUse as BuildingUseId)
@@ -242,9 +247,7 @@ function buildingInspectorState(value: NormalizedObject, staged: StagedObject): 
   const heightM = grammar === null || requestedHeight === null
     ? requestedHeight
     : Math.min(grammar.height.maxM, Math.max(grammar.height.minM, requestedHeight));
-  const normalizedOptions = BUILDING_GRAMMARS.filter((definition) => grammarFitsObject(definition, value));
-  const selectedGrammar = normalizedOptions.find((definition) => definition.id === grammar?.id) ?? normalizedOptions[0] ?? grammar;
-  return { grammar: selectedGrammar, visualUse, heightM, options: normalizedOptions };
+  return { grammar, visualUse, heightM, options };
 }
 
 function normalizedObject(id: string, kind: "building" | "place"): NormalizedObject | null {
@@ -430,8 +433,18 @@ function normalizeStagedBuildingPreset(value: NormalizedObject, grammarId: Build
 
 
 function stagedPatch(value: NormalizedObject, staged: StagedObject): ObjectPropertiesPatch {
-  if (value.kind === "building") return { ...(staged.grammarId === undefined ? {} : { grammarId: staged.grammarId }), ...(staged.visualUse === undefined ? {} : { visualUse: staged.visualUse }), ...(staged.heightM === undefined ? {} : { heightM: staged.heightM }), ...(staged.paletteId === undefined ? {} : { paletteId: staged.paletteId }) };
-  return { ...(staged.landmarkGrammarId === undefined ? {} : { landmarkGrammarId: staged.landmarkGrammarId }), ...(staged.paletteId === undefined ? {} : { paletteId: staged.paletteId }) };
+  if (value.kind === "building") {
+    return {
+      ...(staged.grammarId !== undefined && staged.grammarId !== value.grammarId ? { grammarId: staged.grammarId } : {}),
+      ...(staged.visualUse !== undefined && staged.visualUse !== value.visualUse ? { visualUse: staged.visualUse } : {}),
+      ...(staged.heightM !== undefined && staged.heightM !== value.heightM ? { heightM: staged.heightM } : {}),
+      ...(staged.paletteId !== undefined && staged.paletteId !== value.paletteId ? { paletteId: staged.paletteId } : {})
+    };
+  }
+  return {
+    ...(staged.landmarkGrammarId !== undefined && staged.landmarkGrammarId !== value.landmarkGrammarId ? { landmarkGrammarId: staged.landmarkGrammarId } : {}),
+    ...(staged.paletteId !== undefined && staged.paletteId !== value.paletteId ? { paletteId: staged.paletteId } : {})
+  };
 }
 
 function runObjectAction(label: string, work: Promise<unknown>, ctx: WorkspaceContext, then?: () => void): void {
@@ -484,8 +497,10 @@ export function objectsWorkspace(): WorkspaceModule {
           cancelObjectPlacement(false);
           activePreset = null;
           stagedById.clear();
+          clearObjectSelection();
           setObjectCategory(next as ObjectCategory);
           setCanvasTool(OBJECT_TOOL.SELECT);
+          ctx.rerender();
         }
         return;
       }
@@ -515,11 +530,12 @@ export function objectsWorkspace(): WorkspaceModule {
       if (action === "object-clear-selection") { clearObjectSelection(); return; }
       const current = selectedObject();
       if (current === null || selection().ids.length !== 1) return;
-      if (action === "object-reset") { stagedById.delete(current.id); ctx.rerender(); return; }
       if (action === "object-apply") {
         const staged = stagedById.get(current.id);
         if (staged === undefined || !stagedDirty(staged)) return;
-        runObjectAction("object changes", editObjectProperties(current.id, stagedPatch(current, staged)), ctx, () => stagedById.delete(current.id));
+        const patch = stagedPatch(current, staged);
+        if (Object.keys(patch).length === 0) { stagedById.delete(current.id); ctx.rerender(); return; }
+        runObjectAction("object changes", editObjectProperties(current.id, patch), ctx, () => stagedById.delete(current.id));
         return;
       }
       if (action === "object-lock") { runObjectAction(`${current.locked ? "unlock" : "lock"} object`, setObjectLocked(current.id, !current.locked), ctx); return; }

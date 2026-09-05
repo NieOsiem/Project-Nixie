@@ -92,7 +92,6 @@ function formModel(overrides: Partial<GenerateFormModel> = {}): GenerateFormMode
     districtPool: ["old-city", "waterfront"],
     openSpaceProfile: "low",
     busy: false,
-    blocked: false,
     stagedProblem: null,
     wallWarning: false,
     completedSeed: null,
@@ -216,13 +215,15 @@ describe("Generate tray form state", () => {
     expect(generateFormHTML(formModel({ terrainMode: "coastal" }))).not.toContain('<select data-field="coast-edge" disabled>');
   });
 
-  it("shows refusal language and a disabled action for unsupported and malformed data", () => {
+  it("shows refusal language and disabled action and enable controls for unsupported and malformed data", () => {
     const unsupported = generateFormHTML(formModel({ preflight: preflight({ kind: "unsupported", replaceable: false }) }));
     expect(unsupported).toContain("unsupported City Generator 2.0 schema");
     expect(unsupported).toMatch(/data-action="randomize"[^>]*disabled/);
+    expect(unsupported).toMatch(/data-field="enable"[^>]*disabled/);
     const malformed = generateFormHTML(formModel({ preflight: preflight({ kind: "malformed", replaceable: false }) }));
     expect(malformed).toContain("malformed");
     expect(malformed).toMatch(/data-action="randomize"[^>]*disabled/);
+    expect(malformed).toMatch(/data-field="enable"[^>]*disabled/);
   });
 
   it("keeps the replaceable message for legacy and obsolete data with the action enabled", () => {
@@ -241,11 +242,25 @@ describe("Generate tray form state", () => {
     expect(generateFormHTML(formModel({ preflight: preflight({ gm: true }) }))).toMatch(/data-action="randomize" class="nixie-destructive">/);
   });
 
-  it("blocks generation until the Scene is enabled", () => {
+  it("keeps the enable checkbox actionable while generation stays blocked until the Scene is enabled", () => {
     const html = generateFormHTML(formModel({ preflight: preflight({ kind: "supported", sceneEnabled: false }) }));
     expect(html).toContain("Nixie is disabled on this Scene");
     expect(html).toMatch(/data-action="randomize"[^>]*disabled/);
     expect(html).not.toContain('data-field="enable" checked');
+    expect(html).not.toMatch(/data-field="enable"[^>]*disabled/);
+  });
+
+  it("keeps the enable checkbox actionable for a GM when the Scene has no city", () => {
+    const html = generateFormHTML(formModel({ preflight: preflight({ kind: "absent", sceneEnabled: false }) }));
+    expect(html).not.toMatch(/data-field="enable"[^>]*disabled/);
+    expect(html).toContain('data-field="enable"');
+    expect(html).toMatch(/data-action="randomize"[^>]*disabled/);
+  });
+
+  it("disables the enable checkbox for a non-GM and keeps Randomize gated until enabled", () => {
+    const html = generateFormHTML(formModel({ preflight: preflight({ kind: "absent", sceneEnabled: false, gm: false }) }));
+    expect(html).toMatch(/data-field="enable"[^>]*disabled/);
+    expect(html).toMatch(/data-action="randomize"[^>]*disabled/);
   });
 
   it("disables the action and shows the reason when the staged form is invalid", () => {
@@ -635,5 +650,35 @@ describe("Generate workspace behavior", () => {
     expect(currentDistrictPool()).toEqual(["old-city"]);
     expect(currentOpenSpaceProfile()).toBe("none");
     expect(currentSeed()).toBe("nixie-2");
+  });
+
+  it("renders an actionable enable checkbox when the Scene has no city or Nixie is disabled", () => {
+    const { deps: absentDeps } = depSet({ generationPreflight: () => preflight({ kind: "absent", sceneEnabled: false }) });
+    const absent = generateWorkspace(absentDeps).renderTray();
+    expect(absent).toContain("No Nixie city exists in this Scene");
+    expect(absent).not.toMatch(/data-field="enable"[^>]*disabled/);
+    const { deps: disabledDeps } = depSet({ generationPreflight: () => preflight({ kind: "supported", sceneEnabled: false, revision: 3 }) });
+    const disabled = generateWorkspace(disabledDeps).renderTray();
+    expect(disabled).toContain("Nixie is disabled on this Scene");
+    expect(disabled).not.toMatch(/data-field="enable"[^>]*disabled/);
+    expect(disabled).toMatch(/data-action="randomize"[^>]*disabled/);
+  });
+
+  it("invokes setSceneEnabled when the enable checkbox changes", async () => {
+    stubUi();
+    const { deps, setSceneEnabled } = depSet({ generationPreflight: () => preflight({ kind: "supported", sceneEnabled: false }) });
+    const module = generateWorkspace(deps);
+    const handlers: Record<string, (event: Event) => void> = {};
+    const root = {
+      querySelector: (selector: string) =>
+        selector === '[data-field="enable"]'
+          ? { addEventListener: (type: string, listener: (event: Event) => void) => { handlers[type] = listener; } }
+          : null,
+      querySelectorAll: () => []
+    } as unknown as HTMLElement;
+    module.onRender(root, fakeCtx());
+    handlers.change!({ target: { checked: true } } as unknown as Event);
+    await flushMicrotasks();
+    expect(setSceneEnabled).toHaveBeenCalledWith(true);
   });
 });

@@ -11,16 +11,11 @@ export interface TransformGizmoSnapshot {
   vertexIndex: number | null;
 }
 
-export interface TransformGizmoObject {
-  /** The object kind controls which controls are offered. Places are fixed-size in Phase 5. */
-  kind: "building" | "place";
-  placement: PlacementFrame;
-  sitePolygon?: Ring | null;
-  fixedDimensions?: boolean;
-}
 
 export interface TransformGizmoOptions {
   kind: "building" | "place";
+  /** Control set: "select" offers move/rotate/resize; "site" offers existing vertex handles only. */
+  mode?: "select" | "site";
   placement: PlacementFrame;
   sitePolygon?: Ring | null;
   /** Explicitly suppress resize controls (useful for a fixed-dimension building grammar). */
@@ -191,7 +186,6 @@ export function zoomHitRadius(radius: number, zoom = 1): number {
   return safeRadius / safeZoom;
 }
 
-export const hitRadius = zoomHitRadius;
 
 function finiteZoom(value: number | (() => number) | undefined): number {
   const candidate = typeof value === "function" ? value() : value;
@@ -328,29 +322,36 @@ function drawLine(graphic: object, a: Vec2, b: Vec2): void {
   invokeGraphics(graphic, "moveTo", a.x, a.y);
   invokeGraphics(graphic, "lineTo", b.x, b.y);
 }
-
 function pointLike(value: unknown): Vec2 | null {
-  const record = asRecord(value);
-  const x = record?.x;
-  const y = record?.y;
-  if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y)) return null;
-  return { x, y };
+  const candidate = asRecord(value);
+  const x = candidate?.x;
+  const y = candidate?.y;
+  return typeof x === "number" && Number.isFinite(x) && typeof y === "number" && Number.isFinite(y)
+    ? { x, y }
+    : null;
 }
+
 
 function pointFromEvent(event: unknown, parent: object): Vec2 | null {
   const record = asRecord(event);
   const data = asRecord(record?.data);
   const interactionData = asRecord(record?.interactionData);
+  // The pointer must resolve into the gizmo's local (world-pixel) space first: a
+  // panned or zoomed stage transforms screen globals, so they are a last resort.
+  const eventLocalPosition = record?.getLocalPosition;
+  if (typeof eventLocalPosition === "function") {
+    const point = pointLike(eventLocalPosition.call(record, parent));
+    if (point !== null) return point;
+  }
+  const dataLocalPosition = data?.getLocalPosition;
+  if (typeof dataLocalPosition === "function") {
+    const point = pointLike(dataLocalPosition.call(data, parent));
+    if (point !== null) return point;
+  }
   const candidates = [record?.global, data?.global, interactionData?.global];
   for (const candidate of candidates) {
     const point = pointLike(candidate);
     if (point !== null) return point;
-  }
-  const getLocalPosition = record?.getLocalPosition ?? data?.getLocalPosition;
-  if (typeof getLocalPosition === "function") {
-    const point = getLocalPosition.call(data ?? record, parent);
-    const local = pointLike(point);
-    if (local !== null) return local;
   }
   const clientX = record?.clientX;
   const clientY = record?.clientY;
@@ -479,11 +480,6 @@ export class TransformGizmo extends ContainerBase {
     this.provisional = cloneSnapshot(this.drag.start);
     return true;
   }
-
-  startDrag(action: GizmoAction, pointer: Vec2, vertexIndex: number | null = null): boolean {
-    return this.beginDrag(action, pointer, vertexIndex);
-  }
-
   /** Update only local provisional state. No adapter or expensive rebuild is touched here. */
   updateDrag(pointer: Vec2): boolean {
     const drag = this.drag;
@@ -496,9 +492,6 @@ export class TransformGizmo extends ContainerBase {
     this.options.onPreview?.(cloneSnapshot(next));
     return true;
   }
-
-  moveDrag(pointer: Vec2): boolean { return this.updateDrag(pointer); }
-
   /** Finish one drag and invoke exactly one commit callback. */
   endDrag(pointer?: Vec2): TransformGizmoSnapshot | null {
     const drag = this.drag;
@@ -516,9 +509,6 @@ export class TransformGizmo extends ContainerBase {
     void this.options.onCommit?.(result);
     return result;
   }
-
-  pointerUp(pointer?: Vec2): TransformGizmoSnapshot | null { return this.endDrag(pointer); }
-
   /** Restore the drag's exact pre-drag state and notify the layer without committing. */
   cancel(): TransformGizmoSnapshot | null {
     const drag = this.drag;
@@ -533,9 +523,6 @@ export class TransformGizmo extends ContainerBase {
     this.options.onCancel?.(result);
     return result;
   }
-
-  cancelDrag(): TransformGizmoSnapshot | null { return this.cancel(); }
-
   refresh(): void {
     if (this.destroyed) return;
     const zoom = finiteZoom(this.options.zoom);
@@ -574,13 +561,19 @@ export class TransformGizmo extends ContainerBase {
     super.destroy(options);
   }
 
+  private get mode(): "select" | "site" {
+    return this.options.mode === "site" ? "site" : "select";
+  }
+
   private get canResize(): boolean {
     return this.options.kind === "building" && this.options.fixedDimensions !== true;
   }
 
   private actionAvailable(action: GizmoAction, vertexIndex: number | null): boolean {
+    if (this.mode === "site") {
+      return action === "vertex" && vertexIndex !== null && this.sitePolygon?.[vertexIndex] !== undefined;
+    }
     if (action === "resize-width" || action === "resize-depth") return this.canResize;
-    if (action === "vertex") return vertexIndex !== null && this.sitePolygon?.[vertexIndex] !== undefined;
     return action === "translate" || action === "rotate";
   }
 
@@ -624,9 +617,15 @@ export class TransformGizmo extends ContainerBase {
   }
 
   private buildControls(): void {
-    const required = new Set<string>(["translate", "rotate"]);
-    if (this.canResize) required.add("resize-width").add("resize-depth");
-    for (let index = 0; index < (this.sitePolygon?.length ?? 0); index += 1) required.add(`vertex:${index}`);
+    const required = new Set<string>();
+    if (this.mode === "select") {
+      required.add("translate").add("rotate");
+      if (this.canResize) required.add("resize-width").add("resize-depth");
+    } else {
+      for (let index = 0; index < (this.sitePolygon?.length ?? 0); index += 1) {
+        required.add(`vertex:${index}`);
+      }
+    }
     for (const [key, control] of this.controls) {
       if (required.has(key)) continue;
       this.removeChild?.(control);
@@ -637,9 +636,11 @@ export class TransformGizmo extends ContainerBase {
       if (!required.has(action) || this.controls.has(action)) continue;
       this.createControl(action, null);
     }
-    for (let index = 0; index < (this.sitePolygon?.length ?? 0); index += 1) {
-      const key = `vertex:${index}`;
-      if (!this.controls.has(key)) this.createControl("vertex", index);
+    if (this.mode === "site") {
+      for (let index = 0; index < (this.sitePolygon?.length ?? 0); index += 1) {
+        const key = `vertex:${index}`;
+        if (!this.controls.has(key)) this.createControl("vertex", index);
+      }
     }
     this.drawControls();
   }
@@ -720,10 +721,3 @@ export class TransformGizmo extends ContainerBase {
   }
 
 }
-
-export function createTransformGizmo(options: TransformGizmoOptions): TransformGizmo {
-  return new TransformGizmo(options);
-}
-
-/** Compatibility alias for layer factories that use the repository's *Class naming convention. */
-export const transformGizmoClass = TransformGizmo;

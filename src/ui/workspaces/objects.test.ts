@@ -298,6 +298,41 @@ describe("Objects workspace selection and inspector workflows", () => {
     expect(ctx.rerender).toHaveBeenCalled();
   });
 
+  it("anchors the derived draft on the actual grammar and applies height-only edits as such", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a"], kind: "building" });
+    objectLayerMocks.objectInspector.mockReturnValue({
+      id: "building-a",
+      kind: "building",
+      derived: true,
+      locked: false,
+      plan: {
+        id: "building-a",
+        kind: "building",
+        grammarId: "residential-slab",
+        visualUse: "residential",
+        heightM: 44,
+        paletteId: null,
+        areaM2: 120,
+        placement: { centre: { x: 20, y: 20 }, rotationRad: 0.4, widthM: 9, depthM: 16 },
+        sitePolygon: [{ x: 14, y: 10 }, { x: 26, y: 10 }, { x: 26, y: 30 }, { x: 14, y: 30 }]
+      }
+    });
+    const module = objectsWorkspace();
+    const html = module.renderTray();
+    expect(html).toContain('value="residential-slab" selected');
+    expect(html).toContain('value="residential" selected');
+    expect(html).not.toContain('value="commercial" selected');
+    expect(html).toContain('min="30" max="170" step="1" value="44" data-field="object-height"');
+
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-height"]', "50");
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.editObjectProperties).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.editObjectProperties).toHaveBeenCalledWith("building-a", { heightM: 50 });
+  });
+
   it("renders a same-kind multi-selection as summary-only and blocks mutations", () => {
     objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a", "building-b"], kind: "building" });
     const module = objectsWorkspace();
@@ -335,7 +370,6 @@ describe("Objects workspace selection and inspector workflows", () => {
     module.onAction("object-apply", {} as HTMLElement, ctx);
     expect(adapterMocks.editObjectProperties).toHaveBeenCalledWith("building-a", {
       grammarId: "civic-pavilion",
-      visualUse: "commercial",
       heightM: 42,
       paletteId: "corporate"
     });
@@ -400,5 +434,32 @@ describe("Objects workspace selection and inspector workflows", () => {
     module.onAction("tool", { dataset: { tool: "select" } } as unknown as HTMLElement, ctx);
     expect(objectLayerMocks.cancelObjectPlacement).toHaveBeenCalledTimes(2);
     expect(stateMocks.setCanvasTool).toHaveBeenLastCalledWith("select");
+  });
+  it("clears an incompatible selection and renders the destination catalogue on category change", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a"], kind: "building" });
+    const module = objectsWorkspace();
+    expect(module.renderTray()).toContain('data-panel="objects-inspector"');
+    const ctx = fakeContext();
+    module.onAction("object-category", { dataset: { category: "places" } } as unknown as HTMLElement, ctx);
+    expect(objectLayerMocks.cancelObjectPlacement).toHaveBeenCalledOnce();
+    expect(objectLayerMocks.clearObjectSelection).toHaveBeenCalledOnce();
+    expect(stateMocks.setObjectCategory).toHaveBeenCalledWith("places");
+    expect(stateMocks.setCanvasTool).toHaveBeenCalledWith("select");
+    expect(ctx.rerender).toHaveBeenCalledOnce();
+
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: [], kind: null });
+    stateMocks.currentObjectCategory.mockReturnValue("places");
+    const tray = module.renderTray();
+    expect(tray).toContain('data-panel="objects-catalogue"');
+    expect(tray).toContain("<h3>Places</h3>");
+    expect(tray).not.toContain('data-panel="objects-inspector"');
+    expect(tray).not.toContain('data-panel="objects-multi"');
+
+    const selectionsCleared = objectLayerMocks.clearObjectSelection.mock.calls.length;
+    const rerenders = ctx.rerender.mock.calls.length;
+    module.onAction("object-category", { dataset: { category: "places" } } as unknown as HTMLElement, ctx);
+    expect(objectLayerMocks.clearObjectSelection).toHaveBeenCalledTimes(selectionsCleared);
+    expect(stateMocks.setObjectCategory).toHaveBeenCalledTimes(1);
+    expect(ctx.rerender).toHaveBeenCalledTimes(rerenders);
   });
 });

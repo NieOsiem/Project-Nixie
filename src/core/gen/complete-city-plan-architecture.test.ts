@@ -792,4 +792,113 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(secondBuilding.masses.map((mass) => ({ wallMaterial: mass.wallMaterial, roofMaterial: mass.roofMaterial, facadeSeed: mass.facadeSeed })))
       .not.toEqual(firstBuilding.masses.map((mass) => ({ wallMaterial: mass.wallMaterial, roofMaterial: mass.roofMaterial, facadeSeed: mass.facadeSeed })));
   });
+
+  it("promotes an unchanged concave-site generated building on a height-only edit and keeps authored/changed geometry strict", () => {
+    // L-shaped site: 60x24 bottom leg plus a 30x20 right leg (2040 m2). The persisted
+    // promotion frame mirrors promotedArchitectureSource: the smaller mass-envelope
+    // placementFrameForRing fitted into the concave site (here the bottom leg), whose
+    // width sits below residential-wing's 18 m minWidth even though the site fits.
+    const grammar = BUILDING_GRAMMAR_REGISTRY.get("residential-wing");
+    if (grammar === undefined) throw new Error("Missing building grammar residential-wing");
+    const concaveSite: Ring = [
+      { x: 40, y: 0 },
+      { x: 100, y: 0 },
+      { x: 100, y: 44 },
+      { x: 70, y: 44 },
+      { x: 70, y: 24 },
+      { x: 40, y: 24 }
+    ];
+    const envelopeSource = (): PersistentBuildingSource => ({
+      ...sourceBuilding("concave-envelope", 68, 12, "manual-edit", "generated"),
+      grammarId: "residential-wing",
+      visualUse: grammar.compatibleUses[0]!,
+      heightM: grammar.height.minM,
+      sitePolygon: concaveSite,
+      placement: placement(68, 12, 16, 22)
+    });
+    const frame = frameRing(envelopeSource().placement);
+    expect(isSnapNoise(difference(ringAsMulti(frame), [ringAsMulti(concaveSite)]))).toBe(true);
+
+    const plan = build(baseSource({ buildings: [envelopeSource()], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const building = persistentBuilding(plan, "concave-envelope");
+    expect(building.grammarId).toBe("residential-wing");
+    expect(building.masses.every((mass) =>
+      isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(concaveSite)]))
+    )).toBe(true);
+
+    // Height-only semantic promotion: grammar, use, palette, site, and frame stay verbatim.
+    const promoted = envelopeSource();
+    promoted.heightM = 100;
+    const promotedPlan = build(baseSource({ buildings: [promoted], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(promotedPlan)).toEqual([]);
+    const promotedBuilding = persistentBuilding(promotedPlan, "concave-envelope");
+    expect(promotedBuilding.heightM).toBe(100);
+    expect(promotedBuilding.grammarId).toBe(building.grammarId);
+    expect(promotedBuilding.visualUse).toBe(building.visualUse);
+    expect(promotedBuilding.paletteId).toBe(building.paletteId);
+    expect(promotedBuilding.sitePolygon).toEqual(building.sitePolygon);
+    expect(promotedBuilding.placement).toEqual(building.placement);
+    expect(promotedBuilding.masses.every((mass) =>
+      isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(concaveSite)]))
+    )).toBe(true);
+
+    // Authored placements still validate strictly against the frame itself.
+    expect(() => build(baseSource({
+      buildings: [{ ...envelopeSource(), origin: "authored" }],
+      places: [],
+      overrides: []
+    }))).toThrow(/placement frame does not fit grammar/);
+
+    // Changed geometry (frame and site transformed together, as transformObject does)
+    // shrinks the parcel below the grammar's declared limits and still rejects.
+    const scaleAboutFrameCentre = (ring: Ring, factor: number): Ring =>
+      ring.map((point) => ({
+        x: 68 + (point.x - 68) * factor,
+        y: 12 + (point.y - 12) * factor
+      }));
+    const transformed = envelopeSource();
+    transformed.sitePolygon = scaleAboutFrameCentre(transformed.sitePolygon, 0.3);
+    transformed.placement = {
+      centre: { x: 68, y: 12 },
+      rotationRad: 0,
+      widthM: transformed.placement.widthM * 0.3,
+      depthM: transformed.placement.depthM * 0.3
+    };
+    expect(() => build(baseSource({ buildings: [transformed], places: [], overrides: [] })))
+      .toThrow(/placement frame does not fit grammar/);
+  });
+
+  it("lets a moved generated promotion shadow its original procedural stable id", () => {
+    const initial = build(baseSource());
+    const candidates = initial.buildings.filter((building) =>
+      building.sourceId === null && building.placement !== undefined && building.blockId !== null
+    );
+    const donor = candidates[0];
+    const identity = candidates.find((building) => building.id !== donor?.id);
+    if (donor === undefined || donor.placement === undefined || identity === undefined) {
+      throw new Error("Expected two procedural buildings for promotion regression.");
+    }
+    const promoted: PersistentBuildingSource = {
+      id: identity.id,
+      lineage: identity.lineage,
+      origin: "generated",
+      protection: "manual-edit",
+      seed: donor.seed,
+      appearanceSeed: donor.appearanceSeed,
+      grammarId: donor.grammarId,
+      visualUse: donor.visualUse,
+      heightM: donor.heightM,
+      paletteId: donor.paletteId ?? null,
+      sitePolygon: structuredClone(donor.sitePolygon),
+      placement: structuredClone(donor.placement),
+      districtId: donor.districtId,
+      blockId: donor.blockId
+    };
+
+    const rebuilt = build(baseSource({ buildings: [promoted], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
+    expect(rebuilt.buildings.filter((building) => building.id === identity.id)).toHaveLength(1);
+    expect(persistentBuilding(rebuilt, identity.id).sitePolygon).toEqual(donor.sitePolygon);
+  });
 });

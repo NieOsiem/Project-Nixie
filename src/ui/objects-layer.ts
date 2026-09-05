@@ -17,6 +17,7 @@ import { ringArea, ringBounds } from "../core/geom/types.js";
 import { BUILDING_GRAMMAR_REGISTRY, type BuildingGrammarId, type BuildingGrammarDefinition, type BuildingUseId } from "../core/gen/building-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarId, type LandmarkGrammarDefinition } from "../core/gen/landmark-registry.js";
 import type { PlacementFrame } from "../core/gen/city.js";
+import { TransformGizmo, type TransformGizmoSnapshot } from "./gizmos/transform-gizmo.js";
 
 type UnknownRecord = Record<string, unknown>;
 interface GraphicsLike {
@@ -41,6 +42,7 @@ interface ObjectLayerInstance extends InteractionLayerLike {
   finishDraft(): Promise<boolean>;
   cancelDraft(clearConfig?: boolean, notify?: boolean): void;
   hasDraft(): boolean;
+  transformGizmo(): TransformGizmo | null;
   _activate(): void;
   _deactivate(): void;
   _onMouseMove(event: unknown): void;
@@ -61,6 +63,7 @@ import {
   canvasTool,
   clearEditorActionError,
   editorLayerActivated,
+  isPendingOperation,
   editorLayerDeactivated,
   LAYER_OBJECTS,
   notifyEditorInteraction,
@@ -148,6 +151,7 @@ let activeLayer: InteractionLayerLike & {
   finishDraft?: () => Promise<boolean>;
   cancelDraft?: (clearConfig?: boolean, notify?: boolean) => void;
   hasDraft?: () => boolean;
+  transformGizmo?: () => TransformGizmo | null;
 } | null = null;
 let workspaceBridge: ObjectsWorkspaceBridge | null = null;
 let objectSelection: ObjectSelection = { ids: [], kind: null };
@@ -318,6 +322,71 @@ function frameRing(frame: PlacementFrame): Ring {
 
 export function placementFrameRing(frame: PlacementFrame): Ring {
   return frameRing(frame);
+}
+
+function worldPixelsPerMetre(): number {
+  const origin = metresToWorld({ x: 0, y: 0 });
+  const unit = metresToWorld({ x: 1, y: 0 });
+  const scale = unit.x - origin.x;
+  return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
+/**
+ * Boundary conversion between the authoritative plan (metres) and the gizmo's
+ * world-pixel provisional state. The gizmo never sees or emits metre values.
+ */
+function placementToWorld(frame: PlacementFrame): PlacementFrame {
+  const scale = worldPixelsPerMetre();
+  return {
+    centre: metresToWorld(frame.centre),
+    rotationRad: frame.rotationRad,
+    widthM: frame.widthM * scale,
+    depthM: frame.depthM * scale
+  };
+}
+
+function placementToMetres(frame: PlacementFrame): PlacementFrame {
+  const scale = worldPixelsPerMetre();
+  return {
+    centre: worldToMetres(frame.centre),
+    rotationRad: frame.rotationRad,
+    widthM: frame.widthM / scale,
+    depthM: frame.depthM / scale
+  };
+}
+
+function ringToWorld(ring: Ring): Ring {
+  return ring.map((point) => metresToWorld(point));
+}
+
+function ringToMetres(ring: Ring): Ring {
+  return ring.map((point) => worldToMetres(point));
+}
+
+function validPlacementFrame(value: unknown): value is PlacementFrame {
+  const frame = record(value);
+  if (frame === null) return false;
+  const centre = record(frame.centre);
+  if (centre === null) return false;
+  const width = frame.widthM;
+  const depth = frame.depthM;
+  return typeof centre.x === "number" && Number.isFinite(centre.x)
+    && typeof centre.y === "number" && Number.isFinite(centre.y)
+    && typeof frame.rotationRad === "number" && Number.isFinite(frame.rotationRad)
+    && typeof width === "number" && Number.isFinite(width) && width > 0
+    && typeof depth === "number" && Number.isFinite(depth) && depth > 0;
+}
+
+function sameFrame(left: PlacementFrame, right: PlacementFrame): boolean {
+  return left.centre.x === right.centre.x && left.centre.y === right.centre.y
+    && left.rotationRad === right.rotationRad
+    && left.widthM === right.widthM && left.depthM === right.depthM;
+}
+
+function sameRing(left: Ring | null, right: Ring | null): boolean {
+  if (left === right) return true;
+  if (left === null || right === null || left.length !== right.length) return false;
+  return left.every((point, index) => point.x === right[index]!.x && point.y === right[index]!.y);
 }
 
 function normalizedDimension(value: unknown, fallback: number): number {
@@ -679,6 +748,10 @@ export function objectsLayerClass(): LayerConstructor {
     #ghostCentreWorld: Vec2 | null = null;
     #siteDraft: { id: string; kind: ObjectKind; start: Vec2; current: Vec2 } | null = null;
     #finishing = false;
+    #transformGizmo: TransformGizmo | null = null;
+    #gizmoKey: string | null = null;
+    #gizmoSource: { id: string; placementWorld: PlacementFrame; siteWorld: Ring } | null = null;
+    #gizmoProvisional: TransformGizmoSnapshot | null = null;
 
     invalidateHighlights(): void {
       this.#highlightsCache = null;
@@ -715,6 +788,7 @@ export function objectsLayerClass(): LayerConstructor {
 
     async _tearDown(options: unknown): Promise<void> {
       this.#invalidateCaches();
+      this.#destroyGizmo();
       if (activeLayer === this) activeLayer = null;
       editorLayerDeactivated(OBJECT_LAYER_NAME);
       this.#unwatchPan();
@@ -742,7 +816,11 @@ export function objectsLayerClass(): LayerConstructor {
         this.refresh();
       });
       this.#observedCityRevision = cityRevision(getCity());
-      this.#panHookId ??= Hooks.on("canvasPan", () => this.#syncDragResistance());
+      this.#panHookId ??= Hooks.on("canvasPan", () => {
+        this.#syncDragResistance();
+        // Zoom/pan changes rescale gizmo hit targets; the gizmo reads live stage zoom.
+        this.#transformGizmo?.refresh();
+      });
       this.visible = true;
       this.refresh();
     }
@@ -755,6 +833,7 @@ export function objectsLayerClass(): LayerConstructor {
       this.#removeCityListener = null;
       this.#observedCityRevision = null;
       this.#clearInteractionState();
+      this.#destroyGizmo();
       this.#overlay?.clear();
       this.#highlights?.clear();
       this.#preview?.clear();
@@ -890,6 +969,144 @@ export function objectsLayerClass(): LayerConstructor {
       return Promise.resolve(true);
     }
 
+    transformGizmo(): TransformGizmo | null {
+      return this.#transformGizmo;
+    }
+
+    /** Resolves the single eligible gizmo target from authoritative plan state, if any. */
+    #gizmoTarget(): { id: string; kind: ObjectKind; mode: "select" | "site"; frame: PlacementFrame; sitePolygon: Ring } | null {
+      if (!this.active || !isSceneEnabled() || getCity() === null) return null;
+      const tool = canvasTool();
+      if (tool !== OBJECT_TOOL.SELECT && tool !== OBJECT_TOOL.SITE) return null;
+      if (objectSelection.ids.length !== 1 || objectSelection.kind === null) return null;
+      const id = objectSelection.ids[0]!;
+      const entry = architectureObjects(getArchitecturePlanView())
+        .find((candidate) => candidate.id === id && candidate.kind === objectSelection.kind);
+      if (entry === undefined) return null;
+      if (field(entry.plan, "protection") === "explicit") return null;
+      const frame = field(entry.plan, "placement");
+      if (!validPlacementFrame(frame)) return null;
+      return {
+        id,
+        kind: entry.kind,
+        mode: tool === OBJECT_TOOL.SITE ? "site" : "select",
+        frame,
+        sitePolygon: entry.sitePolygon
+      };
+    }
+
+    /** Reconciles the gizmo with selection, tool, pending, and authoritative plan state. */
+    #syncGizmo(): void {
+      const gizmo = this.#transformGizmo;
+      if (gizmo !== null && gizmo.isDragging) return;
+      if (this.#finishing || isPendingOperation()) {
+        gizmo?.setEnabled(false);
+        return;
+      }
+      const target = this.#gizmoTarget();
+      if (target === null) {
+        this.#destroyGizmo();
+        return;
+      }
+      const placementWorld = placementToWorld(target.frame);
+      const siteWorld = ringToWorld(target.sitePolygon);
+      const key = [
+        target.id,
+        target.kind,
+        target.mode,
+        JSON.stringify(placementWorld),
+        JSON.stringify(siteWorld)
+      ].join("\u0001");
+      if (gizmo !== null && this.#gizmoKey === key) {
+        gizmo.setEnabled(true);
+        gizmo.refresh();
+        return;
+      }
+      this.#destroyGizmo();
+      const next = new TransformGizmo({
+        kind: target.kind,
+        mode: target.mode,
+        placement: placementWorld,
+        sitePolygon: siteWorld,
+        minDimension: worldPixelsPerMetre(),
+        zoom: (): number => canvas?.stage?.scale?.x ?? 1,
+        onPreview: (state) => this.#setGizmoProvisional(state),
+        onCommit: (state) => this.#commitGizmo(target.id, state),
+        onCancel: () => this.#clearGizmoProvisional()
+      });
+      this.#transformGizmo = next;
+      this.#gizmoKey = key;
+      this.#gizmoSource = { id: target.id, placementWorld, siteWorld };
+      this.addChild(next);
+    }
+
+    #destroyGizmo(): void {
+      const gizmo = this.#transformGizmo;
+      if (gizmo === null) return;
+      this.#transformGizmo = null;
+      this.#gizmoKey = null;
+      this.#gizmoSource = null;
+      this.#gizmoProvisional = null;
+      gizmo.destroy();
+    }
+
+    #setGizmoProvisional(state: TransformGizmoSnapshot): void {
+      this.#gizmoProvisional = state;
+      this.#drawGizmoProvisional();
+    }
+
+    #clearGizmoProvisional(): void {
+      if (this.#gizmoProvisional === null) return;
+      this.#gizmoProvisional = null;
+      this.#preview?.clear();
+    }
+
+    /** Draws the provisional site/frame overlay; the gizmo owns its own control visuals. */
+    #drawGizmoProvisional(): void {
+      const preview = this.#preview;
+      const provisional = this.#gizmoProvisional;
+      if (preview === null || provisional === null || !this.active || !isSceneEnabled() || getCity() === null) return;
+      preview.clear();
+      const metreRing = ringToMetres(provisional.sitePolygon ?? frameRing(provisional.placement));
+      if (!validRing(metreRing)) return;
+      this.#drawRing(preview, metreRing, COLOR_SELECTED, 0.28, Math.max(2, (canvas?.dimensions?.size ?? 100) * 0.07), 0.98);
+    }
+
+    /** One release → one atomic adapter action through runMutation; rejection restores authority. */
+    #commitGizmo(id: string, state: TransformGizmoSnapshot): void {
+      this.#gizmoProvisional = null;
+      this.#preview?.clear();
+      const source = this.#gizmoSource;
+      if (source === null || source.id !== id) {
+        this.refresh();
+        return;
+      }
+      if (state.action === "vertex") {
+        if (state.sitePolygon === null || sameRing(state.sitePolygon, source.siteWorld)) {
+          this.refresh();
+          return;
+        }
+        this.#finishing = true;
+        this.#transformGizmo?.setEnabled(false);
+        runMutation("site edit", editSitePolygon(id, ringToMetres(state.sitePolygon)), [id], undefined, () => {
+          this.#finishing = false;
+          this.refresh();
+        });
+        return;
+      }
+      const placement = placementToMetres(state.placement);
+      if (sameFrame(placement, placementToMetres(source.placementWorld))) {
+        this.refresh();
+        return;
+      }
+      this.#finishing = true;
+      this.#transformGizmo?.setEnabled(false);
+      runMutation("object transform", transformObject(id, { placement }), [id], undefined, () => {
+        this.#finishing = false;
+        this.refresh();
+      });
+    }
+
     #placeAt(world: Vec2): Promise<boolean> {
       const config = this.#config;
       if (config === null || this.#finishing) return Promise.resolve(false);
@@ -938,6 +1155,7 @@ export function objectsLayerClass(): LayerConstructor {
     }
     _onDragLeftStart(event: unknown): void {
       if (!isSceneEnabled() || getCity() === null) return;
+      if (this.#transformGizmo?.isDragging) return;
       if (canvasTool() === OBJECT_TOOL.PLACE && this.#config !== null) {
         this.#setGhost(event);
         return;
@@ -951,6 +1169,7 @@ export function objectsLayerClass(): LayerConstructor {
       this.#refreshPreview();
     }
     _onDragLeftMove(event: unknown): void {
+      if (this.#transformGizmo?.isDragging) return;
       if (canvasTool() === OBJECT_TOOL.PLACE && this.#config !== null) {
         this.#setGhost(event);
         return;
@@ -961,6 +1180,7 @@ export function objectsLayerClass(): LayerConstructor {
       }
     }
     _onDragLeftDrop(event: unknown): void {
+      if (this.#transformGizmo?.isDragging) return;
       if (canvasTool() === OBJECT_TOOL.PLACE && this.#config !== null) {
         this.#setGhost(event);
         return;
@@ -969,8 +1189,9 @@ export function objectsLayerClass(): LayerConstructor {
       this.#siteDraft.current = this.#pointer(event);
       void this.#finishSiteDraft();
     }
-
     _onDragLeftCancel(): void {
+      this.#transformGizmo?.cancel();
+      this.#clearGizmoProvisional();
       this.#siteDraft = null;
       this.#refreshPreview();
     }
@@ -1009,6 +1230,8 @@ export function objectsLayerClass(): LayerConstructor {
     }
 
     _onDragRightCancel(): void {
+      this.#transformGizmo?.cancel();
+      this.#clearGizmoProvisional();
       const tool = canvasTool();
       if (tool === OBJECT_TOOL.PLACE || tool === OBJECT_TOOL.SITE) {
         this.#cancelToSelect();
@@ -1043,6 +1266,7 @@ export function objectsLayerClass(): LayerConstructor {
       const overlay = this.#overlay;
       const highlights = this.#highlights;
       if (!overlay || !highlights) return;
+      this.#syncGizmo();
       const city = getCity();
       if (!this.active || !isSceneEnabled() || city === null) {
         overlay.clear();
@@ -1134,6 +1358,7 @@ export function objectsLayerClass(): LayerConstructor {
         this.#drawRing(previewGraphic, site, preview.color, preview.valid ? 0.28 : 0.34, Math.max(2, (canvas?.dimensions?.size ?? 100) * 0.07), 0.98);
         if (!preview.valid) this.#drawMarker(previewGraphic, site, COLOR_ERROR);
       }
+      this.#drawGizmoProvisional();
     }
   };
   return cachedClass;
@@ -1161,4 +1386,9 @@ export function transformObjectSelection(placement: PlacementFrame): boolean {
   const id = objectSelection.ids[0]!;
   runMutation("object transform", transformObject(id, { placement }), [id]);
   return true;
+}
+
+/** The production gizmo owned by the active objects layer, if one is showing controls. */
+export function activeTransformGizmo(): TransformGizmo | null {
+  return activeLayer?.transformGizmo?.() ?? null;
 }

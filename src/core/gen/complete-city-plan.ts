@@ -1514,7 +1514,22 @@ function materializePersistentBuilding(
   }
   const frameRing = placementRing(source.placement);
   const frameAreaM2 = source.placement.widthM * source.placement.depthM;
-  if (!grammarFitsParcel(grammar, {
+  // Generated provenance: the grammar fit was proven at planning time against the
+  // parcel that became this building's sitePolygon, using the same frontage angle the
+  // persisted frame carries. On a concave site the persisted promotion frame is the
+  // smaller mass-envelope fitted inside the site (placementFrameForRing's concave
+  // path), so re-checking declared limits against the frame alone would reject an
+  // unchanged, already-valid derived building. Re-run the identical check against the
+  // site parcel for generated origins; authored placements and genuinely changed
+  // geometry (the frame and site are transformed together) keep the strict gate.
+  const generatedSiteFits = source.origin === "generated"
+    && grammarFitsParcel(grammar, {
+      polygon: source.sitePolygon,
+      frontageAngleRad: source.placement.rotationRad,
+      areaM2: Math.abs(ringArea(source.sitePolygon)),
+      seed: source.seed
+    });
+  if (!generatedSiteFits && !grammarFitsParcel(grammar, {
     polygon: frameRing,
     frontageAngleRad: source.placement.rotationRad,
     areaM2: frameAreaM2,
@@ -3777,7 +3792,14 @@ export function buildCompleteCityPlan(
     occupancy.all,
     ringCentroid(source.terrain.land)
   );
-  const buildings = [...persistentBuildings, ...procedural.buildings].sort((a, b) => a.id.localeCompare(b.id));
+  // A transformed generated building keeps its derived stable ID after promotion.
+  // Once moved away from the original parcel, that parcel may generate the same ID
+  // again; the persistent record is authoritative and shadows that procedural copy.
+  const persistentBuildingIds = new Set(persistentBuildings.map((building) => building.id));
+  const buildings = [
+    ...persistentBuildings,
+    ...procedural.buildings.filter((building) => !persistentBuildingIds.has(building.id))
+  ].sort((a, b) => a.id.localeCompare(b.id));
   const orphanedOverrides = applyArchitectureOverrides(source, buildings, landmarks, districtById, banks);
   const placedLandmarkIds = new Set(landmarks.map((landmark) => landmark.id));
   const keptLandmarkOpenSpaces = landmarkOpenSpaces.filter((openSpace) => openSpace.landmarkId === null || placedLandmarkIds.has(openSpace.landmarkId));

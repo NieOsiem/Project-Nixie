@@ -2,14 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { PlacementFrame } from "../../core/gen/city.js";
 import {
   TransformGizmo,
-  hitRadius,
   localToWorld,
   moveSiteVertex,
   resizePlacement,
   rotatePlacement,
   transformSitePolygon,
   translatePlacement,
-  worldToLocal
+  worldToLocal,
+  zoomHitRadius
 } from "./transform-gizmo.js";
 const placement = (overrides: Partial<PlacementFrame> = {}): PlacementFrame => ({
   centre: { x: 100, y: 80 },
@@ -65,9 +65,9 @@ describe("transform gizmo math", () => {
   });
 
   it("keeps hit targets constant in screen space as zoom changes", () => {
-    expect(hitRadius(18, 1)).toBe(18);
-    expect(hitRadius(18, 2)).toBe(9);
-    expect(hitRadius(18, 0)).toBe(18);
+    expect(zoomHitRadius(18, 1)).toBe(18);
+    expect(zoomHitRadius(18, 2)).toBe(9);
+    expect(zoomHitRadius(18, 0)).toBe(18);
   });
 });
 
@@ -86,10 +86,26 @@ describe("transform gizmo lifecycle", () => {
     expect(gizmo.updateDrag({ x: 112, y: 75 })).toBe(true);
     expect(preview).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
-    expect(gizmo.pointerUp({ x: 115, y: 76 })?.placement.centre).toEqual({ x: 115, y: 76 });
+    expect(gizmo.endDrag({ x: 115, y: 76 })?.placement.centre).toEqual({ x: 115, y: 76 });
     expect(commit).toHaveBeenCalledTimes(1);
-    expect(gizmo.pointerUp({ x: 120, y: 70 })).toBeNull();
+    expect(gizmo.endDrag({ x: 120, y: 70 })).toBeNull();
     expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers only existing vertex handles in site mode", () => {
+    const gizmo = new TransformGizmo({
+      kind: "building",
+      mode: "site",
+      placement: placement(),
+      sitePolygon: [{ x: 90, y: 75 }, { x: 110, y: 75 }, { x: 110, y: 85 }]
+    });
+
+    expect(gizmo.getControl("translate")).toBeUndefined();
+    expect(gizmo.getControl("rotate")).toBeUndefined();
+    expect(gizmo.getControl("resize-width")).toBeUndefined();
+    expect(gizmo.beginDrag("translate", { x: 100, y: 80 })).toBe(false);
+    expect(gizmo.beginDrag("vertex", { x: 110, y: 85 }, 2)).toBe(true);
+    expect(gizmo.beginDrag("vertex", { x: 0, y: 0 }, 3)).toBe(false);
   });
 
   it("restores the exact committed state when a drag is cancelled", () => {
@@ -114,12 +130,10 @@ describe("transform gizmo lifecycle", () => {
     expect(gizmo.getControl("resize-depth")).toBeUndefined();
     expect(gizmo.beginDrag("resize-width", { x: 110, y: 80 })).toBe(false);
     const move = gizmo.getControl("translate");
-    const vertex = gizmo.getVertexControl(1);
+    expect(gizmo.getVertexControl(1)).toBeUndefined();
     expect(move?.accessibleTitle).toBe("Move object");
     expect(move?.ariaLabel).toBe("Move object");
-    expect(vertex?.gizmoAction).toBe("vertex");
-    expect(vertex?.accessibleTitle).toBe("Move site vertex 2");
-    expect(vertex?.eventMode).toBe("static");
+    expect(move?.eventMode).toBe("static");
   });
 
   it("moves an existing vertex through the same provisional/commit lifecycle", () => {
@@ -127,6 +141,7 @@ describe("transform gizmo lifecycle", () => {
     const gizmo = new TransformGizmo({
       kind: "building",
       placement: placement(),
+      mode: "site",
       sitePolygon: [{ x: 90, y: 75 }, { x: 110, y: 75 }, { x: 110, y: 85 }],
       onCommit: commit
     });

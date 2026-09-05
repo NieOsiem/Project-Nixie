@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
+import { BUILDING_GRAMMAR_REGISTRY } from "../core/gen/building-registry.js";
 import { allocateManualId, allocateManualLineage, type CityStateV4, type DistrictSource, type PlacementFrame } from "../core/gen/city.js";
 import { buildCompleteCityPlan, derivePaletteBanks, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import { PLAN_CACHE_FORMAT_VERSION, type CityCacheManifestV1 } from "../core/gen/city-cache.js";
@@ -1887,6 +1888,32 @@ describe("full generation", () => {
         districtId: null,
         blockId: null,
         protection: "manual-edit",
+        sitePolygon: building.sitePolygon,
+        placement: building.placement
+      });
+    }, 120_000);
+    it("promotes a height-only derived edit without altering grammar, use, palette, or frame", async () => {
+      await generatedCity("architecture-height-promotion");
+      const { building } = generatedBuilding();
+      const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId);
+      if (grammar === undefined) throw new Error("expected a known building grammar");
+      const nextHeight = Math.min(grammar.height.maxM, building.heightM + 1);
+
+      await editObjectProperties(building.id, { heightM: nextHeight });
+
+      const promoted = getArchitectureSource();
+      expect(promoted!.overrides).toEqual([]);
+      expect(promoted!.buildings.find((candidate) => candidate.id === building.id)).toMatchObject({
+        id: building.id,
+        lineage: building.lineage,
+        origin: "generated",
+        protection: "manual-edit",
+        seed: building.seed,
+        appearanceSeed: building.appearanceSeed,
+        grammarId: building.grammarId,
+        visualUse: building.visualUse,
+        heightM: nextHeight,
+        paletteId: building.paletteId ?? null,
         sitePolygon: building.sitePolygon,
         placement: building.placement
       });
