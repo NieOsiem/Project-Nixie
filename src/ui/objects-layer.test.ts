@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MultiPolygon, Ring } from "../core/geom/types.js";
+import { compileRouteNetwork } from "../core/graph/compiler.js";
+import type { RoadSource } from "../core/gen/city.js";
+
+type RoadFixture = {
+  nodes: Array<{ id: string; x: number; y: number }>;
+  routes: Array<{ id: string; curvePreset: string }>;
+  edges: Array<{ id: string; a: string; b: string; routeId: string; classId: string; name: string | null; locked: boolean; origin: string }>;
+};
 
 type CityViewFixture = {
   revision: number;
@@ -8,6 +16,8 @@ type CityViewFixture = {
       land: Ring;
       urbanFootprint: Ring;
     };
+    roads?: RoadFixture;
+    districts?: unknown[];
   };
 };
 
@@ -15,7 +25,6 @@ type PlanViewFixture = {
   buildings: Array<{
     id: string;
     sourceId: string | null;
-    protection?: "none" | "manual-edit" | "explicit";
     placement: {
       centre: { x: number; y: number };
       rotationRad: number;
@@ -23,6 +32,15 @@ type PlanViewFixture = {
       depthM: number;
     };
     sitePolygon: Ring;
+    grammarId?: string;
+    visualUse?: string;
+    heightM?: number;
+    lineage?: string;
+    seed?: string;
+    appearanceSeed?: string;
+    paletteId?: string | null;
+    districtId?: string | null;
+    blockId?: string | null;
   }>;
   landmarks: Array<{
     id: string;
@@ -90,6 +108,7 @@ import {
   configureObjectPlacement,
   finishObjectPlacement,
   getObjectError,
+  getObjectRouteFeedback,
   getObjectSelection,
   hasObjectDraft,
   objectsLayerClass,
@@ -112,6 +131,15 @@ const plan: PlanViewFixture = {
     {
       id: "building-a",
       sourceId: "building-a",
+      grammarId: "residential-slab",
+      visualUse: "residential",
+      heightM: 40,
+      lineage: "ln-a",
+      seed: "seed-a",
+      appearanceSeed: "app-a",
+      paletteId: null,
+      districtId: null,
+      blockId: null,
       placement: { centre: { x: 20, y: 20 }, rotationRad: 0, widthM: 20, depthM: 20 },
       sitePolygon: [{ x: 10, y: 10 }, { x: 30, y: 10 }, { x: 30, y: 30 }, { x: 10, y: 30 }]
     },
@@ -131,10 +159,21 @@ const plan: PlanViewFixture = {
   routeOccupancy: { all: [] }
 };
 
+const roadsFixture = (locked = false): RoadFixture => ({
+  nodes: [{ id: "na", x: 50, y: -10 }, { id: "nb", x: 50, y: 110 }],
+  routes: [{ id: "route-1", curvePreset: "standard" }],
+  edges: [{ id: "ab", a: "na", b: "nb", routeId: "route-1", classId: "street", name: null, locked, origin: "generated" }]
+});
+const cityWithRoads = (locked = false): CityViewFixture => ({
+  ...city,
+  source: { ...city.source, districts: [], roads: roadsFixture(locked) }
+});
+const crossingBuildingConfig = { kind: "building" as const, grammarId: "residential-slab" as const, visualUse: "residential" as const, heightM: 40, widthM: 20, depthM: 20 };
+
 class Graphics {
   static instances: Graphics[] = [];
   readonly fills: Array<{ color: number; alpha?: number }> = [];
-  readonly lineStyles: unknown[] = [];
+  readonly lineStyles: Array<{ width?: number; color?: number; alpha?: number }> = [];
   moveCalls = 0;
   eventMode = "none";
   constructor() { Graphics.instances.push(this); }
@@ -142,12 +181,19 @@ class Graphics {
     this.fills.length = 0;
     this.lineStyles.length = 0;
     this.moveCalls = 0;
+    this.points.length = 0;
   }
   beginFill(color: number, alpha?: number): void { this.fills.push({ color, alpha }); }
   endFill(): void {}
-  lineStyle(style: unknown): void { this.lineStyles.push(style); }
-  moveTo(): void { this.moveCalls += 1; }
-  lineTo(): void {}
+  lineStyle(style: { width?: number; color?: number; alpha?: number }): void { this.lineStyles.push(style); }
+  readonly points: Array<{ x: number; y: number }> = [];
+  moveTo(x?: number, y?: number): void {
+    this.moveCalls += 1;
+    if (typeof x === "number" && typeof y === "number") this.points.push({ x, y });
+  }
+  lineTo(x?: number, y?: number): void {
+    if (typeof x === "number" && typeof y === "number") this.points.push({ x, y });
+  }
 }
 class InteractionLayer {
   active = true;
@@ -242,7 +288,10 @@ describe("object geometry and interaction", () => {
     });
     expect(protectedDerived).toMatchObject({ valid: false, reason: 'The placement overlaps building "building-b".' });
 
-    const road = objectPlacementPreview(config, { x: 60, y: 20 }, city, {
+    // Places stay whole-site road-free; building candidates instead route-check their
+    // materialized masses against real compiled roads (see the route preview tests).
+    const placeConfig = { kind: "place" as const, landmarkGrammarId: "hero-tower-plaza" as const, widthM: 40, depthM: 40 };
+    const road = objectPlacementPreview(placeConfig, { x: 60, y: 20 }, city, {
       ...plan,
       buildings: [],
       landmarks: [],
@@ -254,13 +303,14 @@ describe("object geometry and interaction", () => {
       ]]] }
     });
     expect(road).toMatchObject({ valid: false, reason: "The placement overlaps road occupancy." });
+    expect(road.routeConflicts).toBeUndefined();
   });
 
-  it("allows placement in a buildable island enclosed by road occupancy", () => {
-    const config = { kind: "building" as const, grammarId: "narrow-shopfront" as const, visualUse: "commercial" as const, heightM: 30, widthM: 20, depthM: 20 };
+  it("keeps places whole-site road-free, including inside a buildable island", () => {
+    const config = { kind: "place" as const, landmarkGrammarId: "hero-tower-plaza" as const, widthM: 40, depthM: 40 };
     const roadRing: MultiPolygon = [[
       [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
-      [{ x: 30, y: 30 }, { x: 30, y: 70 }, { x: 70, y: 70 }, { x: 70, y: 30 }]
+      [{ x: 20, y: 20 }, { x: 20, y: 80 }, { x: 80, y: 80 }, { x: 80, y: 20 }]
     ]];
     const enclosedPlan = { ...plan, buildings: [], landmarks: [], routeOccupancy: { all: roadRing } };
 
@@ -767,6 +817,169 @@ describe("object geometry and interaction", () => {
     adapterMocks.getCity.mockReturnValue({ ...city, revision: 2 });
     cityListenerState.listener?.();
     expect(getObjectError()).toBeNull();
+    await layer._tearDown({});
+  });
+  it("previews unlocked route crossings on the materialized masses instead of blocking valid work", () => {
+    const preview = objectPlacementPreview(crossingBuildingConfig, { x: 50, y: 50 }, cityWithRoads(), plan);
+    expect(preview.valid).toBe(true);
+    expect(preview.routeConflicts?.map((conflict) => conflict.edgeId)).toEqual(["ab"]);
+    expect(preview.routeConflicts?.[0]?.kind).toBe("road");
+    expect(preview.routeBlockers).toEqual([]);
+    expect(preview.routeProvisional).toBe(true);
+  });
+
+  it("rejects building candidates crossing locked roads and names the blocking edge", () => {
+    const preview = objectPlacementPreview(crossingBuildingConfig, { x: 50, y: 50 }, cityWithRoads(true), plan);
+    expect(preview.valid).toBe(false);
+    expect(preview.routeBlockers?.map((blocker) => blocker.id)).toEqual(["ab"]);
+    expect(preview.routeBlockers?.[0]?.kind).toBe("road");
+    expect(preview.reason).toContain('"ab"');
+    expect(preview.routeConflicts?.map((conflict) => conflict.edgeId)).toEqual(["ab"]);
+  });
+
+  it("lets a building reservation site cross a route when the masses clear every corridor", async () => {
+    const run = vi.fn();
+    setObjectsWorkspaceBridge({ run });
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    adapterMocks.getCity.mockReturnValue(cityWithRoads());
+    adapterMocks.getArchitecturePlanView.mockReturnValue({
+      ...plan,
+      buildings: [{
+        ...plan.buildings[0]!,
+        placement: { centre: { x: 20, y: 20 }, rotationRad: 0, widthM: 12, depthM: 12 }
+      }],
+      landmarks: []
+    });
+    stateMocks.canvasTool.mockReturnValue("site");
+    // Site rect (13,13)-(60,45) contains the committed masses around the placement
+    // frame at (20,20) and crosses the road corridor at x = 50, but the masses stay
+    // clear of the route — a reservation-style crossing commits without road edits.
+    layer._onDragLeftStart(event(13, 13));
+    expect(getObjectRouteFeedback()).toBeNull();
+    layer._onDragLeftDrop(event(60, 45));
+    expect(adapterMocks.editSitePolygon).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.editSitePolygon).toHaveBeenCalledWith(
+      "building-a",
+      [{ x: 13, y: 13 }, { x: 60, y: 13 }, { x: 60, y: 45 }, { x: 13, y: 45 }]
+    );
+    await layer._tearDown({});
+  });
+
+  it("exposes live ghost route feedback with affected edges and clears it on cancellation", async () => {
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    adapterMocks.getCity.mockReturnValue(cityWithRoads());
+    stateMocks.canvasTool.mockReturnValue("place");
+    configureObjectPlacement(crossingBuildingConfig);
+    layer._onMouseMove(event(50, 50));
+    expect(getObjectRouteFeedback()).toMatchObject({
+      kind: "building",
+      targetId: null,
+      provisional: true
+    });
+    expect(getObjectRouteFeedback()?.conflicts.map((conflict) => conflict.edgeId)).toEqual(["ab"]);
+    expect(getObjectRouteFeedback()?.blockers).toEqual([]);
+    // Unlocked trim/removal warning: dashed amber chords are a non-color cue.
+    const preview = Graphics.instances[2]!;
+    expect(preview.lineStyles.some((style) => style.color === 0xffc94a)).toBe(true);
+    layer._onClickRight(event(50, 50));
+    expect(getObjectRouteFeedback()).toBeNull();
+    expect(preview.lineStyles.some((style) => style.color === 0xffc94a)).toBe(false);
+    await layer._tearDown({});
+  });
+
+  it("tracks gizmo drags through the feedback, keeps one gesture commit, and cleans up", async () => {
+    const run = vi.fn();
+    setObjectsWorkspaceBridge({ run });
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    adapterMocks.getCity.mockReturnValue(cityWithRoads());
+    layer._onClickLeft(event(20, 20));
+    const gizmo = activeTransformGizmo();
+    expect(gizmo?.beginDrag("translate", { x: 20, y: 20 })).toBe(true);
+    gizmo?.updateDrag({ x: 50, y: 50 });
+    expect(getObjectRouteFeedback()).toMatchObject({
+      kind: "building",
+      targetId: "building-a",
+      provisional: true
+    });
+    expect(getObjectRouteFeedback()?.conflicts.map((conflict) => conflict.edgeId)).toEqual(["ab"]);
+    gizmo?.endDrag();
+    // One release → one adapter commit; the adapter's route surgery is authoritative.
+    expect(adapterMocks.transformObject).toHaveBeenCalledTimes(1);
+    expect(getObjectRouteFeedback()).toBeNull();
+    await layer._tearDown({});
+    expect(getObjectRouteFeedback()).toBeNull();
+  });
+
+  it("surfaces committed locked-road rejections with the object and blocker named", async () => {
+    const run = vi.fn();
+    setObjectsWorkspaceBridge({ run });
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    adapterMocks.getCity.mockReturnValue(cityWithRoads(true));
+    adapterMocks.transformObject.mockRejectedValueOnce(
+      Object.assign(new Error('Route surgery rejected: locked road edge "ab" — protected corridor.'), {
+        blockers: [{ id: "ab", kind: "road", reason: "protected corridor" }]
+      })
+    );
+    layer._onClickLeft(event(20, 20));
+    const gizmo = activeTransformGizmo();
+    expect(gizmo?.beginDrag("translate", { x: 20, y: 20 })).toBe(true);
+    gizmo?.updateDrag({ x: 50, y: 50 });
+    expect(getObjectRouteFeedback()?.blockers.map((blocker) => blocker.id)).toEqual(["ab"]);
+    // Locked blockers draw solid red chords plus X markers — never color-only.
+    const preview = Graphics.instances[2]!;
+    expect(preview.lineStyles.some((style) => style.color === 0xff6b75)).toBe(true);
+    gizmo?.endDrag();
+    expect(adapterMocks.transformObject).toHaveBeenCalledTimes(1);
+    const committed = run.mock.calls[0]!;
+    await expect(committed[1]).rejects.toThrow('locked road edge "ab"');
+    expect(getObjectError()).toEqual({
+      label: "object transform",
+      message: 'Route surgery rejected: locked road edge "ab" — protected corridor.',
+      affectedIds: ["building-a"]
+    });
+    await layer._tearDown({});
+  });
+  it("draws route conflict overlays along canonical compiled curve segments, not source chords", async () => {
+    const bendRoads: RoadSource = {
+      nodes: [{ id: "na", x: 0, y: 0 }, { id: "nb", x: 50, y: 50 }, { id: "nc", x: 100, y: 0 }],
+      routes: [{ id: "route-1", curvePreset: "standard" }],
+      edges: [
+        { id: "ab", a: "na", b: "nb", routeId: "route-1", classId: "street", name: null, locked: false, origin: "generated" },
+        { id: "bc", a: "nb", b: "nc", routeId: "route-1", classId: "street", name: null, locked: false, origin: "generated" }
+      ]
+    };
+    const bendCity: CityViewFixture = { ...city, source: { ...city.source, districts: [], roads: bendRoads } };
+    const preview = objectPlacementPreview(crossingBuildingConfig, { x: 50, y: 50 }, bendCity, plan);
+    expect(preview.valid).toBe(true);
+    expect(preview.routeConflicts?.length).toBeGreaterThan(0);
+
+    const Layer = objectsLayerClass();
+    const layer = new Layer();
+    await layer._draw({});
+    adapterMocks.getCity.mockReturnValue(bendCity);
+    stateMocks.canvasTool.mockReturnValue("place");
+    configureObjectPlacement(crossingBuildingConfig);
+    layer._onMouseMove(event(50, 50));
+
+    const drawn = Graphics.instances[2]!.points;
+    const conflicting = new Set(preview.routeConflicts!.map((conflict) => conflict.edgeId));
+    const compiledPoints = new Set(
+      compileRouteNetwork(bendRoads)
+        .segments.filter((segment) => conflicting.has(segment.edgeId))
+        .flatMap((segment) => [`${segment.a.x},${segment.a.y}`, `${segment.b.x},${segment.b.y}`])
+    );
+    const nodePoints = new Set(bendRoads.nodes.map((node) => `${node.x},${node.y}`));
+    // The overlay follows the canonical compiled curve: at least one drawn endpoint sits
+    // on a compiled segment but off every source node chord the old renderer used.
+    expect(drawn.some((point) => compiledPoints.has(`${point.x},${point.y}`) && !nodePoints.has(`${point.x},${point.y}`))).toBe(true);
     await layer._tearDown({});
   });
 });

@@ -16,7 +16,10 @@ import type { MultiPolygon, Ring, Rect, Vec2 } from "../core/geom/types.js";
 import { ringArea, ringBounds } from "../core/geom/types.js";
 import { BUILDING_GRAMMAR_REGISTRY, type BuildingGrammarId, type BuildingGrammarDefinition, type BuildingUseId } from "../core/gen/building-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY, type LandmarkGrammarId, type LandmarkGrammarDefinition } from "../core/gen/landmark-registry.js";
-import type { PlacementFrame } from "../core/gen/city.js";
+import type { CitySourceV5, PersistentBuildingSource, PlacementFrame } from "../core/gen/city.js";
+import { analyzeRouteConflicts, type RouteConflict } from "../core/graph/topology.js";
+import { compileRouteNetwork, type CompiledStraightSegment } from "../core/graph/compiler.js";
+import { occupiedPersistentBuildingGeometry } from "../core/gen/complete-city-plan.js";
 import { TransformGizmo, type TransformGizmoSnapshot } from "./gizmos/transform-gizmo.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -98,6 +101,13 @@ export interface ObjectPlacementConfig {
   rotationRad?: number;
 }
 
+/** A locked compiled road edge the adapter's route surgery will reject by id. */
+export interface ObjectRouteBlocker {
+  id: string;
+  kind: "road";
+  reason: string;
+}
+
 export interface ObjectPlacementFramePreview {
   kind: ObjectKind;
   frame: PlacementFrame;
@@ -105,6 +115,30 @@ export interface ObjectPlacementFramePreview {
   valid: boolean;
   reason: string | null;
   color: number;
+  /**
+   * Compiled source edges whose corridors the candidate's materialized masses cross.
+   * Building candidates only; absent when the masses clear every route or no
+   * materializable candidate exists. A building reservation site alone never produces
+   * these: masses clear of roads commit without touching any route.
+   */
+  routeConflicts?: RouteConflict[];
+  /** Locked edges among routeConflicts — the adapter rejects the commit naming these. */
+  routeBlockers?: ObjectRouteBlocker[];
+  /**
+   * Always true when route fields are present: the preview massing is a cheap
+   * synchronous estimate, while the committed adapter surgery stays authoritative.
+   */
+  routeProvisional?: boolean;
+}
+
+/** Live ghost/site-draft/gizmo route state for workspace banners; never a cached commit result. */
+export interface ObjectRouteFeedback {
+  kind: ObjectKind;
+  /** Selected object id, or null for a new-placement ghost. */
+  targetId: string | null;
+  conflicts: RouteConflict[];
+  blockers: ObjectRouteBlocker[];
+  provisional: boolean;
 }
 
 export interface ObjectLayerError {
@@ -152,6 +186,7 @@ let activeLayer: InteractionLayerLike & {
   cancelDraft?: (clearConfig?: boolean, notify?: boolean) => void;
   hasDraft?: () => boolean;
   transformGizmo?: () => TransformGizmo | null;
+  routeFeedback?: () => ObjectRouteFeedback | null;
 } | null = null;
 let workspaceBridge: ObjectsWorkspaceBridge | null = null;
 let objectSelection: ObjectSelection = { ids: [], kind: null };
@@ -457,13 +492,181 @@ function citySource(city: unknown): UnknownRecord {
   return record(field(city, "source")) ?? record(city) ?? {};
 }
 
+const GHOST_BUILDING_ID = "preview ghost";
+
+interface BuildingRoutePreview {
+  conflicts: RouteConflict[];
+  blockers: ObjectRouteBlocker[];
+  /** Present when the candidate could not be materialized; the message names the object and reason. */
+  materializationError: string | null;
+}
+
+function architectureBuildings(source: UnknownRecord): UnknownRecord[] {
+  const buildings = record(field(source, "architecture"))?.buildings;
+  return Array.isArray(buildings)
+    ? buildings.filter((entry): entry is UnknownRecord => record(entry) !== null)
+    : [];
+}
+
+/** The authoritative persistent record behind an object id, when one exists. */
+function persistentBuildingRecord(city: unknown, id: string): PersistentBuildingSource | null {
+  for (const entry of architectureBuildings(citySource(city))) {
+    if (entry.id === id) return entry as unknown as PersistentBuildingSource;
+  }
+  return null;
+}
+
+/**
+ * Derived plan candidates keep their committed seed/frame identity: reusing the plan
+ * entry's seed replays the exact massing the promotion will persist.
+ */
+function planBuildingRecord(plan: unknown, id: string): Omit<PersistentBuildingSource, "placement"> & { placement: PlacementFrame | null } | null {
+  const entry = architectureObjects(plan).find((object) => object.kind === "building" && object.id === id);
+  const candidate = entry === undefined ? null : entry.plan;
+  if (candidate === null || typeof candidate.grammarId !== "string") return null;
+  const placement = record(candidate.placement);
+  return {
+    id: String(candidate.id),
+    lineage: typeof candidate.lineage === "string" ? candidate.lineage : `preview/${String(candidate.id)}`,
+    origin: candidate.origin === "authored" ? "authored" : "generated",
+    protection: candidate.protection === "explicit" ? "explicit" : candidate.protection === "manual-edit" ? "manual-edit" : "none",
+    seed: typeof candidate.seed === "string" ? candidate.seed : `nixie-preview/${String(candidate.id)}/geometry`,
+    appearanceSeed: typeof candidate.appearanceSeed === "string" ? candidate.appearanceSeed : `nixie-preview/${String(candidate.id)}/appearance`,
+    grammarId: candidate.grammarId as PersistentBuildingSource["grammarId"],
+    visualUse: candidate.visualUse as PersistentBuildingSource["visualUse"],
+    heightM: typeof candidate.heightM === "number" ? candidate.heightM : 0,
+    paletteId: candidate.paletteId === null ? null : typeof candidate.paletteId === "string" ? candidate.paletteId : null,
+    sitePolygon: candidate.sitePolygon as Ring,
+    placement: placement === null
+      ? null
+      : {
+          centre: placement.centre as Vec2,
+          rotationRad: placement.rotationRad as number,
+          widthM: placement.widthM as number,
+          depthM: placement.depthM as number
+        },
+    districtId: typeof candidate.districtId === "string" ? candidate.districtId : null,
+    blockId: typeof candidate.blockId === "string" ? candidate.blockId : null
+  };
+}
+
+function ghostBuildingCandidate(config: ObjectPlacementConfig, frame: PlacementFrame, sitePolygon: Ring): PersistentBuildingSource | null {
+  if (config.grammarId === undefined || config.visualUse === undefined || config.heightM === undefined) return null;
+  return {
+    id: GHOST_BUILDING_ID,
+    lineage: "preview",
+    origin: "authored",
+    protection: "manual-edit",
+    seed: `nixie-preview/${config.grammarId}/geometry`,
+    appearanceSeed: `nixie-preview/${config.grammarId}/appearance`,
+    grammarId: config.grammarId,
+    visualUse: config.visualUse,
+    heightM: config.heightM,
+    paletteId: config.paletteId ?? null,
+    sitePolygon,
+    placement: frame,
+    districtId: null,
+    blockId: null
+  };
+}
+
+/**
+ * The persistent building record this gesture would commit: the authoritative source
+ * record (or the derived plan entry's seed identity) re-framed onto the provisional
+ * placement and site. Null when the object carries no usable building identity.
+ */
+function buildingCandidate(
+  city: unknown,
+  plan: unknown,
+  id: string | null,
+  frame: PlacementFrame,
+  sitePolygon: Ring
+): PersistentBuildingSource | null {
+  if (id === null) return null;
+  const base = persistentBuildingRecord(city, id) ?? planBuildingRecord(plan, id);
+  if (base === null || base.placement === null) return null;
+  return { ...base, placement: frame, sitePolygon };
+}
+
+/**
+ * Cheap synchronous route estimate for one building candidate: materializes the actual
+ * production masses (never the reservation site alone) and intersects them with the
+ * compiled route corridors. Locked edges become blockers; unlocked ones are the
+ * trim/removal warning the committed surgery will act on.
+ */
+function buildingRoutePreview(city: unknown, candidate: PersistentBuildingSource): BuildingRoutePreview {
+  const empty: BuildingRoutePreview = { conflicts: [], blockers: [], materializationError: null };
+  const source = citySource(city);
+  const roads = record(field(source, "roads"));
+  if (roads === null || !Array.isArray(roads.edges) || roads.edges.length === 0) return empty;
+  const typed = source as unknown as CitySourceV5;
+  let occupied;
+  try {
+    occupied = occupiedPersistentBuildingGeometry(candidate, typed);
+  } catch (error) {
+    return { conflicts: [], blockers: [], materializationError: errorMessage(error) };
+  }
+  const conflicts = analyzeRouteConflicts(typed.roads, occupied);
+  if (conflicts.length === 0) return empty;
+  const lockedIds = new Set(
+    roads.edges
+      .map((edge) => record(edge))
+      .filter((edge): edge is UnknownRecord => edge !== null && edge.locked === true)
+      .map((edge) => String(edge.id))
+  );
+  const blockers = conflicts
+    .filter((conflict) => lockedIds.has(conflict.edgeId))
+    .map((conflict) => ({ id: conflict.edgeId, kind: "road" as const, reason: conflict.reason }));
+  return { conflicts, blockers, materializationError: null };
+}
+
+let compiledRouteSegmentsCache: { roads: unknown; segments: CompiledStraightSegment[] } | null = null;
+
+/**
+ * Canonical compiled straight segments per edge, cached by the roads source identity so
+ * per-frame previews reuse the network until a commit replaces the roads source.
+ */
+function compiledRouteSegments(city: unknown): CompiledStraightSegment[] {
+  const roads = field(citySource(city), "roads");
+  if (compiledRouteSegmentsCache !== null && compiledRouteSegmentsCache.roads === roads) return compiledRouteSegmentsCache.segments;
+  let segments: CompiledStraightSegment[] = [];
+  try {
+    segments = compileRouteNetwork(roads as CitySourceV5["roads"]).segments;
+  } catch {
+    segments = [];
+  }
+  compiledRouteSegmentsCache = { roads, segments };
+  return segments;
+}
+
+function lockedRouteReason(blockers: readonly ObjectRouteBlocker[]): string {
+  return `Locked roads block this edit: ${blockers.map((blocker) => `"${blocker.id}" — ${blocker.reason}`).join("; ")}`;
+}
+
+function routeFeedbackFromPreview(preview: ObjectPlacementFramePreview, targetId: string | null): ObjectRouteFeedback | null {
+  if (preview.routeConflicts === undefined || preview.routeConflicts.length === 0) return null;
+  return {
+    kind: preview.kind,
+    targetId,
+    conflicts: [...preview.routeConflicts],
+    blockers: (preview.routeBlockers ?? []).map((blocker) => ({ ...blocker })),
+    provisional: preview.routeProvisional ?? true
+  };
+}
+
 function placementValidity(
   config: ObjectPlacementConfig,
   frame: PlacementFrame,
   city: unknown,
   plan: unknown,
   excludeId: string | null = null
-): { valid: boolean; reason: string | null } {
+): {
+  valid: boolean;
+  reason: string | null;
+  routeConflicts?: RouteConflict[];
+  routeBlockers?: ObjectRouteBlocker[];
+  routeProvisional?: boolean;
+} {
   if (city === null || city === undefined) return { valid: false, reason: "Create a City Generator 2.0 terrain first." };
   if (!Number.isFinite(frame.widthM) || !Number.isFinite(frame.depthM) || frame.widthM <= 0 || frame.depthM <= 0) {
     return { valid: false, reason: "The placement frame must have positive dimensions." };
@@ -496,8 +699,31 @@ function placementValidity(
     const area = Math.abs(ringArea(site));
     if (area < grammar.minSiteAreaM2 || area > grammar.maxSiteAreaM2) return { valid: false, reason: "The site area is outside this place grammar's limits." };
   }
-  const occupancy = record(field(plan, "routeOccupancy"))?.all;
-  if (overlapsOccupancy(site, occupancy)) return { valid: false, reason: "The placement overlaps road occupancy." };
+  if (config.kind === "place") {
+    // Places stay whole-site road-free: a landmark reservation may never cross a route.
+    const occupancy = record(field(plan, "routeOccupancy"))?.all;
+    if (overlapsOccupancy(site, occupancy)) return { valid: false, reason: "The placement overlaps road occupancy." };
+  } else {
+    // Phase 6: building ghosts route-check the candidate's materialized masses, never
+    // the reservation site alone. An unlocked crossing stays valid — the committed
+    // adapter surgery trims or removes those edges — while locked edges block here and
+    // again at commit. Without a materializable candidate the conservative whole-site
+    // gate still applies.
+    const candidate = ghostBuildingCandidate(config, frame, site);
+    if (candidate === null) {
+      const occupancy = record(field(plan, "routeOccupancy"))?.all;
+      if (overlapsOccupancy(site, occupancy)) return { valid: false, reason: "The placement overlaps road occupancy." };
+    } else {
+      const route = buildingRoutePreview(city, candidate);
+      if (route.materializationError !== null) return { valid: false, reason: route.materializationError };
+      if (route.blockers.length > 0) {
+        return { valid: false, reason: lockedRouteReason(route.blockers), routeConflicts: route.conflicts, routeBlockers: route.blockers, routeProvisional: true };
+      }
+      if (route.conflicts.length > 0) {
+        return { valid: true, reason: null, routeConflicts: route.conflicts, routeBlockers: [], routeProvisional: true };
+      }
+    }
+  }
   for (const object of architectureObjects(plan)) {
     if (object.id === excludeId || !placementPeerBlocks(object)) continue;
     if (ringsOverlap(site, object.sitePolygon)) return { valid: false, reason: `The placement overlaps ${object.kind} "${object.id}".` };
@@ -516,8 +742,7 @@ export function objectPlacementPreview(
     kind: config.kind,
     frame,
     sitePolygon: frameRing(frame),
-    valid: result.valid,
-    reason: result.reason,
+    ...result,
     color: result.valid ? OBJECT_PREVIEW_OK_COLOR : OBJECT_PREVIEW_ERROR_COLOR
   };
 }
@@ -550,8 +775,43 @@ function sitePreview(site: Ring, kind: ObjectKind, city: unknown, plan: unknown,
       }
     }
   }
+  const centre = { x: 0, y: 0 };
+  if (validRing(site) && site.length > 0) {
+    for (const point of site) {
+      centre.x += point.x;
+      centre.y += point.y;
+    }
+    centre.x /= site.length;
+    centre.y /= site.length;
+  }
+  const bounds = validRing(site) ? ringBounds(site) : { x: centre.x, y: centre.y, width: DEFAULT_WIDTH_M, height: DEFAULT_DEPTH_M };
+  const frame: PlacementFrame = { centre, rotationRad: 0, widthM: Math.max(bounds.width, 1), depthM: Math.max(bounds.height, 1) };
   const routeOccupancy = record(field(plan, "routeOccupancy"))?.all;
-  if (valid && overlapsOccupancy(site, routeOccupancy)) {
+  let route: BuildingRoutePreview | null = null;
+  if (valid && kind === "building") {
+    // Phase 6: building site edits route-check the candidate's materialized masses —
+    // a reservation-only site crossing with clear masses commits without touching any
+    // route. Without a reusable candidate the conservative whole-site gate applies.
+    const base = persistentBuildingRecord(city, excludeId) ?? planBuildingRecord(plan, excludeId);
+    const candidate = base === null || base.placement === null
+      ? null
+      : ({ ...base, placement: base.placement, sitePolygon: site } as PersistentBuildingSource);
+    if (candidate === null) {
+      if (overlapsOccupancy(site, routeOccupancy)) {
+        valid = false;
+        reason = "The site overlaps road occupancy.";
+      }
+    } else {
+      route = buildingRoutePreview(city, candidate);
+      if (route.materializationError !== null) {
+        valid = false;
+        reason = route.materializationError;
+      } else if (route.blockers.length > 0) {
+        valid = false;
+        reason = lockedRouteReason(route.blockers);
+      }
+    }
+  } else if (valid && overlapsOccupancy(site, routeOccupancy)) {
     valid = false;
     reason = "The site overlaps road occupancy.";
   }
@@ -565,18 +825,10 @@ function sitePreview(site: Ring, kind: ObjectKind, city: unknown, plan: unknown,
       }
     }
   }
-  const centre = { x: 0, y: 0 };
-  if (validRing(site) && site.length > 0) {
-    for (const point of site) {
-      centre.x += point.x;
-      centre.y += point.y;
-    }
-    centre.x /= site.length;
-    centre.y /= site.length;
-  }
-  const bounds = validRing(site) ? ringBounds(site) : { x: centre.x, y: centre.y, width: DEFAULT_WIDTH_M, height: DEFAULT_DEPTH_M };
-  const frame: PlacementFrame = { centre, rotationRad: 0, widthM: Math.max(bounds.width, 1), depthM: Math.max(bounds.height, 1) };
-  return { kind, frame, sitePolygon: site, valid, reason, color: valid ? OBJECT_PREVIEW_OK_COLOR : OBJECT_PREVIEW_ERROR_COLOR };
+  const routeFields = route === null || route.materializationError !== null || (route.conflicts.length === 0 && route.blockers.length === 0)
+    ? {}
+    : { routeConflicts: route.conflicts, routeBlockers: route.blockers, routeProvisional: true };
+  return { kind, frame, sitePolygon: site, valid, reason, ...routeFields, color: valid ? OBJECT_PREVIEW_OK_COLOR : OBJECT_PREVIEW_ERROR_COLOR };
 }
 
 function shiftKey(event: unknown): boolean {
@@ -750,8 +1002,9 @@ export function objectsLayerClass(): LayerConstructor {
     #finishing = false;
     #transformGizmo: TransformGizmo | null = null;
     #gizmoKey: string | null = null;
-    #gizmoSource: { id: string; placementWorld: PlacementFrame; siteWorld: Ring } | null = null;
+    #gizmoSource: { id: string; kind: ObjectKind; placementWorld: PlacementFrame; siteWorld: Ring } | null = null;
     #gizmoProvisional: TransformGizmoSnapshot | null = null;
+    #routeFeedback: ObjectRouteFeedback | null = null;
 
     invalidateHighlights(): void {
       this.#highlightsCache = null;
@@ -802,6 +1055,7 @@ export function objectsLayerClass(): LayerConstructor {
       this.#highlights = null;
       this.#preview = null;
       this.#clearInteractionState();
+      this.#routeFeedback = null;
       return super._tearDown(options);
     }
 
@@ -833,6 +1087,7 @@ export function objectsLayerClass(): LayerConstructor {
       this.#removeCityListener = null;
       this.#observedCityRevision = null;
       this.#clearInteractionState();
+      this.#routeFeedback = null;
       this.#destroyGizmo();
       this.#overlay?.clear();
       this.#highlights?.clear();
@@ -847,12 +1102,13 @@ export function objectsLayerClass(): LayerConstructor {
       const hadSiteDraft = this.#siteDraft !== null;
       const hadSelection = objectSelection.kind !== null || objectSelection.ids.length > 0;
       const hadError = objectError !== null;
-      if (!hadConfig && !hadGhost && !hadSiteDraft && !hadSelection && !this.#finishing && !hadError) return;
+      if (!hadConfig && !hadGhost && !hadSiteDraft && !hadSelection && !this.#finishing && !hadError && this.#routeFeedback === null) return;
       if (hadError) clearRememberedError();
       this.#config = null;
       this.#ghostCentreWorld = null;
       this.#siteDraft = null;
       this.#finishing = false;
+      this.#routeFeedback = null;
       objectSelection = { ids: [], kind: null };
       if (hadSelection) this.invalidateHighlights();
       notifyEditorInteraction();
@@ -906,6 +1162,7 @@ export function objectsLayerClass(): LayerConstructor {
       // The shell's single refresh redraws the object rings. Clearing the
       // preview directly avoids a synchronous full-plan redraw during cancel.
       this.#preview?.clear();
+      this.#routeFeedback = null;
       if (notify) notifyEditorInteraction();
     }
 
@@ -969,6 +1226,15 @@ export function objectsLayerClass(): LayerConstructor {
       return Promise.resolve(true);
     }
 
+
+    routeFeedback(): ObjectRouteFeedback | null {
+      if (this.#routeFeedback === null) return null;
+      return {
+        ...this.#routeFeedback,
+        conflicts: [...this.#routeFeedback.conflicts],
+        blockers: this.#routeFeedback.blockers.map((blocker) => ({ ...blocker }))
+      };
+    }
     transformGizmo(): TransformGizmo | null {
       return this.#transformGizmo;
     }
@@ -1036,7 +1302,7 @@ export function objectsLayerClass(): LayerConstructor {
       });
       this.#transformGizmo = next;
       this.#gizmoKey = key;
-      this.#gizmoSource = { id: target.id, placementWorld, siteWorld };
+      this.#gizmoSource = { id: target.id, kind: target.kind, placementWorld, siteWorld };
       this.addChild(next);
     }
 
@@ -1059,23 +1325,93 @@ export function objectsLayerClass(): LayerConstructor {
       if (this.#gizmoProvisional === null) return;
       this.#gizmoProvisional = null;
       this.#preview?.clear();
+      this.#routeFeedback = null;
     }
 
-    /** Draws the provisional site/frame overlay; the gizmo owns its own control visuals. */
+    /** Draws the provisional site/frame overlay plus affected-route cues; the gizmo owns its control visuals. */
     #drawGizmoProvisional(): void {
       const preview = this.#preview;
       const provisional = this.#gizmoProvisional;
       if (preview === null || provisional === null || !this.active || !isSceneEnabled() || getCity() === null) return;
       preview.clear();
+      this.#routeFeedback = null;
       const metreRing = ringToMetres(provisional.sitePolygon ?? frameRing(provisional.placement));
       if (!validRing(metreRing)) return;
       this.#drawRing(preview, metreRing, COLOR_SELECTED, 0.28, Math.max(2, (canvas?.dimensions?.size ?? 100) * 0.07), 0.98);
+      const source = this.#gizmoSource;
+      if (source === null || source.kind !== "building") return;
+      const candidate = buildingCandidate(getCity(), getArchitecturePlanView(), source.id, placementToMetres(provisional.placement), metreRing);
+      if (candidate === null) return;
+      const route = buildingRoutePreview(getCity(), candidate);
+      if (route.materializationError !== null || (route.conflicts.length === 0 && route.blockers.length === 0)) return;
+      this.#drawRouteConflicts(preview, route.conflicts, route.blockers);
+      this.#routeFeedback = {
+        kind: "building",
+        targetId: source.id,
+        conflicts: route.conflicts,
+        blockers: route.blockers,
+        provisional: true
+      };
     }
+
+    /** Affected compiled edges drawn along their canonical straight segments: dashed amber for unlocked trim/removal warnings, solid red + X markers for locked blockers. */
+    #drawRouteConflicts(g: GraphicsLike, conflicts: readonly RouteConflict[], blockers: readonly ObjectRouteBlocker[]): void {
+      const segmentsByEdge = new Map<string, CompiledStraightSegment[]>();
+      for (const segment of compiledRouteSegments(getCity())) {
+        const list = segmentsByEdge.get(segment.edgeId) ?? [];
+        list.push(segment);
+        segmentsByEdge.set(segment.edgeId, list);
+      }
+      const locked = new Set(blockers.map((blocker) => blocker.id));
+      const size = canvas?.dimensions?.size ?? 100;
+      for (const conflict of conflicts) {
+        for (const segment of segmentsByEdge.get(conflict.edgeId) ?? []) {
+          const worldA = metresToWorld(segment.a);
+          const worldB = metresToWorld(segment.b);
+          if (locked.has(conflict.edgeId)) {
+            g.lineStyle({ width: Math.max(2, size * 0.09), color: COLOR_ERROR, alpha: 0.95 });
+            g.moveTo(worldA.x, worldA.y);
+            g.lineTo(worldB.x, worldB.y);
+            // Non-color cue: an X marker on the blocked segment, mirroring the error marker.
+            const mid = { x: (worldA.x + worldB.x) / 2, y: (worldA.y + worldB.y) / 2 };
+            const radius = Math.max(3, size * 0.11);
+            g.lineStyle({ width: Math.max(2, radius * 0.35), color: COLOR_ERROR, alpha: 0.95 });
+            g.moveTo(mid.x - radius, mid.y - radius);
+            g.lineTo(mid.x + radius, mid.y + radius);
+            g.moveTo(mid.x + radius, mid.y - radius);
+            g.lineTo(mid.x - radius, mid.y + radius);
+          } else {
+            this.#drawDashedSegment(g, worldA, worldB, Math.max(2, size * 0.07) * 2.2, Math.max(2, size * 0.07) * 1.4);
+          }
+        }
+      }
+    }
+
+    #drawDashedSegment(g: GraphicsLike, a: Vec2, b: Vec2, dash: number, gap: number): void {
+      const length = Math.hypot(b.x - a.x, b.y - a.y);
+      if (length <= 0) return;
+      const unit = { x: (b.x - a.x) / length, y: (b.y - a.y) / length };
+      g.lineStyle({ width: Math.max(2, dash * 0.5), color: COLOR_HANDLE, alpha: 0.95 });
+      let cursor = 0;
+      let drawing = true;
+      while (cursor < length) {
+        const step = Math.min(drawing ? dash : gap, length - cursor);
+        const start = { x: a.x + unit.x * cursor, y: a.y + unit.y * cursor };
+        if (drawing) {
+          g.moveTo(start.x, start.y);
+          g.lineTo(a.x + unit.x * (cursor + step), a.y + unit.y * (cursor + step));
+        }
+        cursor += step;
+        drawing = !drawing;
+      }
+    }
+
 
     /** One release → one atomic adapter action through runMutation; rejection restores authority. */
     #commitGizmo(id: string, state: TransformGizmoSnapshot): void {
       this.#gizmoProvisional = null;
       this.#preview?.clear();
+      this.#routeFeedback = null;
       const source = this.#gizmoSource;
       if (source === null || source.id !== id) {
         this.refresh();
@@ -1336,6 +1672,7 @@ export function objectsLayerClass(): LayerConstructor {
 
     #refreshPreview(): void {
       const previewGraphic = this.#preview;
+      this.#routeFeedback = null;
       if (!previewGraphic || !this.active || !isSceneEnabled() || getCity() === null) return;
       previewGraphic.clear();
       if (this.#config !== null && this.#ghostCentreWorld !== null && canvasTool() === OBJECT_TOOL.PLACE) {
@@ -1343,6 +1680,10 @@ export function objectsLayerClass(): LayerConstructor {
         const preview = objectPlacementPreview(this.#config, centre, getCity(), getArchitecturePlanView());
         this.#drawRing(previewGraphic, preview.sitePolygon, preview.color, preview.valid ? 0.28 : 0.34, Math.max(2, (canvas?.dimensions?.size ?? 100) * 0.07), 0.98);
         if (!preview.valid) this.#drawMarker(previewGraphic, preview.sitePolygon, COLOR_ERROR);
+        if (preview.routeConflicts !== undefined) {
+          this.#drawRouteConflicts(previewGraphic, preview.routeConflicts, preview.routeBlockers ?? []);
+          this.#routeFeedback = routeFeedbackFromPreview(preview, null);
+        }
       }
       const draft = this.#siteDraft;
       if (draft !== null && canvasTool() === OBJECT_TOOL.SITE) {
@@ -1357,7 +1698,12 @@ export function objectsLayerClass(): LayerConstructor {
         const preview = sitePreview(site, draft.kind, getCity(), getArchitecturePlanView(), draft.id);
         this.#drawRing(previewGraphic, site, preview.color, preview.valid ? 0.28 : 0.34, Math.max(2, (canvas?.dimensions?.size ?? 100) * 0.07), 0.98);
         if (!preview.valid) this.#drawMarker(previewGraphic, site, COLOR_ERROR);
+        if (preview.routeConflicts !== undefined) {
+          this.#drawRouteConflicts(previewGraphic, preview.routeConflicts, preview.routeBlockers ?? []);
+          this.#routeFeedback = routeFeedbackFromPreview(preview, draft.id);
+        }
       }
+      // Overrides the ghost/draft feedback only while a gizmo drag is provisional.
       this.#drawGizmoProvisional();
     }
   };
@@ -1370,6 +1716,7 @@ export function configureObjectPlacement(config: ObjectPlacementConfig | null): 
 
 export function finishObjectPlacement(): Promise<boolean> {
   const layer = activeLayer as { finishDraft?: () => Promise<boolean> } | null;
+
   return layer?.finishDraft?.() ?? Promise.resolve(false);
 }
 
@@ -1379,6 +1726,11 @@ export function cancelObjectPlacement(notify = true): void {
 
 export function hasObjectDraft(): boolean {
   return activeLayer?.hasDraft?.() === true;
+}
+
+/** Live ghost/site-draft/gizmo route feedback for workspace banners; null when nothing is live. */
+export function getObjectRouteFeedback(): ObjectRouteFeedback | null {
+  return activeLayer?.routeFeedback?.() ?? null;
 }
 
 export function transformObjectSelection(placement: PlacementFrame): boolean {

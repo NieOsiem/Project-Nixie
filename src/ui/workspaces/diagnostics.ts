@@ -37,7 +37,9 @@ const USER_FACING_SUBSYSTEMS: Record<string, true> = {
   generation: true,
   objects: true,
   "plan-cache": true,
+  regeneration: true,
   roads: true,
+  routes: true,
   save: true,
   "stale-editor": true,
   terrain: true,
@@ -135,23 +137,29 @@ export function sanitizeDiagnosticEntry(raw: unknown): DiagnosticView | null {
   if (parsedId !== null && !ids.includes(parsedId)) ids.push(parsedId);
   const retry = retryOf(record.retry);
   const rawSubsystem = text(record.subsystem);
-  const subsystem = architectureOrphan
-    ? "architecture"
-    : rawSubsystem === "stale-editor"
-      ? "editor"
-      : rawSubsystem !== null && USER_FACING_SUBSYSTEMS[rawSubsystem] === true
-        ? rawSubsystem
-        : rawKind?.includes("stale") === true
-          ? "editor"
-          : rawKind?.includes("geometry") === true
-            ? "geometry"
-            : retry ?? "city";
+  const subsystem = rawSubsystem === "regeneration" || rawSubsystem === "routes"
+    ? rawSubsystem
+    : architectureOrphan
+      ? "architecture"
+      : rawSubsystem === "stale-editor"
+        ? "editor"
+        : rawSubsystem !== null && USER_FACING_SUBSYSTEMS[rawSubsystem] === true
+          ? rawSubsystem
+          : rawKind?.includes("stale") === true
+            ? "editor"
+            : rawKind?.includes("geometry") === true
+              ? "geometry"
+              : retry ?? "city";
+  const cleanupNotice = rawMessage !== null && /\bcleanup dropped\b/i.test(rawMessage);
+  const routeSurgeryNotice = rawSubsystem === "routes" && rawMessage !== null && !/rejected/i.test(rawMessage);
   const orphaned = orphanCount(record, rawKind, ids) ?? (architectureOrphan ? 1 : null);
   const severity = rawKind?.includes("stale") === true || rawKind?.includes("geometry") === true
     ? "error"
     : record.severity === "warning"
       || rawKind === "degraded"
       || orphaned !== null
+      || cleanupNotice
+      || routeSurgeryNotice
       || retry === "walls"
       || retry === "plan"
       || retry === "geometry"
@@ -239,10 +247,14 @@ function diagnosticIdentityHTML(view: DiagnosticView): string {
 }
 
 function orphanSummaryHTML(views: readonly DiagnosticView[]): string {
-  const count = views.reduce((total, view) => total + (view.orphanedCount ?? 0), 0);
-  if (count === 0) return "";
-  const noun = count === 1 ? "override" : "overrides";
-  return `<p class="nixie-note nixie-diagnostic-orphans" data-status="architecture-orphans"><strong>Architecture:</strong> ${count} orphaned ${noun} were not remapped.</p>`;
+  const summaries: string[] = [];
+  const summarize = (subsystem: string, label: string, text: (count: number) => string): void => {
+    const count = views.reduce((total, view) => total + (view.subsystem === subsystem ? view.orphanedCount ?? 0 : 0), 0);
+    if (count > 0) summaries.push(`<p class="nixie-note nixie-diagnostic-orphans" data-status="${subsystem}-orphans"><strong>${label}:</strong> ${text(count)}</p>`);
+  };
+  summarize("architecture", "Architecture", (count) => `${count} orphaned ${count === 1 ? "override" : "overrides"} were not remapped.`);
+  summarize("regeneration", "Regeneration", (count) => `${count} stale seed record(s) or override(s) were cleaned up.`);
+  return summaries.join("");
 }
 
 function failureSectionHTML(failure: GenerationFailure, busy = false): string {

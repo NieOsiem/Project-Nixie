@@ -12,6 +12,7 @@ export const LAYER_NIXIE = "nixie";
 export const LAYER_ROADS = "nixie-roads";
 export const LAYER_DISTRICTS = "nixie-districts";
 export const LAYER_OBJECTS = "nixie-objects";
+export const LAYER_REGENERATE = "nixie-regenerate";
 
 export const TOOL = {
   LAND_DRAW: "land-draw",
@@ -44,6 +45,12 @@ export const OBJECT_TOOL = {
 } as const;
 export type ObjectTool = (typeof OBJECT_TOOL)[keyof typeof OBJECT_TOOL];
 
+export const REGENERATE_TOOL = {
+  BLOCK: "block",
+  DISTRICT: "district"
+} as const;
+export type RegenerateTool = (typeof REGENERATE_TOOL)[keyof typeof REGENERATE_TOOL];
+
 export interface DistrictSnapOptions {
   districtVertices: boolean;
   roadJunctions: boolean;
@@ -68,7 +75,7 @@ export const WORKSPACE_META: Record<WorkspaceId, { label: string; icon: string; 
   roads: { label: "Roads", icon: "fa-solid fa-road", phase: null },
   districts: { label: "Districts", icon: "fa-solid fa-shapes", phase: null },
   objects: { label: "Objects", icon: "fa-solid fa-boxes-stacked", phase: null },
-  regenerate: { label: "Regenerate", icon: "fa-solid fa-arrows-rotate", phase: "Phase 6" },
+  regenerate: { label: "Regenerate", icon: "fa-solid fa-arrows-rotate", phase: null },
   diagnostics: { label: "Diagnostics", icon: "fa-solid fa-triangle-exclamation", phase: null }
 };
 
@@ -79,7 +86,7 @@ const WORKSPACE_LAYER: Record<WorkspaceId, string | null> = {
   roads: LAYER_ROADS,
   districts: LAYER_DISTRICTS,
   objects: LAYER_OBJECTS,
-  regenerate: null,
+  regenerate: LAYER_REGENERATE,
   diagnostics: null
 };
 
@@ -89,7 +96,7 @@ const DEFAULT_TOOL: Record<WorkspaceId, string | null> = {
   roads: ROAD_TOOL.SELECT,
   districts: DISTRICT_TOOL.SELECT,
   objects: OBJECT_TOOL.SELECT,
-  regenerate: null,
+  regenerate: REGENERATE_TOOL.BLOCK,
   diagnostics: null
 };
 
@@ -101,6 +108,7 @@ function isToolForWorkspace(tool: string | null, workspace: WorkspaceId): boolea
   if (workspace === "terrain") {
     return tool === TOOL.LAND_DRAW || tool === TOOL.FOOTPRINT_DRAW || tool === TOOL.LAND_EDIT || tool === TOOL.FOOTPRINT_EDIT;
   }
+  if (workspace === "regenerate") return tool === REGENERATE_TOOL.BLOCK || tool === REGENERATE_TOOL.DISTRICT;
   if (workspace === "roads") {
     return tool === ROAD_TOOL.DRAW || tool === ROAD_TOOL.SELECT || tool === ROAD_TOOL.EDIT;
   }
@@ -325,6 +333,101 @@ export function clearObjectInteraction(): void {
   cleanupObjectInteraction(true);
 }
 
+export type RegenerationTargetKind = "block" | "district";
+
+export interface RegenerationSelection {
+  kind: RegenerationTargetKind;
+  ids: string[];
+  revision: number | null;
+}
+
+let regenerationSelection: RegenerationSelection | null = null;
+let regenerationSelectionListener: ((selection: RegenerationSelection | null) => void) | null = null;
+let regenerationStagingClearListener: (() => void) | null = null;
+
+function cleanupRegenerationInteraction(clearSelection: boolean): void {
+  regenerationStagingClearListener?.();
+  if (!clearSelection || regenerationSelection === null) return;
+  regenerationSelection = null;
+  regenerationSelectionListener?.(null);
+}
+
+export function getRegenerationSelection(): RegenerationSelection | null {
+  return regenerationSelection === null
+    ? null
+    : { kind: regenerationSelection.kind, ids: [...regenerationSelection.ids], revision: regenerationSelection.revision };
+}
+
+export function selectRegenerationTarget(
+  kind: RegenerationTargetKind,
+  id: string,
+  additive = false,
+  revision: number | null = null
+): RegenerationSelection | null {
+  if (id.length === 0) return getRegenerationSelection();
+  let ids: string[];
+  if (kind === "district") {
+    // District regeneration always targets exactly one district.
+    ids = [id];
+  } else if (additive && regenerationSelection?.kind === "block") {
+    ids = [...regenerationSelection.ids];
+    const index = ids.indexOf(id);
+    if (index >= 0) ids.splice(index, 1);
+    else ids.push(id);
+  } else {
+    ids = [id];
+  }
+  const previous = regenerationSelection;
+  if (ids.length === 0) {
+    if (previous === null) return null;
+    regenerationSelection = null;
+  } else {
+    const next: RegenerationSelection = {
+      kind,
+      ids,
+      revision: revision ?? (previous?.kind === kind ? previous.revision : null)
+    };
+    const unchanged = previous?.kind === next.kind
+      && previous.revision === next.revision
+      && previous.ids.length === next.ids.length
+      && previous.ids.every((existing, index) => existing === next.ids[index]);
+    if (unchanged) return getRegenerationSelection();
+    regenerationSelection = next;
+  }
+  const snapshot = getRegenerationSelection();
+  regenerationSelectionListener?.(snapshot);
+  controller?.onStateChanged();
+  return snapshot;
+}
+
+export function clearRegenerationSelection(): void {
+  if (regenerationSelection === null) return;
+  regenerationSelection = null;
+  regenerationSelectionListener?.(null);
+  controller?.onStateChanged();
+}
+
+export function setRegenerationSelectionListener(listener: ((selection: RegenerationSelection | null) => void) | null): void {
+  regenerationSelectionListener = listener;
+}
+
+/**
+ * After a successful regeneration the same kind+ids stay selected, but their
+ * source revision moved: refresh the stored revision so an immediate follow-up
+ * regeneration is not rejected as stale. External revision changes are never
+ * auto-refreshed — stale selections must still reject via expectedRevision.
+ */
+export function refreshRegenerationSelectionRevision(revision: number): void {
+  if (regenerationSelection === null) return;
+  regenerationSelection = { ...regenerationSelection, revision };
+  regenerationSelectionListener?.(getRegenerationSelection());
+  controller?.onStateChanged();
+}
+
+export function setRegenerationStagingClearListener(listener: (() => void) | null): void {
+  regenerationStagingClearListener = listener;
+}
+
 export function pendingOperation(): string | null {
   return pendingOperationLabel;
 }
@@ -356,10 +459,17 @@ export function endPendingOperation(): void {
 let districtPalette = DISTRICT_TYPE_REGISTRY.get(districtType)!.defaultPaletteId;
 let districtPool: DistrictTypeId[] = [...DISTRICT_TYPE_IDS];
 let openSpaceProfile: DistrictOpenSpaceProfile = "medium";
+export interface RegenerationBlocker {
+  id: string;
+  kind: string;
+  reason: string;
+}
+
 export interface EditorActionError {
   label: string;
   message: string;
   affectedIds: string[];
+  blockers?: RegenerationBlocker[];
 }
 let actionError: EditorActionError | null = null;
 let coastEdge: CoastEdge = "west";
@@ -415,6 +525,7 @@ export function openEditor(): void {
     return;
   }
   cleanupObjectInteraction(true);
+  cleanupRegenerationInteraction(true);
   pendingOperationLabel = null;
   editorOpen = true;
   restorePrefs();
@@ -427,6 +538,7 @@ export function openEditor(): void {
 
 export function closeEditor(options: { restoreDefaultLayer?: boolean } = {}): void {
   cleanupObjectInteraction(true);
+  cleanupRegenerationInteraction(true);
   pendingOperationLabel = null;
   if (!editorOpen) return;
   editorOpen = false;
@@ -449,15 +561,16 @@ export function closeEditor(options: { restoreDefaultLayer?: boolean } = {}): vo
  * Opening the editor by clicking the Nixie control flows through here.
  */
 export function editorLayerActivated(layer: string): void {
-  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS && layer !== LAYER_DISTRICTS && layer !== LAYER_OBJECTS) return;
+  if (layer !== LAYER_NIXIE && layer !== LAYER_ROADS && layer !== LAYER_DISTRICTS && layer !== LAYER_OBJECTS && layer !== LAYER_REGENERATE) return;
   if (!editorOpen) {
     openEditor();
     if (editorOpen && layer === LAYER_OBJECTS) setWorkspace("objects");
+    if (editorOpen && layer === LAYER_REGENERATE) setWorkspace("regenerate");
     return;
   }
   if (ownedLayer === layer) return;
   // The control icon clicked while editing on the other layer: adopt that layer's workspace.
-  setWorkspace(layer === LAYER_ROADS ? "roads" : layer === LAYER_DISTRICTS ? "districts" : layer === LAYER_OBJECTS ? "objects" : "terrain");
+  setWorkspace(layer === LAYER_ROADS ? "roads" : layer === LAYER_DISTRICTS ? "districts" : layer === LAYER_OBJECTS ? "objects" : layer === LAYER_REGENERATE ? "regenerate" : "terrain");
 }
 
 /**
@@ -480,6 +593,7 @@ export function setWorkspace(next: WorkspaceId): void {
   const previousWorkspace = workspace;
   const previousLayer = WORKSPACE_LAYER[workspace];
   if (previousWorkspace === "objects" || next === "objects") cleanupObjectInteraction(true);
+  if (previousWorkspace === "regenerate" || next === "regenerate") cleanupRegenerationInteraction(true);
   workspace = next;
   if (next === "objects" && objectCategory !== "buildings" && objectCategory !== "places") objectCategory = "buildings";
   if (!isToolForWorkspace(tool, next)) tool = DEFAULT_TOOL[next];
@@ -498,6 +612,7 @@ export function setWorkspace(next: WorkspaceId): void {
 export function setCanvasTool(next: string | null): void {
   if (tool === next) return;
   if (workspace === "objects") cleanupObjectInteraction(false);
+  if (workspace === "regenerate") cleanupRegenerationInteraction(true);
   tool = next;
   writePrefs();
   controller?.onStateChanged();
@@ -513,7 +628,13 @@ export function notifyEditorInteraction(): void {
 }
 
 export function currentEditorActionError(): EditorActionError | null {
-  return actionError === null ? null : { ...actionError, affectedIds: [...actionError.affectedIds] };
+  return actionError === null
+    ? null
+    : {
+        ...actionError,
+        affectedIds: [...actionError.affectedIds],
+        ...(actionError.blockers === undefined ? {} : { blockers: actionError.blockers.map((blocker) => ({ ...blocker })) })
+      };
 }
 
 export function clearEditorActionError(): void {
@@ -542,11 +663,27 @@ export function setEditorActionError(label: string, error: unknown): void {
   for (const key of ["affectedIds", "objectId", "objectIds", "siteId", "siteIds", "targetId", "targetIds"]) {
     collect(value?.[key]);
   }
+  const blockers: RegenerationBlocker[] = [];
+  const blockerSeen = new Set<string>();
+  if (Array.isArray(value?.blockers)) {
+    for (const entry of value.blockers) {
+      const candidate = entry as Record<string, unknown> | null;
+      const id = typeof candidate?.id === "string" ? candidate.id : "";
+      if (id.length === 0 || blockerSeen.has(id)) continue;
+      blockerSeen.add(id);
+      blockers.push({
+        id,
+        kind: typeof candidate?.kind === "string" ? candidate.kind : "unknown",
+        reason: typeof candidate?.reason === "string" ? candidate.reason : "Blocked from regeneration."
+      });
+      collect(id);
+    }
+  }
   const stale = value?.code === "STALE" || /\bstale\b|revision mismatch|concurrent scene/i.test(rawMessage);
   const message = stale && !/reopen|refresh|retry/i.test(rawMessage)
     ? `${rawMessage} Reopen or refresh the editor, then retry.`
     : rawMessage;
-  actionError = { label, message, affectedIds: ids };
+  actionError = blockers.length === 0 ? { label, message, affectedIds: ids } : { label, message, affectedIds: ids, blockers };
   controller?.onStateChanged();
 }
 

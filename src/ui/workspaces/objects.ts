@@ -1,12 +1,19 @@
 import {
+  bulkDeleteObjects,
+  bulkEditObjects,
+  bulkSetObjectsLocked,
   cityLoadStatus,
   deleteObject,
   editObjectProperties,
+  getArchitecturePlanView,
   getArchitectureSource,
+  getCity,
+  getRouteEditStatus,
   isSceneEnabled,
   rerollObjectAppearance,
   setObjectLocked,
-  type ObjectPropertiesPatch
+  type ObjectPropertiesPatch,
+  type RouteEditStatus
 } from "../../adapter/canvas.js";
 import { DISTRICT_PALETTE_IDS } from "../../core/gen/district-registry.js";
 import {
@@ -39,6 +46,7 @@ import {
   configureObjectPlacement,
   finishObjectPlacement,
   getObjectError,
+  getObjectRouteFeedback,
   getObjectSelection,
   objectInspector,
   setObjectsWorkspaceBridge
@@ -110,6 +118,27 @@ let activePreset: ObjectsPreset | null = null;
 let lastSelectionKey = "";
 let actionPending = false;
 
+type BulkBlocker = { id: string; kind: string; reason: string };
+
+/**
+ * Shared staging for a same-type multi-selection (UI spec §12.3). The ids and
+ * city revision are captured when staging opens, so the eventual bulk call
+ * applies once to exactly the captured selection at the expected revision.
+ */
+interface BulkStaging {
+  ids: string[];
+  kind: "building" | "place";
+  revision: number | null;
+  grammarId?: BuildingGrammarId;
+  landmarkGrammarId?: LandmarkGrammarId;
+  visualUse?: BuildingUseId;
+  heightM?: number;
+  paletteId?: string | null;
+}
+
+let bulkStaging: BulkStaging | null = null;
+let bulkBlockers: BulkBlocker[] = [];
+
 function asObjectRecord(value: unknown): ObjectRecord | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   return value as ObjectRecord;
@@ -171,12 +200,24 @@ function sourceObject(id: string): unknown | null {
   return architecture.buildings.find((entry) => entry.id === id) ?? architecture.places.find((entry) => entry.id === id) ?? null;
 }
 
+function planObjectRecord(id: string): ObjectRecord | null {
+  try {
+    const plan = getArchitecturePlanView();
+    if (plan === null) return null;
+    const entry = plan.buildings.find((candidate) => candidate.id === id) ?? plan.landmarks.find((candidate) => candidate.id === id);
+    return entry === undefined ? null : asObjectRecord(entry);
+  } catch { return null; }
+}
+
 function inspectionRecord(id: string): ObjectRecord | null {
   try {
     const inspection = objectInspector();
     if (inspection !== null && inspection.id === id) return inspection.plan;
   } catch { /* A plan may not be available while a Scene is loading. */ }
-  return asObjectRecord(sourceObject(id));
+  // The single-selection inspector exposes the plan entry directly; every other
+  // member of a multi-selection reads the same plan view (which also carries
+  // derived objects that have no persistent source record).
+  return planObjectRecord(id) ?? asObjectRecord(sourceObject(id));
 }
 
 function readFiniteNumber(value: ObjectRecord | null, key: string): number | undefined {
@@ -306,6 +347,7 @@ function resetSelectionStaging(value: ObjectsSelection): void {
   if (key === lastSelectionKey) return;
   lastSelectionKey = key;
   stagedById.clear();
+  clearBulkStaging();
 }
 
 function paletteOptions(value: string | null): string {
@@ -327,10 +369,257 @@ function useOptions(value: BuildingUseId | null, grammar: BuildingGrammarDefinit
   return grammar.compatibleUses.map((id) => `<option value="${escapeHTML(id)}"${selected(id, current)}>${escapeHTML(titleCase(id))}</option>`).join("");
 }
 
+function cityRevision(): number | null {
+  try {
+    const city = getCity();
+    return city === null ? null : city.revision;
+  } catch { return null; }
+}
 
-function renderMultiSummary(value: ObjectsSelection, interactive = true): string {
-  const kind = value.kind === "place" ? "places" : "buildings";
-  return `<section data-panel="objects-multi" class="nixie-tray-inspector nixie-objects-inspector" aria-label="Multiple ${kind} selected"><div class="nixie-inspector-head"><h3>${value.ids.length} ${kind} selected</h3><span class="nixie-status-badge">Multiple selection</span></div><p class="nixie-inspector-sub">Shift-click selects same-kind objects. Property editing and transform gizmos are disabled for multi-selection.</p><div class="nixie-object-summary" role="status"><strong>Summary only</strong><span>${escapeHTML(value.ids.join(", "))}</span></div><div class="form-footer"><button type="button" data-action="object-clear-selection" title="Clear object selection"${interactive ? "" : " disabled"}>Clear selection</button></div></section>`;
+function clearBulkStaging(): void {
+  bulkStaging = null;
+  bulkBlockers = [];
+}
+
+function ensureBulkStaging(kind: "building" | "place", ids: readonly string[]): BulkStaging {
+  if (bulkStaging !== null) return bulkStaging;
+  const created: BulkStaging = { ids: [...ids], kind, revision: cityRevision() };
+  bulkStaging = created;
+  return created;
+}
+
+function bulkStagingDirty(): boolean {
+  return bulkStaging !== null
+    && (bulkStaging.grammarId !== undefined
+      || bulkStaging.landmarkGrammarId !== undefined
+      || bulkStaging.visualUse !== undefined
+      || bulkStaging.heightM !== undefined
+      || bulkStaging.paletteId !== undefined);
+}
+
+/** Only explicitly staged fields enter the bulk patch; untouched mixed values never do. */
+function bulkPatch(kind: "building" | "place"): ObjectPropertiesPatch {
+  if (bulkStaging === null || bulkStaging.kind !== kind) return {};
+  return {
+    ...(bulkStaging.grammarId !== undefined ? { grammarId: bulkStaging.grammarId } : {}),
+    ...(bulkStaging.landmarkGrammarId !== undefined ? { landmarkGrammarId: bulkStaging.landmarkGrammarId } : {}),
+    ...(bulkStaging.visualUse !== undefined ? { visualUse: bulkStaging.visualUse } : {}),
+    ...(bulkStaging.heightM !== undefined ? { heightM: bulkStaging.heightM } : {}),
+    ...(bulkStaging.paletteId !== undefined ? { paletteId: bulkStaging.paletteId } : {})
+  };
+}
+
+/** Retains the exact structured blockers so the Inspector can list every rejected id durably. */
+function recordBulkBlockers(error: unknown): void {
+  const record = asObjectRecord(error);
+  const raw = record?.blockers;
+  if (!Array.isArray(raw)) {
+    bulkBlockers = [];
+    return;
+  }
+  bulkBlockers = raw.flatMap((entry) => {
+    const item = asObjectRecord(entry);
+    const id = readString(item, "id");
+    const reason = readString(item, "reason");
+    return id === undefined || reason === undefined ? [] : [{ id, kind: readString(item, "kind") ?? "object", reason }];
+  });
+}
+
+/** Shared value across the selection, or null when values are mixed or missing. */
+function uniformValue<T>(values: readonly (T | null | undefined)[]): T | null {
+  const first = values[0];
+  if (first === undefined || first === null) return null;
+  return values.every((value) => value === first) ? first : null;
+}
+
+function uniformPalette(values: readonly (string | null)[]): { shared: string | null } | null {
+  const first = values[0] ?? null;
+  return values.every((value) => (value ?? null) === first) ? { shared: first } : null;
+}
+
+function bulkMembers(current: ObjectsSelection): NormalizedObject[] {
+  if (current.kind === null) return [];
+  const members: NormalizedObject[] = [];
+  for (const id of current.ids) {
+    const member = normalizedObject(id, current.kind);
+    if (member !== null) members.push(member);
+  }
+  return members;
+}
+
+/** Grammar presets compatible with every member's site frame; each member's own preset stays selectable. */
+function sharedBuildingOptions(members: readonly NormalizedObject[]): BuildingGrammarDefinition[] {
+  let shared: BuildingGrammarDefinition[] | null = null;
+  for (const member of members) {
+    if (member.kind !== "building") return [];
+    const options = buildingInspectorState(member, {}).options;
+    const compatible = new Set(options.map((definition) => definition.id));
+    shared = shared === null ? [...options] : shared.filter((definition) => compatible.has(definition.id));
+  }
+  return shared ?? [];
+}
+
+/** Uses accepted by the staged grammar, or — with grammars still mixed — by every member's own grammar. */
+function sharedUseOptions(members: readonly NormalizedObject[], grammarId: BuildingGrammarId | null): BuildingUseId[] {
+  if (grammarId !== null) {
+    const definition = BUILDING_GRAMMAR_REGISTRY.get(grammarId);
+    return definition === undefined ? [] : [...definition.compatibleUses];
+  }
+  let shared: BuildingUseId[] | null = null;
+  for (const member of members) {
+    const definition = member.grammarId === undefined ? undefined : BUILDING_GRAMMAR_REGISTRY.get(member.grammarId);
+    const uses = definition?.compatibleUses ?? [];
+    const accepted = new Set(uses);
+    shared = shared === null ? [...uses] : shared.filter((use) => accepted.has(use));
+  }
+  return shared ?? [];
+}
+
+/** Height range every affected grammar accepts: the highest floor and the lowest ceiling. */
+function sharedHeightBounds(members: readonly NormalizedObject[], grammarId: BuildingGrammarId | null): { min: number; max: number } {
+  const definitions: BuildingGrammarDefinition[] = [];
+  if (grammarId !== null) {
+    const definition = BUILDING_GRAMMAR_REGISTRY.get(grammarId);
+    if (definition !== undefined) definitions.push(definition);
+  } else {
+    for (const member of members) {
+      const definition = member.grammarId === undefined ? undefined : BUILDING_GRAMMAR_REGISTRY.get(member.grammarId);
+      if (definition !== undefined) definitions.push(definition);
+    }
+  }
+  if (definitions.length === 0) return { min: 1, max: 300 };
+  const min = Math.max(...definitions.map((definition) => definition.height.minM));
+  const max = Math.min(...definitions.map((definition) => definition.height.maxM));
+  return min <= max ? { min, max } : { min: definitions[0]!.height.minM, max: definitions[0]!.height.maxM };
+}
+
+/** Multi selects prepend a disabled `Multiple` sentinel for mixed, untouched fields. */
+function mixedOption(): string {
+  return `<option value="" disabled selected>Multiple</option>`;
+}
+
+function bulkUseOptions(value: BuildingUseId | null, options: readonly BuildingUseId[], mixed: boolean): string {
+  if (options.length === 0) return mixedOption() + `<option value="" disabled>No shared compatible uses</option>`;
+  const current = value ?? options[0]!;
+  return (mixed ? mixedOption() : "") + options.map((id) => `<option value="${escapeHTML(id)}"${selected(id, current)}>${escapeHTML(titleCase(id))}</option>`).join("");
+}
+
+function bulkPaletteOptions(value: string | null, mixed: boolean): string {
+  return (mixed ? `<option value="multiple" selected disabled>Multiple</option>` : "") + paletteOptions(mixed ? "multiple" : value);
+}
+
+function renderBulkBlockers(): string {
+  if (bulkBlockers.length === 0) return "";
+  const items = bulkBlockers.map((blocker) => `<li><code>${escapeHTML(blocker.id)}</code> — ${escapeHTML(blocker.reason)}</li>`).join("");
+  return `<section class="nixie-object-error" data-panel="objects-bulk-blockers" role="alert" aria-live="assertive"><h3><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i> Bulk action rejected for the whole selection</h3><p>Every selected object must be compatible; nothing was changed.</p><ul>${items}</ul></section>`;
+}
+
+interface RouteIssueList {
+  id: string;
+  reason: string;
+}
+
+function routeIssues(value: unknown, idKey: "id" | "edgeId"): RouteIssueList[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const record = asObjectRecord(entry);
+    const id = readString(record, idKey);
+    const reason = readString(record, "reason");
+    return id === undefined || reason === undefined ? [] : [{ id, reason }];
+  });
+}
+
+/** Route editing status per UI spec §25.2/§31: live preview warnings, committed trim/removal, disconnection as warning. */
+function renderRouteStatus(): string {
+  let feedback: unknown = null;
+  try { feedback = getObjectRouteFeedback(); } catch { feedback = null; }
+  const feedbackRecord = asObjectRecord(feedback);
+  const liveConflicts = routeIssues(feedbackRecord?.conflicts, "edgeId");
+  const liveBlockers = routeIssues(feedbackRecord?.blockers, "id");
+  let committed: RouteEditStatus | null = null;
+  try { committed = getRouteEditStatus(); } catch { committed = null; }
+  const parts: string[] = [];
+  if (liveConflicts.length > 0) {
+    const edges = liveConflicts.map((conflict) => `<code>${escapeHTML(conflict.id)}</code>`).join(", ");
+    parts.push(`<p class="nixie-note" data-status-kind="warning" role="status">Route preview: road edges ${edges} conflict with the edited geometry. Conflicts warn before Apply; unlocked edges are trimmed on commit.</p>`);
+  }
+  if (liveBlockers.length > 0) {
+    const blockers = liveBlockers.map((blocker) => `<code>${escapeHTML(blocker.id)}</code> — ${escapeHTML(blocker.reason)}`).join("; ");
+    parts.push(`<p class="nixie-note" data-status-kind="error" role="alert">Locked road edges block this edit: ${blockers}. Unlock the roads separately; nothing changes them here.</p>`);
+  }
+  if (committed !== null) {
+    if (committed.trimmedEdgeIds.length > 0) parts.push(`<p class="nixie-note" data-status-kind="info" role="status">Committed route trim: ${committed.trimmedEdgeIds.map(escapeHTML).join(", ")}.</p>`);
+    if (committed.removedEdgeIds.length > 0) parts.push(`<p class="nixie-note" data-status-kind="info" role="status">Committed route removal: ${committed.removedEdgeIds.map(escapeHTML).join(", ")}.</p>`);
+    if (committed.blockers.length > 0) {
+      const blockers = committed.blockers.map((blocker) => `<code>${escapeHTML(blocker.id)}</code> — ${escapeHTML(blocker.reason)}`).join("; ");
+      parts.push(`<p class="nixie-note" data-status-kind="error" role="alert">Protected road blockers from the last edit: ${blockers}.</p>`);
+    }
+    if (committed.disconnectedVehicleNetwork) parts.push(`<p class="nixie-note" data-status-kind="warning" role="status">The last committed edit disconnected the vehicle network. This is a warning, not a rejection — review road connectivity before continuing.</p>`);
+  }
+  if (parts.length === 0) return "";
+  return `<section class="nixie-object-route-status" data-panel="objects-route-status" aria-label="Route editing status">${parts.join("")}</section>`;
+}
+
+function renderMultiInspector(current: ObjectsSelection, enabled: boolean): string {
+  const pendingAction = actionPending || currentPendingOperation() !== null;
+  const kind = current.kind === "place" ? "place" : "building";
+  const noun = kind === "place" ? "places" : "buildings";
+  const members = bulkMembers(current);
+  const staged = bulkStaging;
+  const editable = enabled && !pendingAction;
+  const grammarValues = members.map((member) => member.kind === "building" ? member.grammarId : undefined);
+  const grammarShared = uniformValue(grammarValues);
+  const grammarMixed = staged?.grammarId === undefined && grammarShared === null;
+  const sharedGrammarId = staged?.grammarId ?? (grammarShared as BuildingGrammarId | null);
+  const optionDefinitions = sharedBuildingOptions(members);
+  const grammarOptions = sharedGrammarId !== null && BUILDING_GRAMMAR_REGISTRY.has(sharedGrammarId) && !optionDefinitions.some((definition) => definition.id === sharedGrammarId)
+    ? [BUILDING_GRAMMAR_REGISTRY.get(sharedGrammarId)!, ...optionDefinitions]
+    : optionDefinitions;
+  const useValues = members.map((member) => member.kind === "building" ? (member.visualUse ?? null) : null);
+  const useShared = uniformValue(useValues);
+  const useMixed = staged?.visualUse === undefined && useShared === null;
+  const sharedUse = staged?.visualUse ?? (useShared as BuildingUseId | null);
+  const useOptionIds = sharedUseOptions(members, sharedGrammarId);
+  const heightValues = members.map((member) => member.kind === "building" ? (member.heightM ?? null) : null);
+  const heightShared = uniformValue(heightValues);
+  const bounds = sharedHeightBounds(members, sharedGrammarId);
+  const heightNow = staged?.heightM ?? heightShared;
+  const paletteValues = members.map((member) => member.paletteId);
+  const paletteUniform = uniformPalette(paletteValues);
+  const paletteMixed = staged?.paletteId === undefined && paletteUniform === null;
+  const paletteCurrent = staged?.paletteId !== undefined ? staged.paletteId : paletteUniform?.shared ?? null;
+  const landmarkValues = members.map((member) => member.kind === "place" ? member.landmarkGrammarId : undefined);
+  const landmarkShared = uniformValue(landmarkValues);
+  const landmarkMixed = staged?.landmarkGrammarId === undefined && landmarkShared === null;
+  const sharedLandmarkId = staged?.landmarkGrammarId ?? (landmarkShared as LandmarkGrammarId | null);
+  const lockedCount = members.filter((member) => member.locked).length;
+  const derived = members.filter((member) => !member.persistent);
+  const patch = bulkPatch(kind);
+  const dirty = bulkStagingDirty();
+  const substantial = patch.grammarId !== undefined || patch.visualUse !== undefined || patch.heightM !== undefined || patch.landmarkGrammarId !== undefined;
+  // Disclosures before Apply: promotion/protection must never happen silently (UI spec §12.4).
+  const promotionNotice = dirty && derived.length > 0 && substantial
+    ? `<p class="nixie-note" data-status-kind="warning" role="note">Applying will promote these derived ${noun} to protected persistent records: ${derived.map((member) => escapeHTML(member.id)).join(", ")}.</p>`
+    : "";
+  const overrideNotice = dirty && derived.length > 0 && !substantial && patch.paletteId !== undefined
+    ? `<p class="nixie-note" data-status-kind="warning" role="note">Palette-only edits to derived objects are stored as protected manual-edit overrides; the objects stay derived and protected instead of being promoted.</p>`
+    : "";
+  const unlockAll = members.length > 0 && members.every((member) => member.locked);
+  const lockLabel = unlockAll ? "Unlock all" : "Lock all";
+  const allResolved = members.length === current.ids.length;
+  const deleteBlocked = !allResolved || derived.length > 0;
+  const deleteTitle = deleteBlocked
+    ? "Bulk delete is persistent-only: derived or unresolved objects cannot be deleted"
+    : `Delete all ${current.ids.length} selected persistent ${noun}`;
+  const fieldDisabled = editable ? "" : " disabled";
+  const grammarField = `<div class="form-group"><label for="nixie-object-grammar">Shared preset</label><div class="form-fields"><select id="nixie-object-grammar" data-field="object-grammar"${fieldDisabled}>${grammarMixed ? mixedOption() : ""}${buildingOptions(sharedGrammarId ?? "", grammarOptions)}</select></div></div>`;
+  const useField = `<div class="form-group"><label for="nixie-object-use">Shared use</label><div class="form-fields"><select id="nixie-object-use" data-field="object-use"${fieldDisabled}>${bulkUseOptions(sharedUse, useOptionIds, useMixed)}</select></div></div>`;
+  const heightField = `<div class="form-group"><label for="nixie-object-height">Shared height <output data-height-output>${heightNow === null ? "Multiple" : `${Math.round(heightNow)} m`}</output></label><div class="form-fields"><input id="nixie-object-height" type="range" min="${bounds.min}" max="${bounds.max}" step="1" value="${escapeHTML(String(staged?.heightM ?? bounds.min))}" data-field="object-height" aria-label="Shared height for all selected ${noun}"${fieldDisabled}></div></div>`;
+  const landmarkField = `<div class="form-group"><label for="nixie-object-landmark">Shared preset</label><div class="form-fields"><select id="nixie-object-landmark" data-field="object-landmark"${fieldDisabled}>${landmarkMixed ? mixedOption() : ""}${placeOptions(sharedLandmarkId ?? "")}</select></div></div>`;
+  const paletteField = `<div class="form-group"><label for="nixie-object-palette">Shared palette</label><div class="form-fields"><select id="nixie-object-palette" data-field="object-palette"${fieldDisabled}>${bulkPaletteOptions(paletteCurrent, paletteMixed)}</select></div></div>`;
+  const fields = kind === "building" ? grammarField + useField + heightField + paletteField : landmarkField + paletteField;
+  const actionDisabled = enabled && !pendingAction ? "" : " disabled";
+  return `<section data-panel="objects-multi" class="nixie-tray-inspector nixie-objects-inspector"${pendingAction ? ' aria-busy="true"' : ""} aria-label="Multiple ${noun} selected"><div class="nixie-inspector-head"><h3>${current.ids.length} ${noun} selected</h3><span class="nixie-status-badge">Multiple selection</span></div><p class="nixie-inspector-sub"><span class="nixie-status-badge">${lockedCount} locked • ${members.length - lockedCount} editable</span> Same-type selection. Shared property edits apply to every selected object at once; transform gizmos are disabled for multi-selection.</p>${renderBulkBlockers()}${promotionNotice}${overrideNotice}<div class="nixie-form-grid">${fields}</div><p class="nixie-note" data-status="object-inspector">${dirty ? "Unapplied bulk changes are staged in this inspector." : "Changes stay staged until Apply."}</p><div class="form-footer"><button type="button" data-action="object-reset"${dirty ? actionDisabled : " disabled"}>Reset</button><button type="button" data-action="object-apply"${dirty ? actionDisabled : " disabled"} title="Apply staged changes to all ${current.ids.length} selected ${noun}">Apply</button></div><div class="form-footer"><p class="nixie-note">Locking marks every selected ${kind} explicitly protected; unlocking releases that protection. Protection is never changed silently.</p><button type="button" data-action="object-lock" title="${lockLabel} every selected ${kind}"${actionDisabled}>${lockLabel}</button><button type="button" data-action="object-delete"${deleteBlocked || actionDisabled !== "" ? " disabled" : ""} title="${escapeHTML(deleteTitle)}" aria-disabled="${deleteBlocked}">Delete all</button><button type="button" data-action="object-clear-selection" title="Clear object selection">Clear selection</button></div>${renderRouteStatus()}</section>`;
 }
 
 function renderSingleInspector(value: NormalizedObject, enabled: boolean): string {
@@ -354,7 +643,7 @@ function renderSingleInspector(value: NormalizedObject, enabled: boolean): strin
   const origin = value.origin === undefined ? "Derived" : titleCase(value.origin);
   const protection = value.locked ? "Locked" : value.protection === undefined ? "Editable" : titleCase(value.protection);
   const deleteEnabled = enabled && !pendingAction && !value.locked && value.persistent;
-  return `<section data-panel="objects-inspector" class="nixie-tray-inspector nixie-objects-inspector" aria-label="${escapeHTML(value.label)} inspector"><div class="nixie-inspector-head"><h3>${escapeHTML(value.label)}</h3><button type="button" data-action="object-lock" title="${value.locked ? "Unlock" : "Lock"} ${escapeHTML(value.label)}"${enabled && !pendingAction ? "" : " disabled"}>${value.locked ? "Unlock" : "Lock"}</button></div><p class="nixie-inspector-sub"><span class="nixie-status-badge">${escapeHTML(protection)}</span> ${escapeHTML(origin)} • ${escapeHTML(value.kind)} • <code>${escapeHTML(value.id)}</code></p><div class="nixie-form-grid">${fields}<div class="form-group"><label for="nixie-object-palette">Palette</label><div class="form-fields"><select id="nixie-object-palette" data-field="object-palette"${editable ? "" : " disabled"}>${paletteOptions(palette)}</select></div></div></div><p class="nixie-note" data-status="object-inspector">${dirty ? "Unapplied changes are staged in this inspector." : "Changes stay staged until Apply."}</p><div class="form-footer"><button type="button" data-action="object-reset"${dirty && editable ? "" : " disabled"}>Reset</button><button type="button" data-action="object-apply"${dirty && editable ? "" : " disabled"}>Apply</button></div><div class="form-footer"><button type="button" data-action="object-reroll"${enabled && !pendingAction && !value.locked ? "" : " disabled"}>Reroll Appearance</button><button type="button" data-action="object-site"${enabled && !pendingAction && !value.locked ? "" : " disabled"} title="Move existing site polygon vertices">Edit Site</button><button type="button" data-action="object-delete"${deleteEnabled ? "" : " disabled"} title="Delete this persistent object">Delete</button><button type="button" data-action="object-clear-selection">Clear selection</button></div></section>`;
+  return `<section data-panel="objects-inspector" class="nixie-tray-inspector nixie-objects-inspector"${pendingAction ? ' aria-busy="true"' : ""} aria-label="${escapeHTML(value.label)} inspector"><div class="nixie-inspector-head"><h3>${escapeHTML(value.label)}</h3><button type="button" data-action="object-lock" title="${value.locked ? "Unlock" : "Lock"} ${escapeHTML(value.label)}"${enabled && !pendingAction ? "" : " disabled"}>${value.locked ? "Unlock" : "Lock"}</button></div><p class="nixie-inspector-sub"><span class="nixie-status-badge">${escapeHTML(protection)}</span> ${escapeHTML(origin)} • ${escapeHTML(value.kind)} • <code>${escapeHTML(value.id)}</code></p><div class="nixie-form-grid">${fields}<div class="form-group"><label for="nixie-object-palette">Palette</label><div class="form-fields"><select id="nixie-object-palette" data-field="object-palette"${editable ? "" : " disabled"}>${paletteOptions(palette)}</select></div></div></div><p class="nixie-note" data-status="object-inspector">${dirty ? "Unapplied changes are staged in this inspector." : "Changes stay staged until Apply."}</p><div class="form-footer"><button type="button" data-action="object-reset"${dirty && editable ? "" : " disabled"}>Reset</button><button type="button" data-action="object-apply"${dirty && editable ? "" : " disabled"}>Apply</button></div><div class="form-footer"><button type="button" data-action="object-reroll"${enabled && !pendingAction && !value.locked ? "" : " disabled"}>Reroll Appearance</button><button type="button" data-action="object-site"${enabled && !pendingAction && !value.locked ? "" : " disabled"} title="Move existing site polygon vertices">Edit Site</button><button type="button" data-action="object-delete"${deleteEnabled ? "" : " disabled"} title="Delete this persistent object">Delete</button><button type="button" data-action="object-clear-selection">Clear selection</button></div>${renderRouteStatus()}</section>`;
 }
 
 function renderDiagnostics(): string {
@@ -459,6 +748,7 @@ export function clearObjectsWorkspaceState(): void {
   activePreset = null;
   lastSelectionKey = "";
   actionPending = false;
+  clearBulkStaging();
   setObjectsWorkspaceBridge(null);
 }
 
@@ -484,8 +774,8 @@ export function objectsWorkspace(): WorkspaceModule {
       resetSelectionStaging(currentSelection);
       const inspected = currentSelection.ids.length === 1 && currentSelection.kind !== null ? normalizedObject(currentSelection.ids[0]!, currentSelection.kind) : null;
       const pending = actionPending || currentPendingOperation() !== null;
-      const body = currentSelection.ids.length > 1 ? renderMultiSummary(currentSelection, !pending) : inspected === null ? renderCatalogue(category, enabled && !pending) : renderSingleInspector(inspected, enabled);
-      const state = pending ? `<p class="nixie-object-pending" data-status-kind="pending" role="status"><strong>Pending:</strong> applying the object change. Controls are temporarily locked.</p>` : enabled ? "" : `<p class="nixie-note" data-status-kind="warning" role="status">Enable Nixie on this Scene and create a city before editing objects.</p>`;
+      const body = currentSelection.ids.length > 1 ? renderMultiInspector(currentSelection, enabled) : inspected === null ? renderCatalogue(category, enabled && !pending) : renderSingleInspector(inspected, enabled);
+      const state = pending ? `<p class="nixie-object-pending" data-status-kind="pending" role="status" aria-busy="true"><strong>Pending:</strong> applying the object change. Controls are temporarily locked.</p>` : enabled ? "" : `<p class="nixie-note" data-status-kind="warning" role="status">Enable Nixie on this Scene and create a city before editing objects.</p>`;
       return state + renderDiagnostics() + body;
     },
     onAction(action: string, target: HTMLElement, ctx: WorkspaceContext): void {
@@ -497,6 +787,7 @@ export function objectsWorkspace(): WorkspaceModule {
           cancelObjectPlacement(false);
           activePreset = null;
           stagedById.clear();
+          clearBulkStaging();
           clearObjectSelection();
           setObjectCategory(next as ObjectCategory);
           setCanvasTool(OBJECT_TOOL.SELECT);
@@ -528,6 +819,43 @@ export function objectsWorkspace(): WorkspaceModule {
         return;
       }
       if (action === "object-clear-selection") { clearObjectSelection(); return; }
+      // Same-type multi-selection: one bulk adapter call per action, expected
+      // revision captured with the staging, exact blockers retained on rejection.
+      const multi = selection();
+      if (multi.ids.length > 1 && multi.kind !== null) {
+        const ids = [...(bulkStaging?.ids ?? multi.ids)];
+        const revision = bulkStaging?.revision ?? cityRevision();
+        const expected = revision === null ? undefined : revision;
+        const members = bulkMembers(multi);
+        // Treat this as the recorded selection so the post-action render does not
+        // mistake the unchanged selection for a change and drop the blockers.
+        resetSelectionStaging(multi);
+        const tracked = (work: Promise<unknown>): Promise<unknown> => work.then(
+          (value) => { bulkBlockers = []; return value; },
+          (error: unknown) => { recordBulkBlockers(error); throw error; }
+        );
+        if (action === "object-apply") {
+          if (!bulkStagingDirty()) return;
+          const patch = bulkPatch(multi.kind);
+          if (Object.keys(patch).length === 0) { clearBulkStaging(); ctx.rerender(); return; }
+          runObjectAction(`bulk object changes for ${ids.length} ${multi.kind}s`, tracked(bulkEditObjects(ids, patch, expected)), ctx, () => clearBulkStaging());
+          return;
+        }
+        if (action === "object-lock") {
+          if (members.length === 0) return;
+          const unlockAll = members.every((member) => member.locked);
+          runObjectAction(`${unlockAll ? "unlock" : "lock"} ${ids.length} objects`, tracked(bulkSetObjectsLocked(ids, !unlockAll, expected)), ctx, () => clearBulkStaging());
+          return;
+        }
+        if (action === "object-delete") {
+          // Persistent-only contract: derived members disable the control, and a
+          // stale or partially resolved selection never reaches the adapter.
+          if (members.length !== ids.length || members.some((member) => !member.persistent)) return;
+          runObjectAction(`delete ${ids.length} objects`, tracked(bulkDeleteObjects(ids, expected)), ctx, () => clearBulkStaging());
+          return;
+        }
+        return;
+      }
       const current = selectedObject();
       if (current === null || selection().ids.length !== 1) return;
       if (action === "object-apply") {
@@ -549,6 +877,7 @@ export function objectsWorkspace(): WorkspaceModule {
       const currentSelection = selection();
       resetSelectionStaging(currentSelection);
       const current = selectedObject();
+      const multi = currentSelection.ids.length > 1 && currentSelection.kind !== null ? currentSelection : null;
       root.querySelector('[data-field="object-catalogue-group"]')?.addEventListener("change", (event: Event) => {
         const group = (event.target as HTMLSelectElement).value;
         const category = currentObjectCategory();
@@ -558,6 +887,33 @@ export function objectsWorkspace(): WorkspaceModule {
         }
       });
       root.querySelector('[data-field="object-grammar"]')?.addEventListener("change", (event: Event) => {
+        if (multi !== null) {
+          if (multi.kind !== "building") return;
+          const value = (event.target as HTMLSelectElement).value as BuildingGrammarId;
+          if (!BUILDING_GRAMMAR_REGISTRY.has(value)) return;
+          const members = bulkMembers(multi);
+          const options = sharedBuildingOptions(members);
+          const stagedBulk = ensureBulkStaging("building", multi.ids);
+          if (!options.some((definition) => definition.id === value) && stagedBulk.grammarId !== value) return;
+          stagedBulk.grammarId = value;
+          // Mirror the singular preset normalization: a currently shared use or
+          // staged height is re-normalized to the new grammar; mixed values are
+          // left untouched so they never enter the bulk patch implicitly.
+          const sharedUse = stagedBulk.visualUse ?? uniformValue(members.map((member) => member.visualUse ?? null));
+          if (sharedUse !== null) {
+            const definition = BUILDING_GRAMMAR_REGISTRY.get(value)!;
+            stagedBulk.visualUse = definition.compatibleUses.includes(sharedUse)
+              ? sharedUse
+              : definition.compatibleUses[0] ?? BUILDING_USE_IDS[0];
+          }
+          if (stagedBulk.heightM !== undefined) {
+            const bounds = sharedHeightBounds(members, value);
+            stagedBulk.heightM = Math.min(bounds.max, Math.max(bounds.min, stagedBulk.heightM));
+          }
+          syncInspectorButtons(root, multi.ids[0]!);
+          ctx.rerender();
+          return;
+        }
         if (current === null || current.kind !== "building") return;
         const value = (event.target as HTMLSelectElement).value as BuildingGrammarId;
         if (BUILDING_GRAMMAR_REGISTRY.has(value)) {
@@ -569,8 +925,34 @@ export function objectsWorkspace(): WorkspaceModule {
           ctx.rerender();
         }
       });
-      root.querySelector('[data-field="object-landmark"]')?.addEventListener("change", (event: Event) => { if (current === null) return; const value = (event.target as HTMLSelectElement).value as LandmarkGrammarId; if (LANDMARK_GRAMMAR_REGISTRY.has(value)) { stagedFor(current).landmarkGrammarId = value; syncInspectorButtons(root, current.id); } });
+      root.querySelector('[data-field="object-landmark"]')?.addEventListener("change", (event: Event) => {
+        const value = (event.target as HTMLSelectElement).value as LandmarkGrammarId;
+        if (multi !== null) {
+          if (multi.kind === "place" && LANDMARK_GRAMMAR_REGISTRY.has(value)) {
+            ensureBulkStaging("place", multi.ids).landmarkGrammarId = value;
+            syncInspectorButtons(root, multi.ids[0]!);
+          }
+          return;
+        }
+        if (current === null) return;
+        if (LANDMARK_GRAMMAR_REGISTRY.has(value)) {
+          stagedFor(current).landmarkGrammarId = value;
+          syncInspectorButtons(root, current.id);
+        }
+      });
       root.querySelector('[data-field="object-use"]')?.addEventListener("change", (event: Event) => {
+        if (multi !== null) {
+          if (multi.kind !== "building") return;
+          const value = (event.target as HTMLSelectElement).value as BuildingUseId | "";
+          if (value === "") return;
+          const members = bulkMembers(multi);
+          const grammarId = bulkStaging?.grammarId ?? (uniformValue(members.map((member) => member.grammarId)) as BuildingGrammarId | null);
+          if (!sharedUseOptions(members, grammarId).includes(value)) return;
+          ensureBulkStaging("building", multi.ids).visualUse = value;
+          syncInspectorButtons(root, multi.ids[0]!);
+          ctx.rerender();
+          return;
+        }
         if (current === null || current.kind !== "building") return;
         const value = (event.target as HTMLSelectElement).value as BuildingUseId;
         const staged = stagedFor(current);
@@ -583,6 +965,20 @@ export function objectsWorkspace(): WorkspaceModule {
         }
       });
       root.querySelector('[data-field="object-height"]')?.addEventListener("input", (event: Event) => {
+        if (multi !== null) {
+          if (multi.kind !== "building") return;
+          const value = Number((event.target as HTMLInputElement).value);
+          if (!Number.isFinite(value) || value <= 0) return;
+          const members = bulkMembers(multi);
+          const grammarId = bulkStaging?.grammarId ?? (uniformValue(members.map((member) => member.grammarId)) as BuildingGrammarId | null);
+          const bounds = sharedHeightBounds(members, grammarId);
+          const normalized = Math.min(bounds.max, Math.max(bounds.min, value));
+          ensureBulkStaging("building", multi.ids).heightM = normalized;
+          const output = root.querySelector<HTMLOutputElement>("[data-height-output]");
+          if (output !== null) output.value = `${Math.round(normalized)} m`;
+          syncInspectorButtons(root, multi.ids[0]!);
+          return;
+        }
         if (current === null || current.kind !== "building") return;
         const value = Number((event.target as HTMLInputElement).value);
         const grammarId = stagedFor(current).grammarId ?? current.grammarId;
@@ -595,13 +991,26 @@ export function objectsWorkspace(): WorkspaceModule {
           syncInspectorButtons(root, current.id);
         }
       });
-      root.querySelector('[data-field="object-palette"]')?.addEventListener("change", (event: Event) => { if (current === null) return; const value = (event.target as HTMLSelectElement).value; stagedFor(current).paletteId = value === "" ? null : value; syncInspectorButtons(root, current.id); });
+      root.querySelector('[data-field="object-palette"]')?.addEventListener("change", (event: Event) => {
+        const value = (event.target as HTMLSelectElement).value;
+        if (multi !== null) {
+          if (value !== "multiple" && multi.kind !== null) {
+            ensureBulkStaging(multi.kind, multi.ids).paletteId = value === "" ? null : value;
+            syncInspectorButtons(root, multi.ids[0]!);
+          }
+          return;
+        }
+        if (current === null) return;
+        stagedFor(current).paletteId = value === "" ? null : value;
+        syncInspectorButtons(root, current.id);
+      });
     }
   };
 }
 
 function syncInspectorButtons(root: HTMLElement, id: string): void {
-  const dirty = stagedById.has(id) && stagedDirty(stagedById.get(id)!);
+  const staged = stagedById.get(id);
+  const dirty = (staged !== undefined && stagedDirty(staged)) || bulkStagingDirty();
   const disabled = actionPending || currentPendingOperation() !== null || !dirty;
   const apply = root.querySelector<HTMLButtonElement>('[data-action="object-apply"]');
   const reset = root.querySelector<HTMLButtonElement>('[data-action="object-reset"]');

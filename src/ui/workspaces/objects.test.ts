@@ -17,10 +17,16 @@ type WorkspaceContextFixture = {
 };
 
 const adapterMocks = vi.hoisted(() => ({
+  bulkDeleteObjects: vi.fn(() => Promise.resolve({ full: true })),
+  bulkEditObjects: vi.fn(() => Promise.resolve({ full: true })),
+  bulkSetObjectsLocked: vi.fn(() => Promise.resolve({ full: true })),
   cityLoadStatus: vi.fn(() => ({ kind: "supported" })),
   deleteObject: vi.fn(() => Promise.resolve({ full: true })),
   editObjectProperties: vi.fn(() => Promise.resolve({ full: true })),
+  getArchitecturePlanView: vi.fn<() => unknown>(() => null),
   getArchitectureSource: vi.fn(),
+  getCity: vi.fn(() => ({ revision: 4 })),
+  getRouteEditStatus: vi.fn<() => unknown>(() => null),
   isSceneEnabled: vi.fn(() => true),
   rerollObjectAppearance: vi.fn(() => Promise.resolve({ full: true })),
   setObjectLocked: vi.fn(() => Promise.resolve({ full: true }))
@@ -40,11 +46,11 @@ const objectLayerMocks = vi.hoisted(() => ({
   configureObjectPlacement: vi.fn(),
   finishObjectPlacement: vi.fn(() => Promise.resolve(true)),
   getObjectError: vi.fn<() => ObjectErrorFixture | null>(() => null),
+  getObjectRouteFeedback: vi.fn<() => unknown>(() => null),
   getObjectSelection: vi.fn<() => ObjectSelectionFixture>(() => ({ ids: [], kind: null })),
   objectInspector: vi.fn<() => unknown>(() => null),
   setObjectsWorkspaceBridge: vi.fn()
 }));
-
 vi.mock("../../adapter/canvas.js", () => adapterMocks);
 vi.mock("../editor-state.js", () => stateMocks);
 vi.mock("../objects-layer.js", () => objectLayerMocks);
@@ -71,6 +77,17 @@ const architecture = {
       id: "building-a",
       kind: "building",
       label: "Shopfront",
+      grammarId: "narrow-shopfront",
+      visualUse: "commercial",
+      heightM: 30,
+      paletteId: null,
+      protection: "generated",
+      origin: "manual"
+    },
+    {
+      id: "building-c",
+      kind: "building",
+      label: "Twin shopfront",
       grammarId: "narrow-shopfront",
       visualUse: "commercial",
       heightM: 30,
@@ -142,8 +159,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   clearObjectsWorkspaceState();
   adapterMocks.cityLoadStatus.mockReturnValue({ kind: "supported" });
+  adapterMocks.getArchitecturePlanView.mockReturnValue(null);
   adapterMocks.getArchitectureSource.mockReturnValue(architecture);
+  adapterMocks.getCity.mockReturnValue({ revision: 4 });
+  adapterMocks.getRouteEditStatus.mockReturnValue(null);
   adapterMocks.isSceneEnabled.mockReturnValue(true);
+  adapterMocks.bulkDeleteObjects.mockImplementation(() => Promise.resolve({ full: true }));
+  adapterMocks.bulkEditObjects.mockImplementation(() => Promise.resolve({ full: true }));
+  adapterMocks.bulkSetObjectsLocked.mockImplementation(() => Promise.resolve({ full: true }));
   adapterMocks.editObjectProperties.mockImplementation(() => Promise.resolve({ full: true }));
   adapterMocks.deleteObject.mockImplementation(() => Promise.resolve({ full: true }));
   adapterMocks.rerollObjectAppearance.mockImplementation(() => Promise.resolve({ full: true }));
@@ -152,10 +175,10 @@ beforeEach(() => {
   stateMocks.currentObjectCategory.mockReturnValue("buildings");
   stateMocks.currentPendingOperation.mockReturnValue(null);
   objectLayerMocks.getObjectSelection.mockReturnValue({ ids: [], kind: null });
+  objectLayerMocks.getObjectRouteFeedback.mockReturnValue(null);
   objectLayerMocks.objectInspector.mockReturnValue(null);
   objectLayerMocks.getObjectError.mockReturnValue(null);
 });
-
 describe("Objects workspace catalogue", () => {
   it("derives the complete building and place breadth from registries", () => {
     const buildings = objectCatalogueEntries("buildings");
@@ -199,7 +222,6 @@ describe("Objects workspace catalogue", () => {
     triggerControl(controls, '[data-field="object-catalogue-group"]', buildingGroups[1]!);
     expect(module.renderTray()).toContain(`data-catalogue-group="${buildingGroups[1]}"`);
     expect(module.renderTray()).not.toContain(`data-object-id="${firstBuilding.id}"`);
-
     stateMocks.currentObjectCategory.mockReturnValue("places");
     const placeGroups = objectCatalogueGroupNames("places");
     expect(module.renderTray()).toContain(`data-catalogue-group="${placeGroups[0]!.replaceAll("&", "&#38;")}"`);
@@ -333,25 +355,6 @@ describe("Objects workspace selection and inspector workflows", () => {
     expect(adapterMocks.editObjectProperties).toHaveBeenCalledWith("building-a", { heightM: 50 });
   });
 
-  it("renders a same-kind multi-selection as summary-only and blocks mutations", () => {
-    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a", "building-b"], kind: "building" });
-    const module = objectsWorkspace();
-    const html = module.renderTray();
-    expect(html).toContain('data-panel="objects-multi"');
-    expect(html).toContain("2 buildings selected");
-    expect(html).toContain("Summary only");
-    expect(html).toContain("transform gizmos are disabled");
-
-    const ctx = fakeContext();
-    for (const action of ["object-apply", "object-reset", "object-lock", "object-reroll", "object-delete", "object-site"]) {
-      module.onAction(action, {} as HTMLElement, ctx);
-    }
-    expect(adapterMocks.editObjectProperties).not.toHaveBeenCalled();
-    expect(adapterMocks.setObjectLocked).not.toHaveBeenCalled();
-    expect(adapterMocks.rerollObjectAppearance).not.toHaveBeenCalled();
-    expect(adapterMocks.deleteObject).not.toHaveBeenCalled();
-    expect(ctx.run).not.toHaveBeenCalled();
-  });
 
   it("stages inspector fields and applies one combined patch through the workspace runner", () => {
     objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a"], kind: "building" });
@@ -444,6 +447,7 @@ describe("Objects workspace selection and inspector workflows", () => {
     expect(objectLayerMocks.cancelObjectPlacement).toHaveBeenCalledOnce();
     expect(objectLayerMocks.clearObjectSelection).toHaveBeenCalledOnce();
     expect(stateMocks.setObjectCategory).toHaveBeenCalledWith("places");
+
     expect(stateMocks.setCanvasTool).toHaveBeenCalledWith("select");
     expect(ctx.rerender).toHaveBeenCalledOnce();
 
@@ -461,5 +465,193 @@ describe("Objects workspace selection and inspector workflows", () => {
     expect(objectLayerMocks.clearObjectSelection).toHaveBeenCalledTimes(selectionsCleared);
     expect(stateMocks.setObjectCategory).toHaveBeenCalledTimes(1);
     expect(ctx.rerender).toHaveBeenCalledTimes(rerenders);
+  });
+});
+describe("Objects workspace bulk editing", () => {
+  const mixedSelection = { ids: ["building-a", "building-b"], kind: "building" as const };
+  const derivedPlanView = () => ({
+    buildings: [{
+      id: "derived-1",
+      kind: "building",
+      grammarId: "narrow-shopfront",
+      visualUse: "commercial",
+      heightM: 30,
+      paletteId: null,
+      protection: "none",
+      sitePolygon: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 12 }, { x: 0, y: 12 }],
+      placement: { centre: { x: 5, y: 6 }, rotationRad: 0, widthM: 10, depthM: 12 }
+    }],
+    landmarks: []
+  });
+
+  function multiTray(ids: string[], kind: "building" | "place" = "building"): string {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids, kind });
+    return objectsWorkspace().renderTray();
+  }
+
+  it("renders shared fields with Multiple for mixed values and keeps gizmos and reroll disabled", () => {
+    const html = multiTray(mixedSelection.ids);
+    expect(html).toContain('data-panel="objects-multi"');
+    expect(html).toContain("2 buildings selected");
+    expect(html).toContain(">Multiple</option>");
+    expect(html).toContain(">Multiple</output>");
+    expect(html).toContain('value="multiple" selected');
+    expect(html).toContain("transform gizmos are disabled");
+    expect(html).not.toContain('data-action="object-reroll"');
+    expect(html).not.toContain('data-action="object-site"');
+    expect(html).not.toContain("lasso");
+    expect(html).not.toContain("Drag-box");
+  });
+
+  it("applies only explicitly staged shared fields with the captured revision in one bulk call", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    const module = objectsWorkspace();
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-palette"]', "corporate");
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.bulkEditObjects).toHaveBeenCalledWith(["building-a", "building-b"], { paletteId: "corporate" }, 4);
+    expect(adapterMocks.editObjectProperties).not.toHaveBeenCalled();
+    expect(ctx.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("stages shared fields for same-value selections and never includes untouched mixed fields", () => {
+    const html = multiTray(["building-a", "building-c"]);
+    expect(html).toContain('value="narrow-shopfront" selected');
+    expect(html).toContain('value="commercial" selected');
+    expect(html).not.toContain(">Multiple</option>");
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    objectsWorkspace().onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-use"]', "entertainment");
+    objectsWorkspace().onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).toHaveBeenCalledWith(["building-a", "building-c"], { visualUse: "entertainment" }, 4);
+  });
+
+  it("discloses promotion of derived objects to protected persistent records before Apply", () => {
+    adapterMocks.getArchitecturePlanView.mockReturnValue(derivedPlanView());
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a", "derived-1"], kind: "building" });
+    const module = objectsWorkspace();
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-height"]', "40");
+    const html = module.renderTray();
+    expect(html).toContain("promote these derived buildings to protected persistent records");
+    expect(html).toContain("derived-1");
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).toHaveBeenCalledWith(["building-a", "derived-1"], { heightM: 40 }, 4);
+  });
+
+  it("discloses protected sparse overrides for palette-only derived edits without promotion", () => {
+    adapterMocks.getArchitecturePlanView.mockReturnValue(derivedPlanView());
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a", "derived-1"], kind: "building" });
+    const module = objectsWorkspace();
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-palette"]', "corporate");
+    const html = module.renderTray();
+    expect(html).toContain("protected manual-edit overrides");
+    expect(html).not.toContain("promote these derived");
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).toHaveBeenCalledWith(["building-a", "derived-1"], { paletteId: "corporate" }, 4);
+  });
+
+  it("keeps bulk delete persistent-only and deletes the whole eligible selection once", () => {
+    adapterMocks.getArchitecturePlanView.mockReturnValue(derivedPlanView());
+    const module = objectsWorkspace();
+    const ctx = fakeContext();
+    expect(multiTray(["building-a", "derived-1"])).toContain('data-action="object-delete" disabled');
+    expect(multiTray(["building-a", "derived-1"])).toContain("persistent-only");
+    module.onAction("object-delete", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkDeleteObjects).not.toHaveBeenCalled();
+
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    expect(module.renderTray()).not.toContain('data-action="object-delete" disabled');
+    module.onAction("object-delete", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkDeleteObjects).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.bulkDeleteObjects).toHaveBeenCalledWith(["building-a", "building-b"], 4);
+  });
+
+  it("locks the whole selection through one call with the explicit protection statement", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    const module = objectsWorkspace();
+    const html = module.renderTray();
+    expect(html).toContain("Lock all");
+    expect(html).toContain("Protection is never changed silently");
+    const ctx = fakeContext();
+    module.onAction("object-lock", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkSetObjectsLocked).toHaveBeenCalledTimes(1);
+    expect(adapterMocks.bulkSetObjectsLocked).toHaveBeenCalledWith(["building-a", "building-b"], true, 4);
+  });
+
+  it("lists every rejected id and reason durably when the whole selection is rejected", async () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    adapterMocks.bulkSetObjectsLocked.mockRejectedValueOnce(Object.assign(new Error("Bulk architecture action rejected"), {
+      blockers: [{ id: "building-b", kind: "building", reason: "The architecture object is locked." }]
+    }));
+    const module = objectsWorkspace();
+    const ctx = fakeContext();
+    module.onAction("object-lock", {} as HTMLElement, ctx);
+    const runCall = ctx.run.mock.calls[0]!;
+    // The tracked promise records blockers before the runner's promise rejects,
+    // so awaiting that exact rejection is the deterministic flush signal.
+    await expect(runCall[1] as Promise<unknown>).rejects.toThrow("Bulk architecture action rejected");
+    const html = module.renderTray();
+    expect(html).toContain("Bulk action rejected for the whole selection");
+    expect(html).toContain("building-b");
+    expect(html).toContain("The architecture object is locked.");
+  });
+
+  it("drops stale bulk drafts when the selection or category changes", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    const module = objectsWorkspace();
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-height"]', "40");
+    expect(module.renderTray()).toContain('value="40"');
+
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a"], kind: "building" });
+    expect(module.renderTray()).toContain('data-panel="objects-inspector"');
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).not.toHaveBeenCalled();
+
+    triggerControl(controls, '[data-field="object-height"]', "42");
+    module.onAction("object-category", { dataset: { category: "places" } } as unknown as HTMLElement, ctx);
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).not.toHaveBeenCalled();
+  });
+
+  it("surfaces live route warnings and committed trim, removal, and disconnection durably", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ids: ["building-a"], kind: "building" });
+    objectLayerMocks.getObjectRouteFeedback.mockReturnValue({
+      kind: "building",
+      targetId: "building-a",
+      provisional: true,
+      conflicts: [{ edgeId: "edge-1", kind: "road", reason: "crosses the corridor", blockedArcM: [], processable: true }],
+      blockers: [{ id: "edge-9", kind: "road", reason: "edge is locked" }]
+    });
+    adapterMocks.getRouteEditStatus.mockReturnValue({
+      conflicts: [],
+      blockers: [],
+      trimmedEdgeIds: ["edge-3"],
+      removedEdgeIds: ["edge-4"],
+      disconnectedVehicleNetwork: true
+    });
+    const html = objectsWorkspace().renderTray();
+    expect(html).toContain('data-panel="objects-route-status"');
+    expect(html).toContain("Route preview: road edges");
+    expect(html).toContain("edge-1");
+    expect(html).toContain("Locked road edges block this edit");
+    expect(html).toContain("edge-9");
+    expect(html).toContain("Committed route trim: edge-3");
+    expect(html).toContain("Committed route removal: edge-4");
+    expect(html).toContain("warning, not a rejection");
   });
 });

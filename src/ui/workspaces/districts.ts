@@ -120,6 +120,11 @@ export function districtEmptyTrayHTML(): string {
   return "<section data-panel=\"district-empty\" class=\"nixie-tray-inspector\"><h3>Districts</h3><p class=\"nixie-note\">Select a district to inspect it. Fill, draw, split, and merge operate on the canvas.</p><div class=\"form-footer\"><button type=\"button\" data-action=\"district-delete-all\">Delete all districts</button></div>" + districtGalleryLauncherHTML() + "</section>";
 }
 
+/** §26.6: seed Apply/Reroll is a district-wide regeneration event and must be disclosed before commit. */
+export function districtSeedDisclosureHTML(): string {
+  return "<section data-panel=\"district-seed-disclosure\" class=\"nixie-tray-inspector nixie-regen-disclosure\" role=\"note\" aria-label=\"District seed regeneration disclosure\"><h3><i class=\"fa-solid fa-triangle-exclamation\" aria-hidden=\"true\"></i> Seed changes regenerate the whole district</h3><p class=\"nixie-note\">Applying or rerolling this seed performs a <strong>district-wide regeneration</strong>: all unprotected generated content in this district is rebuilt from the seed. <strong>Roads remain fixed.</strong> Protected content and reserved sites are preserved.</p><p class=\"nixie-note\">The seed is recorded as the <strong>newest district event</strong> and overrides older block seed attempts for this district without deleting their records. Protected-content preflight runs before any commit; blockers reject the whole action and must be resolved with separate unlock or move actions — there is no ignore option.</p></section>";
+}
+
 export function districtGalleryHTML(mode: DistrictGalleryMode = "overview"): string {
   const safeMode: DistrictGalleryMode = mode === "play" ? "play" : "overview";
   const previews = districtGalleryPreviews(safeMode);
@@ -356,7 +361,7 @@ export function districtsWorkspace(): WorkspaceModule {
       if (availability.districtCount === 0) return renderGenerationTray(availability) + districtGalleryLauncherHTML();
       const ids = districtIds();
       if (ids.length === 0) return districtEmptyTrayHTML();
-      return renderInspector(ids, kind === "supported" && isSceneEnabled()) + districtGalleryLauncherHTML();
+      return (stagedSeed !== undefined ? districtSeedDisclosureHTML() : "") + renderInspector(ids, kind === "supported" && isSceneEnabled()) + districtGalleryLauncherHTML();
     },
     onAction(action: string, target: HTMLElement, ctx: WorkspaceContext): void {
       const ids = districtIds();
@@ -386,7 +391,7 @@ export function districtsWorkspace(): WorkspaceModule {
             const mode = stagedOverride ?? (currentOverride === null ? "inherit" : "explicit");
             patch.openSpaceOverride = mode === "inherit" ? null : stagedOverrideConfig ?? currentOverride ?? defaultOverride();
           }
-          if (ids.length > 0 && Object.keys(patch).length > 0) ctx.run("district changes", Promise.resolve(updateDistricts(ids, patch)), () => resetStaged(ids));
+          if (ids.length > 0 && Object.keys(patch).length > 0) ctx.run(stagedSeed !== undefined && patch.seed !== undefined ? "district seed regeneration" : "district changes", Promise.resolve(updateDistricts(ids, patch)), () => resetStaged(ids));
           return;
         }
         case "district-reroll-seed": {

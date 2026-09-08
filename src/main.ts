@@ -70,6 +70,12 @@ import {
   setLeanAtCurrentZoom,
   setLookDials,
   setSceneEnabled,
+  bulkDeleteObjects,
+  bulkEditObjects,
+  bulkSetObjectsLocked,
+  getRouteEditStatus,
+  preflightRegeneration,
+  regenerateTargets,
   stats,
   undo
 } from "./adapter/canvas.js";
@@ -87,11 +93,12 @@ import { WEATHER_PRESETS } from "./render/look-dials.js";
 import { registerSettings, setSettingValue, settingValue } from "./settings.js";
 import { registerEditorSceneControls } from "./ui/editor-controls.js";
 import { installEditorShellController, openDistrictApp, openObjectsApp, openRoadApp, openTerrainApp } from "./ui/editor-shell.js";
-import { isEditorOpen } from "./ui/editor-state.js";
+import { isEditorOpen, LAYER_REGENERATE } from "./ui/editor-state.js";
 import { LAYER_NAME, nixieLayerClass } from "./ui/nixie-layer.js";
 import { ROAD_LAYER_NAME, roadLayerClass } from "./ui/road-layer.js";
 import { DISTRICT_LAYER_NAME, districtLayerClass } from "./ui/district-layer.js";
 import { OBJECT_LAYER_NAME, objectsLayerClass } from "./ui/objects-layer.js";
+import { regenerateLayerClass } from "./ui/regenerate-layer.js";
 
 const CONTROL = "Control";
 const SHIFT = "Shift";
@@ -121,6 +128,7 @@ Hooks.once("init", () => {
   CONFIG.Canvas.layers[ROAD_LAYER_NAME] = { layerClass: roadLayerClass(), group: "interface" };
   CONFIG.Canvas.layers[OBJECT_LAYER_NAME] = { layerClass: objectsLayerClass(), group: "interface" };
   CONFIG.Canvas.layers[DISTRICT_LAYER_NAME] = { layerClass: districtLayerClass(), group: "interface" };
+  CONFIG.Canvas.layers[LAYER_REGENERATE] = { layerClass: regenerateLayerClass(), group: "interface" };
   registerSettings();
   installEditorShellController();
   registerEditorSceneControls();
@@ -179,6 +187,12 @@ Hooks.once("init", () => {
     mergeDistricts,
     updateDistricts,
     deleteDistricts,
+    regenerateTargets,
+    preflightRegeneration,
+    bulkSetObjectsLocked,
+    bulkDeleteObjects,
+    bulkEditObjects,
+    getRouteEditStatus,
     retryGeneratedWalls,
     roadInspector,
     moveRoadNode,

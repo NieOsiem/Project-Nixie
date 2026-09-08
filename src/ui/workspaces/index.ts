@@ -3,10 +3,10 @@ import { diagnosticsWorkspace } from "./diagnostics.js";
 import { districtsWorkspace } from "./districts.js";
 import { generateWorkspace } from "./generate.js";
 import { objectsWorkspace } from "./objects.js";
+import { regenerateWorkspace } from "./regenerate.js";
 import { roadsWorkspace } from "./roads.js";
 import { terrainWorkspace } from "./terrain.js";
 import type { WorkspaceModule } from "./types.js";
-import { unavailableWorkspace } from "./unavailable.js";
 
 const modules: Record<WorkspaceId, WorkspaceModule> = {
   generate: generateWorkspace(),
@@ -14,7 +14,7 @@ const modules: Record<WorkspaceId, WorkspaceModule> = {
   roads: roadsWorkspace(),
   districts: districtsWorkspace(),
   objects: objectsWorkspace(),
-  regenerate: unavailableWorkspace("regenerate", "Block and district regeneration arrives in Phase 6."),
+  regenerate: regenerateWorkspace(),
   diagnostics: diagnosticsWorkspace()
 };
 

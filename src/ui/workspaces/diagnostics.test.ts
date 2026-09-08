@@ -138,6 +138,71 @@ describe("Diagnostics workspace", () => {
     });
   });
 
+  it("categorizes regeneration blockers as durable errors naming the affected target", () => {
+    const view = sanitizeDiagnosticEntry({
+      subsystem: "regeneration",
+      message: 'Blocker building "b-1": A protected building occupies a reserved site inside the target.',
+      revision: 7
+    });
+    expect(view).toEqual({
+      severity: "error",
+      message: 'Blocker building "b-1": A protected building occupies a reserved site inside the target.',
+      subsystem: "regeneration",
+      retry: null,
+      affectedId: "b-1"
+    });
+  });
+
+  it("presents route disconnection and surgery notices as warnings while locked rejections stay errors", () => {
+    const disconnected = sanitizeDiagnosticEntry({
+      subsystem: "routes",
+      message: "Route surgery trimmed [edge-1] and removed [edge-2]; vehicle network disconnected (warning permitted, commit proceeds).",
+      revision: 8
+    });
+    expect(disconnected).toMatchObject({ severity: "warning", subsystem: "routes", retry: null });
+    const rejected = sanitizeDiagnosticEntry({
+      subsystem: "routes",
+      message: "Building edit rejected by locked road edges: edge-9 — locked roads cannot be crossed.",
+      revision: 8
+    });
+    expect(rejected).toMatchObject({ severity: "error", subsystem: "routes" });
+  });
+
+  it("presents regeneration cleanup of stale seed records and overrides as warnings with counts and identity", () => {
+    const seeds = {
+      subsystem: "regeneration",
+      kind: "orphan-seed-cleanup",
+      message: "Partial-seed cleanup dropped 2 stale record(s) for vanished targets: block/b-1, block/b-2.",
+      orphanedCount: 2,
+      revision: 9
+    };
+    expect(sanitizeDiagnosticEntry(seeds)).toMatchObject({ severity: "warning", subsystem: "regeneration", orphanedCount: 2, retry: null });
+    const overrides = {
+      subsystem: "regeneration",
+      kind: "orphan-override-cleanup",
+      message: 'Regeneration cleanup dropped the stale unprotected building override for "b-3": its derived object no longer matches the override lineage.',
+      orphanedOverrides: ["b-3"],
+      orphanedCount: 1,
+      revision: 9
+    };
+    expect(sanitizeDiagnosticEntry(overrides)).toMatchObject({ severity: "warning", subsystem: "regeneration", orphanedCount: 1, affectedId: "b-3" });
+    const html = diagnosticsTrayHTML([seeds, overrides]);
+    expect(html).toContain('data-status="regeneration-orphans"');
+    expect(html).toContain("3 stale seed record(s) or override(s) were cleaned up.");
+    expect(html).toContain("Affected object/site: b-3");
+    expect(html).toContain('data-severity="warning"');
+  });
+
+  it("keeps stale regeneration rejections as errors without exposing internals", () => {
+    const stale = sanitizeDiagnosticEntry({
+      subsystem: "regeneration",
+      message: "Regeneration for block [b-1] became stale before save; nothing was committed.",
+      revision: 10
+    });
+    expect(stale).toMatchObject({ severity: "error", subsystem: "regeneration", retry: null });
+    expect(stale?.affectedId).toBeUndefined();
+  });
+
   it("retains durable geometry and stale errors with a sanitized affected identity", () => {
     const geometry = sanitizeDiagnosticEntry({
       subsystem: "objects",

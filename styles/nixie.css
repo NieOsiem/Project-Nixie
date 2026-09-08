@@ -1141,3 +1141,184 @@
     height: 60px;
   }
 }
+/* ---- Regenerate workspace (Phase 6, UI spec §28) ---- */
+
+.nixie-regen-tools .nixie-shelf-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nixie-regen-clear {
+  padding: 4px 8px;
+}
+
+.nixie-regen {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 560px;
+}
+
+.nixie-regen h3 {
+  margin: 0;
+  color: var(--nixie-text-bright);
+}
+
+.nixie-regen-target {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.nixie-regen-target code,
+.nixie-regen code {
+  overflow-wrap: anywhere;
+  color: var(--nixie-text-bright);
+}
+
+.nixie-regen-field-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--nixie-text);
+}
+
+.nixie-regen-seed-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.nixie-regen-seed-row input[type="text"] {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--nixie-border);
+  color: var(--nixie-text);
+  font-family: var(--font-mono, monospace);
+}
+
+.nixie-regen-seed-row input[type="text"]:focus {
+  border-color: var(--nixie-border-strong);
+}
+
+.nixie-regen-seed-row button {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--nixie-border);
+  color: var(--nixie-text);
+}
+
+.nixie-regen-seed-row button:hover:not(:disabled) {
+  border-color: var(--nixie-border-strong);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-regen-seed-row button:disabled {
+  color: var(--nixie-disabled);
+  cursor: default;
+}
+
+.nixie-regen-run {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid var(--nixie-accent);
+  color: var(--nixie-text-bright);
+  box-shadow: inset 0 0 0 1px var(--nixie-accent);
+}
+
+.nixie-regen-run:hover:not(:disabled) {
+  background: var(--nixie-bg-raised);
+}
+
+.nixie-regen-run:disabled {
+  border-color: var(--nixie-border);
+  box-shadow: none;
+  color: var(--nixie-disabled);
+  cursor: default;
+}
+
+.nixie-regen-progress {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--nixie-accent);
+  color: var(--nixie-text-bright);
+}
+
+.nixie-regen-blockers {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--nixie-error);
+  border-left-width: 3px;
+}
+
+.nixie-regen-blockers h4 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  color: var(--nixie-error);
+}
+
+.nixie-regen-blockers ul {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+
+.nixie-regen-blocker {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 5px 6px;
+  border: 1px dashed var(--nixie-error);
+}
+
+.nixie-regen-blocker > i {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--nixie-error);
+}
+
+.nixie-regen-blocker p {
+  margin: 2px 0 0;
+}
+
+.nixie-regen-blocker-kind {
+  display: inline-block;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  color: var(--nixie-error);
+  font-size: var(--font-size-11, 0.6875rem);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Destructive-action disclosure panel shared by the seed-editing workflows:
+   warning icon + accent border carry the emphasis (never color alone). */
+.nixie-regen-disclosure {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--nixie-warning, #d9b64e);
+  border-left-width: 3px;
+}
+
+.nixie-regen-disclosure > strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--nixie-text-bright);
+}
+
+.nixie-regen-disclosure .nixie-note {
+  margin: 4px 0 0;
+}

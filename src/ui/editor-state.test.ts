@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GeneratePresetId, TerrainMode } from "./editor-state.js";
+
 import {
   applyGeneratePreset,
   beginPendingOperation,
@@ -32,12 +32,22 @@ import {
   getObjectSelection,
   isEditorOpen,
   LAYER_OBJECTS,
-  notifyEditorInteraction,
+  LAYER_REGENERATE,
   OBJECT_TOOL,
+  REGENERATE_TOOL,
+  refreshRegenerationSelectionRevision,
   openEditor,
   ownedLayerName,
   ROAD_TOOL,
   setCanvasTool,
+  type TerrainMode,
+  type GeneratePresetId,
+  notifyEditorInteraction,
+  clearRegenerationSelection,
+  getRegenerationSelection,
+  selectRegenerationTarget,
+  setRegenerationSelectionListener,
+  setRegenerationStagingClearListener,
   setCoastEdge,
   setDistrictPool,
   setDistrictSnapOptions,
@@ -79,6 +89,7 @@ function stubCanvas(): { nixieActivate: ReturnType<typeof vi.fn>; tokensActivate
   const roadsActivate = vi.fn();
   const districtsActivate = vi.fn();
   const objectsActivate = vi.fn();
+  const regenerateActivate = vi.fn();
   const tokensActivate = vi.fn();
   vi.stubGlobal("canvas", {
     ready: true,
@@ -86,6 +97,7 @@ function stubCanvas(): { nixieActivate: ReturnType<typeof vi.fn>; tokensActivate
     "nixie-roads": { active: false, activate: roadsActivate, refresh: vi.fn() },
     "nixie-districts": { active: false, activate: districtsActivate, refresh: vi.fn() },
     "nixie-objects": { active: false, activate: objectsActivate, refresh: vi.fn() },
+    "nixie-regenerate": { active: false, activate: regenerateActivate, refresh: vi.fn() },
     tokens: { active: false, activate: tokensActivate }
   });
   return { nixieActivate, tokensActivate };
@@ -105,7 +117,9 @@ afterEach(() => {
   setObjectSelectionListener(null);
   setObjectDraftCancelListener(null);
   setObjectStagingClearListener(null);
-  clearObjectSelection();
+  setRegenerationSelectionListener(null);
+  setRegenerationStagingClearListener(null);
+  clearRegenerationSelection();
   endPendingOperation();
   setObjectCategory("buildings");
   setDistrictSnapOptions({ districtVertices: true, roadJunctions: true, blockBoundaries: true, foundryGrid: false });
@@ -317,6 +331,145 @@ describe("layer activation hooks", () => {
     await Promise.resolve();
     expect(isEditorOpen()).toBe(true);
     expect(currentWorkspace()).toBe("roads");
+  });
+});
+
+describe("Regenerate workspace (Phase 6)", () => {
+  it("activates the Regenerate layer with the block tool by default", () => {
+    openEditor();
+    setWorkspace("regenerate");
+    expect(currentWorkspace()).toBe("regenerate");
+    expect(ownedLayerName()).toBe(LAYER_REGENERATE);
+    expect(canvasTool()).toBe(REGENERATE_TOOL.BLOCK);
+  });
+
+  it("opens the editor at the Regenerate workspace when its layer activates", () => {
+    editorLayerActivated(LAYER_REGENERATE);
+    expect(isEditorOpen()).toBe(true);
+    expect(currentWorkspace()).toBe("regenerate");
+    expect(ownedLayerName()).toBe(LAYER_REGENERATE);
+  });
+
+  it("toggles block targets additively, replaces on non-additive picks, and keeps the revision", () => {
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1", true, 7);
+    expect(getRegenerationSelection()).toEqual({ kind: "block", ids: ["b-1"], revision: 7 });
+    selectRegenerationTarget("block", "b-2", true);
+    expect(getRegenerationSelection()).toEqual({ kind: "block", ids: ["b-1", "b-2"], revision: 7 });
+    selectRegenerationTarget("block", "b-2", true);
+    expect(getRegenerationSelection()).toEqual({ kind: "block", ids: ["b-1"], revision: 7 });
+    selectRegenerationTarget("block", "b-9");
+    expect(getRegenerationSelection()).toEqual({ kind: "block", ids: ["b-9"], revision: 7 });
+    selectRegenerationTarget("block", "b-9", true);
+    expect(getRegenerationSelection()).toBeNull();
+  });
+
+  it("keeps district regeneration selection to exactly one district", () => {
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("district", "d-1", true, 3);
+    expect(getRegenerationSelection()).toEqual({ kind: "district", ids: ["d-1"], revision: 3 });
+    selectRegenerationTarget("district", "d-2", true);
+    expect(getRegenerationSelection()).toEqual({ kind: "district", ids: ["d-2"], revision: 3 });
+  });
+
+  it("notifies the selection listener and the shell controller on selection change", () => {
+    const selectionChanged = vi.fn();
+    setRegenerationSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1", false, 2);
+    expect(selectionChanged).toHaveBeenCalledWith({ kind: "block", ids: ["b-1"], revision: 2 });
+    expect(controller.onStateChanged).toHaveBeenCalled();
+    clearRegenerationSelection();
+    expect(selectionChanged).toHaveBeenLastCalledWith(null);
+  });
+
+  it("clears selection and staging when the regenerate tool mode changes", () => {
+    const clearStaging = vi.fn();
+    const selectionChanged = vi.fn();
+    setRegenerationStagingClearListener(clearStaging);
+    setRegenerationSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1");
+    setCanvasTool(REGENERATE_TOOL.DISTRICT);
+    expect(clearStaging).toHaveBeenCalled();
+    expect(getRegenerationSelection()).toBeNull();
+    expect(selectionChanged).toHaveBeenCalledWith(null);
+    expect(canvasTool()).toBe(REGENERATE_TOOL.DISTRICT);
+  });
+
+  it("clears regeneration selection when leaving the workspace or closing the editor", () => {
+    const selectionChanged = vi.fn();
+    setRegenerationSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1");
+    setWorkspace("terrain");
+    expect(getRegenerationSelection()).toBeNull();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1");
+    closeEditor({ restoreDefaultLayer: false });
+    expect(getRegenerationSelection()).toBeNull();
+    expect(selectionChanged).toHaveBeenCalledWith(null);
+  });
+
+  it("keeps the pending-operation gate independent of selection changes", () => {
+    openEditor();
+    setWorkspace("regenerate");
+    expect(beginPendingOperation("regenerate block")).toBe(true);
+    selectRegenerationTarget("block", "b-1");
+    expect(beginPendingOperation("regenerate block again")).toBe(false);
+    endPendingOperation();
+    selectRegenerationTarget("block", "b-2");
+    expect(getRegenerationSelection()?.ids).toEqual(["b-2"]);
+  });
+
+  it("surfaces structured regeneration blockers without leaking stack or seed details", () => {
+    const error = Object.assign(new Error("regeneration blocked"), {
+      blockers: [
+        { id: "obj-1", kind: "road", reason: "vehicle network would disconnect" },
+        { id: "obj-2", kind: "block", reason: "locked objects remain" },
+        { id: "obj-1", kind: "road", reason: "duplicate" }
+      ],
+      stack: "sensitive stack trace",
+      seedHash: "sensitive-hash"
+    });
+    setEditorActionError("regenerate", error);
+    const snapshot = currentEditorActionError();
+    expect(snapshot?.affectedIds).toEqual(["obj-1", "obj-2"]);
+    expect(snapshot?.blockers).toEqual([
+      { id: "obj-1", kind: "road", reason: "vehicle network would disconnect" },
+      { id: "obj-2", kind: "block", reason: "locked objects remain" }
+    ]);
+    expect(JSON.stringify(snapshot)).not.toContain("sensitive");
+  });
+
+  it("notifies the selection listener and the shell controller on selection change", () => {
+    const selectionChanged = vi.fn();
+    setRegenerationSelectionListener(selectionChanged);
+    openEditor();
+    setWorkspace("regenerate");
+    selectRegenerationTarget("block", "b-1", false, 2);
+    expect(selectionChanged).toHaveBeenCalledWith({ kind: "block", ids: ["b-1"], revision: 2 });
+    expect(controller.onStateChanged).toHaveBeenCalled();
+    refreshRegenerationSelectionRevision(9);
+    expect(getRegenerationSelection()).toEqual({ kind: "block", ids: ["b-1"], revision: 9 });
+    expect(selectionChanged).toHaveBeenLastCalledWith({ kind: "block", ids: ["b-1"], revision: 9 });
+    clearRegenerationSelection();
+    expect(selectionChanged).toHaveBeenLastCalledWith(null);
+  });
+
+  it("ignores revision refreshes without a selection and keeps kind+ids intact", () => {
+    openEditor();
+    setWorkspace("regenerate");
+    refreshRegenerationSelectionRevision(5);
+    expect(getRegenerationSelection()).toBeNull();
+    selectRegenerationTarget("district", "d-1", false, 4);
+    refreshRegenerationSelectionRevision(6);
+    expect(getRegenerationSelection()).toEqual({ kind: "district", ids: ["d-1"], revision: 6 });
   });
 });
 

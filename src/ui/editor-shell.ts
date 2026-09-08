@@ -102,7 +102,10 @@ function shellHTML(): string {
   const shelf = generationBusy ? "" : module.renderShelf();
   const tray = trayModule.renderTray();
   const actionError = currentEditorActionError();
-  const error = actionError === null ? "" : `<section class="nixie-action-error" data-panel="action-error" role="alert"><h3>${escapeHTML(actionError.label)} failed</h3><p>${escapeHTML(actionError.message)}</p>${actionError.affectedIds.length === 0 ? "" : `<p class="nixie-note">Affected IDs: ${actionError.affectedIds.map((id) => escapeHTML(id)).join(", ")}</p>`}</section>`;
+  const blockerNote = actionError?.blockers === undefined || actionError.blockers.length === 0
+    ? ""
+    : `<p class="nixie-note">Blocked: ${actionError.blockers.map((blocker) => `${escapeHTML(blocker.id)} (${escapeHTML(blocker.kind)}) — ${escapeHTML(blocker.reason)}`).join("; ")}</p>`;
+  const error = actionError === null ? "" : `<section class="nixie-action-error" data-panel="action-error" role="alert"><h3>${escapeHTML(actionError.label)} failed</h3><p>${escapeHTML(actionError.message)}</p>${actionError.affectedIds.length === 0 ? "" : `<p class="nixie-note">Affected IDs: ${actionError.affectedIds.map((id) => escapeHTML(id)).join(", ")}</p>`}${blockerNote}</section>`;
   const pendingPanel = pending === null ? "" : `<section class="nixie-operation-pending" data-panel="pending-operation" role="status" aria-live="polite"><i class="fa-solid fa-spinner" aria-hidden="true"></i><span>Working: ${escapeHTML(pending)}</span></section>`;
   const trayContent = generationBusy ? tray : actionError === null ? `${pendingPanel}${tray}` : `${error}${tray}`;
   const trayIsGenerate = generationBusy || activeWorkspace === "generate";
