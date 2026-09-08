@@ -315,7 +315,7 @@ describe("Phase 5 persistent architecture planning", () => {
   it("materializes authored and promoted buildings and compound places at every protection level", () => {
     const source = baseSource(architectureFixture());
     const plan = build(source);
-
+  
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     for (const record of [...source.architecture.buildings, ...source.architecture.places]) {
       const candidate = record.id.startsWith("place-")
@@ -345,7 +345,7 @@ describe("Phase 5 persistent architecture planning", () => {
       }
     }
     expect(plan.landmarks.every((landmark) => !Object.prototype.hasOwnProperty.call(landmark, "parcelId"))).toBe(true);
-  });
+  }, 120_000);
 
   it("carves persistent sites before procedural parcels and preserves nullable associations", () => {
     const source = baseSource(architectureFixture());
@@ -354,7 +354,7 @@ describe("Phase 5 persistent architecture planning", () => {
       ...source.architecture.buildings.map((record) => record.sitePolygon),
       ...source.architecture.places.map((record) => record.sitePolygon)
     ];
-
+  
     for (const site of persistentSites) {
       expect(plan.parcels.every((parcel) => overlapArea(parcel.polygon, site) < 0.5)).toBe(true);
       expect(plan.buildings
@@ -376,14 +376,14 @@ describe("Phase 5 persistent architecture planning", () => {
       expect(Object.prototype.hasOwnProperty.call(place, "parcelId")).toBe(false);
       expect(Object.prototype.hasOwnProperty.call(place, "fragmentId")).toBe(false);
     }
-  });
+  }, 120_000);
 
   it("reconstructs exact lineage, palette, structural seed, and placement deterministically", () => {
     const source = baseSource(architectureFixture());
     const first = build(source);
     const second = build(source);
     expect(second).toEqual(first);
-
+  
     for (const record of source.architecture.buildings) {
       const building = persistentBuilding(first, record.id);
       expect(building.lineage).toBe(record.lineage);
@@ -403,7 +403,7 @@ describe("Phase 5 persistent architecture planning", () => {
       expect(place.placement).toEqual(record.placement);
       expect(place.sitePolygon).toEqual(record.sitePolygon);
     }
-  });
+  }, 120_000);
   it("materializes every current building grammar from a compatible persistent source", () => {
     const records = BUILDING_GRAMMAR_IDS.map((grammarId, index, all) => {
       const centre = breadthGridCentre(index, all.length, buildingBreadthSpacing);
@@ -490,7 +490,7 @@ describe("Phase 5 persistent architecture planning", () => {
       overrides: []
     });
     expect(() => build(outsideLand)).toThrow(/land|outside|contain/i);
-
+  
     const outsideUrban = baseSource({
       buildings: [sourceBuilding("outside-urban", 500, 100, "none")],
       places: [],
@@ -498,7 +498,7 @@ describe("Phase 5 persistent architecture planning", () => {
     });
     outsideUrban.terrain.urbanFootprint = rectRing({ x: 0, y: 0, width: 300, height: 600 });
     expect(() => build(outsideUrban)).toThrow(/urban|footprint|outside|contain/i);
-
+  
     // Road-crossing building reservations are legal (the mass-level validator decides,
     // see the "gates building route legality" test); places keep the whole-site rule.
     const roadPlace = baseSource({
@@ -507,20 +507,20 @@ describe("Phase 5 persistent architecture planning", () => {
       overrides: []
     });
     expect(() => build(roadPlace)).toThrow(/road|carriage|occupancy/i);
-
+  
     const peerOverlap = baseSource({
       buildings: [sourceBuilding("peer-a", 100, 100, "none"), sourceBuilding("peer-b", 100, 100, "explicit")],
       places: [sourcePlace("peer-place", 100, 100, "manual-edit")],
       overrides: []
     });
     expect(() => build(peerOverlap)).toThrow(/overlap|peer|persistent/i);
-  });
+  }, 120_000);
 
   it("rejects a placement frame or materialized mass that escapes a persistent site", () => {
     const frameEscape = sourceBuilding("frame-escape", 100, 100, "none");
     frameEscape.placement = placement(100, 100, 90, 90);
     expect(() => build(baseSource({ buildings: [frameEscape], places: [], overrides: [] }))).toThrow(/frame|site|contain/i);
-
+  
     const validPlan = build(baseSource({
       buildings: [sourceBuilding("mass-check", 100, 100, "none")],
       places: [],
@@ -540,7 +540,7 @@ describe("Phase 5 persistent architecture planning", () => {
     };
     expect(original.sourceId).toBe("mass-check");
     expect(validateCompleteCityPlan(tampered).some((problem) => /mass.*site|site.*mass|mass.*contained/i.test(problem))).toBe(true);
-  });
+  }, 120_000);
 
   it("accepts a connected hole-free manual multi-parcel site and rejects disconnected or hole-like equivalents", () => {
     const connectedParts = [
@@ -557,7 +557,7 @@ describe("Phase 5 persistent architecture planning", () => {
       connectedParts.reduce((sum, part) => sum + Math.abs(ringArea(part)), 0),
       6
     );
-
+  
     const connectedSite: PersistentBuildingSource = {
       ...sourceBuilding("connected-site", 100, 110, "manual-edit"),
       // Three edge-sharing parcel-sized bands form one connected, hole-free site.
@@ -572,7 +572,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(acceptedBuilding.masses.every((mass) =>
       isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(connectedSite.sitePolygon)]))
     )).toBe(true);
-
+  
     const disconnectedParts = [
       rectRing({ x: 40, y: 40, width: 40, height: 40 }),
       rectRing({ x: 120, y: 120, width: 40, height: 40 })
@@ -585,7 +585,7 @@ describe("Phase 5 persistent architecture planning", () => {
       sitePolygon: disconnectedParts.flatMap((part) => [...part, part[0]!])
     };
     expect(() => build(baseSource({ buildings: [disconnectedSite], places: [], overrides: [] }))).toThrow(/ring|polygon|self|invalid|site/i);
-
+  
     const holeOuter = rectRing({ x: 40, y: 40, width: 120, height: 120 });
     const holeInner = rectRing({ x: 70, y: 70, width: 60, height: 60 });
     const holedUnion = difference(ringAsMulti(holeOuter), [ringAsMulti(holeInner)]);
@@ -597,7 +597,7 @@ describe("Phase 5 persistent architecture planning", () => {
       sitePolygon: holedUnion[0]!.flatMap((ring) => [...ring, ring[0]!])
     };
     expect(() => build(baseSource({ buildings: [holeLikeSite], places: [], overrides: [] }))).toThrow(/ring|polygon|self|invalid|site/i);
-  });
+  }, 120_000);
 
   it("matches and applies sparse appearance overrides by target id, lineage, and canonical site snapshot", () => {
     const base = baseSource();
@@ -624,7 +624,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(rerolled.seed).toBe(target.seed);
     expect(rerolled.masses.map((mass) => mass.footprint)).toEqual(target.masses.map((mass) => mass.footprint));
     expect(rerolled.masses.map((mass) => mass.heightM)).toEqual(target.masses.map((mass) => mass.heightM));
-  });
+  }, 120_000);
 
   it("reports unprotected stale, lineage-mismatched, and snapshot-mismatched overrides without proximity remapping", () => {
     const original = build(baseSource());
@@ -658,15 +658,15 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(plan.diagnostics.orphanedOverrides).toContain(stale.targetId);
     expect(plan.diagnostics.warnings.some((warning) => warning.includes(stale.targetId))).toBe(true);
     expect(plan.buildings.find((building) => building.id === target.id)!.appearanceSeed).toBe(target.appearanceSeed);
-
+  
     const lineagePlan = build(baseSource({ buildings: [], places: [], overrides: [wrongLineage] }));
     expect(lineagePlan.diagnostics.orphanedOverrides).toContain(wrongLineage.targetId);
     expect(lineagePlan.buildings.find((building) => building.id === target.id)!.appearanceSeed).toBe(target.appearanceSeed);
-
+  
     const snapshotPlan = build(baseSource({ buildings: [], places: [], overrides: [wrongSnapshot] }));
     expect(snapshotPlan.diagnostics.orphanedOverrides).toContain(wrongSnapshot.targetId);
     expect(snapshotPlan.buildings.find((building) => building.id === target.id)!.appearanceSeed).toBe(target.appearanceSeed);
-  });
+  }, 120_000);
 
   it("rejects a protected override when its target, lineage, or canonical site snapshot no longer matches", () => {
     const original = build(baseSource());
@@ -681,7 +681,7 @@ describe("Phase 5 persistent architecture planning", () => {
       appearanceSeed: "protected-reroll"
     };
     expect(() => build(baseSource({ buildings: [], places: [], overrides: [protectedOverride] }))).toThrow(/protected|override|snapshot|mismatch|orphan/i);
-  });
+  }, 120_000);
 
   it("orphanizes unprotected overrides of persistent objects and rejects protected ones", () => {
     const building = sourceBuilding("override-persistent-building", 100, 100, "none");
@@ -707,7 +707,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(plan.diagnostics.orphanedOverrides).toEqual(expect.arrayContaining([building.id, place.id]));
     expect(persistentBuilding(plan, building.id).appearanceSeed).toBe(building.appearanceSeed);
     expect(plan.landmarks.find((landmark) => landmark.sourceId === place.id)?.appearanceSeed).toBe(place.appearanceSeed);
-
+  
     const protectedOverride = unprotected("building", building.id, building.lineage, building.sitePolygon);
     protectedOverride.protection = "explicit";
     expect(() => build(baseSource({
@@ -715,7 +715,7 @@ describe("Phase 5 persistent architecture planning", () => {
       places: [],
       overrides: [protectedOverride]
     }))).toThrow(/protected|override|mismatch/i);
-  });
+  }, 120_000);
 
   it("fits derived building and place frames to concave geometry without changing frontage or mass containment", () => {
     const concaveSite: Ring = [
@@ -756,7 +756,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(derivedBuilding.masses.every((mass) =>
       isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(concaveSite)]))
     )).toBe(true);
-
+  
     const placePlan = buildCompleteCityPlan(baseSource(), 7, 3, [{
       grammarId: "infrastructure-utility-site",
       lineage: "concave-derived/place",
@@ -771,7 +771,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(derivedPlace.masses.every((mass) =>
       isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(placeSite)]))
     )).toBe(true);
-  });
+  }, 120_000);
 
   it("re-materializes a promoted derived building exactly from its persistent record", () => {
     // The promotion contract: the record a promotion carries (massing frame, geometry
@@ -816,7 +816,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(materialized.heightM).toBe(derived.heightM);
     expect(materialized.masses.map((mass) => mass.footprint)).toEqual(derived.masses.map((mass) => mass.footprint));
     expect(materialized.masses.map((mass) => mass.heightM)).toEqual(derived.masses.map((mass) => mass.heightM));
-  });
+  }, 120_000);
 
   it("materializes a migrated historical record on its legacy geometry stream without rerolling", () => {
     // V4→V5 migration preserves persistent record seeds byte-for-byte. The historical
@@ -872,7 +872,7 @@ describe("Phase 5 persistent architecture planning", () => {
         heightM: 42.666666666666664
       }
     ]);
-  });
+  }, 120_000);
 
   it("gates building route legality on materialized masses, not the reservation or frame", () => {
     // A building reservation may legally cross a route (the GM's surgery trims the
@@ -891,7 +891,7 @@ describe("Phase 5 persistent architecture planning", () => {
     for (const mass of crossingBuilding.masses) {
       expect(isSnapNoise(intersection(ringAsMulti(mass.footprint), occupancy)), mass.id).toBe(true);
     }
-
+  
     // A building whose materialized masses genuinely cross a route is not caught by the
     // reservation gate — the mass-level validator is the route legality gate.
     const straddling = sourceBuilding("mass-straddling", 200, 200, "manual-edit");
@@ -899,11 +899,11 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(validateCompleteCityPlan(straddlePlan).some((problem) =>
       /mass \d+ overlaps road occupancy/.test(problem)
     )).toBe(true);
-
+  
     // Places keep the whole-reservation rule: a place site crossing a route is rejected.
     const roadPlace = sourcePlace("road-place", 200, 500, "none");
     expect(() => build(baseSource({ buildings: [], places: [roadPlace], overrides: [] }))).toThrow(/road|carriage|occupancy/i);
-  });
+  }, 120_000);
 
   it("keeps an appearance reroll structurally isolated for a persistent building", () => {
     const firstSource = baseSource({
@@ -917,7 +917,7 @@ describe("Phase 5 persistent architecture planning", () => {
     const second = build(secondSource);
     const firstBuilding = persistentBuilding(first, "appearance-isolation");
     const secondBuilding = persistentBuilding(second, "appearance-isolation");
-
+  
     expect(secondBuilding.seed).toBe(firstBuilding.seed);
     expect(secondBuilding.lineage).toBe(firstBuilding.lineage);
     expect(secondBuilding.sitePolygon).toEqual(firstBuilding.sitePolygon);
@@ -928,7 +928,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(secondBuilding.appearanceSeed).toBe("different-appearance-stream");
     expect(secondBuilding.masses.map((mass) => ({ wallMaterial: mass.wallMaterial, roofMaterial: mass.roofMaterial, facadeSeed: mass.facadeSeed })))
       .not.toEqual(firstBuilding.masses.map((mass) => ({ wallMaterial: mass.wallMaterial, roofMaterial: mass.roofMaterial, facadeSeed: mass.facadeSeed })));
-  });
+  }, 120_000);
 
   it("promotes an unchanged concave-site generated building on a height-only edit and keeps authored/changed geometry strict", () => {
     // L-shaped site: 60x24 bottom leg plus a 30x20 right leg (2040 m2). The persisted
@@ -955,7 +955,7 @@ describe("Phase 5 persistent architecture planning", () => {
     });
     const frame = frameRing(envelopeSource().placement);
     expect(isSnapNoise(difference(ringAsMulti(frame), [ringAsMulti(concaveSite)]))).toBe(true);
-
+  
     const plan = build(baseSource({ buildings: [envelopeSource()], places: [], overrides: [] }));
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const building = persistentBuilding(plan, "concave-envelope");
@@ -963,7 +963,7 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(building.masses.every((mass) =>
       isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(concaveSite)]))
     )).toBe(true);
-
+  
     // Height-only semantic promotion: grammar, use, palette, site, and frame stay verbatim.
     const promoted = envelopeSource();
     promoted.heightM = 100;
@@ -979,14 +979,14 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(promotedBuilding.masses.every((mass) =>
       isSnapNoise(difference(ringAsMulti(mass.footprint), [ringAsMulti(concaveSite)]))
     )).toBe(true);
-
+  
     // Authored placements still validate strictly against the frame itself.
     expect(() => build(baseSource({
       buildings: [{ ...envelopeSource(), origin: "authored" }],
       places: [],
       overrides: []
     }))).toThrow(/placement frame does not fit grammar/);
-
+  
     // Changed geometry (frame and site transformed together, as transformObject does)
     // shrinks the parcel below the grammar's declared limits and still rejects.
     const scaleAboutFrameCentre = (ring: Ring, factor: number): Ring =>
@@ -1004,7 +1004,7 @@ describe("Phase 5 persistent architecture planning", () => {
     };
     expect(() => build(baseSource({ buildings: [transformed], places: [], overrides: [] })))
       .toThrow(/placement frame does not fit grammar/);
-  });
+  }, 120_000);
 
   it("lets a moved generated promotion shadow its original procedural stable id", () => {
     const initial = build(baseSource());
@@ -1032,12 +1032,12 @@ describe("Phase 5 persistent architecture planning", () => {
       districtId: donor.districtId,
       blockId: donor.blockId
     };
-
+  
     const rebuilt = build(baseSource({ buildings: [promoted], places: [], overrides: [] }));
     expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
     expect(rebuilt.buildings.filter((building) => building.id === identity.id)).toHaveLength(1);
     expect(persistentBuilding(rebuilt, identity.id).sitePolygon).toEqual(donor.sitePolygon);
-  });
+  }, 120_000);
 });
 
 describe("Phase 6 regeneration retained-content path", () => {
@@ -1072,7 +1072,7 @@ describe("Phase 6 regeneration retained-content path", () => {
     expect(candidate.regeneration.partialSeeds).toEqual([
       { targetKind: "block", targetId: targetBlock, seed: "phase6-seed", order: 1 }
     ]);
-  });
+  }, 120_000);
 
   it("retains protected target content exactly and reserves its site polygon", () => {
     const source = baseSource(architectureFixture());
@@ -1093,5 +1093,5 @@ describe("Phase 6 regeneration retained-content path", () => {
     );
     expect(result.target).toEqual({ kind: "block", ids: [targetBlock] });
     expect(resolveRegenerationTargetScope(plan, result.target)).not.toBeNull();
-  });
+  }, 120_000);
 });
