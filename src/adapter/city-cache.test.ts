@@ -24,7 +24,7 @@ import {
   type CompleteCityPlan
 } from "../core/gen/complete-city-plan.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV4 } from "../core/gen/city.js";
+import type { CityStateV5 } from "../core/gen/city.js";
 
 const storage = vi.hoisted(() => ({
   fetchCacheAsset: vi.fn(),
@@ -61,7 +61,7 @@ let scene: MockScene;
 let setFlag: Mock;
 let unsetFlag: Mock;
 
-function city(revision = 7): CityStateV4 {
+function city(revision = 7): CityStateV5 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -93,14 +93,15 @@ function city(revision = 7): CityStateV4 {
         buildings: [],
         places: [],
         overrides: []
-      }
+      },
+      regeneration: { partialSeeds: [] }
     }
   };
 }
 function persistentBuilding(
   id: string,
   lineage: string
-): CityStateV4["source"]["architecture"]["buildings"][number] {
+): CityStateV5["source"]["architecture"]["buildings"][number] {
   return {
     id,
     lineage,
@@ -127,7 +128,7 @@ function persistentBuilding(
 function persistentPlace(
   id: string,
   lineage: string
-): CityStateV4["source"]["architecture"]["places"][number] {
+): CityStateV5["source"]["architecture"]["places"][number] {
   return {
     id,
     lineage,
@@ -152,7 +153,7 @@ function persistentPlace(
 function architectureOverride(
   targetId: string,
   lineage: string
-): CityStateV4["source"]["architecture"]["overrides"][number] {
+): CityStateV5["source"]["architecture"]["overrides"][number] {
   return {
     targetKind: "building",
     targetId,
@@ -169,7 +170,7 @@ function architectureOverride(
   };
 }
 
-function planFor(source: CityStateV4): CompleteCityPlan {
+function planFor(source: CityStateV5): CompleteCityPlan {
   const structuralInput = completeCityStructuralInput(source.source);
   return {
     sourceRevision: source.revision,
@@ -216,7 +217,7 @@ function planFor(source: CityStateV4): CompleteCityPlan {
   };
 }
 
-function planFilenameFor(source: CityStateV4, compressed: Uint8Array): string {
+function planFilenameFor(source: CityStateV5, compressed: Uint8Array): string {
   const structuralInput = completeCityStructuralInput(source.source);
   const sourceSignature = checksumBytes(new TextEncoder().encode(JSON.stringify([
     structuralInput.terrain,
@@ -224,6 +225,7 @@ function planFilenameFor(source: CityStateV4, compressed: Uint8Array): string {
     structuralInput.districts,
     structuralInput.generation,
     structuralInput.architecture,
+    structuralInput.regeneration,
     structuralInput.schemaVersion,
     structuralInput.generatorVersion
   ])));
@@ -231,7 +233,7 @@ function planFilenameFor(source: CityStateV4, compressed: Uint8Array): string {
 }
 
 function manifestFor(
-  source: CityStateV4,
+  source: CityStateV5,
   compressed: Uint8Array,
   slot: CacheSlot = 0
 ): CityCacheManifestV1 {
@@ -294,7 +296,7 @@ function chunkRecord(id: string, x: number): CachedCompleteChunkRecord {
 }
 
 function manifestWithChunks(
-  source: CityStateV4,
+  source: CityStateV5,
   plan: CompleteCityPlan,
   planBytes: Uint8Array,
   records: readonly CachedCompleteChunkRecord[]
@@ -337,7 +339,7 @@ function manifestWithChunks(
   };
 }
 
-function install(currentCity: CityStateV4 = city(), manifest: unknown = undefined): void {
+function install(currentCity: CityStateV5 = city(), manifest: unknown = undefined): void {
   cityFlag = currentCity;
   cacheFlag = manifest;
   setFlag = vi.fn(async (_moduleId: string, flag: string, value: unknown): Promise<unknown> => {
@@ -416,7 +418,7 @@ describe("complete plan cache loading", () => {
     cacheFlag = { ...manifestFor(source, bytes), cityRevision: source.revision + 1 };
     await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
 
-    for (const key of ["terrain", "roads", "districts", "generation", "architecture"] as const) {
+    for (const key of ["terrain", "roads", "districts", "generation", "architecture", "regeneration"] as const) {
       const stale = manifestFor(source, bytes);
       stale.structuralInput[key] = `${stale.structuralInput[key]}-stale`;
       cacheFlag = stale;
@@ -428,6 +430,12 @@ describe("complete plan cache loading", () => {
       },
       (manifest: CityCacheManifestV1): void => {
         (manifest.structuralInput as unknown as Record<string, unknown>).generatorVersion = 11;
+      },
+      (manifest: CityCacheManifestV1): void => {
+        (manifest.structuralInput as unknown as Record<string, unknown>).schemaVersion = 4;
+      },
+      (manifest: CityCacheManifestV1): void => {
+        (manifest.structuralInput as unknown as Record<string, unknown>).generatorVersion = 12;
       }
     ]) {
       const stale = manifestFor(source, bytes);
@@ -435,6 +443,23 @@ describe("complete plan cache loading", () => {
       cacheFlag = stale;
       await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
     }
+    expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
+  });
+
+  it("misses a cached plan whose partial seeds differ at the same city revision", async () => {
+    const cached = city();
+    const bytes = encodeCompleteCityPlan(planFor(cached));
+    const regenerated: CityStateV5 = {
+      ...structuredClone(cached),
+      source: {
+        ...structuredClone(cached.source),
+        regeneration: { partialSeeds: [{ targetKind: "district", targetId: "district-a", seed: "rerolled", order: 1 }] }
+      }
+    };
+    // The Scene city matches the request; only the stored manifest still carries the
+    // pre-edit partial-seed signature, so the artifact must miss before any fetch.
+    install(regenerated, manifestFor(cached, bytes));
+    await expect(loadCachedCompletePlan(regenerated)).resolves.toBeNull();
     expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
   });
 
@@ -515,6 +540,7 @@ describe("complete plan cache loading", () => {
   it("rejects legacy shared and cross-scene plan refs before fetch", async () => {
     const source = city();
     const bytes = encodeCompleteCityPlan(planFor(source));
+
     const legacy = manifestFor(source, bytes);
     legacy.plan.artifact.path = "city-cache/scene-1/slot-0/plan.json.gz";
     install(source, legacy);
@@ -526,6 +552,16 @@ describe("complete plan cache loading", () => {
       "city-cache/scene-other/"
     );
     install(source, crossScene);
+    await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
+    expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
+  });
+  it("safely misses a legacy plan-format manifest without fetching", async () => {
+    const source = city();
+    const bytes = encodeCompleteCityPlan(planFor(source));
+    const legacy = manifestFor(source, bytes);
+    legacy.plan.formatVersion = (PLAN_CACHE_FORMAT_VERSION - 1) as typeof PLAN_CACHE_FORMAT_VERSION;
+    install(source, legacy);
+
     await expect(loadCachedCompletePlan(source)).resolves.toBeNull();
     expect(storage.fetchCacheAsset).not.toHaveBeenCalled();
   });
@@ -742,9 +778,9 @@ describe("complete plan cache publication", () => {
   });
 
   it.each([
-    ["terrain", (current: CityStateV4): void => { current.source.terrain.land[0]!.x += 1; }],
-    ["roads", (current: CityStateV4): void => { current.source.roads.routes.push({ id: "route-new", curvePreset: "standard" }); }],
-    ["districts", (current: CityStateV4): void => {
+    ["terrain", (current: CityStateV5): void => { current.source.terrain.land[0]!.x += 1; }],
+    ["roads", (current: CityStateV5): void => { current.source.roads.routes.push({ id: "route-new", curvePreset: "standard" }); }],
+    ["districts", (current: CityStateV5): void => {
       current.source.districts.push({
         id: "district-new",
         polygon: [{ x: -90, y: -70 }, { x: -10, y: -70 }, { x: -10, y: 70 }, { x: -90, y: 70 }],
@@ -756,10 +792,10 @@ describe("complete plan cache publication", () => {
         openSpaceOverride: null
       });
     }],
-    ["architecture", (current: CityStateV4): void => {
+    ["architecture", (current: CityStateV5): void => {
       current.source.architecture.buildings.push(persistentBuilding("persistent-b", "lineage-b"));
     }],
-    ["generation", (current: CityStateV4): void => { current.source.generation.openSpaceProfile = "high"; }]
+    ["generation", (current: CityStateV5): void => { current.source.generation.openSpaceProfile = "high"; }]
   ] as const)("rejects a stale %s signature after upload and before setFlag", async (_key, mutate) => {
     const source = city();
     const plan = planFor(source);

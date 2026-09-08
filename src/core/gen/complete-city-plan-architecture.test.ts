@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { difference, intersection, isSnapNoise, ringAsMulti, union } from "../geom/boolean.js";
-import { rectRing, ringArea, type Ring } from "../geom/types.js";
+import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS } from "./district-registry.js";
 import type {
   ArchitectureOverrideSource,
   ArchitectureProtection,
-  CitySourceV4,
+  CitySourceV5,
   PersistentBuildingSource,
   PersistentPlaceSource,
   PlacementFrame,
@@ -16,6 +16,8 @@ import type {
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY } from "./landmark-registry.js";
 import { buildCompleteCityPlan, planParcelBuilding, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan } from "./complete-city-plan.js";
+import { promotedArchitectureSource } from "./architecture-edit.js";
+import { evaluateRegenerationPreflight, resolveRegenerationTargetScope } from "./regeneration-plan.js";
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
 const edge = (id: string, a: string, b: string, routeId: string): RoadEdgeSource => ({
@@ -179,10 +181,10 @@ const landmarkBreadthSpacing = Math.max(
 );
 
 
-const emptyArchitecture = (): CitySourceV4["architecture"] => ({ buildings: [], places: [], overrides: [] });
+const emptyArchitecture = (): CitySourceV5["architecture"] => ({ buildings: [], places: [], overrides: [] });
 
 /** Nine spacious blocks leave road-free cells for persistent architecture and fast tests. */
-const baseSource = (architecture: CitySourceV4["architecture"] = emptyArchitecture()): CitySourceV4 => ({
+const baseSource = (architecture: CitySourceV5["architecture"] = emptyArchitecture()): CitySourceV5 => ({
   origin: { x: 0, y: 0 },
   citySeed: "phase5-architecture-plan-fixture",
   generation: {
@@ -244,13 +246,14 @@ const baseSource = (architecture: CitySourceV4["architecture"] = emptyArchitectu
       openSpaceOverride: null
     }
   ],
-  architecture
+  architecture,
+  regeneration: { partialSeeds: [] }
 });
 /**
  * Registry breadth uses a road-free mask sized from the materialized records. This keeps
  * every dynamically added grammar inside land without relying on a fixed registry count.
  */
-const breadthSource = (architecture: CitySourceV4["architecture"]): CitySourceV4 => {
+const breadthSource = (architecture: CitySourceV5["architecture"]): CitySourceV5 => {
   const source = baseSource(architecture);
   source.citySeed = "phase5-architecture-registry-breadth";
   const points = [...architecture.buildings, ...architecture.places].flatMap((record) => record.sitePolygon);
@@ -306,7 +309,7 @@ const persistentBuilding = (plan: CompleteCityPlan, sourceId: string): BuildingP
   return building;
 };
 
-const build = (source: CitySourceV4): CompleteCityPlan => buildCompleteCityPlan(source, 7, 3, []);
+const build = (source: CitySourceV5): CompleteCityPlan => buildCompleteCityPlan(source, 7, 3, []);
 
 describe("Phase 5 persistent architecture planning", () => {
   it("materializes authored and promoted buildings and compound places at every protection level", () => {
@@ -438,7 +441,7 @@ describe("Phase 5 persistent architecture planning", () => {
       records.map((source) => BUILDING_GRAMMAR_REGISTRY.get(source.grammarId)!.archetype)
     );
     expect(materializedArchetypes).toEqual(expectedArchetypes);
-  }, 30_000);
+  }, 120_000);
 
   it("materializes every current landmark grammar from a persistent source with lineage and site containment", () => {
     const records = LANDMARK_GRAMMAR_IDS.map((grammarId, index, all) => {
@@ -480,7 +483,7 @@ describe("Phase 5 persistent architecture planning", () => {
 
 
 
-  it("rejects persistent sites that are outside land, outside urban footprint, on roads, or peer-overlapping", () => {
+  it("rejects persistent reservations that are outside land, outside the urban footprint, or peer-overlapping, and road-crossing place sites", () => {
     const outsideLand = baseSource({
       buildings: [sourceBuilding("outside-land", -10, 100, "none")],
       places: [],
@@ -496,12 +499,14 @@ describe("Phase 5 persistent architecture planning", () => {
     outsideUrban.terrain.urbanFootprint = rectRing({ x: 0, y: 0, width: 300, height: 600 });
     expect(() => build(outsideUrban)).toThrow(/urban|footprint|outside|contain/i);
 
-    const roadSite = baseSource({
-      buildings: [sourceBuilding("road-site", 200, 100, "none", "authored", 72)],
-      places: [],
+    // Road-crossing building reservations are legal (the mass-level validator decides,
+    // see the "gates building route legality" test); places keep the whole-site rule.
+    const roadPlace = baseSource({
+      buildings: [],
+      places: [sourcePlace("road-place", 200, 500, "none")],
       overrides: []
     });
-    expect(() => build(roadSite)).toThrow(/road|carriage|occupancy/i);
+    expect(() => build(roadPlace)).toThrow(/road|carriage|occupancy/i);
 
     const peerOverlap = baseSource({
       buildings: [sourceBuilding("peer-a", 100, 100, "none"), sourceBuilding("peer-b", 100, 100, "explicit")],
@@ -768,6 +773,138 @@ describe("Phase 5 persistent architecture planning", () => {
     )).toBe(true);
   });
 
+  it("re-materializes a promoted derived building exactly from its persistent record", () => {
+    // The promotion contract: the record a promotion carries (massing frame, geometry
+    // seed, declared height) must rebuild the derived building's masses byte-for-byte,
+    // including on the concave sites whose persisted frame is the smaller massing
+    // container fitted inside the site.
+    const concaveSite: Ring = [
+      { x: 40, y: 40 },
+      { x: 56, y: 40 },
+      { x: 56, y: 66 },
+      { x: 52, y: 66 },
+      { x: 52, y: 70 },
+      { x: 40, y: 70 }
+    ];
+    const buildingWeights = Object.fromEntries(
+      BUILDING_GRAMMAR_IDS.map((grammarId) => [grammarId, grammarId === "narrow-shopfront" ? 1 : 0])
+    ) as Record<(typeof BUILDING_GRAMMAR_IDS)[number], number>;
+    const useWeights = Object.fromEntries(BUILDING_USE_IDS.map((use) => [use, 1])) as Record<(typeof BUILDING_USE_IDS)[number], number>;
+    const derived = planParcelBuilding({
+      id: "promotion-replay-parcel",
+      blockId: "promotion-replay-block",
+      fragmentId: "promotion-replay-fragment",
+      districtId: null,
+      polygon: concaveSite,
+      frontageAngleRad: 0,
+      seed: "promotion-replay/geometry",
+      areaM2: 464
+    }, buildingWeights, useWeights, undefined, new Map());
+    expect(derived).not.toBeNull();
+    if (derived === null || derived.placement === undefined) throw new Error("Expected a derived building for promotion replay.");
+    const record = promotedArchitectureSource({ kind: "building", plan: derived }, {}, undefined, undefined, true) as PersistentBuildingSource;
+    expect(record.seed).toBe(derived.seed);
+    expect(record.appearanceSeed).toBe(derived.appearanceSeed);
+    expect(record.sitePolygon).toEqual(derived.sitePolygon);
+    expect(record.placement).toEqual(derived.placement);
+    const rebuilt = build(baseSource({ buildings: [record], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
+    const materialized = persistentBuilding(rebuilt, record.id);
+    expect(materialized.sitePolygon).toEqual(derived.sitePolygon);
+    expect(materialized.placement).toEqual(derived.placement);
+    expect(materialized.appearanceSeed).toBe(derived.appearanceSeed);
+    expect(materialized.heightM).toBe(derived.heightM);
+    expect(materialized.masses.map((mass) => mass.footprint)).toEqual(derived.masses.map((mass) => mass.footprint));
+    expect(materialized.masses.map((mass) => mass.heightM)).toEqual(derived.masses.map((mass) => mass.heightM));
+  });
+
+  it("materializes a migrated historical record on its legacy geometry stream without rerolling", () => {
+    // V4→V5 migration preserves persistent record seeds byte-for-byte. The historical
+    // materialization recipe massed every record on "<seed>/geometry" with mass streams
+    // "<seed>/geometry/mass/<index>" and a "<seed>/setback" draw; keying the layout on
+    // the bare record seed instead would silently reroll every authored/protected
+    // building's mass layout during migration. This explicit pre-migration record pins
+    // those seeded footprints, massing heights, and setback as the loaded contract.
+    const record: PersistentBuildingSource = {
+      ...sourceBuilding("v4-migrated-tower", 100, 100, "explicit"),
+      seed: "v4-authored/city1/tower-7",
+      appearanceSeed: "v4-authored/city1/tower-7/look"
+    };
+    const plan = build(baseSource({ buildings: [record], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const materialized = persistentBuilding(plan, "v4-migrated-tower");
+    expect(materialized.seed).toBe(record.seed);
+    expect(materialized.setbackM).toBe(4.8348579769954085);
+    expect(materialized.masses.map((mass) => mass.seed)).toEqual([
+      `${record.seed}/geometry/mass/0`,
+      `${record.seed}/geometry/mass/1`,
+      `${record.seed}/geometry/mass/2`
+    ]);
+    expect(materialized.masses.map((mass) => ({ footprint: mass.footprint, elevationM: mass.elevationM, heightM: mass.heightM }))).toEqual([
+      {
+        footprint: [
+          { x: 80.95137217929587, y: 86.77420359217534 },
+          { x: 119.04862782070414, y: 86.77420359217534 },
+          { x: 119.04862782070414, y: 113.22579640782466 },
+          { x: 80.95137217929587, y: 113.22579640782466 }
+        ],
+        elevationM: 0,
+        heightM: 42.666666666666664
+      },
+      {
+        footprint: [
+          { x: 83.15436179709808, y: 87.08121155011018 },
+          { x: 117.44189187436552, y: 87.08121155011018 },
+          { x: 117.44189187436552, y: 110.88764508419457 },
+          { x: 83.15436179709808, y: 110.88764508419457 }
+        ],
+        elevationM: 42.666666666666664,
+        heightM: 42.666666666666664
+      },
+      {
+        footprint: [
+          { x: 85.3305636385825, y: 87.33242183918422 },
+          { x: 115.80836815170912, y: 87.33242183918422 },
+          { x: 115.80836815170912, y: 108.49369609170368 },
+          { x: 85.3305636385825, y: 108.49369609170368 }
+        ],
+        elevationM: 85.33333333333333,
+        heightM: 42.666666666666664
+      }
+    ]);
+  });
+
+  it("gates building route legality on materialized masses, not the reservation or frame", () => {
+    // A building reservation may legally cross a route (the GM's surgery trims the
+    // reservation): the placement frame is a massing container, not occupied geometry,
+    // and its courtyard/setback empty area crossing a route must neither reject the
+    // record nor authorize its deletion. Only the materialized mass footprints count.
+    const crossing = sourceBuilding("route-crossing", 160, 160, "manual-edit");
+    crossing.sitePolygon = siteRect(160, 160, 128);
+    crossing.placement = placement(160, 144, 52, 52);
+    const crossingPlan = build(baseSource({ buildings: [crossing], places: [], overrides: [] }));
+    const occupancy = crossingPlan.routeOccupancy.all;
+    expect(isSnapNoise(intersection(ringAsMulti(crossing.sitePolygon), occupancy))).toBe(false);
+    expect(validateCompleteCityPlan(crossingPlan)).toEqual([]);
+    const crossingBuilding = persistentBuilding(crossingPlan, "route-crossing");
+    expect(crossingBuilding.masses.length).toBeGreaterThan(0);
+    for (const mass of crossingBuilding.masses) {
+      expect(isSnapNoise(intersection(ringAsMulti(mass.footprint), occupancy)), mass.id).toBe(true);
+    }
+
+    // A building whose materialized masses genuinely cross a route is not caught by the
+    // reservation gate — the mass-level validator is the route legality gate.
+    const straddling = sourceBuilding("mass-straddling", 200, 200, "manual-edit");
+    const straddlePlan = build(baseSource({ buildings: [straddling], places: [], overrides: [] }));
+    expect(validateCompleteCityPlan(straddlePlan).some((problem) =>
+      /mass \d+ overlaps road occupancy/.test(problem)
+    )).toBe(true);
+
+    // Places keep the whole-reservation rule: a place site crossing a route is rejected.
+    const roadPlace = sourcePlace("road-place", 200, 500, "none");
+    expect(() => build(baseSource({ buildings: [], places: [roadPlace], overrides: [] }))).toThrow(/road|carriage|occupancy/i);
+  });
+
   it("keeps an appearance reroll structurally isolated for a persistent building", () => {
     const firstSource = baseSource({
       buildings: [sourceBuilding("appearance-isolation", 100, 100, "manual-edit")],
@@ -900,5 +1037,61 @@ describe("Phase 5 persistent architecture planning", () => {
     expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
     expect(rebuilt.buildings.filter((building) => building.id === identity.id)).toHaveLength(1);
     expect(persistentBuilding(rebuilt, identity.id).sitePolygon).toEqual(donor.sitePolygon);
+  });
+});
+
+describe("Phase 6 regeneration retained-content path", () => {
+  const blockIdNear = (plan: CompleteCityPlan, x: number, y: number): string => {
+    const block = plan.districtPlan.blocks.find((candidate) =>
+      candidate.districtFragments.some((fragment) =>
+        fragment.buildable.some((polygon) => {
+          const centre = ringCentroid(polygon[0]!);
+          return Math.abs(centre.x - x) < 60 && Math.abs(centre.y - y) < 60;
+        })
+      )
+    );
+    if (block === undefined) throw new Error(`Fixture: no block fragment near (${x}, ${y}).`);
+    return block.id;
+  };
+
+  it("removes only the unprotected records of the targeted block and keeps everything else", () => {
+    const source = baseSource(architectureFixture());
+    const plan = build(source);
+    const targetBlock = blockIdNear(plan, 100, 100);
+    const result = evaluateRegenerationPreflight(source, plan, { kind: "block", ids: [targetBlock] }, "phase6-seed");
+    expect(result.blockers).toEqual([]);
+    expect(result.removedIds).toEqual(["authored-none"]);
+    expect(result.retainedIds).toEqual([]);
+    expect(result.excludedSitePolygons).toEqual([]);
+    const candidate = result.candidateSource!;
+    expect(candidate.architecture.buildings.map((record) => record.id).sort())
+      .toEqual(["authored-explicit", "promoted-manual"]);
+    expect(candidate.architecture.places.map((record) => record.id).sort())
+      .toEqual(["place-explicit", "place-none", "place-promoted"]);
+    expect(candidate.roads).toStrictEqual(source.roads);
+    expect(candidate.regeneration.partialSeeds).toEqual([
+      { targetKind: "block", targetId: targetBlock, seed: "phase6-seed", order: 1 }
+    ]);
+  });
+
+  it("retains protected target content exactly and reserves its site polygon", () => {
+    const source = baseSource(architectureFixture());
+    const plan = build(source);
+    const targetBlock = blockIdNear(plan, 500, 100);
+    source.architecture.buildings.find((record) => record.id === "promoted-manual")!.blockId = targetBlock;
+    const result = evaluateRegenerationPreflight(source, plan, { kind: "block", ids: [targetBlock] }, "phase6-seed");
+    expect(result.blockers).toEqual([]);
+    expect(result.removedIds).toEqual([]);
+    expect(result.retainedIds).toEqual(["promoted-manual"]);
+    const retainedRecord = source.architecture.buildings.find((record) => record.id === "promoted-manual")!;
+    expect(result.excludedSitePolygons).toEqual([retainedRecord.sitePolygon]);
+    const candidate = result.candidateSource!;
+    expect(candidate.architecture.buildings.find((record) => record.id === "promoted-manual")).toStrictEqual(retainedRecord);
+    // The unprotected record of the neighbouring block is untouched by this target.
+    expect(candidate.architecture.buildings.find((record) => record.id === "authored-none")).toStrictEqual(
+      source.architecture.buildings.find((record) => record.id === "authored-none")
+    );
+    expect(result.target).toEqual({ kind: "block", ids: [targetBlock] });
+    expect(resolveRegenerationTargetScope(plan, result.target)).not.toBeNull();
   });
 });

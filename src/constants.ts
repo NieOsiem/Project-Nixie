@@ -5,13 +5,13 @@ export const FLAG_CITY = "city";
 export const FLAG_GENERATED = "generated";
 
 /** City Generator 2.0 schema version. Independent from the generator algorithm version. */
-export const CITY_SCHEMA_VERSION = 4;
+export const CITY_SCHEMA_VERSION = 5;
 
 /**
  * Identifies the generation algorithm. Never change the output of an existing version —
  * bump this instead, so an in-progress campaign's city survives a module update.
  */
-export const GENERATOR_VERSION = 12;
+export const GENERATOR_VERSION = 13;
 
 /**
  * Weather presets. Stored strings, so renaming one strands an existing scene's setting.

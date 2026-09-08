@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { rectRing } from "../geom/types.js";
+import type { CitySourceV5 } from "./city.js";
 import {
   assertCompleteCityPlanCacheIdentity,
   CompleteCityPlanCacheArtifactError,
@@ -7,14 +9,16 @@ import {
 } from "./complete-city-plan-cache.js";
 import type { CompleteCityPlan } from "./complete-city-plan.js";
 import type { StructuralInputSignature } from "./district-plan.js";
+import { districtStructuralInputSignature } from "./district-plan.js";
 const STRUCTURAL_INPUT: StructuralInputSignature = {
   terrain: "terrain-signature",
   roads: "roads-signature",
   districts: "districts-signature",
   generation: "generation-signature",
   architecture: "architecture-signature",
-  schemaVersion: 4,
-  generatorVersion: 12
+  regeneration: "regeneration-signature",
+  schemaVersion: 5,
+  generatorVersion: 13
 };
 
 function smallPlan(): CompleteCityPlan {
@@ -116,6 +120,14 @@ describe("complete city plan cache codec", () => {
 
     expectArtifactError(() => decodeCompleteCityPlan(jsonBytes(legacy)));
   });
+  it("rejects a schema-4 plan artifact as a safe cache miss", () => {
+    const schema4Artifact = structuredClone(smallPlan());
+    const structuralInput = schema4Artifact.structuralInput as unknown as Record<string, unknown>;
+    structuralInput.schemaVersion = 4;
+    structuralInput.generatorVersion = 12;
+
+    expectArtifactError(() => decodeCompleteCityPlan(jsonBytes(schema4Artifact)));
+  });
   it("accepts an exact stable identity without comparing transient fields", () => {
     const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
     const expected = {
@@ -134,7 +146,7 @@ describe("complete city plan cache codec", () => {
     }));
   });
 
-  it.each(["terrain", "roads", "districts", "generation", "architecture"] as const)(
+  it.each(["terrain", "roads", "districts", "generation", "architecture", "regeneration"] as const)(
     "rejects a %s structural-signature mismatch",
     (field) => {
       const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
@@ -149,6 +161,34 @@ describe("complete city plan cache codec", () => {
       }));
     }
   );
+
+  const SIGNATURE_SOURCE: CitySourceV5 = {
+    origin: { x: 0, y: 0 },
+    citySeed: "cache-signature-fixture",
+    generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [], openSpaceProfile: "none" },
+    terrain: { land: rectRing({ x: 0, y: 0, width: 10, height: 10 }), urbanFootprint: null },
+    roads: { nodes: [], routes: [], edges: [] },
+    districts: [],
+    architecture: { buildings: [], places: [], overrides: [] },
+    regeneration: { partialSeeds: [{ targetKind: "district", targetId: "district-a", seed: "seed-a", order: 1 }] }
+  };
+
+  it("changes the semantic signature when partial seeds change, so equal-revision stale artifacts miss", () => {
+    const before = districtStructuralInputSignature(SIGNATURE_SOURCE);
+    const after = districtStructuralInputSignature({
+      ...SIGNATURE_SOURCE,
+      regeneration: { partialSeeds: [{ targetKind: "district", targetId: "district-a", seed: "seed-b", order: 1 }] }
+    });
+    // A partial-seed edit changes exactly the regeneration component of the identity.
+    expect(after.regeneration).not.toBe(before.regeneration);
+    expect({ ...after, regeneration: before.regeneration }).toEqual(before);
+
+    const decoded = decodeCompleteCityPlan(encodeCompleteCityPlan(smallPlan()));
+    expectArtifactError(() => assertCompleteCityPlanCacheIdentity(decoded, {
+      sourceRevision: decoded.sourceRevision,
+      structuralInput: { ...decoded.structuralInput, regeneration: after.regeneration }
+    }));
+  });
 
   it.each([
     ["schemaVersion", (value: StructuralInputSignature): StructuralInputSignature => ({

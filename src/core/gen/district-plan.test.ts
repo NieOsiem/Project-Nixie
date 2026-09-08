@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { validateRouteTopology } from "../graph/topology.js";
 import { intersection, ringAsMulti } from "../geom/boolean.js";
 import { rectRing, ringArea, ringCentroid, type Ring } from "../geom/types.js";
-import type { CitySourceV4, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
-import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, splitSimpleFaceCycles, type DistrictBlockFragment } from "./district-plan.js";
+import type { CitySourceV5, DistrictOpenSpaceOverride, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
+import { buildDistrictPlan, planDistrictFragmentWithGrammar, OPEN_SPACE_PROFILE_CATEGORY_GATES, splitSimpleFaceCycles, type DerivedBlock, type DistrictBlockFragment } from "./district-plan.js";
 import { BLOCK_GRAMMAR_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictPlanningBounds } from "./district-registry.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 import { validateRing } from "./terrain.js";
@@ -12,7 +12,7 @@ const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y }
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
 const edge = (id: string, a: string, b: string, routeId: string, classId: RoadEdgeSource["classId"] = "street"): RoadEdgeSource => ({ id, a, b, routeId, classId, name: null, locked: false, origin: "authored" });
 
-const gridSource = (): CitySourceV4 => ({
+const gridSource = (): CitySourceV5 => ({
   origin: { x: 700, y: 300 },
   citySeed: "district-plan-fixture",
   generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
@@ -23,7 +23,7 @@ const gridSource = (): CitySourceV4 => ({
     edges: [edge("north", "n", "c", "vertical"), edge("west", "w", "c", "horizontal"), edge("east", "c", "e", "horizontal"), edge("south", "c", "s", "vertical")]
   },
   districts: [],
-  architecture: { buildings: [], places: [], overrides: [] }
+  architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
 });
 
 const override = (rate = 0.4): DistrictOpenSpaceOverride => ({
@@ -258,6 +258,22 @@ describe("buildDistrictPlan", () => {
     expect(after.blocks).toHaveLength(5);
     expect(after.blocks.map((block) => block.id).filter((id) => beforeIds.has(id))).toEqual(["block_22a1a0cc", "block_4b41ea78", "block_c618de54"]);
     expect(after.blocks.some((block) => block.id === "block_77873fa4")).toBe(false);
+    // Unchanged faces keep their whole block record — id, face, buildable geometry, and
+    // boundary roads — so persisted block lineages survive local topology edits exactly.
+    // Only faces whose id survived the edit are genuinely unaffected; the removed face
+    // (block_77873fa4) is not expected to persist.
+    const unaffectedIds = new Set(after.blocks.map((block) => block.id).filter((id) => beforeIds.has(id)));
+    const afterById: Record<string, DerivedBlock> = Object.fromEntries(after.blocks.map((block) => [block.id, block]));
+    for (const beforeBlock of before.blocks) {
+      if (!unaffectedIds.has(beforeBlock.id)) continue;
+      expect(afterById[beforeBlock.id]).toEqual(beforeBlock);
+    }
+    // Fragment identities embedded in cells and seed records stay stable for the genuinely
+    // unaffected blocks — the removed face contributes fragments only to `before`, so it
+    // must be excluded from both sides of the stability comparison.
+    const fragmentIds = (blocks: DerivedBlock[]): string[] =>
+      blocks.filter((block) => unaffectedIds.has(block.id)).flatMap((block) => block.districtFragments.map((fragment) => fragment.id)).sort();
+    expect(fragmentIds(after.blocks)).toEqual(fragmentIds(before.blocks));
     const permuted = buildDistrictPlan({ ...source, roads: { nodes: [...source.roads.nodes].reverse(), routes: [...source.roads.routes].reverse(), edges: [...source.roads.edges].reverse() } });
     expect(permuted.blocks).toEqual(after.blocks);
   });

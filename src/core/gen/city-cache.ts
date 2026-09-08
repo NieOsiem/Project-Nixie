@@ -2,7 +2,7 @@ import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import type { StructuralInputSignature } from "./district-plan.js";
 
 export const CITY_CACHE_SCHEMA_VERSION = 1;
-export const PLAN_CACHE_FORMAT_VERSION = 2;
+export const PLAN_CACHE_FORMAT_VERSION = 3;
 export const CHUNK_CACHE_FORMAT_VERSION = 1;
 export const CITY_CACHE_FLAG = "city-cache";
 
@@ -123,12 +123,12 @@ function validateStructuralInput(value: unknown, problems: string[]): void {
   const signature = exactRecord(
     value,
     "Cache manifest structuralInput",
-    ["terrain", "roads", "districts", "generation", "architecture", "schemaVersion", "generatorVersion"],
+    ["terrain", "roads", "districts", "generation", "architecture", "regeneration", "schemaVersion", "generatorVersion"],
     [],
     problems
   );
   if (!signature) return;
-  for (const key of ["terrain", "roads", "districts", "generation", "architecture"] as const) {
+  for (const key of ["terrain", "roads", "districts", "generation", "architecture", "regeneration"] as const) {
     if (!nonEmptyText(signature[key])) problems.push(`Cache manifest structuralInput.${key} must be non-empty text.`);
   }
   if (signature.schemaVersion !== CITY_SCHEMA_VERSION) {

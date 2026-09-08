@@ -7,9 +7,9 @@ import {
 } from "./terrain-session.js";
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV4 } from "../core/gen/city.js";
+import type { CityStateV5 } from "../core/gen/city.js";
 
-function state(revision: number, seed = "session-seed"): CityStateV4 {
+function state(revision: number, seed = "session-seed"): CityStateV5 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -92,12 +92,13 @@ function state(revision: number, seed = "session-seed"): CityStateV4 {
           appearanceSeed: "override-appearance-seed",
           paletteId: "corporate"
         }]
-      }
+      },
+      regeneration: { partialSeeds: [] }
     }
   };
 }
 
-function supported(value: CityStateV4): CityLoadResult {
+function supported(value: CityStateV5): CityLoadResult {
   return { kind: "supported", state: value };
 }
 

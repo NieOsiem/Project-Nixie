@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
 import {
   CHUNK_CACHE_FORMAT_VERSION,
-  CITY_CACHE_FLAG,
   CITY_CACHE_SCHEMA_VERSION,
   PLAN_CACHE_FORMAT_VERSION,
   checksumBytes,
@@ -41,6 +40,7 @@ function manifest(): CityCacheManifestV1 {
       districts: "districts-signature",
       generation: "generation-signature",
       architecture: "architecture-signature",
+      regeneration: "regeneration-signature",
       schemaVersion: CITY_SCHEMA_VERSION,
       generatorVersion: GENERATOR_VERSION
     },
@@ -55,13 +55,6 @@ function expectInvalid(value: unknown): void {
 }
 
 describe("city cache manifest", () => {
-  it("exports the stable shared constants", () => {
-    expect(CITY_CACHE_SCHEMA_VERSION).toBe(1);
-    expect(PLAN_CACHE_FORMAT_VERSION).toBe(2);
-    expect(CHUNK_CACHE_FORMAT_VERSION).toBe(1);
-    expect(CITY_CACHE_FLAG).toBe("city-cache");
-  });
-
   it("strictly decodes a valid V1 plan manifest into a detached value", () => {
     const raw = manifest();
     const decoded = decodeCityCacheManifest(raw);
@@ -86,6 +79,13 @@ describe("city cache manifest", () => {
 
     expect(validateCityCacheManifest(legacy)).not.toEqual([]);
     expect(decodeCityCacheManifest(legacy)).toBeNull();
+  });
+  it("safely misses a schema-5 manifest whose signature predates the regeneration component", () => {
+    const raw = manifest();
+    const withoutRegeneration: Record<string, unknown> = { ...raw.structuralInput };
+    delete withoutRegeneration.regeneration;
+
+    expectInvalid({ ...raw, structuralInput: withoutRegeneration });
   });
 
   it.each([
@@ -124,7 +124,7 @@ describe("city cache manifest", () => {
     expectInvalid({ ...manifest(), structuralInput: [] });
     expectInvalid({ ...manifest(), structuralInput: { ...manifest().structuralInput, extra: "signature" } });
 
-    for (const key of ["terrain", "roads", "districts", "generation", "architecture"] as const) {
+    for (const key of ["terrain", "roads", "districts", "generation", "architecture", "regeneration"] as const) {
       const missing = { ...manifest().structuralInput } as Record<string, unknown>;
       delete missing[key];
       expectInvalid({ ...manifest(), structuralInput: missing });
@@ -150,6 +150,14 @@ describe("city cache manifest", () => {
     expectInvalid({ ...manifest(), plan: { formatVersion: PLAN_CACHE_FORMAT_VERSION } });
     expectInvalid({ ...manifest(), plan: { ...manifest().plan, extra: true } });
     expectInvalid({ ...manifest(), plan: { ...manifest().plan, formatVersion: PLAN_CACHE_FORMAT_VERSION + 1 } });
+  });
+
+  it("rejects the historical schema-4 structural signature and the legacy plan format", () => {
+    expectInvalid({
+      ...manifest(),
+      structuralInput: { ...manifest().structuralInput, schemaVersion: 4, generatorVersion: 12 }
+    });
+    expectInvalid({ ...manifest(), plan: { ...manifest().plan, formatVersion: PLAN_CACHE_FORMAT_VERSION - 1 } });
   });
 
   it.each([

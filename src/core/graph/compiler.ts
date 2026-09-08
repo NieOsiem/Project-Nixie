@@ -1,4 +1,4 @@
-import type { Vec2 } from "../geom/types.js";
+import type { Ring, Vec2 } from "../geom/types.js";
 import {
   ROUTE_CLASS_REGISTRY,
   type RoadEdgeSource,
@@ -12,6 +12,35 @@ import {
 export const CONNECTION_TOLERANCE_M = 1;
 export const TOPOLOGY_EPSILON_M = 0.001;
 export const CURVE_CHORD_TOLERANCE_M = 0.1;
+
+/** Below this length a corridor quad is degenerate and contributes no occupancy. */
+const CORRIDOR_MIN_LENGTH_M = 1e-6;
+
+/**
+ * Canonical per-edge corridor half width: vehicle routes reserve their full clearance
+ * (carriageway half plus sidewalk), non-vehicle routes their paved half width. The single
+ * source of truth consumed by whole-plan occupancy and per-edge conflict analysis alike.
+ */
+export const spanCorridorHalfWidthM = (span: CompiledSpan): number => (span.vehicle ? span.clearanceM : span.widthM / 2);
+
+/** Canonical road corridor rectangle for a span or any of its chord extensions. */
+export function corridorQuad(a: Vec2, b: Vec2, halfWidth: number): Ring {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const length = Math.hypot(dx, dy);
+  if (length <= CORRIDOR_MIN_LENGTH_M || halfWidth <= 0) return [];
+  const nx = (-dy / length) * halfWidth;
+  const ny = (dx / length) * halfWidth;
+  return [{ x: a.x + nx, y: a.y + ny }, { x: b.x + nx, y: b.y + ny }, { x: b.x - nx, y: b.y - ny }, { x: a.x - nx, y: a.y - ny }];
+}
+
+/** Canonical junction end-cap disc: 24 segments, matching the occupancy unions. */
+export function corridorDisc(center: Vec2, radius: number): Ring {
+  return Array.from({ length: 24 }, (_, index) => {
+    const angle = (index / 24) * Math.PI * 2;
+    return { x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius };
+  });
+}
 
 export interface CompiledSpan {
   id: string;

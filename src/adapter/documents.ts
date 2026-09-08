@@ -15,8 +15,10 @@ import {
   type ArchitectureProtection,
   type CitySourceV3,
   type CitySourceV4,
+  type CitySourceV5,
   type CityStateV3,
   type CityStateV4,
+  type CityStateV5,
   type DistrictOpenSpaceOverride,
   type DistrictSource,
   type OpenSpaceCategory,
@@ -24,7 +26,10 @@ import {
   type PersistentBuildingSource,
   type PersistentPlaceSource,
   type PlacementFrame,
-  validateCityStateV4
+  type RegenerationPartialSeedRecord,
+  validateCityStateV4,
+  validateCityStateV5,
+  validateRegenerationPartialSeedRecords
 } from "../core/gen/city.js";
 import { validateCitySourceV3 } from "../core/gen/city.js";
 import type { BuildingGrammarId, BuildingUseId } from "../core/gen/building-registry.js";
@@ -36,7 +41,7 @@ import { validateRouteTopology } from "../core/graph/topology.js";
 export type CityLoadResult =
   | { kind: "absent" }
   | { kind: "legacy"; raw: unknown }
-  | { kind: "supported"; state: CityStateV4; raw?: unknown }
+  | { kind: "supported"; state: CityStateV5; raw?: unknown }
   | {
       kind: "obsolete-precomplete";
       raw: unknown;
@@ -457,6 +462,29 @@ function decodeArchitecture(value: unknown): CitySourceV4["architecture"] | null
   };
 }
 
+function decodePartialSeedRecord(value: unknown): RegenerationPartialSeedRecord | null {
+  if (!isRecord(value) || !has(value, "targetKind") || !has(value, "targetId") || !has(value, "seed") || !has(value, "order")) return null;
+  const targetKind = value.targetKind;
+  if (targetKind !== "district" && targetKind !== "block") return null;
+  if (!nonEmptyText(value.targetId) || !nonEmptyText(value.seed)) return null;
+  if (typeof value.order !== "number" || !Number.isSafeInteger(value.order) || value.order < 1) return null;
+  return { targetKind, targetId: value.targetId, seed: value.seed, order: value.order };
+}
+
+function decodeRegeneration(value: unknown): CitySourceV5["regeneration"] | null {
+  if (!isRecord(value) || !has(value, "partialSeeds") || !Array.isArray(value.partialSeeds)) return null;
+  const records: RegenerationPartialSeedRecord[] = [];
+  for (const raw of value.partialSeeds) {
+    const record = decodePartialSeedRecord(raw);
+    if (record === null) return null;
+    records.push(record);
+  }
+  // WHY: records are append-only in stored order with unique (targetKind, targetId) and
+  // strictly increasing positive orders; refuse stored states that violate the invariant.
+  if (validateRegenerationPartialSeedRecords(records).length > 0) return null;
+  return { partialSeeds: records };
+}
+
 function decodeV3Generation(value: unknown): CitySourceV3["generation"] | null {
   if (!isRecord(value) || !has(value, "terrainMode") || !has(value, "coastEdge") || !has(value, "roadLayout") || !has(value, "hubMode") || !has(value, "districtPool") || !has(value, "openSpaceProfile")) return null;
   const mode = value.terrainMode;
@@ -498,7 +526,8 @@ function decodeV3Source(value: unknown): CitySourceV3 | null {
   };
 }
 function decodeV4Source(value: unknown): CitySourceV4 | null {
-  if (!isRecord(value)) return null;
+  // WHY: a regeneration branch cannot exist in a genuine schema-4 source; accepting it here would silently drop its data during migration.
+  if (!isRecord(value) || has(value, "regeneration")) return null;
   const sourceProblems = validateCityStateV4({
     kind: "city-generator-2",
     schemaVersion: 4,
@@ -530,6 +559,39 @@ export function migrateCityStateV3ToV4(stateV3: CityStateV3): CityStateV4 {
   };
 }
 
+export function migrateCityStateV4ToV5(stateV4: CityStateV4): CityStateV5 {
+  return {
+    kind: "city-generator-2",
+    schemaVersion: 5,
+    generatorVersion: 13,
+    revision: stateV4.revision,
+    source: {
+      ...stateV4.source,
+      regeneration: {
+        partialSeeds: []
+      }
+    }
+  };
+}
+
+function decodeV5Source(value: unknown): CitySourceV5 | null {
+  if (!isRecord(value)) return null;
+  const sourceProblems = validateCityStateV5({
+    kind: "city-generator-2",
+    schemaVersion: 5,
+    generatorVersion: 13,
+    revision: 1,
+    source: value
+  });
+  if (sourceProblems.length > 0) return null;
+  const source = decodeV3Source(value);
+  if (source === null || !has(value, "architecture") || !has(value, "regeneration")) return null;
+  const architecture = decodeArchitecture(value.architecture);
+  const regeneration = decodeRegeneration(value.regeneration);
+  if (architecture === null || regeneration === null) return null;
+  return { ...source, architecture, regeneration };
+}
+
 function decodeV3Supported(raw: unknown): { state: CityStateV3 } | { reason: string } {
   if (!isRecord(raw)) return { reason: "state is not an object" };
   if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
@@ -558,7 +620,33 @@ function decodeV3Supported(raw: unknown): { state: CityStateV3 } | { reason: str
   };
 }
 
-function decodeSupported(raw: unknown): { state: CityStateV4 } | { reason: string } {
+function decodeV4Supported(raw: unknown): { state: CityStateV4 } | { reason: string } {
+  if (!isRecord(raw)) return { reason: "state is not an object" };
+  if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
+  if (raw.schemaVersion !== 4) return { reason: "invalid schema version" };
+  if (raw.generatorVersion !== 12) return { reason: "unsupported generator version" };
+  if (!has(raw, "revision") || !positiveInteger(raw.revision)) return { reason: "invalid city revision" };
+  if (!has(raw, "source")) return { reason: "missing city source" };
+  const source = decodeV4Source(raw.source);
+  if (source === null) return { reason: "invalid city source" };
+  try {
+    const topology = validateRouteTopology(source.roads);
+    if (!topology.ok) return { reason: topology.problems.join(" ") };
+  } catch (error) {
+    return { reason: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    state: {
+      kind: "city-generator-2",
+      schemaVersion: 4,
+      generatorVersion: 12,
+      revision: raw.revision,
+      source
+    }
+  };
+}
+
+function decodeSupported(raw: unknown): { state: CityStateV5 } | { reason: string } {
   if (!isRecord(raw)) return { reason: "state is not an object" };
   if (!has(raw, "kind") || raw.kind !== "city-generator-2") return { reason: "invalid city kind" };
   if (!has(raw, "schemaVersion") || raw.schemaVersion !== CITY_SCHEMA_VERSION) return { reason: "invalid schema version" };
@@ -566,16 +654,16 @@ function decodeSupported(raw: unknown): { state: CityStateV4 } | { reason: strin
   if (raw.generatorVersion !== GENERATOR_VERSION) return { reason: "unsupported generator version" };
   if (!has(raw, "revision") || !positiveInteger(raw.revision)) return { reason: "invalid city revision" };
   if (!has(raw, "source")) return { reason: "missing city source" };
-  const source = decodeV4Source(raw.source);
+  const source = decodeV5Source(raw.source);
   if (source === null) return { reason: "invalid city source" };
-  const state: CityStateV4 = {
+  const state: CityStateV5 = {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
     generatorVersion: GENERATOR_VERSION,
     revision: raw.revision,
     source
   };
-  const problems = validateCityStateV4(state);
+  const problems = validateCityStateV5(state);
   if (problems.length > 0) return { reason: problems.join(" ") };
   try {
     const topology = validateRouteTopology(source.roads);
@@ -587,8 +675,9 @@ function decodeSupported(raw: unknown): { state: CityStateV4 } | { reason: strin
 }
 
 // WHY: Schema 1/gen 8, schema 2/gen 9, and schema 3/gen 10 are known pre-complete
-// generations. They remain read-only; schema 3/gen 11 is the sole migration input.
-// Migration is in-memory and never writes the Scene until a later guarded edit.
+// generations. They remain read-only; schema 3/gen 11 and schema 4/gen 12 are the
+// migration inputs, chained in memory (3→4→5). Migration never writes the Scene
+// until a later guarded edit.
 const OBSOLETE_PRECOMPLETE_GENERATOR: Record<number, number> = {
   1: 8,
   2: 9,
@@ -624,7 +713,13 @@ function classify(raw: unknown): CityLoadResult {
   if (schema === 3 && generator === 11) {
     const decoded = decodeV3Supported(raw);
     return "state" in decoded
-      ? { kind: "supported", state: migrateCityStateV3ToV4(decoded.state), raw }
+      ? { kind: "supported", state: migrateCityStateV4ToV5(migrateCityStateV3ToV4(decoded.state)), raw }
+      : { kind: "malformed", raw, reason: decoded.reason };
+  }
+  if (schema === 4 && generator === 12) {
+    const decoded = decodeV4Supported(raw);
+    return "state" in decoded
+      ? { kind: "supported", state: migrateCityStateV4ToV5(decoded.state), raw }
       : { kind: "malformed", raw, reason: decoded.reason };
   }
   if (schema !== CITY_SCHEMA_VERSION) {
@@ -657,7 +752,7 @@ export function loadCityState(): CityLoadResult {
   return classify(canvas?.scene?.getFlag(MODULE_ID, FLAG_CITY));
 }
 
-function validateCandidate(candidate: CityStateV4): CityStateV4 {
+function validateCandidate(candidate: CityStateV5): CityStateV5 {
   const decoded = decodeSupported(candidate);
   if (!("state" in decoded)) throw new Error(`Invalid City Generator 2.0 state: ${decoded.reason}`);
   if (decoded.state.generatorVersion !== GENERATOR_VERSION) {
@@ -667,9 +762,9 @@ function validateCandidate(candidate: CityStateV4): CityStateV4 {
 }
 
 export async function saveCityState(
-  candidate: CityStateV4,
+  candidate: CityStateV5,
   expectation: SaveExpectation
-): Promise<CityStateV4> {
+): Promise<CityStateV5> {
   requireGM();
   const state = validateCandidate(candidate);
   const scene = requireScene();

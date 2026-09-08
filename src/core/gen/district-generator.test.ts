@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { rectRing, type Ring } from "../geom/types.js";
-import type { CitySourceV4, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
+import type { CitySourceV5, DistrictSource, RoadEdgeSource, RoadNodeSource, RoadRouteSource } from "./city.js";
 import { assignLandmarkCompatibleDistrictTypes, districtGenerationAvailability, districtRegionContext, generateInitialDistricts, resolveGeneratedRegions } from "./district-generator.js";
 import { buildDistrictPlan, type DerivedBlock } from "./district-plan.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "./district-registry.js";
@@ -12,7 +12,7 @@ const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y }
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
 const edge = (id: string, a: string, b: string, routeId: string): RoadEdgeSource => ({ id, a, b, routeId, classId: "street", name: null, locked: false, origin: "authored" });
 
-const source = (): CitySourceV4 => ({
+const source = (): CitySourceV5 => ({
   origin: { x: 0, y: 0 },
   citySeed: "district-generation",
   generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "multiple-hubs", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
@@ -23,7 +23,7 @@ const source = (): CitySourceV4 => ({
     edges: [edge("n", "n", "c", "v"), edge("w", "w", "c", "h"), edge("e", "c", "e", "h"), edge("s", "c", "s", "v")]
   },
   districts: [],
-  architecture: { buildings: [], places: [], overrides: [] }
+  architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
 });
 
 describe("initial district generation", () => {
@@ -59,7 +59,7 @@ describe("initial district generation", () => {
         ...original.generation,
         terrainMode: "coastal" as const,
         coastEdge: "north" as const,
-        districtPool: ["corporate-core", "heavy-industrial", "waterfront"] as CitySourceV4["generation"]["districtPool"]
+        districtPool: ["corporate-core", "heavy-industrial", "waterfront"] as CitySourceV5["generation"]["districtPool"]
       }
     };
     const generated = generateInitialDistricts(coastal);
@@ -127,14 +127,14 @@ describe("initial district generation", () => {
     const land = rectRing(bounds);
     const citySeed = "phase2-organic-european";
     const roads = generateInitialRoadNetwork({ citySeed, mask: land, land, layout: "european", hubMode: "multiple-hubs", sceneBounds: bounds }).roads;
-    const european: CitySourceV4 = {
+    const european: CitySourceV5 = {
       origin: { x: 0, y: 0 },
       citySeed,
       generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "european", hubMode: "multiple-hubs", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
       terrain: { land, urbanFootprint: null },
       roads,
       districts: [],
-      architecture: { buildings: [], places: [], overrides: [] }
+      architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
     };
     const first = generateInitialDistricts(european);
     expect(generateInitialDistricts(european)).toEqual(first);
@@ -148,14 +148,14 @@ describe("initial district generation", () => {
   it("plans the representative 83-block fixture with the complete 16-type pool and coherent hierarchy", () => {
     const land = rectRing({ x: 0, y: 0, width: 1_000, height: 1_000 });
     const roads = generateInitialRoadNetwork({ citySeed: "phase3-acceptance-1400m", mask: land, land, layout: "grid", hubMode: "single-centre" }).roads;
-    const representative: CitySourceV4 = {
+    const representative: CitySourceV5 = {
       origin: { x: 12_000, y: 9_000 },
       citySeed: "phase3-acceptance-1400m",
       generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "medium" },
       terrain: { land, urbanFootprint: null },
       roads,
       districts: [],
-      architecture: { buildings: [], places: [], overrides: [] }
+      architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
     };
     const districts = generateInitialDistricts(representative);
     const plan = buildDistrictPlan({ ...representative, districts });

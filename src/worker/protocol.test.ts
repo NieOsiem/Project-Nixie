@@ -30,13 +30,13 @@ import {
   type WorkerRequest,
   type WorkerSuccess
 } from "./protocol.js";
-import type { CitySourceV2 as CitySourceV2Roads, CitySourceV4 } from "../core/gen/city.js";
-import { validateCitySourceV4 } from "../core/gen/city.js";
+import type { CitySourceV2 as CitySourceV2Roads, CitySourceV5 } from "../core/gen/city.js";
+import { validateCitySourceV5 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictCompatibilityTag } from "../core/gen/district-registry.js";
 import { LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarId } from "../core/gen/landmark-registry.js";
-import { buildDistrictPlan } from "../core/gen/district-plan.js";
+import { buildDistrictPlan, districtStructuralInputSignature } from "../core/gen/district-plan.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "../core/gen/district-generator.js";
-import { buildCompleteCityPlan, reserveMajorLandmarkSites, validateCompleteCityPlan } from "../core/gen/complete-city-plan.js";
+import { buildCompleteCityPlan, completeCityStructuralInput, reserveMajorLandmarkSites, validateCompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import type { ChunkKey } from "../core/gen/chunks.js";
 import {
   buildCompleteCityChunks,
@@ -82,7 +82,7 @@ const CITY_SOURCE: CitySourceV2Roads = {
   }
 };
 
-const DISTRICT_SOURCE: CitySourceV4 = {
+const DISTRICT_SOURCE: CitySourceV5 = {
   origin: { x: 5000, y: 4000 },
   citySeed: "protocol-district-fixture",
   generation: {
@@ -92,14 +92,14 @@ const DISTRICT_SOURCE: CitySourceV4 = {
   terrain: { land: rectangleLand({ x: -96, y: -96, width: 192, height: 192 }), urbanFootprint: null },
   roads: structuredClone(CITY_SOURCE.roads),
   districts: [],
-  architecture: { buildings: [], places: [], overrides: [] }
+  architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
 };
 
 /**
  * A 200×200 grid-cross city with two district halves — the canonical small fixture that
  * validates as a complete plan (landmarks skip because the reserved sites are too small).
  */
-const COMPLETE_SOURCE: CitySourceV4 = {
+const COMPLETE_SOURCE: CitySourceV5 = {
   origin: { x: 700, y: 300 },
   citySeed: "protocol-complete-cross",
   generation: {
@@ -127,10 +127,10 @@ const COMPLETE_SOURCE: CitySourceV4 = {
     { id: "west", polygon: rectRing({ x: 0, y: 0, width: 100, height: 200 }), seed: "west-seed", typeId: "mixed-use-centre", paletteId: DISTRICT_PALETTE_IDS[2]!, origin: "generated", locked: false, openSpaceOverride: null },
     { id: "east", polygon: rectRing({ x: 100, y: 0, width: 100, height: 200 }), seed: "east-seed", typeId: "dense-residential", paletteId: DISTRICT_PALETTE_IDS[4]!, origin: "generated", locked: false, openSpaceOverride: null }
   ],
-  architecture: { buildings: [], places: [], overrides: [] }
+  architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
 };
 
-const ARCHITECTURE_SOURCE: CitySourceV4 = {
+const ARCHITECTURE_SOURCE: CitySourceV5 = {
   ...structuredClone(COMPLETE_SOURCE),
   architecture: {
     buildings: [{
@@ -463,7 +463,7 @@ describe("handleRequest generateCompleteCityPlan", () => {
     expect(result.plan).toEqual(expectedPlan);
     expect(validateCompleteCityPlan(result.plan)).toEqual([]);
     expect(result.plan.diagnostics.explicitReservationCount).toBe(replayReservations.length > 0 ? replayReservations.length : undefined);
-    expect(validateCitySourceV4(result.candidate)).toEqual([]);
+    expect(validateCitySourceV5(result.candidate)).toEqual([]);
     expect(result.validation).toEqual([]);
     expect(result.counts.districtCount).toBe(result.candidate.districts.length);
     expect(result.counts.blockCount).toBeGreaterThan(0);
@@ -535,7 +535,7 @@ describe("handleRequest buildCompleteCityPlan", () => {
     expect(result.epoch).toBe(request.epoch);
     expect(result.plan).toEqual(buildCompleteCityPlan(COMPLETE_SOURCE, request.sourceRevision, request.epoch));
     expect(validateCompleteCityPlan(result.plan)).toEqual([]);
-    expect(result.validation).toEqual([]);
+    expect(result.normalizedPartialSeeds).toEqual([]);
     expect(response.transfer).toBeUndefined();
   }, 120_000);
   it("retains persistent architecture while preserving request and plan identity", () => {
@@ -570,6 +570,7 @@ describe("handleRequest buildCompleteCityPlan", () => {
       origin: "authored",
       protection: "explicit"
     });
+    expect(result.normalizedPartialSeeds).toEqual([]);
     expect(result.validation).toEqual([]);
   }, 120_000);
   it("carries revision, token and epoch identity on a failure response", () => {
@@ -584,6 +585,45 @@ describe("handleRequest buildCompleteCityPlan", () => {
       epoch: 5
     });
   });
+  it("returns partial-seed records normalized against the plan, dropping vanished targets without remapping", () => {
+    const liveBlockId = buildDistrictPlan(COMPLETE_SOURCE).blocks[0]!.id;
+    const seededSource: CitySourceV5 = {
+      ...structuredClone(COMPLETE_SOURCE),
+      regeneration: { partialSeeds: [
+        { targetKind: "district", targetId: "west", seed: "west-reroll", order: 1 },
+        { targetKind: "block", targetId: "block-vanished", seed: "stale-block", order: 2 },
+        { targetKind: "district", targetId: "district-vanished", seed: "stale-district", order: 3 },
+        { targetKind: "block", targetId: liveBlockId, seed: "live-block", order: 4 }
+      ] }
+    };
+    const seededRequest: BuildCompleteCityPlanRequest = {
+      ...request,
+      id: 107,
+      source: seededSource,
+      sourceRevision: 31,
+      actionToken: "seed-action",
+      buildToken: "seed-build",
+      epoch: 9
+    };
+    const response = handleRequest(seededRequest) as WorkerSuccess;
+    expect(response.ok).toBe(true);
+    const result = response.result as BuildCompleteCityPlanResult;
+    expect(result.sourceRevision).toBe(31);
+    expect(result.actionToken).toBe("seed-action");
+    expect(result.buildToken).toBe("seed-build");
+    expect(result.epoch).toBe(9);
+    expect(result.normalizedPartialSeeds).toEqual([
+      { targetKind: "district", targetId: "west", seed: "west-reroll", order: 1 },
+      { targetKind: "block", targetId: liveBlockId, seed: "live-block", order: 4 }
+    ]);
+    // The returned plan's structural identity represents the normalized source, not the
+    // pre-normalization one whose records included vanished targets.
+    const normalizedSource = { ...seededSource, regeneration: { partialSeeds: result.normalizedPartialSeeds } };
+    expect(result.plan.structuralInput).toEqual(completeCityStructuralInput(normalizedSource));
+    expect(result.plan.districtPlan.revisionInputs).toEqual(districtStructuralInputSignature(normalizedSource));
+    expect(validateCompleteCityPlan(result.plan)).toEqual([]);
+    expect(result.validation).toEqual([]);
+  }, 120_000);
 });
 
 describe("handleRequest buildCompleteCityChunks", () => {

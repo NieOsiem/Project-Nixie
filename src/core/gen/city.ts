@@ -244,6 +244,37 @@ export interface CityStateV4 {
   source: CitySourceV4;
 }
 
+export const REGENERATION_TARGET_KINDS = ["district", "block"] as const;
+export type RegenerationTargetKind = (typeof REGENERATION_TARGET_KINDS)[number];
+
+/**
+ * One partial-regeneration seed intent recorded on the current city source. Records are
+ * append-only in stored order: `order` is a strictly increasing positive safe integer so
+ * the newest record (highest order) deterministically wins seed precedence.
+ */
+export interface RegenerationPartialSeedRecord {
+  targetKind: RegenerationTargetKind;
+  targetId: string;
+  seed: string;
+  order: number;
+}
+
+export interface RegenerationBranch {
+  partialSeeds: RegenerationPartialSeedRecord[];
+}
+
+export interface CitySourceV5 extends CitySourceV4 {
+  regeneration: RegenerationBranch;
+}
+
+export interface CityStateV5 {
+  kind: "city-generator-2";
+  schemaVersion: 5;
+  generatorVersion: 13;
+  revision: number;
+  source: CitySourceV5;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -707,6 +738,67 @@ export function validateCityStateV4(state: unknown): string[] {
   if (state.generatorVersion !== 12) problems.push("Unsupported city generator version.");
   if (typeof state.revision !== "number" || !Number.isInteger(state.revision) || state.revision < 1) problems.push("City revision must be a positive integer.");
   problems.push(...validateCitySourceV4(state.source));
+  return problems;
+}
+
+export function validateRegenerationPartialSeedRecords(records: unknown): string[] {
+  const problems: string[] = [];
+  if (!Array.isArray(records)) return ["Regeneration partial seeds must be an array."];
+  const seenTargets = new Set<string>();
+  let previousOrder: number | null = null;
+  for (const record of records) {
+    if (!isObject(record)) {
+      problems.push("Regeneration partial seed record must be an object.");
+      continue;
+    }
+    if (!enumValue(record.targetKind, REGENERATION_TARGET_KINDS)) {
+      problems.push(`Regeneration partial seed record target kind must be one of ${REGENERATION_TARGET_KINDS.map((kind) => `"${kind}"`).join(", ")}.`);
+    }
+    if (!nonEmptyText(record.targetId)) problems.push("Regeneration partial seed record target id must be non-empty trimmed text.");
+    if (!nonEmptyText(record.seed)) problems.push("Regeneration partial seed record seed must be non-empty trimmed text.");
+    if (typeof record.order !== "number" || !Number.isSafeInteger(record.order) || record.order < 1) {
+      problems.push("Regeneration partial seed record order must be a positive safe integer.");
+    } else if (previousOrder !== null && record.order <= previousOrder) {
+      problems.push(`Regeneration partial seed record order ${record.order} must strictly increase after ${previousOrder}.`);
+    } else {
+      previousOrder = record.order;
+    }
+    if (enumValue(record.targetKind, REGENERATION_TARGET_KINDS) && nonEmptyText(record.targetId)) {
+      const target = `${record.targetKind}/${record.targetId}`;
+      if (seenTargets.has(target)) problems.push(`Duplicate regeneration target "${target}".`);
+      seenTargets.add(target);
+    }
+  }
+  return problems;
+}
+
+export function validateCitySourceV5(source: unknown): string[] {
+  const problems = validateCitySourceV4(source);
+  if (!isObject(source)) return problems;
+  if (!Object.prototype.hasOwnProperty.call(source, "regeneration")) {
+    problems.push("City regeneration branch is required for schema 5.");
+    return problems;
+  }
+  if (!isObject(source.regeneration)) {
+    problems.push("City regeneration branch must be an object.");
+    return problems;
+  }
+  if (!Object.prototype.hasOwnProperty.call(source.regeneration, "partialSeeds")) {
+    problems.push("Regeneration partial seeds are required for schema 5.");
+    return problems;
+  }
+  problems.push(...validateRegenerationPartialSeedRecords(source.regeneration.partialSeeds));
+  return problems;
+}
+
+export function validateCityStateV5(state: unknown): string[] {
+  const problems: string[] = [];
+  if (!isObject(state)) return ["City state must be an object."];
+  if (state.kind !== "city-generator-2") problems.push("Invalid city kind.");
+  if (state.schemaVersion !== 5) problems.push("Unsupported city schema version.");
+  if (state.generatorVersion !== 13) problems.push("Unsupported city generator version.");
+  if (typeof state.revision !== "number" || !Number.isInteger(state.revision) || state.revision < 1) problems.push("City revision must be a positive integer.");
+  problems.push(...validateCitySourceV5(state.source));
   return problems;
 }
 

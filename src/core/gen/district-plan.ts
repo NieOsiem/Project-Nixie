@@ -1,9 +1,9 @@
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../../constants.js";
-import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
+import { compileRouteNetwork, corridorDisc, corridorQuad, spanCorridorHalfWidthM, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { difference, intersection, intersectMultiWithRing, isSnapNoise, ringAsMulti, subtractPieceFromMulti, union } from "../geom/boolean.js";
 import { rectRing, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring, type Vec2 } from "../geom/types.js";
 import { triangulate } from "../geom/tessellate.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV4, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type CitySourceV5, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type RouteClassId } from "./city.js";
 import {
   BLOCK_GRAMMAR_IDS,
   DISTRICT_TYPE_REGISTRY,
@@ -12,6 +12,7 @@ import {
   type DistrictTypeDefinition
 } from "./district-registry.js";
 import { normalizeRing, validateRing } from "./terrain.js";
+import { effectiveRegenerationSeed } from "./regeneration.js";
 
 const GEOMETRY_EPSILON = 1e-6;
 const KEY_SCALE = 1_000;
@@ -63,6 +64,12 @@ export interface StructuralInputSignature {
   districts: string;
   generation: string;
   architecture: string;
+  /**
+   * Canonical hash of the partial-regeneration chronology. The regeneration branch
+   * MUST enter the structural signature: the adapter reuses plan signatures across
+   * revisions, so a partial-seed edit alone has to invalidate cached artifacts.
+   */
+  regeneration: string;
   schemaVersion: typeof CITY_SCHEMA_VERSION;
   generatorVersion: typeof GENERATOR_VERSION;
 }
@@ -75,6 +82,14 @@ export interface DistrictBlockFragment {
 }
 
 export interface DerivedBlock {
+  /**
+   * Persisted block lineage. `id` is a `stableId("block", …)` over the boundary-road
+   * lineage group, the deterministic local index within that group, and the face's
+   * compatible geometry signature — it already combines canonical boundary-road
+   * relationships, deterministic local position, and compatible geometry, and it is
+   * the stable identity partial-seed block records key on. There is deliberately no
+   * parallel lineage field: geometry-qualified identity lives here alone.
+   */
   id: string;
   zoningFace: Ring;
   buildable: MultiPolygon;
@@ -403,7 +418,7 @@ function openFaceHoles(outer: Ring, holes: readonly Ring[]): Ring {
           const dx = (candidate.b.x - candidate.a.x) / distance;
           const dy = (candidate.b.y - candidate.a.y) / distance;
           const extension = Math.max(halfWidth * 2, 0.004);
-          corridor = edgeQuad(
+          corridor = corridorQuad(
             { x: candidate.a.x - dx * extension, y: candidate.a.y - dy * extension },
             { x: candidate.b.x + dx * extension, y: candidate.b.y + dy * extension },
             halfWidth
@@ -664,22 +679,6 @@ function extractFaces(network: CompiledRouteNetwork, mask: Ring): { faces: FaceC
   return { faces: faces.sort((a, b) => a.geometrySignature.localeCompare(b.geometrySignature)), discarded };
 }
 
-function edgeQuad(a: Vec2, b: Vec2, halfWidth: number): Ring {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const length = Math.hypot(dx, dy);
-  if (length <= GEOMETRY_EPSILON || halfWidth <= 0) return [];
-  const nx = (-dy / length) * halfWidth;
-  const ny = (dx / length) * halfWidth;
-  return [{ x: a.x + nx, y: a.y + ny }, { x: b.x + nx, y: b.y + ny }, { x: b.x - nx, y: b.y - ny }, { x: a.x - nx, y: a.y - ny }];
-}
-
-function nodeDisc(center: Vec2, radius: number): Ring {
-  return Array.from({ length: 24 }, (_, index) => {
-    const angle = (index / 24) * Math.PI * 2;
-    return { x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius };
-  });
-}
 
 export interface RouteOccupancy {
   vehicle: MultiPolygon;
@@ -694,22 +693,22 @@ export function compiledRouteOccupancy(network: CompiledRouteNetwork): RouteOccu
   for (const segment of network.segments) {
     const cls = ROUTE_CLASS_REGISTRY.get(segment.classId as RouteClassId);
     if (!cls || segment.lengthM <= GEOMETRY_EPSILON) continue;
-    const halfWidth = cls.vehicle ? segment.clearanceM : segment.widthM / 2;
+    const halfWidth = spanCorridorHalfWidthM(segment);
     const target = cls.vehicle ? vehicle : nonVehicle;
-    target.push(ringAsMulti(edgeQuad(segment.a, segment.b, halfWidth)));
+    target.push(ringAsMulti(corridorQuad(segment.a, segment.b, halfWidth)));
     for (const point of [segment.a, segment.b]) {
       const key = `${cls.vehicle ? "v" : "n"}:${pointKey(point)}`;
       const previous = radii.get(key);
       if (!previous || halfWidth > previous.radius) radii.set(key, { point, radius: halfWidth, vehicle: cls.vehicle });
     }
   }
-  for (const endpoint of radii.values()) (endpoint.vehicle ? vehicle : nonVehicle).push(ringAsMulti(nodeDisc(endpoint.point, endpoint.radius)));
+  for (const endpoint of radii.values()) (endpoint.vehicle ? vehicle : nonVehicle).push(ringAsMulti(corridorDisc(endpoint.point, endpoint.radius)));
   const vehicleUnion = union(vehicle);
   const nonVehicleUnion = difference(union(nonVehicle), [vehicleUnion]);
   return { vehicle: vehicleUnion, nonVehicle: nonVehicleUnion, all: union([vehicleUnion, nonVehicleUnion]) };
 }
 
-function canonicalArchitectureSignature(source: CitySourceV4): string {
+function canonicalArchitectureSignature(source: CitySourceV5): string {
   const architecture = source.architecture;
   const canonicalPlacement = (placement: { centre: Vec2; rotationRad: number; widthM: number; depthM: number }) => ({
     centre: { x: placement.centre.x, y: placement.centre.y },
@@ -768,23 +767,25 @@ function canonicalArchitectureSignature(source: CitySourceV4): string {
   });
 }
 
-export function districtStructuralInputSignature(source: CitySourceV4): StructuralInputSignature {
+export function districtStructuralInputSignature(source: CitySourceV5): StructuralInputSignature {
   const nodes = [...source.roads.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const routes = [...source.roads.routes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...source.roads.edges].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, a, b, routeId, classId }) => ({ id, a, b, routeId, classId }));
   const districts = [...source.districts].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, polygon, seed, typeId, openSpaceOverride }) => ({ id, polygon, seed, typeId, openSpaceOverride }));
+  const partialSeeds = [...source.regeneration.partialSeeds].sort((a, b) => a.order - b.order);
   return {
     terrain: stableId("terrain", `${ringSignature(source.terrain.land)}|${source.terrain.urbanFootprint ? ringSignature(source.terrain.urbanFootprint) : ""}`),
     roads: stableId("roads", JSON.stringify({ nodes, routes, edges })),
     districts: stableId("districts", JSON.stringify(districts)),
     generation: stableId("generation", JSON.stringify({ districtPool: [...source.generation.districtPool].sort(), openSpaceProfile: source.generation.openSpaceProfile })),
     architecture: stableId("architecture", canonicalArchitectureSignature(source)),
+    regeneration: stableId("regeneration", JSON.stringify(partialSeeds)),
     schemaVersion: CITY_SCHEMA_VERSION,
     generatorVersion: GENERATOR_VERSION
   };
 }
 
-function blockCandidates(source: CitySourceV4, network: CompiledRouteNetwork, wallCells: MultiPolygon): { blocks: DerivedBlock[]; discarded: number; warnings: string[] } {
+function blockCandidates(source: CitySourceV5, network: CompiledRouteNetwork, wallCells: MultiPolygon): { blocks: DerivedBlock[]; discarded: number; warnings: string[] } {
   const mask = normalizeRing(source.terrain.urbanFootprint ?? source.terrain.land);
   const extracted = extractFaces(network, mask);
   const rejected = new Set<number>();
@@ -1202,8 +1203,8 @@ function weightedChoice<T extends string>(weights: Readonly<Record<T, number>>, 
   return values[0]!;
 
 }
-function openSpaceIntent(source: CitySourceV4, block: DerivedBlock, fragment: DistrictBlockFragment, district: DistrictSource | undefined, definition: DistrictTypeDefinition | undefined): BlockOpenSpaceIntent {
-  const seed = `${district?.seed ?? source.citySeed}/districts/v3/open-space/${fragment.id}`;
+function openSpaceIntent(source: CitySourceV5, block: DerivedBlock, fragment: DistrictBlockFragment, district: DistrictSource | undefined, definition: DistrictTypeDefinition | undefined, seedBase: string): BlockOpenSpaceIntent {
+  const seed = `${seedBase}/districts/v3/open-space/${fragment.id}`;
   if (!district || !definition) return { blockId: block.id, fragmentId: fragment.id, districtId: null, category: null, size: null, targetShare: 0, seed };
   const override = district.openSpaceOverride;
   const targetShare = Math.max(0, Math.min(1, override ? override.rate : PROFILE_RATES[source.generation.openSpaceProfile] * definition.openSpaceMultiplier));
@@ -1240,8 +1241,7 @@ function openSpaceIntent(source: CitySourceV4, block: DerivedBlock, fragment: Di
     seed
   };
 }
-
-function planFragments(source: CitySourceV4, blocks: DerivedBlock[]): { cells: DevelopmentCellPlan[]; intents: BlockOpenSpaceIntent[] } {
+function planFragments(source: CitySourceV5, blocks: DerivedBlock[]): { cells: DevelopmentCellPlan[]; intents: BlockOpenSpaceIntent[] } {
   const districtById = new Map(source.districts.map((district) => [district.id, district]));
   const cells: DevelopmentCellPlan[] = [];
   const intents: BlockOpenSpaceIntent[] = [];
@@ -1249,9 +1249,14 @@ function planFragments(source: CitySourceV4, blocks: DerivedBlock[]): { cells: D
     for (const fragment of block.districtFragments) {
       const district = fragment.districtId ? districtById.get(fragment.districtId) : undefined;
       const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
-      const intent = openSpaceIntent(source, block, fragment, district, definition);
+      // One effective-seed resolution per fragment: a block record covers every
+      // fragment of the block, a district record only the fragments assigned to that
+      // district, and the newest applicable record wins. No record resolves to the
+      // gen-13 baseline material, so record-free sources replay identically.
+      const seedBase = effectiveRegenerationSeed(source, { blockId: fragment.blockId, districtId: fragment.districtId });
+      const intent = openSpaceIntent(source, block, fragment, district, definition, seedBase);
       intents.push(intent);
-      const grammarSeed = `${district?.seed ?? source.citySeed}/districts/v3/grammar/${fragment.id}`;
+      const grammarSeed = `${seedBase}/districts/v3/grammar/${fragment.id}`;
       const grammarId = definition ? weightedGrammar(definition, grammarSeed) : "irregular-mosaic";
       const planningBounds = definition?.bounds ?? { minCellWidthM: 12, maxCellWidthM: 28, minCellDepthM: 14, maxCellDepthM: 34, minAspect: 0.4, maxAspect: 3 };
       const planned = planDistrictFragmentWithGrammar(fragment, grammarId, planningBounds, grammarSeed, block.boundaryRoadIds);
@@ -1263,7 +1268,7 @@ function planFragments(source: CitySourceV4, blocks: DerivedBlock[]): { cells: D
   return { cells: cells.sort((a, b) => a.id.localeCompare(b.id)), intents: intents.sort((a, b) => a.fragmentId.localeCompare(b.fragmentId)) };
 }
 
-export function buildDistrictPlan(source: CitySourceV4): DistrictPlan {
+export function buildDistrictPlan(source: CitySourceV5): DistrictPlan {
   const network = compileRouteNetwork(source.roads, ROUTE_CLASS_REGISTRY);
   const mask = ringAsMulti(normalizeRing(source.terrain.urbanFootprint ?? source.terrain.land));
   const land = ringAsMulti(normalizeRing(source.terrain.land));

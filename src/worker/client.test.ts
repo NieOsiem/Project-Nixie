@@ -2,12 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { rectRing } from "../core/geom/types.js";
 import { buildCompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CitySourceV4 } from "../core/gen/city.js";
+import type { CitySourceV5 } from "../core/gen/city.js";
 import { WorkerClient } from "./client.js";
 import { handleRequest, type BuildCompleteCityChunksSummary, type CompleteCityChunkProgress, type WorkerMessage, type WorkerRequest } from "./protocol.js";
 
 /** Compact 200×200 grid-cross city: cheap to plan and enough for transfer-shaped fixtures. */
-const SOURCE: CitySourceV4 = {
+const SOURCE: CitySourceV5 = {
   origin: { x: 700, y: 300 },
   citySeed: "client-complete-fixture",
   generation: {
@@ -43,7 +43,8 @@ const SOURCE: CitySourceV4 = {
     buildings: [],
     places: [],
     overrides: []
-  }
+  },
+  regeneration: { partialSeeds: [] }
 };
 const PLAN = buildCompleteCityPlan(SOURCE, 12, 5);
 

@@ -24,25 +24,38 @@ import {
   allocateManualId,
   allocateManualLineage,
   validateArchitectureSource,
-  validateCitySourceV4,
+  validateCitySourceV5,
   type ArchitectureOverrideSource,
   type ArchitectureProtection,
   type ArchitectureSource,
-  type CitySourceV4,
-  type CityStateV4,
+  type CitySourceV5,
+  type CityStateV5,
   type PersistentBuildingSource,
   type PersistentPlaceSource,
   type PlacementFrame,
   type DistrictOpenSpaceProfile,
   type DistrictSource,
   type HubMode,
+  type RegenerationPartialSeedRecord,
   type RoadCurvePreset,
   type RoadLayout,
   type RoadOrigin,
   type RouteClassId
 } from "../core/gen/city.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
-import { completeCityStructuralInput, derivePaletteBanks, patchCompleteCityPlanPersistentBuilding, restyleCompleteCityPlanObjectPalette, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type LandmarkPlan } from "../core/gen/complete-city-plan.js";
+import { completeCityStructuralInput, derivePaletteBanks, occupiedPersistentBuildingGeometry, patchCompleteCityPlanPersistentBuilding, restyleCompleteCityPlanObjectPalette, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
+import {
+  architectureOverrideFor,
+  architecturePlanTarget,
+  architectureSourceTarget,
+  hasOwn,
+  promotedArchitectureSource,
+  removeArchitectureOverride,
+  replaceArchitectureOverride,
+  type ArchitecturePlanTarget,
+  type ArchitectureSourcePatch,
+  validateArchitectureObjectPatch
+} from "../core/gen/architecture-edit.js";
 import type { DistrictPlan } from "../core/gen/district-plan.js";
 import type { CompleteChunkBuild } from "../core/gen/complete-city-chunk.js";
 import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
@@ -65,17 +78,22 @@ import {
   type RoadGenerationDiagnostics
 } from "../core/gen/road-generator.js";
 import {
+  analyzeRouteConflicts,
   appendRoute,
+  applyBuildingRouteSurgery,
   deleteEdges,
   deleteJunction,
   moveNode,
+  RouteSurgeryError,
   validateRouteTopology,
-  weldNodes
+  weldNodes,
+  type RouteConflict,
+  type RouteSurgeryResult
 } from "../core/graph/topology.js";
 import { compileRouteNetwork } from "../core/graph/compiler.js";
-import { difference, intersection, ringAsMulti } from "../core/geom/boolean.js";
+import { difference, intersection, isSnapNoise, ringAsMulti, union } from "../core/geom/boolean.js";
 import { emptyMesh, type MeshBuffers } from "../core/geom/mesh.js";
-import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type Rect, type Ring, type Vec2 } from "../core/geom/types.js";
+import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../core/geom/types.js";
 import {
   BANK_COUNT,
   CITY_BANK,
@@ -115,11 +133,22 @@ import {
   publishCompletePlanCache
 } from "./city-cache.js";
 import { WallReplacementScheduler, wallSegmentsForPlan } from "./generated-walls.js";
+import type { RegenerationTarget } from "../core/gen/regeneration.js";
+import {
+  evaluateRegenerationPreflight,
+  resolveRegenerationTargetScope,
+  type RegenerationPreflight
+} from "../core/gen/regeneration-plan.js";
+import { buildBulkArchitectureCandidate, BulkArchitectureError } from "../core/gen/architecture-bulk.js";
 import {
   TerrainActionQueue,
   TerrainSession,
   terrainBuildIsCurrent
 } from "./terrain-session.js";
+export type { RegenerationPreflight };
+export type { RegenerationBlocker } from "../core/gen/regeneration-plan.js";
+export type { RegenerationTarget };
+export type { RouteConflict };
 
 const DEFAULT_CAMERA_HEIGHT_M = 500;
 const WEATHER_SORT_LAYER = 990;
@@ -416,6 +445,31 @@ let bloomStrength = 1;
 let rainStrength = 1;
 let weather: Weather = WEATHER.RAIN;
 
+export interface RegenerationStats {
+  status: "complete" | "failed" | "stale";
+  target: RegenerationTarget | null;
+  seed: string | null;
+  preflightMs: number;
+  workerMs: number;
+  saveMs: number;
+  installMs: number;
+  affectedChunks: number;
+  totalChunks: number;
+}
+
+export interface RouteEditStatus {
+  conflicts: RouteConflict[];
+  blockers: { id: string; kind: "road"; reason: string }[];
+  trimmedEdgeIds: string[];
+  removedEdgeIds: string[];
+  disconnectedVehicleNetwork: boolean;
+}
+
+let lastRegenerationStats: RegenerationStats | null = null;
+let routeEditStatusState: RouteEditStatus | null = null;
+const editDiagnosticEntries: Array<Record<string, unknown>> = [];
+const EDIT_DIAGNOSTIC_LIMIT = 64;
+
 function applyDistrictEditorPresentation(): void {
   if (cityRenderer === null) return;
   const alpha = districtEditorPresentation ? 0.48 : 1;
@@ -433,7 +487,7 @@ function cancelScheduledWalls(): void {
   wallScheduler.cancel();
 }
 
-async function installGeneratedWalls(city: CityStateV4, plan: DistrictPlan, sourceRevision: number, sourceEpoch: number, replacementToken: number): Promise<void> {
+async function installGeneratedWalls(city: CityStateV5, plan: DistrictPlan, sourceRevision: number, sourceEpoch: number, replacementToken: number): Promise<void> {
   const started = performance.now();
   if (replacementToken !== wallScheduler.token || !terrainBuildIsCurrent(sourceRevision, sourceEpoch, session.current?.revision ?? null, session.buildEpoch)) {
     if (replacementToken === wallScheduler.token) lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: 0, stale: true };
@@ -471,7 +525,7 @@ async function installGeneratedWalls(city: CityStateV4, plan: DistrictPlan, sour
   }
 }
 
-function scheduleGeneratedWallRebuild(city: CityStateV4, plan: DistrictPlan, immediate = false): void {
+function scheduleGeneratedWallRebuild(city: CityStateV5, plan: DistrictPlan, immediate = false): void {
   const sourceRevision = city.revision;
   const sourceEpoch = session.buildEpoch;
   lastWallBuild = { scheduled: sourceRevision, created: 0, deleted: 0, ms: 0, stale: false };
@@ -620,7 +674,7 @@ function waitForCompletePlan(revision: number): Promise<boolean> {
   });
 }
 
-async function requireCompletePlan(city: CityStateV4): Promise<CompleteCityPlan> {
+async function requireCompletePlan(city: CityStateV5): Promise<CompleteCityPlan> {
   if (completePlanRevision === city.revision && completePlan !== null) return completePlan;
   if (planBuildInFlight === null && planBuildQueued === null) requestCompletePlanRebuild(city);
   await waitForCompletePlan(city.revision);
@@ -629,7 +683,7 @@ async function requireCompletePlan(city: CityStateV4): Promise<CompleteCityPlan>
 }
 type CompletePlanOrigin = "cache" | "generated" | "incremental" | "restamped";
 
-function structuralInputMatchesCity(city: CityStateV4, plan: CompleteCityPlan): boolean {
+function structuralInputMatchesCity(city: CityStateV5, plan: CompleteCityPlan): boolean {
   const current = completeCityStructuralInput(city.source);
   const planned = plan.structuralInput;
   return current.terrain === planned.terrain &&
@@ -637,6 +691,7 @@ function structuralInputMatchesCity(city: CityStateV4, plan: CompleteCityPlan): 
     current.districts === planned.districts &&
     current.generation === planned.generation &&
     current.architecture === planned.architecture &&
+    current.regeneration === planned.regeneration &&
     current.schemaVersion === planned.schemaVersion &&
     current.generatorVersion === planned.generatorVersion;
 }
@@ -658,7 +713,7 @@ function recordPlanCache(operation: number, value: PlanCacheStats): void {
 }
 
 async function tryLoadCachedPlan(
-  city: CityStateV4,
+  city: CityStateV5,
   revision: number,
   epoch: number
 ): Promise<{ plan: CompleteCityPlan | null; stale: boolean }> {
@@ -697,7 +752,7 @@ async function tryLoadCachedPlan(
   }
 }
 
-function schedulePlanCachePublish(city: CityStateV4, plan: CompleteCityPlan): void {
+function schedulePlanCachePublish(city: CityStateV5, plan: CompleteCityPlan): void {
   if (game.user?.isGM !== true) return;
   const operation = ++planCacheOperationSequence;
   queueMicrotask(() => {
@@ -771,7 +826,7 @@ function publishCompletePlan(
   notifyCityChanged();
 }
 
-function requestCompletePlanRebuild(city: CityStateV4): void {
+function requestCompletePlanRebuild(city: CityStateV5): void {
   const revision = city.revision;
   const epoch = session.buildEpoch;
   if (planBuildInFlight !== null) {
@@ -783,7 +838,7 @@ function requestCompletePlanRebuild(city: CityStateV4): void {
 
 // WHY: never fall back to a synchronous plan build; the UI thread must not run the
 // planning pipeline. A degraded plan is surfaced in Diagnostics and retryable.
-async function runCompletePlanRebuild(city: CityStateV4, revision: number, epoch: number): Promise<void> {
+async function runCompletePlanRebuild(city: CityStateV5, revision: number, epoch: number): Promise<void> {
   planBuildInFlight = { revision, epoch };
   const actionToken = nextCompleteSequence();
   try {
@@ -791,7 +846,7 @@ async function runCompletePlanRebuild(city: CityStateV4, revision: number, epoch
     if (cached.stale) {
       resolvePlanWaiters();
     } else {
-      const plan = cached.plan ?? await buildCompletePlanThroughWorker(city.source, revision, epoch, actionToken);
+      const plan = cached.plan ?? (await buildCompletePlanThroughWorker(city.source, revision, epoch, actionToken)).plan;
       const current = session.current;
       if (current !== null && terrainBuildIsCurrent(revision, epoch, current.revision, session.buildEpoch)) {
         publishCompletePlan(plan, revision, epoch, false, completePlanRoundTripMs, cached.plan === null ? "generated" : "cache");
@@ -857,7 +912,7 @@ export function cityLoadStatus(): CityLoadResult {
   return session.status;
 }
 
-export function getCity(): CityStateV4 | null {
+export function getCity(): CityStateV5 | null {
   return session.current;
 }
 
@@ -957,6 +1012,9 @@ export function unmount(): void {
   wallDiagnostic = null;
   localWriteRevision = null;
   roadSelection = { edgeIds: [], nodeIds: [] };
+  lastRegenerationStats = null;
+  routeEditStatusState = null;
+  editDiagnosticEntries.length = 0;
   notifyCityChanged();
 }
 
@@ -1009,7 +1067,7 @@ function multiArea(multi: ReturnType<typeof ringAsMulti>): number {
 }
 
 export function roadClearanceBlockers(
-  roads: CitySourceV4["roads"],
+  roads: CitySourceV5["roads"],
   land: Ring,
   sceneBounds: Rect
 ): string[] {
@@ -1036,8 +1094,8 @@ export function roadClearanceBlockers(
   return [...blocked].sort((left, right) => left.localeCompare(right));
 }
 
-function validateCandidate(candidate: CityStateV4): void {
-  const sourceProblems = validateCitySourceV4(candidate.source);
+function validateCandidate(candidate: CityStateV5): void {
+  const sourceProblems = validateCitySourceV5(candidate.source);
   if (sourceProblems.length > 0) throw new Error(sourceProblems.join(" "));
   const result = validateTerrain(candidate.source.terrain);
   if (!result.ok) throw new Error(result.reason);
@@ -1053,9 +1111,9 @@ function validateCandidate(candidate: CityStateV4): void {
 }
 
 async function guardedSave(
-  candidate: CityStateV4,
+  candidate: CityStateV5,
   expectation: SaveExpectation
-): Promise<CityStateV4> {
+): Promise<CityStateV5> {
   validateCandidate(candidate);
   localWriteRevision = candidate.revision;
   try {
@@ -1076,7 +1134,7 @@ function nextRoadSequence(): number {
 }
 
 function validateRoadEdgeSelection(
-  source: CitySourceV4["roads"],
+  source: CitySourceV5["roads"],
   edgeIds: readonly string[]
 ): Set<string> {
   if (edgeIds.length === 0) throw new Error("Select at least one road segment.");
@@ -1089,7 +1147,7 @@ function validateRoadEdgeSelection(
 }
 
 /** Keep the selection across commits, dropping any road or junction the commit removed. */
-function pruneRoadSelection(selection: RoadSelection, source: CitySourceV4["roads"]): RoadSelection {
+function pruneRoadSelection(selection: RoadSelection, source: CitySourceV5["roads"]): RoadSelection {
   const edgeIds = new Set(source.edges.map((edge) => edge.id));
   const nodeIds = new Set(source.nodes.map((node) => node.id));
   return {
@@ -1099,7 +1157,7 @@ function pruneRoadSelection(selection: RoadSelection, source: CitySourceV4["road
 }
 
 function roadEdgesForSelection(
-  source: CitySourceV4["roads"],
+  source: CitySourceV5["roads"],
   edgeIds: readonly string[],
   contiguousName: boolean
 ): Set<string> {
@@ -1130,7 +1188,7 @@ function roadEdgesForSelection(
 
 
 /** The current plan when the candidate's structural input is unchanged (metadata reuse). */
-function planForCandidate(candidate: CityStateV4): CompleteCityPlan | null {
+function planForCandidate(candidate: CityStateV5): CompleteCityPlan | null {
   const plan = completePlan;
   const current = session.current;
   if (plan === null || current === null) return null;
@@ -1146,17 +1204,29 @@ function planForCandidate(candidate: CityStateV4): CompleteCityPlan | null {
     signature.districts !== stored.districts ||
     signature.generation !== stored.generation ||
     signature.architecture !== stored.architecture ||
+    signature.regeneration !== stored.regeneration ||
     signature.schemaVersion !== stored.schemaVersion ||
     signature.generatorVersion !== stored.generatorVersion
   ) return null;
   return plan;
 }
 
+/** One Worker-built complete plan plus the normalized partial-seed chronology persisted with it. */
+interface BuiltCompletePlan {
+  plan: CompleteCityPlan;
+  normalizedPartialSeeds: RegenerationPartialSeedRecord[];
+}
+
 // WHY: the complete plan and its chunks are worker-only; there is deliberately no
 // synchronous main-thread build fallback for either. Identity (revision/action/build/
 // epoch) is validated on every result and every progressive chunk message, so stale or
 // superseded work installs nothing.
-async function buildCompletePlanThroughWorker(source: CitySourceV4, sourceRevision: number, epoch: number, actionToken: number): Promise<CompleteCityPlan> {
+async function buildCompletePlanThroughWorker(
+  source: CitySourceV5,
+  sourceRevision: number,
+  epoch: number,
+  actionToken: number
+): Promise<BuiltCompletePlan> {
   const client = ensureWorker();
   if (client === null) throw new Error("The city worker is unavailable; the complete city plan cannot be built.");
   const started = performance.now();
@@ -1179,7 +1249,7 @@ async function buildCompletePlanThroughWorker(source: CitySourceV4, sourceRevisi
     throw new Error(`The complete city plan is invalid: ${result.validation.join(" ")}`);
   }
   completePlanRoundTripMs = performance.now() - started;
-  return result.plan;
+  return { plan: result.plan, normalizedPartialSeeds: result.normalizedPartialSeeds };
 }
 
 interface CompleteIdentity {
@@ -1286,7 +1356,7 @@ function sameRect(a: Rect, b: Rect): boolean {
 
 function scheduleCompleteChunkCachePublish(
   operation: number,
-  city: CityStateV4,
+  city: CityStateV5,
   plan: CompleteCityPlan,
   epoch: number,
   boundsM: Rect,
@@ -1356,7 +1426,7 @@ function renderFailureReason(error: unknown): string {
  * and publication happens only after the complete live set is present.
  */
 async function installCompleteChunks(
-  city: CityStateV4,
+  city: CityStateV5,
   plan: CompleteCityPlan,
   actionToken: number,
   epoch: number,
@@ -1589,7 +1659,7 @@ async function installCompleteChunks(
   return result;
 }
 async function installCompleteChunkSubset(
-  city: CityStateV4,
+  city: CityStateV5,
   plan: CompleteCityPlan,
   keys: readonly ChunkKey[],
   epoch: number,
@@ -1692,11 +1762,13 @@ async function installCompleteChunkSubset(
  * exact plan atomically. Metadata edits reuse only a structurally identical plan.
  */
 async function commitCandidate(
-  candidate: CityStateV4,
-  options: { wallRelevant?: boolean; changedChunkKeys?: readonly ChunkKey[]; preparedPlan?: CompleteCityPlan } = {}
+  candidate: CityStateV5,
+  options: { wallRelevant?: boolean; changedChunkKeys?: readonly ChunkKey[]; preparedPlan?: CompleteCityPlan; cacheableSubset?: boolean } = {},
+  metrics?: { saveMs?: number }
 ): Promise<RebuildResult> {
   const current = session.current;
   if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
+  const epoch = session.buildEpoch;
   const wallRelevant = options.wallRelevant ?? true;
   const changedChunkKeys = options.changedChunkKeys;
   const canInstallSubset = changedChunkKeys !== undefined && changedChunkKeys.length > 0;
@@ -1717,13 +1789,28 @@ async function commitCandidate(
     plan = reusable;
   } else {
     actionToken = nextCompleteSequence();
-    plan = await buildCompletePlanThroughWorker(candidate.source, candidate.revision, session.buildEpoch, actionToken);
+    const built = await buildCompletePlanThroughWorker(candidate.source, candidate.revision, epoch, actionToken);
+    plan = built.plan;
+    // WHY: the Worker normalizes partial-seed records against the built district plan;
+    // topology-changing commits merge the cleanup into the same atomic candidate so the
+    // main thread never recomputes topology to decide what vanished. The Worker already
+    // stamped the plan's structuralInput against the normalized source.
+    candidate = { ...candidate, source: { ...candidate.source, regeneration: { partialSeeds: built.normalizedPartialSeeds } } };
   }
   if (preparedPlan !== undefined) {
     const planProblems = validateCompleteCityPlan(plan);
     if (planProblems.length > 0) throw new Error(`The incrementally updated city plan is invalid: ${planProblems.join(" ")}`);
   }
+  // WHY: identity across await: between plan acquisition and the guarded save the
+  // session revision or render epoch may have moved (external Scene change); publishing
+  // a plan/chunks stamped for the captured epoch would mix revisions.
+  const live = session.current;
+  if (live === null || !terrainBuildIsCurrent(current.revision, epoch, live.revision, session.buildEpoch)) {
+    throw new Error("The pending commit was superseded by newer Scene state; nothing was saved.");
+  }
+  const saveStarted = performance.now();
   const saved = await guardedSave(candidate, current.revision);
+  if (metrics !== undefined) metrics.saveMs = performance.now() - saveStarted;
   session.publishCommit(saved);
   plan = restampCompletePlan(plan, saved.revision, session.buildEpoch);
   publishCompletePlan(plan, saved.revision, session.buildEpoch, wallRelevant, completePlanRoundTripMs, preparedPlan !== undefined ? "incremental" : reusable === null ? "generated" : "restamped");
@@ -1757,7 +1844,7 @@ async function commitCandidate(
   }
   try {
     if (canInstallSubset && changedChunkKeys !== undefined) {
-      return await installCompleteChunkSubset(saved, plan, changedChunkKeys, session.buildEpoch, preparedPlan === undefined);
+      return await installCompleteChunkSubset(saved, plan, changedChunkKeys, session.buildEpoch, preparedPlan === undefined || options.cacheableSubset === true);
     }
     return await installCompleteChunks(saved, plan, actionToken, session.buildEpoch);
   } catch (error) {
@@ -1776,14 +1863,14 @@ async function commitCandidate(
   }
 }
 
-async function commitSource(source: CityStateV4["source"], wallRelevant = true): Promise<RebuildResult> {
+async function commitSource(source: CityStateV5["source"], wallRelevant = true): Promise<RebuildResult> {
   const current = session.current;
   if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
-  const candidate: CityStateV4 = { ...current, revision: current.revision + 1, source };
+  const candidate: CityStateV5 = { ...current, revision: current.revision + 1, source };
   return commitCandidate(candidate, { wallRelevant });
 }
 function manualArchitectureIdentity(
-  city: CityStateV4,
+  city: CityStateV5,
   kind: "bldg" | "plc",
   placementParameters: readonly unknown[]
 ): {
@@ -1811,7 +1898,7 @@ function manualArchitectureIdentity(
   };
 }
 
-function architectureOverrideTargetProblems(source: CitySourceV4["architecture"]): string[] {
+function architectureOverrideTargetProblems(source: CitySourceV5["architecture"]): string[] {
   const persistent = new Set([
     ...source.buildings.map((building) => `building:${building.id}`),
     ...source.places.map((place) => `place:${place.id}`)
@@ -1863,9 +1950,9 @@ function architectureChangedChunkKeys(plan: CompleteCityPlan, scope: Architectur
   return [...new Map(keys.map((key) => [chunkId(key), key])).values()];
 }
 function preserveProtectedArchitectureOverrides(
-  source: CitySourceV4["architecture"],
+  source: CitySourceV5["architecture"],
   plan: CompleteCityPlan
-): CitySourceV4["architecture"] {
+): CitySourceV5["architecture"] {
   let preserved = structuredClone(source);
   for (const override of source.overrides) {
     if (override.protection === "none") continue;
@@ -1888,7 +1975,7 @@ function preserveProtectedArchitectureOverrides(
 }
 
 async function architectureSourceCommit(
-  source: CitySourceV4["architecture"],
+  source: CitySourceV5["architecture"],
   scope?: ArchitectureChangeScope
 ): Promise<RebuildResult> {
   const current = session.current;
@@ -1904,7 +1991,7 @@ async function architectureSourceCommit(
   const changedChunkKeys = scope === undefined || currentPlan === undefined
     ? undefined
     : architectureChangedChunkKeys(currentPlan, scope);
-  const candidate: CityStateV4 = {
+  const candidate: CityStateV5 = {
     ...current,
     revision: current.revision + 1,
     source: { ...current.source, architecture: structuredClone(preservedSource) }
@@ -1919,7 +2006,7 @@ async function architectureSourceCommit(
   });
 }
 async function architecturePaletteSourceCommit(
-  architecture: CitySourceV4["architecture"],
+  architecture: CitySourceV5["architecture"],
   kind: "building" | "place",
   id: string,
   paletteId: string | null
@@ -1936,7 +2023,7 @@ async function architecturePaletteSourceCommit(
   const currentPlan = await requireCompletePlan(current);
   const target = architecturePlanTarget(currentPlan, id);
   if (target === null || target.kind !== kind) throw new Error(`Unknown architecture object "${id}".`);
-  const candidate: CityStateV4 = {
+  const candidate: CityStateV5 = {
     ...current,
     revision: current.revision + 1,
     source: { ...current.source, architecture: structuredClone(architecture) }
@@ -1998,46 +2085,9 @@ export function commitArchitectureCandidate(architecture: ArchitectureSource): P
   });
 }
 
-type ArchitecturePlanTarget =
-  | { kind: "building"; plan: BuildingPlan }
-  | { kind: "place"; plan: LandmarkPlan };
-
-function architecturePlanTarget(plan: CompleteCityPlan, id: string): ArchitecturePlanTarget | null {
-  const building = plan.buildings.find((candidate) => candidate.id === id);
-  if (building !== undefined) return { kind: "building", plan: building };
-  const place = plan.landmarks.find((candidate) => candidate.id === id);
-  return place === undefined ? null : { kind: "place", plan: place };
-}
-
-function architectureSourceTarget(
-  architecture: ArchitectureSource,
-  id: string
-): { kind: "building"; source: PersistentBuildingSource } | { kind: "place"; source: PersistentPlaceSource } | null {
-  const building = architecture.buildings.find((candidate) => candidate.id === id);
-  if (building !== undefined) return { kind: "building", source: building };
-  const place = architecture.places.find((candidate) => candidate.id === id);
-  return place === undefined ? null : { kind: "place", source: place };
-}
-
-function hasOwn(value: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function validateObjectPatch(kind: "building" | "place", patch: ObjectPropertiesPatch): void {
-  const keys = Object.keys(patch as object);
-  const allowed = kind === "building"
-    ? new Set(["grammarId", "visualUse", "heightM", "paletteId"])
-    : new Set(["landmarkGrammarId", "paletteId"]);
-  const unknown = keys.filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new Error(`Unknown ${kind} object property "${unknown[0]}".`);
-  if (keys.length === 0) throw new Error("Object property patch is empty.");
-  if (kind === "building" && hasOwn(patch, "landmarkGrammarId")) {
-    throw new Error("Building object properties cannot include landmarkGrammarId.");
-  }
-
-  if (kind === "place" && (hasOwn(patch, "grammarId") || hasOwn(patch, "visualUse") || hasOwn(patch, "heightM"))) {
-    throw new Error("Place object properties cannot include building fields.");
-  }
+  const problems = validateArchitectureObjectPatch(kind, patch as object);
+  if (problems.length > 0) throw new Error(problems[0]);
 }
 function validateTransformPatch(patch: TransformObjectPatch): void {
   if (patch === null || typeof patch !== "object" || !hasOwn(patch, "placement")) {
@@ -2067,101 +2117,11 @@ function assertArchitectureUnlocked(
   }
 }
 
-function replaceArchitectureOverride(
-  architecture: ArchitectureSource,
-  override: ArchitectureOverrideSource
-): ArchitectureSource {
-  const key = `${override.targetKind}:${override.targetId}`;
-  return {
-    ...architecture,
-    overrides: [
-      ...architecture.overrides.filter((candidate) => `${candidate.targetKind}:${candidate.targetId}` !== key),
-      structuredClone(override)
-    ]
-  };
-}
-
-function removeArchitectureOverride(architecture: ArchitectureSource, kind: "building" | "place", id: string): ArchitectureSource {
-  const key = `${kind}:${id}`;
-  return {
-    ...architecture,
-    overrides: architecture.overrides.filter((candidate) => `${candidate.targetKind}:${candidate.targetId}` !== key)
-  };
-}
-
-function architectureOverrideFor(
-  architecture: ArchitectureSource,
-  target: ArchitecturePlanTarget,
-  protection: ArchitectureProtection,
-  patch: { appearanceSeed?: string; paletteId?: string | null } = {}
-): ArchitectureOverrideSource {
-  const existing = architecture.overrides.find(
-    (candidate) => candidate.targetKind === target.kind && candidate.targetId === target.plan.id
-  );
-  const effectiveProtection = existing?.protection === "explicit" && protection !== "none"
-    ? "explicit"
-    : protection;
-  const override: ArchitectureOverrideSource = {
-    ...(existing === undefined ? {} : structuredClone(existing)),
-    targetKind: target.kind,
-    targetId: target.plan.id,
-    lineage: target.plan.lineage ?? "",
-    protection: effectiveProtection,
-    snapshotSitePolygon: structuredClone(target.plan.sitePolygon)
-  };
-  if (patch.appearanceSeed !== undefined) override.appearanceSeed = patch.appearanceSeed;
-  if (patch.paletteId !== undefined) override.paletteId = patch.paletteId;
-  return override;
-}
 
 function manualEditProtection(protection: ArchitectureProtection): ArchitectureProtection {
   return protection === "explicit" ? "explicit" : "manual-edit";
 }
 
-function promotedArchitectureSource(
-  target: ArchitecturePlanTarget,
-  patch: ObjectPropertiesPatch,
-  placement: PlacementFrame = target.plan.placement!,
-  sitePolygon = target.plan.sitePolygon,
-  clearAssociations = false
-): PersistentBuildingSource | PersistentPlaceSource {
-  const lineage = target.plan.lineage;
-  if (lineage === undefined) throw new Error("The generated architecture object has no stable lineage.");
-  if (target.kind === "building") {
-    const plan = target.plan;
-    return {
-      id: plan.id,
-      lineage,
-      origin: "generated",
-      protection: "manual-edit",
-      seed: plan.seed,
-      appearanceSeed: plan.appearanceSeed,
-      grammarId: patch.grammarId ?? plan.grammarId,
-      visualUse: patch.visualUse ?? plan.visualUse,
-      heightM: patch.heightM ?? plan.heightM,
-      paletteId: hasOwn(patch, "paletteId") ? patch.paletteId ?? null : plan.paletteId ?? null,
-      sitePolygon: structuredClone(sitePolygon),
-      placement: structuredClone(placement),
-      districtId: clearAssociations ? null : plan.districtId,
-      blockId: clearAssociations ? null : plan.blockId
-    };
-  }
-  const plan = target.plan;
-  return {
-    id: plan.id,
-    lineage,
-    origin: "generated",
-    protection: "manual-edit",
-    seed: plan.seed,
-    appearanceSeed: plan.appearanceSeed,
-    landmarkGrammarId: patch.landmarkGrammarId ?? plan.landmarkGrammarId,
-    paletteId: hasOwn(patch, "paletteId") ? patch.paletteId ?? null : plan.paletteId ?? null,
-    sitePolygon: structuredClone(sitePolygon),
-    placement: structuredClone(placement),
-    districtId: clearAssociations ? null : plan.districtId,
-    blockId: clearAssociations ? null : plan.blockId
-  };
-}
 function transformedSite(sitePolygon: Ring, before: PlacementFrame, after: PlacementFrame): Ring {
   if (
     !Number.isFinite(before.widthM) || before.widthM <= 0
@@ -2220,11 +2180,12 @@ export function placeBuilding(input: BuildingPlacementInput): Promise<RebuildRes
       ...city.source.architecture,
       buildings: [...city.source.architecture.buildings, building]
     };
-    return architectureSourceCommit(architecture, {
+    const scope: ArchitectureChangeScope = {
       sitePolygons: [building.sitePolygon],
       buildingId: building.id,
       preserveOverrides: true,
-    });
+    };
+    return commitBuildingRouteAware(city, building, architecture, await requireCompletePlan(city), scope);
   });
 }
 export function placePlace(input: PlacePlacementInput): Promise<RebuildResult> {
@@ -2255,6 +2216,7 @@ export function placePlace(input: PlacePlacementInput): Promise<RebuildResult> {
       ...city.source.architecture,
       places: [...city.source.architecture.places, place]
     };
+    assertPlaceRoadFree(await requireCompletePlan(city), place.sitePolygon, place.id);
     return architectureSourceCommit(architecture, {
       sitePolygons: [place.sitePolygon],
       preserveOverrides: true
@@ -2276,6 +2238,7 @@ export function transformObject(id: string, patch: TransformObjectPatch): Promis
     const site = sourceTarget?.source.sitePolygon ?? planTarget?.plan.sitePolygon;
     if (before === undefined || site === undefined) throw new Error(`Architecture object "${id}" has no placement frame.`);
     const nextSite = transformedSite(site, before, patch.placement);
+    let promotedRecord: PersistentBuildingSource | PersistentPlaceSource | null = null;
     let architecture = city.source.architecture;
     if (sourceTarget !== null) {
       if (sourceTarget.kind === "building") {
@@ -2294,7 +2257,8 @@ export function transformObject(id: string, patch: TransformObjectPatch): Promis
         };
       }
     } else if (planTarget !== null) {
-      const promoted = promotedArchitectureSource(planTarget, {}, patch.placement, nextSite, true);
+      const promoted = withResolvedAssociations(promotedArchitectureSource(planTarget, {}, patch.placement, nextSite, true), plan, nextSite);
+      promotedRecord = promoted;
       architecture = removeArchitectureOverride(
         planTarget.kind === "building"
           ? { ...architecture, buildings: [...architecture.buildings, promoted as PersistentBuildingSource] }
@@ -2304,11 +2268,19 @@ export function transformObject(id: string, patch: TransformObjectPatch): Promis
       );
     }
     const kind = sourceTarget?.kind ?? planTarget!.kind;
-    return architectureSourceCommit(architecture, {
+    const scope: ArchitectureChangeScope = {
       sitePolygons: [site, nextSite],
       blockIds: [sourceTarget?.source.blockId, planTarget?.plan.blockId],
       ...(kind === "building" ? { buildingId: id } : {})
-    });
+    };
+    if (kind === "place") {
+      assertPlaceRoadFree(plan, nextSite, id);
+      return architectureSourceCommit(architecture, scope);
+    }
+    const candidateRecord: PersistentBuildingSource = sourceTarget?.kind === "building"
+      ? { ...sourceTarget.source, placement: structuredClone(patch.placement), sitePolygon: nextSite }
+      : promotedRecord as PersistentBuildingSource;
+    return commitBuildingRouteAware(city, candidateRecord, architecture, plan, scope);
   });
 }
 
@@ -2327,6 +2299,15 @@ export function editObjectProperties(id: string, patch: ObjectPropertiesPatch): 
     const substantial = kind === "building"
       ? hasOwn(patch, "grammarId") || hasOwn(patch, "visualUse") || hasOwn(patch, "heightM")
       : hasOwn(patch, "landmarkGrammarId");
+    let surgery: RouteSurgeryResult | null = null;
+    if (kind === "building" && substantial) {
+      const candidateRecord: PersistentBuildingSource = sourceTarget?.kind === "building"
+        ? { ...sourceTarget.source, ...patch, protection: manualEditProtection(sourceTarget.source.protection) }
+        : promotedArchitectureSource(planTarget!, patch) as PersistentBuildingSource;
+      surgery = buildingRouteSurgery(city, occupiedPersistentBuildingGeometry(candidateRecord, city.source));
+    } else if (kind === "place" && substantial) {
+      assertPlaceRoadFree(plan, sourceTarget?.source.sitePolygon ?? planTarget!.plan.sitePolygon, id);
+    }
     if (sourceTarget !== null) {
       if (sourceTarget.kind === "building") {
         architecture = {
@@ -2363,11 +2344,15 @@ export function editObjectProperties(id: string, patch: ObjectPropertiesPatch): 
     if (Object.keys(patch).length === 1 && hasOwn(patch, "paletteId")) {
       return architecturePaletteSourceCommit(architecture, kind, id, patch.paletteId ?? null);
     }
-    return architectureSourceCommit(architecture, {
+    const scope: ArchitectureChangeScope = {
       sitePolygons: [sourceTarget?.source.sitePolygon ?? planTarget!.plan.sitePolygon],
       blockIds: [sourceTarget?.source.blockId, planTarget?.plan.blockId],
       ...(kind === "building" ? { buildingId: id } : {})
-    });
+    };
+    if (surgery !== null && roadsChangedBySurgery(surgery)) {
+      return commitArchitectureWithRoads(city, architecture, surgery, plan, scope);
+    }
+    return architectureSourceCommit(architecture, scope);
   });
 }
 
@@ -2484,6 +2469,7 @@ export function editSitePolygon(id: string, sitePolygon: Ring): Promise<RebuildR
     if (sourceTarget === null && planTarget === null) throw new Error(`Unknown architecture object "${id}".`);
     assertArchitectureUnlocked(sourceTarget, planTarget, city.source.architecture);
     const nextSite = structuredClone(sitePolygon);
+    let promotedRecord: PersistentBuildingSource | PersistentPlaceSource | null = null;
     let architecture = city.source.architecture;
     if (sourceTarget !== null) {
       if (sourceTarget.kind === "building") {
@@ -2498,7 +2484,8 @@ export function editSitePolygon(id: string, sitePolygon: Ring): Promise<RebuildR
         };
       }
     } else if (planTarget !== null) {
-      const promoted = promotedArchitectureSource(planTarget, {}, planTarget.plan.placement!, nextSite, true);
+      const promoted = withResolvedAssociations(promotedArchitectureSource(planTarget, {}, planTarget.plan.placement!, nextSite, true), plan, nextSite);
+      promotedRecord = promoted;
       architecture = removeArchitectureOverride(
         planTarget.kind === "building"
           ? { ...architecture, buildings: [...architecture.buildings, promoted as PersistentBuildingSource] }
@@ -2507,23 +2494,566 @@ export function editSitePolygon(id: string, sitePolygon: Ring): Promise<RebuildR
         id
       );
     }
-    return architectureSourceCommit(architecture, {
+    const kind = sourceTarget?.kind ?? planTarget!.kind;
+    const scope: ArchitectureChangeScope = {
       sitePolygons: [sourceTarget?.source.sitePolygon ?? planTarget!.plan.sitePolygon, nextSite],
       blockIds: [sourceTarget?.source.blockId, planTarget?.plan.blockId]
-    });
+    };
+    if (kind === "place") {
+      assertPlaceRoadFree(plan, nextSite, id);
+      return architectureSourceCommit(architecture, scope);
+    }
+    const candidateRecord: PersistentBuildingSource = sourceTarget?.kind === "building"
+      ? { ...sourceTarget.source, sitePolygon: nextSite }
+      : promotedRecord as PersistentBuildingSource;
+    return commitBuildingRouteAware(city, candidateRecord, architecture, plan, scope);
   });
 }
 
 
-async function commitRoadSource(source: CitySourceV4["roads"], generation?: Partial<CitySourceV4["generation"]>, metadataOnly = false): Promise<RebuildResult> {
+// ---------------------------------------------------------------------------
+// Phase 6 Slice E: atomic regeneration, bulk architecture edits, and route-safe
+// manual building edits. Every public entry below is one queue action, one guarded
+// save, one history entry; a stale or blocked attempt changes nothing.
+// ---------------------------------------------------------------------------
+
+function pushEditDiagnostic(entry: Record<string, unknown>): void {
+  editDiagnosticEntries.push({ ...entry, revision: session.current?.revision ?? null });
+  if (editDiagnosticEntries.length > EDIT_DIAGNOSTIC_LIMIT) {
+    editDiagnosticEntries.splice(0, editDiagnosticEntries.length - EDIT_DIAGNOSTIC_LIMIT);
+  }
+}
+
+function captureExpectedRevision(expectedRevision?: number): number | null {
+  return expectedRevision ?? session.current?.revision ?? null;
+}
+
+function assertRevisionCurrent(expected: number | null, action: string): void {
   const current = session.current;
   if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
-  const nextSource: CityStateV4["source"] = {
+  if (expected === null || current.revision !== expected) {
+    pushEditDiagnostic({
+      subsystem: "regeneration",
+      message: `${action} was stale at revision ${current.revision} (expected ${String(expected)}); nothing changed.`
+    });
+    throw new Error(`${action} was superseded by a newer city revision; nothing changed. Retry on the current revision.`);
+  }
+}
+
+function recordRegenerationBlockers(preflight: RegenerationPreflight): void {
+  for (const blocker of preflight.blockers) {
+    pushEditDiagnostic({ subsystem: "regeneration", message: `Blocker ${blocker.kind} "${blocker.id}": ${blocker.reason}` });
+  }
+}
+
+/**
+ * Recovery disclosure for regeneration cleanup (§26.6): the pure preflight drops
+ * stale unprotected overrides — those whose derived object or lineage no longer
+ * matches — without raising a blocker, so the GM would lose a record silently.
+ * This reports the exact dropped target IDs/reasons as Diagnostics entries only;
+ * it never changes authoritative state and never promotes the cleanup to a blocker.
+ */
+function droppedOverrideOrphans(source: CitySourceV5, candidate: CitySourceV5, plan: CompleteCityPlan): ArchitectureOverrideSource[] {
+  const surviving = new Set(candidate.architecture.overrides.map((override) => `${override.targetKind}:${override.targetId}`));
+  const orphans: ArchitectureOverrideSource[] = [];
+  for (const override of source.architecture.overrides) {
+    if (override.protection !== "none" || surviving.has(`${override.targetKind}:${override.targetId}`)) continue;
+    // Overrides the plan still matches die with the regenerated target content; only
+    // overrides no longer matching any derived object/lineage are stale orphans.
+    const planTarget = architecturePlanTarget(plan, override.targetId);
+    if (planTarget !== null && planTarget.kind === override.targetKind && planTarget.plan.lineage === override.lineage) continue;
+    orphans.push(override);
+  }
+  return orphans;
+}
+
+function recordOverrideOrphanCleanup(overrides: readonly ArchitectureOverrideSource[]): void {
+  for (const override of overrides) {
+    pushEditDiagnostic({
+      subsystem: "regeneration",
+      kind: "orphan-override-cleanup",
+      message: `Regeneration cleanup dropped the stale unprotected ${override.targetKind} override for "${override.targetId}": its derived object no longer matches the override lineage.`,
+      orphanedOverrides: [override.targetId],
+      orphanedCount: 1
+    });
+  }
+}
+
+function recordPartialSeedCleanup(before: readonly RegenerationPartialSeedRecord[], after: readonly RegenerationPartialSeedRecord[]): void {
+  const dropped = before.filter((record) => !after.some((next) => next.targetKind === record.targetKind && next.targetId === record.targetId));
+  if (dropped.length === 0) return;
+  pushEditDiagnostic({
+    subsystem: "regeneration",
+    kind: "orphan-seed-cleanup",
+    message: `Partial-seed cleanup dropped ${dropped.length} stale record(s) for vanished targets: ${dropped.map((record) => `${record.targetKind}/${record.targetId}`).join(", ")}.`,
+    orphanedCount: dropped.length
+  });
+}
+
+function regenerationBlockerError(preflight: RegenerationPreflight): Error & { blockers: RegenerationPreflight["blockers"] } {
+  return Object.assign(
+    new Error(`Regeneration blocked: ${preflight.blockers.map((blocker) => `${blocker.kind} "${blocker.id}" — ${blocker.reason}`).join("; ")}`),
+    { blockers: preflight.blockers }
+  );
+}
+
+function roadsChangedBySurgery(surgery: RouteSurgeryResult): boolean {
+  return surgery.trimmedEdgeIds.length > 0 || surgery.removedEdgeIds.length > 0;
+}
+
+/**
+ * Deterministic route surgery for one building candidate's materialized masses
+ * (never the reservation site alone). Locked edges reject the whole action naming
+ * the edge; unlocked edges are trimmed or removed, orphans pruned, and topology is
+ * re-validated inside the surgery (adjacent locked geometry re-verified per pass).
+ * Returns null when the masses touch no road.
+ */
+function buildingRouteSurgery(city: CityStateV5, occupied: MultiPolygon): RouteSurgeryResult | null {
+  const conflicts = analyzeRouteConflicts(city.source.roads, occupied);
+  if (conflicts.length === 0) {
+    // WHY: every route-aware operation refreshes the shared status; a conflict-free
+    // edit must not keep presenting a previous attempt's blockers.
+    routeEditStatusState = null;
+    return null;
+  }
+  const lockedIds = new Set(city.source.roads.edges.filter((edge) => edge.locked).map((edge) => edge.id));
+  const blockers = conflicts
+    .filter((conflict) => lockedIds.has(conflict.edgeId))
+    .map((conflict) => ({ id: conflict.edgeId, kind: "road" as const, reason: conflict.reason }));
+  if (blockers.length > 0) {
+    routeEditStatusState = {
+      conflicts: structuredClone(conflicts),
+      blockers,
+      trimmedEdgeIds: [],
+      removedEdgeIds: [],
+      disconnectedVehicleNetwork: false
+    };
+    pushEditDiagnostic({ subsystem: "routes", message: `Building edit rejected by locked road edges: ${blockers.map((blocker) => `${blocker.id} — ${blocker.reason}`).join("; ")}` });
+    throw new RouteSurgeryError(blockers);
+  }
+  const surgery = applyBuildingRouteSurgery(city.source.roads, occupied, { revision: city.revision, sequence: nextRoadSequence() });
+  routeEditStatusState = {
+    conflicts: structuredClone(surgery.conflicts),
+    blockers: [],
+    trimmedEdgeIds: [...surgery.trimmedEdgeIds],
+    removedEdgeIds: [...surgery.removedEdgeIds],
+    disconnectedVehicleNetwork: surgery.disconnectedVehicleNetwork
+  };
+  if (roadsChangedBySurgery(surgery)) {
+    pushEditDiagnostic({
+      subsystem: "routes",
+      message: `Route surgery trimmed [${surgery.trimmedEdgeIds.join(", ")}] and removed [${surgery.removedEdgeIds.join(", ")}]` +
+        (surgery.disconnectedVehicleNetwork ? "; vehicle network disconnected (warning permitted, commit proceeds)." : ".")
+    });
+  }
+  return surgery;
+}
+
+/** Places stay road-free: the landmark site must clear the canonical compiled occupancy. */
+function assertPlaceRoadFree(plan: CompleteCityPlan, site: Ring, id: string): void {
+  if (!isSnapNoise(intersection(ringAsMulti(site), plan.routeOccupancy.all))) {
+    throw new Error(`Place "${id}" must stay clear of roads.`);
+  }
+}
+
+/**
+ * Transformed generated promotions keep valid district/block associations: the core
+ * resolves membership from associations and falls back to site centroid only for
+ * authored records, so a stale null association would make an unlocked moved
+ * promotion immune to regeneration.
+ */
+function associationForPoint(plan: CompleteCityPlan, point: Vec2): { districtId: string | null; blockId: string | null } {
+  for (const block of plan.districtPlan.blocks) {
+    for (const fragment of block.districtFragments) {
+      for (const polygon of fragment.buildable) {
+        if (districtPointInRing(point, polygon[0]!)) return { districtId: fragment.districtId, blockId: block.id };
+      }
+    }
+  }
+  for (const block of plan.districtPlan.blocks) {
+    if (districtPointInRing(point, block.zoningFace)) {
+      return { districtId: block.districtFragments[0]?.districtId ?? null, blockId: block.id };
+    }
+  }
+  return { districtId: null, blockId: null };
+}
+
+function withResolvedAssociations(
+  record: PersistentBuildingSource | PersistentPlaceSource,
+  plan: CompleteCityPlan,
+  site: Ring
+): PersistentBuildingSource | PersistentPlaceSource {
+  if (record.origin !== "generated") return record;
+  return { ...record, ...associationForPoint(plan, ringCentroid(site)) };
+}
+
+interface PlannedFootprints {
+  buildings: Map<string, Ring>;
+  landmarks: Map<string, Ring>;
+  openSpaces: Map<string, Ring>;
+}
+
+function plannedFootprints(plan: CompleteCityPlan): PlannedFootprints {
+  return {
+    buildings: new Map(plan.buildings.map((building) => [building.id, building.sitePolygon])),
+    landmarks: new Map(plan.landmarks.map((landmark) => [landmark.id, landmark.sitePolygon])),
+    openSpaces: new Map(plan.openSpaces.map((openSpace) => [openSpace.id, openSpace.polygon]))
+  };
+}
+
+/**
+ * The affected chunk set for a regeneration: the old and new target scope union plus
+ * every chunk carrying cross-boundary buildings, landmarks, and open spaces, plus the
+ * connector-ownership chunks (midpoint between same-block peers) for affected
+ * buildings. Chunks wholly outside both scopes never reinstall.
+ */
+export function affectedRegenerationChunkKeys(oldPlan: CompleteCityPlan, newPlan: CompleteCityPlan, target: RegenerationTarget): ChunkKey[] {
+  const keys = new Map<string, ChunkKey>();
+  const addRect = (rect: Rect): void => {
+    for (const key of chunksCovering(rect)) keys.set(chunkId(key), key);
+  };
+  const addRing = (ring: Ring): void => addRect(ringBounds(ring));
+  const scopeRects: Rect[] = [];
+  for (const plan of [oldPlan, newPlan]) {
+    const scope = resolveRegenerationTargetScope(plan, target);
+    if (scope === null) continue;
+    for (const polygon of scope.scopePolygon) {
+      const bounds = ringBounds(polygon[0]!);
+      addRect(bounds);
+      scopeRects.push(bounds);
+    }
+  }
+  if (scopeRects.length === 0) return [...keys.values()];
+  const intersectsScope = (ring: Ring): boolean => {
+    const bounds = ringBounds(ring);
+    return scopeRects.some((scope) => rectsIntersect(bounds, scope));
+  };
+  const layers: [PlannedFootprints, PlannedFootprints][] = [
+    [plannedFootprints(oldPlan), plannedFootprints(newPlan)],
+    [plannedFootprints(newPlan), plannedFootprints(oldPlan)]
+  ];
+  for (const [layer, other] of layers) {
+    for (const key of ["buildings", "landmarks", "openSpaces"] as const) {
+      for (const [id, ring] of layer[key]) {
+        if (intersectsScope(ring)) {
+          addRing(ring);
+          continue;
+        }
+        const next = other[key].get(id);
+        if (next === undefined || !sameRect(ringBounds(next), ringBounds(ring))) {
+          addRing(ring);
+          if (next !== undefined) addRing(next);
+        }
+      }
+    }
+  }
+  // Connector ownership: a connector is emitted by the chunk containing the midpoint
+  // between its two same-block endpoint buildings, so peers of affected buildings in
+  // the new plan need their midpoint chunks too.
+  const parcelById = new Map(newPlan.parcels.map((parcel) => [parcel.id, parcel]));
+  const ownerRing = (building: BuildingPlan): Ring =>
+    building.parcelId === null ? building.sitePolygon : parcelById.get(building.parcelId)?.polygon ?? building.sitePolygon;
+  for (const building of newPlan.buildings) {
+    if (building.blockId === null) continue;
+    if (!intersectsScope(ownerRing(building))) continue;
+    const centre = ringCentroid(ownerRing(building));
+    for (const peer of newPlan.buildings) {
+      if (peer.id === building.id || peer.blockId !== building.blockId) continue;
+      const peerCentre = ringCentroid(ownerRing(peer));
+      addRect({ x: (centre.x + peerCentre.x) / 2, y: (centre.y + peerCentre.y) / 2, width: Number.EPSILON, height: Number.EPSILON });
+    }
+  }
+  return [...keys.values()];
+}
+
+function emptyRegenerationStats(target: RegenerationTarget, seed: string | null, status: RegenerationStats["status"], preflightMs: number, city: CityStateV5): RegenerationStats {
+  return {
+    status,
+    target: { ...target, ids: [...target.ids] },
+    seed,
+    preflightMs,
+    workerMs: 0,
+    saveMs: 0,
+    installMs: 0,
+    affectedChunks: 0,
+    totalChunks: chunksCovering(sceneBoundsM(city.source.origin)).length
+  };
+}
+
+/**
+ * Regenerate one district or a set of complete blocks: preflight, full Worker rebuild,
+ * commit-revision preflight against the retained current source and plan, then one
+ * guarded save with the prepared validated plan, the Worker-normalized partial seeds,
+ * and scoped chunk installation. A null seed generates and persists fresh seed text
+ * instead of silently replaying the persisted chronology. Roads and walls are never
+ * touched.
+ */
+export function regenerateTargets(target: RegenerationTarget, seed: string | null, expectedRevision?: number): Promise<RebuildResult> {
+  const expected = captureExpectedRevision(expectedRevision);
+  // WHY: the caller may mutate the target (or its ids array) while the action queues;
+  // the whole operation runs against the ids captured at invocation.
+  const snapshotTarget: RegenerationTarget = { kind: target.kind, ids: [...target.ids] };
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    assertRevisionCurrent(expected, "Regeneration");
+    const plan = await requireCompletePlan(city);
+    // WHY: a null seed never replays the persisted chronology — fresh seed text is
+    // generated here, recorded as the newest event for the target by the preflight
+    // candidate, and reported in stats, so every attempt is a disclosed new intent.
+    const chosenSeed = seed ?? randomSeed();
+    const preflightStarted = performance.now();
+    const preflight = evaluateRegenerationPreflight(city.source, plan, snapshotTarget, chosenSeed);
+    const preflightMs = performance.now() - preflightStarted;
+    if (preflight.blockers.length > 0 || preflight.candidateSource === null) {
+      recordRegenerationBlockers(preflight);
+      lastRegenerationStats = emptyRegenerationStats(snapshotTarget, chosenSeed, "failed", preflightMs, city);
+      throw regenerationBlockerError(preflight);
+    }
+    const epoch = session.buildEpoch;
+    const candidate: CityStateV5 = { ...city, revision: city.revision + 1, source: preflight.candidateSource };
+    const workerStarted = performance.now();
+    let built: BuiltCompletePlan;
+    try {
+      built = await buildCompletePlanThroughWorker(candidate.source, candidate.revision, epoch, nextCompleteSequence());
+    } catch (error) {
+      const workerMs = performance.now() - workerStarted;
+      lastRegenerationStats = { ...emptyRegenerationStats(snapshotTarget, chosenSeed, "failed", preflightMs, city), workerMs };
+      pushEditDiagnostic({ subsystem: "regeneration", message: `Regeneration for ${snapshotTarget.kind} [${snapshotTarget.ids.join(", ")}] failed in the Worker: ${error instanceof Error ? error.message : String(error)}` });
+      throw error;
+    }
+    const workerMs = performance.now() - workerStarted;
+    const mergedSource: CitySourceV5 = { ...candidate.source, regeneration: { partialSeeds: built.normalizedPartialSeeds } };
+    const mergedCandidate: CityStateV5 = { ...candidate, source: mergedSource };
+    // WHY: the live revision/epoch gate runs first; the commit preflight then re-runs
+    // against the retained CURRENT source and plan — re-evaluating the regenerated
+    // candidate would be a second logical regeneration — and the guarded save still
+    // rejects any external revision that lands after this check.
+    const live = session.current;
+    if (live === null || !terrainBuildIsCurrent(city.revision, epoch, live.revision, session.buildEpoch)) {
+      pushEditDiagnostic({ subsystem: "regeneration", message: `Regeneration for ${snapshotTarget.kind} [${snapshotTarget.ids.join(", ")}] became stale before save; nothing was committed.` });
+      lastRegenerationStats = { ...emptyRegenerationStats(snapshotTarget, chosenSeed, "stale", preflightMs, city), workerMs };
+      throw new Error("The regeneration was superseded by a newer city revision; nothing changed.");
+    }
+    const commitPreflight = evaluateRegenerationPreflight(city.source, plan, snapshotTarget, chosenSeed);
+    if (commitPreflight.blockers.length > 0 || commitPreflight.candidateSource === null) {
+      recordRegenerationBlockers(commitPreflight);
+      lastRegenerationStats = { ...emptyRegenerationStats(snapshotTarget, chosenSeed, "failed", preflightMs, city), workerMs };
+      throw regenerationBlockerError(commitPreflight);
+    }
+    // WHY: the committed candidate is the initial preflight's; cleanup is disclosed
+    // only after the save succeeds so a stale/failed attempt claims nothing.
+    const cleanedOverrideOrphans = droppedOverrideOrphans(city.source, preflight.candidateSource, plan);
+    const affectedKeys = affectedRegenerationChunkKeys(plan, built.plan, snapshotTarget);
+    const metrics: { saveMs?: number } = {};
+    const result = await commitCandidate(
+      mergedCandidate,
+      { wallRelevant: false, changedChunkKeys: affectedKeys, preparedPlan: built.plan, cacheableSubset: true },
+      metrics
+    );
+    recordPartialSeedCleanup(city.source.regeneration.partialSeeds, built.normalizedPartialSeeds);
+    recordOverrideOrphanCleanup(cleanedOverrideOrphans);
+    lastRegenerationStats = {
+      status: "complete",
+      target: { ...snapshotTarget, ids: [...snapshotTarget.ids] },
+      seed: chosenSeed,
+      preflightMs,
+      workerMs,
+      saveMs: metrics.saveMs ?? 0,
+      installMs: result.ms,
+      affectedChunks: affectedKeys.length,
+      totalChunks: chunksCovering(sceneBoundsM(mergedCandidate.source.origin)).length
+    };
+    return result;
+  });
+}
+
+/** Structured preflight for the Regenerate tray; never mutates any state. */
+export function preflightRegeneration(target: RegenerationTarget, seed: string, expectedRevision?: number): Promise<RegenerationPreflight> {
+  const expected = captureExpectedRevision(expectedRevision);
+  // WHY: the caller may mutate the target while the action queues; the preflight
+  // evaluates the ids captured at invocation.
+  const snapshotTarget: RegenerationTarget = { kind: target.kind, ids: [...target.ids] };
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    assertRevisionCurrent(expected, "Regeneration preflight");
+    const plan = await requireCompletePlan(city);
+    const started = performance.now();
+    const preflight = evaluateRegenerationPreflight(city.source, plan, snapshotTarget, seed);
+    const preflightMs = performance.now() - started;
+    recordRegenerationBlockers(preflight);
+    lastRegenerationStats = emptyRegenerationStats(snapshotTarget, seed, preflight.blockers.length > 0 ? "failed" : "complete", preflightMs, city);
+    return preflight;
+  });
+}
+
+/** Structured route-edit preview/commit feedback for the next UI wave. */
+export function getRouteEditStatus(): RouteEditStatus | null {
+  return routeEditStatusState === null ? null : structuredClone(routeEditStatusState);
+}
+
+/**
+ * Compound architecture + route-surgery commit for building edits whose materialized
+ * masses cross unlocked roads: one atomic candidate carries the deterministic surgery,
+ * district reconciliation, and (via the shared commit path) the Worker-normalized
+ * stale-seed cleanup; walls rebuild because roads changed.
+ */
+async function commitArchitectureWithRoads(
+  city: CityStateV5,
+  architecture: ArchitectureSource,
+  surgery: RouteSurgeryResult,
+  plan: CompleteCityPlan,
+  scope: ArchitectureChangeScope
+): Promise<RebuildResult> {
+  const problems = validateArchitectureSource(architecture);
+  if (problems.length > 0) throw new Error(problems.join(" "));
+  const targetProblems = architectureOverrideTargetProblems(architecture);
+  if (targetProblems.length > 0) throw new Error(targetProblems.join(" "));
+  const roads = surgery.source;
+  const roadBase: CityStateV5["source"] = { ...city.source, roads };
+  const candidate: CityStateV5 = {
+    ...city,
+    revision: city.revision + 1,
+    source: {
+      ...roadBase,
+      districts: reconcileDistrictsForRoadEdit(city.source, roadBase),
+      architecture
+    }
+  };
+  const keys = new Map<string, ChunkKey>(architectureChangedChunkKeys(plan, scope).map((key) => [chunkId(key), key]));
+  // Trimmed/removed edges leave old corridor geometry behind in chunks the edited
+  // sites do not cover.
+  const nodeById = new Map(city.source.roads.nodes.map((node) => [node.id, node]));
+  for (const edgeId of [...surgery.trimmedEdgeIds, ...surgery.removedEdgeIds]) {
+    const edge = city.source.roads.edges.find((candidate2) => candidate2.id === edgeId);
+    const a = edge === undefined ? undefined : nodeById.get(edge.a);
+    const b = edge === undefined ? undefined : nodeById.get(edge.b);
+    if (a === undefined || b === undefined) continue;
+    for (const key of chunksCovering({
+      x: Math.min(a.x, b.x),
+      y: Math.min(a.y, b.y),
+      width: Math.abs(a.x - b.x),
+      height: Math.abs(a.y - b.y)
+    })) keys.set(chunkId(key), key);
+  }
+  const result = await commitCandidate(candidate, { wallRelevant: true, changedChunkKeys: [...keys.values()] });
+  roadSelection = pruneRoadSelection(roadSelection, roads);
+  return result;
+}
+
+async function runBulkArchitectureOperation(
+  ids: readonly string[],
+  operation: { kind: "lock"; locked: boolean } | { kind: "delete" } | { kind: "edit"; patch: ArchitectureSourcePatch },
+  expected: number | null,
+  action: string
+): Promise<RebuildResult> {
+  // WHY: the caller may mutate the selection array while the action queues; the whole
+  // operation runs against the ids captured at invocation.
+  const snapshotIds = [...ids];
+  return terrainActions.run(async () => {
+    const city = session.current;
+    if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
+    assertRevisionCurrent(expected, action);
+    if (snapshotIds.length === 0) throw new Error(`${action} requires at least one selected object.`);
+    const plan = await requireCompletePlan(city);
+    let bulk: { architecture: ArchitectureSource; sitePolygons: Ring[]; affectedIds: string[] };
+    try {
+      bulk = buildBulkArchitectureCandidate(city.source, plan, snapshotIds, operation);
+    } catch (error) {
+      if (error instanceof BulkArchitectureError) {
+        for (const blocker of error.blockers) {
+          pushEditDiagnostic({ subsystem: "objects", message: `Bulk blocker "${blocker.id}": ${blocker.reason}` });
+        }
+      }
+      throw error;
+    }
+    const sitePolygons = [...bulk.sitePolygons];
+    const blockIds = new Set<string | null | undefined>();
+    for (const id of bulk.affectedIds) {
+      const sourceTarget = architectureSourceTarget(city.source.architecture, id);
+      if (sourceTarget !== null) {
+        blockIds.add(sourceTarget.source.blockId);
+        sitePolygons.push(structuredClone(sourceTarget.source.sitePolygon));
+      }
+      const planTarget = architecturePlanTarget(plan, id);
+      if (planTarget !== null) {
+        blockIds.add(planTarget.plan.blockId);
+        sitePolygons.push(structuredClone(planTarget.plan.sitePolygon));
+      }
+    }
+    // Freed fragment area is refilled by procedural planning, so every affected block
+    // face joins the scoped chunk set.
+    for (const blockId of blockIds) {
+      if (blockId === null || blockId === undefined) continue;
+      const block = plan.districtPlan.blocks.find((candidate) => candidate.id === blockId);
+      if (block !== undefined) sitePolygons.push(structuredClone(block.zoningFace));
+    }
+    const scope: ArchitectureChangeScope = {
+      sitePolygons,
+      blockIds: [...blockIds],
+      preserveOverrides: true
+    };
+    // WHY: bulk geometry edits share the singular edit's route contract: the occupied
+    // geometry of every changed building in the candidate materializes into one union,
+    // one route surgery runs over the whole selection before the commit (any locked
+    // edge rejects the entire action, a disconnected vehicle network only warns), and
+    // the surgery result commits atomically with the architecture candidate. Lock and
+    // delete never grow occupancy, so they stay surgery-free.
+    if (operation.kind === "edit") {
+      const occupied: MultiPolygon[] = [];
+      for (const id of bulk.affectedIds) {
+        const target = architectureSourceTarget(bulk.architecture, id);
+        if (target?.kind !== "building") continue;
+        occupied.push(occupiedPersistentBuildingGeometry(target.source, city.source));
+      }
+      if (occupied.length > 0) {
+        const surgery = buildingRouteSurgery(city, union(occupied));
+        if (surgery !== null && roadsChangedBySurgery(surgery)) {
+          return commitArchitectureWithRoads(city, bulk.architecture, surgery, plan, scope);
+        }
+      }
+    }
+    return architectureSourceCommit(bulk.architecture, scope);
+  });
+}
+
+export function bulkSetObjectsLocked(ids: readonly string[], locked: boolean, expectedRevision?: number): Promise<RebuildResult> {
+  return runBulkArchitectureOperation(ids, { kind: "lock", locked }, captureExpectedRevision(expectedRevision), "Bulk lock");
+}
+
+export function bulkDeleteObjects(ids: readonly string[], expectedRevision?: number): Promise<RebuildResult> {
+  return runBulkArchitectureOperation(ids, { kind: "delete" }, captureExpectedRevision(expectedRevision), "Bulk delete");
+}
+
+export function bulkEditObjects(ids: readonly string[], patch: ObjectPropertiesPatch, expectedRevision?: number): Promise<RebuildResult> {
+  return runBulkArchitectureOperation(ids, { kind: "edit", patch: structuredClone(patch) }, captureExpectedRevision(expectedRevision), "Bulk edit");
+}
+
+async function commitBuildingRouteAware(
+  city: CityStateV5,
+  candidateRecord: PersistentBuildingSource,
+  architecture: ArchitectureSource,
+  plan: CompleteCityPlan,
+  scope: ArchitectureChangeScope
+): Promise<RebuildResult> {
+  const occupied = occupiedPersistentBuildingGeometry(candidateRecord, city.source);
+  const surgery = buildingRouteSurgery(city, occupied);
+  if (surgery !== null && roadsChangedBySurgery(surgery)) {
+    return commitArchitectureWithRoads(city, architecture, surgery, plan, scope);
+  }
+  return architectureSourceCommit(architecture, scope);
+}
+
+async function commitRoadSource(source: CitySourceV5["roads"], generation?: Partial<CitySourceV5["generation"]>, metadataOnly = false): Promise<RebuildResult> {
+  const current = session.current;
+  if (current === null) throw new Error("Create a City Generator 2.0 terrain first.");
+  const nextSource: CityStateV5["source"] = {
     ...current.source,
     generation: { ...current.source.generation, ...generation },
     roads: source
   };
-  const candidate: CityStateV4 = {
+  const candidate: CityStateV5 = {
     ...current,
     revision: current.revision + 1,
     source: {
@@ -2638,8 +3168,8 @@ export function appendRoad(
 }
 
 export function generateRoads(
-  layout: CitySourceV4["generation"]["roadLayout"] = "european",
-  hubMode: CitySourceV4["generation"]["hubMode"] = "single-centre"
+  layout: CitySourceV5["generation"]["roadLayout"] = "european",
+  hubMode: CitySourceV5["generation"]["hubMode"] = "single-centre"
 ): Promise<RebuildResult> {
   return terrainActions.run(async () => {
     const city = session.current;
@@ -2770,7 +3300,7 @@ function districtPointInRing(point: Vec2, ring: Ring): boolean {
   return inside;
 }
 
-function districtManualId(city: CityStateV4, lineage: string): string {
+function districtManualId(city: CityStateV5, lineage: string): string {
   let hash = 0x811c9dc5;
   const material = `${city.source.citySeed}\0districts/manual/${city.revision}/${lineage}`;
   for (let index = 0; index < material.length; index++) hash = Math.imul(hash ^ material.charCodeAt(index), 0x01000193);
@@ -2783,11 +3313,11 @@ function districtManualId(city: CityStateV4, lineage: string): string {
   }
 }
 
-function districtSeed(city: CityStateV4, lineage: string): string {
+function districtSeed(city: CityStateV5, lineage: string): string {
   return `${city.source.citySeed}/district/${city.revision}/${lineage}`;
 }
 
-function districtRecord(city: CityStateV4, polygon: Ring, typeId: DistrictTypeId, lineage: string, paletteId?: string): DistrictSource {
+function districtRecord(city: CityStateV5, polygon: Ring, typeId: DistrictTypeId, lineage: string, paletteId?: string): DistrictSource {
   if (!DISTRICT_TYPE_REGISTRY.has(typeId)) throw new Error(`Unknown district type "${typeId}".`);
   const resolvedPaletteId = paletteId ?? DISTRICT_TYPE_REGISTRY.get(typeId)!.defaultPaletteId;
   if (!DISTRICT_PALETTE_IDS.includes(resolvedPaletteId)) throw new Error(`Unknown district palette "${resolvedPaletteId}".`);
@@ -2803,7 +3333,7 @@ function districtRecord(city: CityStateV4, polygon: Ring, typeId: DistrictTypeId
   };
 }
 
-function districtSourceCommit(source: CityStateV4["source"]): Promise<RebuildResult> {
+function districtSourceCommit(source: CityStateV5["source"]): Promise<RebuildResult> {
   // WHY: district-only commits never schedule walls; the derived walls follow the plan,
   // which the commit publishes and the wall scheduler refreshes after the next structural
   // road/terrain commit or an explicit Retry.
@@ -2901,6 +3431,7 @@ export function districtDiagnostics(): Array<Record<string, unknown>> {
   if (geometryDiagnostic !== null) {
     entries.push({ subsystem: "geometry", retry: "geometry", message: geometryDiagnostic.reason, revision: geometryDiagnostic.revision });
   }
+  entries.push(...editDiagnosticEntries);
   return entries;
 }
 
@@ -2946,7 +3477,7 @@ export function generateDistricts(options: { districtPool: DistrictTypeId[]; ope
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
     if (city.source.districts.length > 0) throw new Error("Initial district generation requires an empty district source.");
-    const source: CityStateV4["source"] = {
+    const source: CityStateV5["source"] = {
       ...city.source,
       generation: {
         ...city.source.generation,
@@ -3032,8 +3563,78 @@ export function updateDistricts(ids: readonly string[], patch: DistrictUpdatePat
   return terrainActions.run(async () => {
     const city = session.current;
     if (city === null) throw new Error("Create a City Generator 2.0 terrain first.");
-    const districts = districtUpdateCandidate(city.source, ids, patch);
-    return districtSourceCommit({ ...city.source, districts });
+    if (patch.seed === undefined) {
+      const districts = districtUpdateCandidate(city.source, ids, patch);
+      return districtSourceCommit({ ...city.source, districts });
+    }
+    // WHY: applying or rerolling a district base seed is a disclosed district-wide
+    // regeneration: the same seed is recorded as the newest district event (older block
+    // attempts are preserved, never deleted) and the same protected-content preflight,
+    // full Worker rebuild, and atomic commit run as for any regeneration.
+    const plan = await requireCompletePlan(city);
+    const targets: RegenerationTarget[] = ids.map((id) => ({ kind: "district", ids: [id] }));
+    const preflightStarted = performance.now();
+    let candidateSource = city.source;
+    for (const target of targets) {
+      const preflight = evaluateRegenerationPreflight(candidateSource, plan, target, patch.seed);
+      if (preflight.blockers.length > 0 || preflight.candidateSource === null) {
+        recordRegenerationBlockers(preflight);
+        lastRegenerationStats = emptyRegenerationStats(target, patch.seed, "failed", performance.now() - preflightStarted, city);
+        throw regenerationBlockerError(preflight);
+      }
+      candidateSource = preflight.candidateSource;
+    }
+    // WHY: the committed candidate is this loop's chained result; cleanup is disclosed
+    // only after the save succeeds so a stale/failed attempt claims nothing.
+    const cleanedOverrideOrphans = droppedOverrideOrphans(city.source, candidateSource, plan);
+    const preflightMs = performance.now() - preflightStarted;
+    // WHY: the base seed still updates through the existing district edit candidate so
+    // the persisted DistrictSource.seed and the newest district event never diverge.
+    const districts = districtUpdateCandidate(candidateSource, ids, patch);
+    const epoch = session.buildEpoch;
+    const candidate: CityStateV5 = { ...city, revision: city.revision + 1, source: { ...candidateSource, districts } };
+    const workerStarted = performance.now();
+    const built = await buildCompletePlanThroughWorker(candidate.source, candidate.revision, epoch, nextCompleteSequence());
+    const workerMs = performance.now() - workerStarted;
+    const mergedSource: CitySourceV5 = { ...candidate.source, regeneration: { partialSeeds: built.normalizedPartialSeeds } };
+    const mergedCandidate: CityStateV5 = { ...candidate, source: mergedSource };
+    for (const target of targets) {
+      const commitPreflight = evaluateRegenerationPreflight(mergedSource, built.plan, target, patch.seed);
+      if (commitPreflight.blockers.length > 0 || commitPreflight.candidateSource === null) {
+        recordRegenerationBlockers(commitPreflight);
+        lastRegenerationStats = { ...emptyRegenerationStats(target, patch.seed, "failed", preflightMs, city), workerMs };
+        throw regenerationBlockerError(commitPreflight);
+      }
+    }
+    const live = session.current;
+    if (live === null || !terrainBuildIsCurrent(city.revision, epoch, live.revision, session.buildEpoch)) {
+      pushEditDiagnostic({ subsystem: "regeneration", message: `District seed update for [${ids.join(", ")}] became stale before save; nothing was committed.` });
+      lastRegenerationStats = { ...emptyRegenerationStats(targets[0] ?? { kind: "district", ids: [...ids] }, patch.seed, "stale", preflightMs, city), workerMs };
+      throw new Error("The district seed update was superseded by a newer city revision; nothing changed.");
+    }
+    const affectedKeys = [...new Map(
+      targets.flatMap((target) => affectedRegenerationChunkKeys(plan, built.plan, target)).map((key) => [chunkId(key), key])
+    ).values()];
+    const metrics: { saveMs?: number } = {};
+    const result = await commitCandidate(
+      mergedCandidate,
+      { wallRelevant: false, changedChunkKeys: affectedKeys, preparedPlan: built.plan, cacheableSubset: true },
+      metrics
+    );
+    recordPartialSeedCleanup(city.source.regeneration.partialSeeds, built.normalizedPartialSeeds);
+    recordOverrideOrphanCleanup(cleanedOverrideOrphans);
+    lastRegenerationStats = {
+      status: "complete",
+      target: { kind: "district", ids: [...ids] },
+      seed: patch.seed,
+      preflightMs,
+      workerMs,
+      saveMs: metrics.saveMs ?? 0,
+      installMs: result.ms,
+      affectedChunks: affectedKeys.length,
+      totalChunks: chunksCovering(sceneBoundsM(mergedCandidate.source.origin)).length
+    };
+    return result;
   });
 }
 
@@ -3126,7 +3727,7 @@ async function applyHistory(direction: "undo" | "redo"): Promise<boolean> {
     plan = reusable;
   } else {
     actionToken = nextCompleteSequence();
-    plan = await buildCompletePlanThroughWorker(target.source, target.revision, session.buildEpoch, actionToken);
+    plan = (await buildCompletePlanThroughWorker(target.source, target.revision, session.buildEpoch, actionToken)).plan;
   }
   const saved = await guardedSave(target, current.revision);
   if (direction === "undo") session.publishUndo(saved);
@@ -3467,8 +4068,8 @@ async function runFullGeneration(staging: FullGenerationStaging, seed: string, p
     operation.phase = "saving";
     notifyCityChanged();
     // WHY: the worker composes the revision-1 SOURCE; the adapter wraps it into the full
-    // persisted state so the guarded revision-1 save validates a real CityStateV4.
-    const candidate: CityStateV4 = {
+    // persisted state so the guarded revision-1 save validates a real CityStateV5.
+    const candidate: CityStateV5 = {
       kind: "city-generator-2",
       schemaVersion: CITY_SCHEMA_VERSION,
       generatorVersion: GENERATOR_VERSION,
@@ -3594,7 +4195,7 @@ export function retryGeometry(): Promise<RebuildResult> {
 }
 
 async function planInitialDistricts(
-  source: CitySourceV4,
+  source: CitySourceV5,
   sourceRevision: number,
   actionToken: number,
   buildToken: number
@@ -3699,7 +4300,7 @@ export async function rebuildGeometry(): Promise<RebuildResult> {
     let origin: CompletePlanOrigin = "cache";
     if (plan === null) {
       try {
-        plan = await buildCompletePlanThroughWorker(city.source, revision, epoch, nextCompleteSequence());
+        plan = (await buildCompletePlanThroughWorker(city.source, revision, epoch, nextCompleteSequence())).plan;
         origin = "generated";
       } catch (error) {
         noteWorkerFailure(error);
@@ -3874,6 +4475,8 @@ export function stats(): Record<string, unknown> | null {
     terrainMode: city.source.generation.terrainMode,
     coastEdge: city.source.generation.coastEdge,
     citySeed: city.source.citySeed,
+    regeneration: lastRegenerationStats,
+    routeEdit: getRouteEditStatus(),
     landVertices: city.source.terrain.land.length,
     urbanFootprintVertices: city.source.terrain.urbanFootprint?.length ?? 0,
     roadNodes: city.source.roads.nodes.length,

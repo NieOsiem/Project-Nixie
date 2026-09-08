@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CITY_SCHEMA_VERSION, FLAG_CITY, GENERATOR_VERSION, MODULE_ID } from "../constants.js";
 import { DISTRICT_TYPE_IDS } from "../core/gen/district-registry.js";
-import type { CityStateV3, CityStateV4 } from "../core/gen/city.js";
+import type { CityStateV3, CityStateV5 } from "../core/gen/city.js";
 import { CITY_CACHE_FLAG } from "../core/gen/city-cache.js";
 import { rectangleLand } from "../core/gen/terrain.js";
 import { loadCityState, replaceGeneratedWalls, saveCityState } from "./documents.js";
@@ -55,7 +55,7 @@ function schema2(revision = 3): Record<string, unknown> {
   };
 }
 
-function schema3(revision = 1): CityStateV4 {
+function schema3(revision = 1): CityStateV5 {
   return {
     kind: "city-generator-2",
     schemaVersion: CITY_SCHEMA_VERSION,
@@ -75,14 +75,15 @@ function schema3(revision = 1): CityStateV4 {
       terrain: { land: rectangleLand({ x: -100, y: -80, width: 200, height: 160 }), urbanFootprint: null },
       roads: { nodes: [], routes: [], edges: [] },
       districts: [],
-      architecture: { buildings: [], places: [], overrides: [] }
+      architecture: { buildings: [], places: [], overrides: [] },
+      regeneration: { partialSeeds: [] }
     }
   };
 }
 
 function schema3Legacy(revision = 1): CityStateV3 {
   const current = schema3(revision);
-  const { architecture: _architecture, ...source } = current.source;
+  const { architecture: _architecture, regeneration: _regeneration, ...source } = current.source;
   return {
     ...current,
     schemaVersion: 3,

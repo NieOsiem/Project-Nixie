@@ -1,5 +1,5 @@
 import type { CityLoadResult } from "./documents.js";
-import type { CityStateV4 } from "../core/gen/city.js";
+import type { CityStateV5 } from "../core/gen/city.js";
 import { CITY_SCHEMA_VERSION, GENERATOR_VERSION } from "../constants.js";
 import { History } from "../core/history.js";
 
@@ -11,16 +11,16 @@ function supported(result: CityLoadResult): result is Extract<CityLoadResult, { 
   return result.kind === "supported";
 }
 
-function withoutRevision(state: CityStateV4): Omit<CityStateV4, "revision"> {
+function withoutRevision(state: CityStateV5): Omit<CityStateV5, "revision"> {
   const { revision: _revision, ...rest } = state;
   return rest;
 }
 
-function sameSource(a: CityStateV4, b: CityStateV4): boolean {
+function sameSource(a: CityStateV5, b: CityStateV5): boolean {
   return JSON.stringify(withoutRevision(a)) === JSON.stringify(withoutRevision(b));
 }
 
-function rewritten(state: CityStateV4, revision: number): CityStateV4 {
+function rewritten(state: CityStateV5, revision: number): CityStateV5 {
   return { ...copy(state), revision };
 }
 
@@ -48,8 +48,8 @@ export class TerrainActionQueue {
 
 export class TerrainSession {
   #status: CityLoadResult = { kind: "absent" };
-  #current: CityStateV4 | null = null;
-  #history = new History<CityStateV4>();
+  #current: CityStateV5 | null = null;
+  #history = new History<CityStateV5>();
   #buildEpoch = 0;
   #draftVersion = 0;
 
@@ -57,7 +57,7 @@ export class TerrainSession {
     return copy(this.#status);
   }
 
-  get current(): CityStateV4 | null {
+  get current(): CityStateV5 | null {
     return this.#current === null ? null : copy(this.#current);
   }
 
@@ -89,7 +89,7 @@ export class TerrainSession {
     this.#draftVersion++;
   }
 
-  publishCreation(saved: CityStateV4): void {
+  publishCreation(saved: CityStateV5): void {
     // WHY: Creation only ever follows an explicit clear of the city flag; direct
     // replacement of legacy data is no longer a supported path. The cleared Scene is
     // the post-clear baseline: empty history, no prior revision to reconcile.
@@ -100,22 +100,22 @@ export class TerrainSession {
     this.#publish(saved);
   }
 
-  publishCommit(saved: CityStateV4): void {
+  publishCommit(saved: CityStateV5): void {
     const current = this.#requireCurrent();
     this.#assertSaved(saved, current.revision + 1);
     this.#history.push(copy(current));
     this.#publish(saved);
   }
 
-  get undoTarget(): CityStateV4 | null {
+  get undoTarget(): CityStateV5 | null {
     return this.#target(this.#history.undoTarget);
   }
 
-  get redoTarget(): CityStateV4 | null {
+  get redoTarget(): CityStateV5 | null {
     return this.#target(this.#history.redoTarget);
   }
 
-  publishUndo(saved: CityStateV4): void {
+  publishUndo(saved: CityStateV5): void {
     const current = this.#requireCurrent();
     const target = this.#history.undoTarget;
     if (target === null) throw new Error("Nothing to undo.");
@@ -125,7 +125,7 @@ export class TerrainSession {
     this.#publish(saved);
   }
 
-  publishRedo(saved: CityStateV4): void {
+  publishRedo(saved: CityStateV5): void {
     const current = this.#requireCurrent();
     const target = this.#history.redoTarget;
     if (target === null) throw new Error("Nothing to redo.");
@@ -150,17 +150,17 @@ export class TerrainSession {
     return true;
   }
 
-  #target(target: CityStateV4 | null): CityStateV4 | null {
+  #target(target: CityStateV5 | null): CityStateV5 | null {
     if (target === null || this.#current === null) return null;
     return rewritten(target, this.#current.revision + 1);
   }
 
-  #requireCurrent(): CityStateV4 {
+  #requireCurrent(): CityStateV5 {
     if (this.#current === null) throw new Error("No supported city is loaded.");
     return this.#current;
   }
 
-  #assertSaved(saved: CityStateV4, revision: number): void {
+  #assertSaved(saved: CityStateV5, revision: number): void {
     if (
       saved.kind !== "city-generator-2" ||
       saved.schemaVersion !== CITY_SCHEMA_VERSION ||
@@ -173,7 +173,7 @@ export class TerrainSession {
     }
   }
 
-  #publish(saved: CityStateV4): void {
+  #publish(saved: CityStateV5): void {
     this.#current = copy(saved);
     this.#status = { kind: "supported", state: copy(saved) };
     this.#buildEpoch++;

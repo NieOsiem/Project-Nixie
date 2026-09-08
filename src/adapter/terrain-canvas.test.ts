@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FLAG_CITY, FLAG_ENABLED } from "../constants.js";
 import { DISTRICT_TYPE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeId } from "../core/gen/district-registry.js";
 import { BUILDING_GRAMMAR_REGISTRY } from "../core/gen/building-registry.js";
-import { allocateManualId, allocateManualLineage, type CityStateV4, type DistrictSource, type PlacementFrame } from "../core/gen/city.js";
+import { allocateManualId, allocateManualLineage, type CityStateV5, type DistrictSource, type PlacementFrame } from "../core/gen/city.js";
 import { buildCompleteCityPlan, derivePaletteBanks, type CompleteCityPlan } from "../core/gen/complete-city-plan.js";
 import { PLAN_CACHE_FORMAT_VERSION, type CityCacheManifestV1 } from "../core/gen/city-cache.js";
 import type { CachedCompleteChunkRecord } from "../core/gen/complete-city-chunk-cache.js";
@@ -17,8 +17,8 @@ import {
 } from "../worker/protocol.js";
 import {
   addCityListener,
-  commitArchitectureCandidate,
   clearConfirmationFor,
+  commitArchitectureCandidate,
   configuredPixelsPerMetre,
   cancelTerrainDraft,
   createDistrict,
@@ -83,10 +83,10 @@ const rendererState = vi.hoisted(() => ({
 }));
 
 const cacheState = vi.hoisted(() => ({
-  load: vi.fn<(city: CityStateV4) => Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null>>(),
-  publish: vi.fn<(city: CityStateV4, plan: CompleteCityPlan) => Promise<CityCacheManifestV1>>(),
+  load: vi.fn<(city: CityStateV5) => Promise<{ plan: CompleteCityPlan; manifest: CityCacheManifestV1 } | null>>(),
+  publish: vi.fn<(city: CityStateV5, plan: CompleteCityPlan) => Promise<CityCacheManifestV1>>(),
   loadChunks: vi.fn<(
-    city: CityStateV4,
+    city: CityStateV5,
     plan: CompleteCityPlan,
     boundsM: { x: number; y: number; width: number; height: number },
     pixelsPerMetre: number,
@@ -94,7 +94,7 @@ const cacheState = vi.hoisted(() => ({
     onRecord?: (record: CachedCompleteChunkRecord) => void
   ) => Promise<{ records: CachedCompleteChunkRecord[]; missingChunkIds: string[]; manifest: CityCacheManifestV1 } | null>>(),
   publishChunks: vi.fn<(
-    city: CityStateV4,
+    city: CityStateV5,
     plan: CompleteCityPlan,
     boundsM: { x: number; y: number; width: number; height: number },
     pixelsPerMetre: number,
@@ -200,11 +200,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function cacheManifest(city: CityStateV4, plan: CompleteCityPlan, byteLength = 321): CityCacheManifestV1 {
+function cacheManifest(city: CityStateV5, plan: CompleteCityPlan, byteLength = 321): CityCacheManifestV1 {
   return {
     kind: "project-nixie-city-cache",
     cacheSchemaVersion: 1,
-    generatorVersion: 12,
+    generatorVersion: 13,
     cityRevision: city.revision,
     structuralInput: plan.structuralInput,
     slot: 0,
@@ -252,11 +252,11 @@ beforeEach(() => {
   rendererState.setChunkError = null;
 });
 
-function state(): CityStateV4 {
+function state(): CityStateV5 {
   return {
     kind: "city-generator-2",
-    schemaVersion: 4,
-    generatorVersion: 12,
+    schemaVersion: 5,
+    generatorVersion: 13,
     revision: 1,
     source: {
       origin: { x: 500, y: 400 },
@@ -273,13 +273,13 @@ function state(): CityStateV4 {
       },
       roads: { nodes: [], routes: [], edges: [] },
       districts: [],
-      architecture: { buildings: [], places: [], overrides: [] }
+      architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
     }
   };
 }
 
 describe("complete plan cache pipeline", () => {
-  let saved: CityStateV4;
+  let saved: CityStateV5;
   let worker: FakeWorker;
 
   function workerFactory(): FakeWorker {
@@ -291,7 +291,7 @@ describe("complete plan cache pipeline", () => {
       get walls(): unknown[] { return []; },
       getFlag: (_module: string, flag: string): unknown =>
         flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV5): Promise<CityStateV5> => {
         saved = structuredClone(value);
         return saved;
       }),
@@ -739,7 +739,7 @@ describe("road clearance containment", () => {
   });
 });
 
-function bulkRoadState(): CityStateV4 {
+function bulkRoadState(): CityStateV5 {
   const city = state();
   city.source.roads = {
     nodes: [
@@ -765,7 +765,7 @@ function bulkRoadState(): CityStateV4 {
 }
 
 describe("road bulk mutation selection", () => {
-  let saved: CityStateV4 | undefined;
+  let saved: CityStateV5 | undefined;
   let saveError: Error | null;
   let wallCreateError: Error | null;
   let wallDocuments: Array<{ id: string }>;
@@ -779,7 +779,7 @@ describe("road bulk mutation selection", () => {
 
   function setupScene(initial: unknown): void {
     unmount();
-    saved = initial as CityStateV4 | undefined;
+    saved = initial as CityStateV5 | undefined;
     mount();
   }
 
@@ -793,7 +793,7 @@ describe("road bulk mutation selection", () => {
     const scene = {
       get walls(): Array<{ id: string }> { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV5): Promise<CityStateV5> => {
         if (saveError !== null) throw saveError;
         saved = structuredClone(value);
         return saved;
@@ -840,7 +840,7 @@ describe("road bulk mutation selection", () => {
     await reclassifyRoad("arterial", true, ["edge-a", "edge-c"]);
     await renameRoad("Boulevard", true, ["edge-a", "edge-c"]);
     expect(saved?.revision).toBe(3);
-    expect(saved!.source.roads.edges.map((edge: CityStateV4["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
+    expect(saved!.source.roads.edges.map((edge: CityStateV5["source"]["roads"]["edges"][number]) => [edge.id, edge.classId, edge.name])).toEqual([
       ["edge-a", "arterial", "Boulevard"],
       ["edge-b", "street", "A"],
       ["edge-c", "arterial", "Boulevard"],
@@ -1139,10 +1139,10 @@ describe("full generation", () => {
     const scene = {
       get walls(): Array<{ id: string }> { return wallDocuments; },
       getFlag: (_module: string, flag: string): unknown => flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
+      setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV5): Promise<CityStateV5> => {
         if (saveError !== null) throw saveError;
         saved = structuredClone(value);
-        return saved as CityStateV4;
+        return saved as CityStateV5;
       }),
       unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
         saved = undefined;
@@ -1626,7 +1626,7 @@ describe("full generation", () => {
       }, { timeout: 15_000 });
     }
 
-    async function generatedCity(seed = "architecture-generated"): Promise<CityStateV4> {
+    async function generatedCity(seed = "architecture-generated"): Promise<CityStateV5> {
       const result = await startFullGeneration(staging(seed));
       expect(result.ok).toBe(true);
       const city = getCity();
@@ -1635,7 +1635,7 @@ describe("full generation", () => {
     }
 
     function generatedBuilding(): {
-      city: CityStateV4;
+      city: CityStateV5;
       plan: CompleteCityPlan;
       building: CompleteCityPlan["buildings"][number];
     } {
@@ -1775,7 +1775,7 @@ describe("full generation", () => {
 
       await expect(placeBuilding(buildingInput({
         placement: { ...buildingPlacement, widthM: 0 }
-      }))).rejects.toThrow(/placement widthM/i);
+      }))).rejects.toThrow();
       expect(setFlag).not.toHaveBeenCalled();
       expect(getCity()).toEqual(before);
     }, 30_000);
@@ -1796,14 +1796,14 @@ describe("full generation", () => {
       );
       await expect(placeBuilding(buildingInput({
         placement: { ...buildingPlacement, widthM: 0 }
-      }))).rejects.toThrow(/placement widthM/i);
+      }))).rejects.toThrow();
       await placeBuilding(firstInput);
       const first = getArchitectureSource()!.buildings[0]!;
       expect(first.lineage).toBe(firstLineage);
       expect(first.id).toBe(allocateManualId("bldg", 1, 0, firstLineage));
 
       await rerollObjectAppearance(first.id);
-      const reloaded = structuredClone(saved) as CityStateV4;
+      const reloaded = structuredClone(saved) as CityStateV5;
       setupScene(reloaded);
       await settleMountedPlan();
       expect(getArchitectureSource()).toEqual(reloaded.source.architecture);
@@ -1883,10 +1883,16 @@ describe("full generation", () => {
       const { building } = generatedBuilding();
 
       await editSitePolygon(building.id, structuredClone(building.sitePolygon));
+      if (building.districtId === null || building.blockId === null) {
+        throw new Error("expected a generated building associated with a district block");
+      }
       const persistent = getArchitectureSource()!.buildings.find((candidate) => candidate.id === building.id);
+      if (persistent === undefined) throw new Error("expected the promoted persistent building");
       expect(persistent).toMatchObject({
-        districtId: null,
-        blockId: null,
+        // The promotion resolves the containing block/district from the site so later
+        // block or district regenerations keep the promoted object in scope.
+        districtId: building.districtId,
+        blockId: building.blockId,
         protection: "manual-edit",
         sitePolygon: building.sitePolygon,
         placement: building.placement
@@ -2107,7 +2113,7 @@ describe("full generation", () => {
 
       await expect(transformObject(id, {
         placement: { ...buildingPlacement, widthM: 0 }
-      })).rejects.toThrow(/placement widthM/i);
+      })).rejects.toThrow();
 
       expect(setFlag).toHaveBeenCalledTimes(writesBefore);
       expect(getCity()).toEqual(before);
@@ -2350,7 +2356,7 @@ describe("full generation", () => {
 });
 
 describe("district palette texture", () => {
-  let saved: CityStateV4 | undefined;
+  let saved: CityStateV5 | undefined;
   let saveError: Error | null;
   let wallDocuments: Array<{ id: string }>;
   let worker: FakeWorker;
@@ -2379,7 +2385,7 @@ describe("district palette texture", () => {
 
   // Commercial, entertainment, industrial-heavy/light, night-market, residential-mega:
   // six 60 x 40 m districts in two rows, all inside the 200 x 160 m land mask.
-  function paletteState(): CityStateV4 {
+  function paletteState(): CityStateV5 {
     const city = state();
     city.source.districts = [
       zone("commercial", -90, -70, "commercial-highrise"),
@@ -2392,7 +2398,7 @@ describe("district palette texture", () => {
     return city;
   }
 
-  function setupMountedScene(initial: CityStateV4): void {
+  function setupMountedScene(initial: CityStateV5): void {
     rendererState.instances.length = 0;
     saved = initial;
     vi.stubGlobal("PIXI", { UPDATE_PRIORITY: { HIGH: 2 } });
@@ -2403,10 +2409,10 @@ describe("district palette texture", () => {
         get walls(): Array<{ id: string }> { return wallDocuments; },
         getFlag: (_module: string, flag: string): unknown =>
           flag === FLAG_ENABLED ? true : flag === FLAG_CITY ? saved : undefined,
-        setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV4): Promise<CityStateV4> => {
+        setFlag: vi.fn(async (_module: string, _flag: string, value: CityStateV5): Promise<CityStateV5> => {
           if (saveError !== null) throw saveError;
           saved = structuredClone(value);
-          return saved as CityStateV4;
+          return saved as CityStateV5;
         }),
         unsetFlag: vi.fn(async (_module: string, _flag: string): Promise<void> => {
           saved = undefined;

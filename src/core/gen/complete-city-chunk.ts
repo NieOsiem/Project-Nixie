@@ -35,7 +35,7 @@ import { hash2 } from "./hash.js";
 import { neonMesh } from "./neon.js";
 import { chunkId, chunkRect, type ChunkKey } from "./chunks.js";
 import { citySurfaces, type CitySurfacePartitions } from "./city-chunk.js";
-import type { CitySourceV4 } from "./city.js";
+import type { CitySourceV5 } from "./city.js";
 import type {
   BuildingMassPlan,
   BuildingPlan,
@@ -745,21 +745,27 @@ function makeConnector(
 
 /**
  * The plan-wide connector set: same-block eligible pairs, ranked by a pure hash of the
- * pair id and cut at each kind's sparse per-block budget. Blocks are road-network faces,
- * so a same-block pair can never have a vehicle road between its endpoints. Deterministic
- * in every chunk, which is what lets one owner emit each connector.
+ * pair id. Blocks are road-network faces, so a same-block pair can never have a vehicle
+ * road between its endpoints. Deterministic in every chunk, which is what lets one owner
+ * emit each connector.
+ *
+ * Budget scoping is regeneration-isolated: a pair whose endpoints share one fragment is
+ * charged to that fragment's own per-kind budget, so regenerating one district's
+ * fragment can never reshuffle which connectors survive in another fragment. Pairs
+ * spanning two fragments (or anchored on persistent records without a fragment) are
+ * admitted on pair-local plausibility alone — they are inherently target-anchored
+ * content when either endpoint regenerates, and charging them to a shared block budget
+ * would let the target modify outside-owned dressing.
  */
 function planConnectors(plan: CompleteCityPlan): readonly BlockConnector[] {
   const byBlock = new Map<string, BuildingPlan[]>();
   for (const building of plan.buildings) {
     if (building.blockId === null || building.blockId === undefined) continue;
-    const list = byBlock.get(building.blockId);
-    if (list === undefined) byBlock.set(building.blockId, [building]);
-    else list.push(building);
+    byBlock.set(building.blockId, [...(byBlock.get(building.blockId) ?? []), building]);
   }
   const kept: BlockConnector[] = [];
   for (const [, buildings] of byBlock) {
-    const eligible: BlockConnector[] = [];
+    const eligible: { connector: BlockConnector; sharedFragmentId: string | null }[] = [];
     for (let i = 0; i < buildings.length; i++) {
       const a = buildings[i]!;
       if (a.masses.length === 0) continue;
@@ -769,19 +775,25 @@ function planConnectors(plan: CompleteCityPlan): readonly BlockConnector[] {
         const kind = pairConnectorKind(a, b);
         if (kind === null) continue;
         const connector = makeConnector(a, b, kind, CONNECTOR_CONFIGS[kind]);
-        if (connector !== null) eligible.push(connector);
+        if (connector === null) continue;
+        const sharedFragmentId = a.fragmentId !== null && a.fragmentId !== undefined && a.fragmentId === b.fragmentId ? a.fragmentId : null;
+        eligible.push({ connector, sharedFragmentId });
       }
     }
     eligible.sort(
       (p, q) =>
-        hash2(fnv1a(p.id), 3) - hash2(fnv1a(q.id), 3) ||
-        (p.id < q.id ? -1 : p.id > q.id ? 1 : 0)
+        hash2(fnv1a(p.connector.id), 3) - hash2(fnv1a(q.connector.id), 3) ||
+        (p.connector.id < q.connector.id ? -1 : p.connector.id > q.connector.id ? 1 : 0)
     );
-    const spent: Partial<Record<ConnectorKind, number>> = {};
-    for (const connector of eligible) {
-      const used = spent[connector.kind] ?? 0;
-      if (used >= CONNECTOR_CONFIGS[connector.kind].budgetPerBlock) continue;
-      spent[connector.kind] = used + 1;
+    const spentByFragment = new Map<string, Partial<Record<ConnectorKind, number>>>();
+    for (const { connector, sharedFragmentId } of eligible) {
+      if (sharedFragmentId !== null) {
+        const spent = spentByFragment.get(sharedFragmentId) ?? {};
+        const used = spent[connector.kind] ?? 0;
+        if (used >= CONNECTOR_CONFIGS[connector.kind].budgetPerBlock) continue;
+        spent[connector.kind] = used + 1;
+        spentByFragment.set(sharedFragmentId, spent);
+      }
       kept.push(connector);
     }
   }
@@ -829,7 +841,7 @@ function connectorPrism(connector: BlockConnector, origin: Vec2, pixelsPerMetre:
 }
 
 export function buildCompleteCityChunk(
-  source: CitySourceV4,
+  source: CitySourceV5,
   plan: CompleteCityPlan,
   key: ChunkKey,
   sceneBoundsM: Rect,
@@ -1059,7 +1071,7 @@ export interface CompleteChunkBatch {
 }
 
 export function openCompleteCityChunkBatch(
-  source: CitySourceV4,
+  source: CitySourceV5,
   plan: CompleteCityPlan,
   keys: ChunkKey[],
   sceneBoundsM: Rect,
@@ -1103,7 +1115,7 @@ export function openCompleteCityChunkBatch(
 }
 
 export function buildCompleteCityChunks(
-  source: CitySourceV4,
+  source: CitySourceV5,
   plan: CompleteCityPlan,
   keys: ChunkKey[],
   sceneBoundsM: Rect,

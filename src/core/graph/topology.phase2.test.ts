@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzeRouteConflicts,
   appendRoute,
+  applyBuildingRouteSurgery,
   connectRoadPoints,
   deleteEdges,
   deleteJunction,
   moveNode,
+  RouteSurgeryError,
   splitEdgeAtPoint,
   validateRouteTopology,
   weldNodes
 } from "./topology.js";
 import { ROUTE_CLASS_REGISTRY } from "../gen/city.js";
 import type { RoadSource } from "../gen/city.js";
+import type { MultiPolygon } from "../geom/types.js";
 
 const empty = (): RoadSource => ({ nodes: [], routes: [], edges: [] });
 
@@ -198,5 +202,187 @@ describe("Phase 2 explicit road topology", () => {
     expect(result.disconnectedVehicleNetwork).toBe(true);
     expect(result.source.edges.map((edge) => edge.id).sort()).toEqual(["e-aj", "e-jb", "e-kc"]);
     expect(validateRouteTopology(result.source)).toMatchObject({ ok: true });
+  });
+});
+
+const box = (minX: number, minY: number, maxX: number, maxY: number): MultiPolygon => [
+  [[{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }]]
+];
+
+const bend = (): RoadSource => ({
+  nodes: [
+    { id: "a", x: 0, y: 0 },
+    { id: "b", x: 50, y: 0 },
+    { id: "c", x: 50, y: 50 }
+  ],
+  routes: [{ id: "route-bend", curvePreset: "standard" }],
+  edges: [
+    { id: "e1", a: "a", b: "b", routeId: "route-bend", classId: "street", name: null, locked: false, origin: "authored" },
+    { id: "e2", a: "b", b: "c", routeId: "route-bend", classId: "street", name: null, locked: false, origin: "authored" }
+  ]
+});
+
+const chain = (lockedFirst: boolean): RoadSource => ({
+  nodes: [
+    { id: "a", x: 0, y: 0 },
+    { id: "b", x: 50, y: 0 },
+    { id: "c", x: 100, y: 0 }
+  ],
+  routes: [{ id: "route-chain", curvePreset: "standard" }],
+  edges: [
+    { id: "e1", a: "a", b: "b", routeId: "route-chain", classId: "street", name: null, locked: lockedFirst, origin: "authored" },
+    { id: "e2", a: "b", b: "c", routeId: "route-chain", classId: "street", name: null, locked: false, origin: "authored" }
+  ]
+});
+
+const tripleChain = (): RoadSource => ({
+  nodes: [
+    { id: "a", x: 0, y: 0 },
+    { id: "b", x: 40, y: 0 },
+    { id: "c", x: 80, y: 0 },
+    { id: "d", x: 120, y: 0 }
+  ],
+  routes: [{ id: "route-triple", curvePreset: "standard" }],
+  edges: [
+    { id: "e1", a: "a", b: "b", routeId: "route-triple", classId: "street", name: null, locked: false, origin: "authored" },
+    { id: "e2", a: "b", b: "c", routeId: "route-triple", classId: "street", name: null, locked: false, origin: "authored" },
+    { id: "e3", a: "c", b: "d", routeId: "route-triple", classId: "street", name: null, locked: false, origin: "authored" }
+  ]
+});
+
+const blockersOf = (run: () => unknown): { id: string; kind: string; reason: string }[] => {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof RouteSurgeryError) return error.blockers;
+    throw error;
+  }
+  throw new Error("Expected route surgery to reject the edit.");
+};
+
+describe("Phase 6 building route surgery", () => {
+  it("enumerates edge-level conflicts with exact blocked arc ranges", () => {
+    const conflicts = analyzeRouteConflicts(horizontal(), box(40, -4, 60, 4));
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({ edgeId: "edge-horizontal", kind: "road", processable: true });
+    expect(conflicts[0]!.blockedArcM).toHaveLength(1);
+    expect(conflicts[0]!.blockedArcM[0]!.startM).toBeCloseTo(39.99, 1);
+    expect(conflicts[0]!.blockedArcM[0]!.endM).toBeCloseTo(60.01, 1);
+  });
+
+  it("trims a straight edge at deterministic occupancy bounds and keeps outside fragments", () => {
+    const source = horizontal();
+    const result = applyBuildingRouteSurgery(source, box(40, -4, 60, 4));
+    expect(result.trimmedEdgeIds).toEqual(["edge-horizontal"]);
+    expect(result.removedEdgeIds).toEqual([]);
+    expect(result.source.edges).toHaveLength(2);
+    const west = result.source.edges.find((edge) => edge.a === "a")!;
+    const east = result.source.edges.find((edge) => edge.b === "b")!;
+    expect(west).toBeDefined();
+    expect(east).toBeDefined();
+    const westEnd = result.source.nodes.find((node) => node.id === west.b)!;
+    const eastStart = result.source.nodes.find((node) => node.id === east.a)!;
+    // WHY: The end-cap disc retreats past the occupied wall at x=40/60 by its own radius (6m).
+    expect(westEnd.x).toBeCloseTo(34, 1);
+    expect(eastStart.x).toBeCloseTo(66, 1);
+    expect(result.source.edges.every((edge) => edge.classId === "street")).toBe(true);
+    // The gap severs the street into two vehicle components — a warning, not a rejection.
+    expect(result.disconnectedVehicleNetwork).toBe(true);
+    expect(JSON.stringify(source)).toBe(JSON.stringify(horizontal()));
+  });
+
+  it("removes a curved edge whole when its fragment is not source-representable", () => {
+    const source = bend();
+    const result = applyBuildingRouteSurgery(source, box(46, 26, 54, 34));
+    expect(result.removedEdgeIds).toEqual(["e2"]);
+    expect(result.trimmedEdgeIds).toEqual([]);
+    expect(result.source.edges.map((edge) => edge.id)).toEqual(["e1"]);
+    expect(result.source.nodes.map((node) => node.id).sort()).toEqual(["a", "b"]);
+    expect(result.disconnectedVehicleNetwork).toBe(false);
+    expect(JSON.stringify(source)).toBe(JSON.stringify(bend()));
+  });
+
+  it("rejects surgery on a locked edge with a blocker and leaves the source untouched", () => {
+    const source = horizontal();
+    source.edges[0]!.locked = true;
+    const before = JSON.stringify(source);
+    const blockers = blockersOf(() => applyBuildingRouteSurgery(source, box(40, -4, 60, 4)));
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0]).toMatchObject({ id: "edge-horizontal", kind: "road" });
+    expect(JSON.stringify(source)).toBe(before);
+  });
+
+  it("rejects surgery that would bend a locked adjacent edge through a neighbour trim", () => {
+    const source = chain(true);
+    const blockers = blockersOf(() => applyBuildingRouteSurgery(source, box(70, -4, 80, 4)));
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0]).toMatchObject({ id: "e1", kind: "road" });
+    expect(JSON.stringify(source)).toBe(JSON.stringify(chain(true)));
+  });
+
+  it("prunes the orphaned junction after the star centre is occupied", () => {
+    const source = star();
+    const result = applyBuildingRouteSurgery(source, box(-5, -5, 5, 5));
+    expect(result.source.nodes.map((node) => node.id)).not.toContain("junction");
+    expect(result.source.nodes).toHaveLength(8);
+    expect(result.source.edges).toHaveLength(4);
+    const north = result.source.edges.find((edge) => edge.b === "north")!;
+    const cut = result.source.nodes.find((node) => node.id === north.a)!;
+    expect(cut.y).toBeCloseTo(11, 1);
+    expect(result.trimmedEdgeIds).toEqual(["edge-east", "edge-north", "edge-south", "edge-west"]);
+    expect(result.removedEdgeIds).toEqual([]);
+    expect(result.disconnectedVehicleNetwork).toBe(true);
+    expect(JSON.stringify(source)).toBe(JSON.stringify(star()));
+  });
+
+  it("removes a fully occupied bridge edge and warns about the severed vehicle network", () => {
+    const source = tripleChain();
+    const result = applyBuildingRouteSurgery(source, box(30, -4, 90, 4));
+    expect(result.removedEdgeIds).toEqual(["e2"]);
+    expect(result.trimmedEdgeIds).toEqual(["e1", "e3"]);
+    expect(result.source.edges).toHaveLength(2);
+    const nodeIds = result.source.nodes.map((node) => node.id);
+    const edgeNodeIds = new Set(result.source.edges.flatMap((edge) => [edge.a, edge.b]));
+    // The fully occupied bridge edge goes whole while e1/e3 are trimmed in place: their
+    // outer anchors survive and each gains a cut endpoint, and the old interior junctions
+    // b/c become orphaned and are pruned.
+    expect(nodeIds).toContain("a");
+    expect(nodeIds).toContain("d");
+    expect(nodeIds).not.toContain("b");
+    expect(nodeIds).not.toContain("c");
+    // Every surviving edge endpoint resolves to a real node, and no node is left orphaned.
+    expect([...edgeNodeIds].every((id) => nodeIds.includes(id))).toBe(true);
+    expect(nodeIds.every((id) => edgeNodeIds.has(id))).toBe(true);
+    // The two trim endpoints land on the surviving fragments, outside the occupied region.
+    const trimEndpoints = result.source.nodes.filter((node) => node.id !== "a" && node.id !== "d");
+    expect(trimEndpoints).toHaveLength(2);
+    const trimXs = trimEndpoints.map((node) => node.x).sort((x, y) => x - y);
+    expect(trimXs[0]).toBeCloseTo(24, 1);
+    expect(trimXs[1]).toBeCloseTo(96, 1);
+    expect(trimEndpoints.every((node) => node.x < 30 || node.x > 90)).toBe(true);
+    expect(result.disconnectedVehicleNetwork).toBe(true);
+    expect(JSON.stringify(source)).toBe(JSON.stringify(tripleChain()));
+  });
+
+  it("replays deterministically for identical input", () => {
+    const first = applyBuildingRouteSurgery(star(), box(-5, -5, 5, 5));
+    const second = applyBuildingRouteSurgery(star(), box(-5, -5, 5, 5));
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+  });
+
+  it("treats empty and distant occupied areas as no-ops", () => {
+    const emptyResult = applyBuildingRouteSurgery(horizontal(), []);
+    expect(emptyResult.source).toEqual(horizontal());
+    expect(emptyResult.conflicts).toEqual([]);
+    expect(emptyResult.trimmedEdgeIds).toEqual([]);
+    expect(emptyResult.removedEdgeIds).toEqual([]);
+    expect(emptyResult.disconnectedVehicleNetwork).toBe(false);
+    const distantResult = applyBuildingRouteSurgery(horizontal(), box(200, -5, 210, 5));
+    expect(distantResult.source).toEqual(horizontal());
+    expect(distantResult.conflicts).toEqual([]);
+    expect(distantResult.trimmedEdgeIds).toEqual([]);
+    expect(distantResult.removedEdgeIds).toEqual([]);
+    expect(distantResult.disconnectedVehicleNetwork).toBe(false);
+    expect(analyzeRouteConflicts(horizontal(), [])).toEqual([]);
   });
 });

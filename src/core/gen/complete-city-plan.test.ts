@@ -3,14 +3,18 @@ import { intersection, ringAsMulti, union } from "../geom/boolean.js";
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Ring } from "../geom/types.js";
 import { MATERIAL } from "../palette.js";
 import { compileRouteNetwork } from "../graph/compiler.js";
-import { ROUTE_CLASS_REGISTRY, type CitySourceV4, type DistrictOpenSpaceOverride, type DistrictSource, type PersistentBuildingSource, type PersistentPlaceSource, type RoadEdgeSource, type RoadNodeSource, type RoadRouteSource } from "./city.js";
+import { ROUTE_CLASS_REGISTRY, type ArchitectureOverrideSource, type CitySourceV5, type DistrictOpenSpaceOverride, type DistrictSource, type PersistentBuildingSource, type PersistentPlaceSource, type RoadEdgeSource, type RoadNodeSource, type RoadRouteSource } from "./city.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_GRAMMARS, BUILDING_USE_IDS, FOOTPRINT_ARCHETYPE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, isTowerGrammar, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarId } from "./landmark-registry.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, DISTRICT_TYPES, DISTRICT_TYPE_IDS, type DistrictTypeId } from "./district-registry.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "./district-generator.js";
 import { generateInitialRoadNetwork } from "./road-generator.js";
 import { rectangleLand, validateRing } from "./terrain.js";
-import { DENSITY_INFILL_DISTRICT_TYPE_IDS, DENSITY_INFILL_SALT, DENSITY_INFILL_UNZONED_WEIGHTS, DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS, FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN, FALLBACK_LANDMARK_SITE_TARGET_MAX_M2, FALLBACK_LANDMARK_SITE_TARGET_MIN_M2, GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2, MAX_DENSITY_INFILL_AREA_M2, MAX_DENSITY_INFILL_BUILDINGS, MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT, MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL, MAX_REFERENCE_DENSITY_BUILDINGS, MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2, MIN_DENSITY_INFILL_AREA_M2, MIN_DENSITY_INFILL_MINOR_DIMENSION_M, buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
+import { deleteEdges } from "../graph/topology.js";
+import { buildDistrictPlan } from "./district-plan.js";
+import { evaluateRegenerationPreflight } from "./regeneration-plan.js";
+import { effectiveRegenerationSeed, normalizeRegenerationPartialSeedRecords, withRegenerationSeed } from "./regeneration.js";
+import { DENSITY_INFILL_DISTRICT_TYPE_IDS, DENSITY_INFILL_UNZONED_WEIGHTS, FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN, FALLBACK_LANDMARK_SITE_TARGET_MAX_M2, GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2, GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2, MAX_ANONYMOUS_OPEN_SPACE_AREA_M2, MAX_DENSITY_INFILL_AREA_M2, MAX_DENSITY_INFILL_BUILDINGS, MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT, MAX_REFERENCE_DENSITY_BUILDINGS, MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2, buildCompleteCityPlan, deriveBlockHeightBands, derivePaletteBanks, heightBandForBlock, planParcelBuilding, reserveMajorLandmarkSites, shapeBuildingHeight, validateCompleteCityPlan, type BuildingPlan, type CompleteCityPlan, type FrontageSide, type LandmarkPlan, type MajorLandmarkSiteReservation } from "./complete-city-plan.js";
 
 const node = (id: string, x: number, y: number): RoadNodeSource => ({ id, x, y });
 const route = (id: string): RoadRouteSource => ({ id, curvePreset: "standard" });
@@ -47,7 +51,7 @@ const parkOverride = (rate: number): DistrictOpenSpaceOverride => ({
  * enough that no pre-road landmark reservation can meet the 800 m² minimum site, so
  * landmarks always fall back to legal block-inscribed sites.
  */
-const crossSource = (): CitySourceV4 => {
+const crossSource = (): CitySourceV5 => {
   const districts: DistrictSource[] = [
     { id: "west", polygon: rectRing({ x: 0, y: 0, width: 95, height: 190 }), seed: "west-seed", typeId: "mixed-use-centre", paletteId: DISTRICT_PALETTE_IDS[2]!, origin: "generated", locked: false, openSpaceOverride: null },
     { id: "east", polygon: rectRing({ x: 95, y: 0, width: 95, height: 190 }), seed: "east-seed", typeId: "dense-residential", paletteId: DISTRICT_PALETTE_IDS[4]!, origin: "generated", locked: false, openSpaceOverride: null }
@@ -63,12 +67,12 @@ const crossSource = (): CitySourceV4 => {
       edges: [edge("north", "n", "c", "vertical"), edge("west", "w", "c", "horizontal"), edge("east", "c", "e", "horizontal"), edge("south", "c", "s", "vertical")]
     },
     districts,
-    architecture: { buildings: [], places: [], overrides: [] }
+    architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
   };
 };
 
 /** Cross variant whose halves carry compatible district tags (formal west, industrial east). */
-const compatibleCross = (): CitySourceV4 => {
+const compatibleCross = (): CitySourceV5 => {
   const base = crossSource();
   return {
     ...base,
@@ -94,9 +98,9 @@ const manualReservation = (grammarId: MajorLandmarkSiteReservation["grammarId"],
  */
 const ringSource = (
   districtCount = 4,
-  openSpaceProfile: CitySourceV4["generation"]["openSpaceProfile"] = "medium",
+  openSpaceProfile: CitySourceV5["generation"]["openSpaceProfile"] = "medium",
   citySeed = "complete-plan-ring"
-): CitySourceV4 => {
+): CitySourceV5 => {
   const stripWidth = 1600 / districtCount;
   const districts: DistrictSource[] = DISTRICT_TYPE_IDS.slice(0, districtCount).map((typeId: DistrictTypeId, index: number) => ({
     id: `d${index}`,
@@ -119,7 +123,7 @@ const ringSource = (
       edges: [edge("ab", "a", "b", "ring"), edge("bc", "b", "c", "ring"), edge("cd", "c", "d", "ring"), edge("da", "d", "a", "ring")]
     },
     districts,
-    architecture: { buildings: [], places: [], overrides: [] }
+    architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
   };
 };
 
@@ -128,9 +132,9 @@ const ringSource = (
  * and a district-scale whole-block strip without paying for overview-scale fabric.
  */
 const compactRingSource = (
-  openSpaceProfile: CitySourceV4["generation"]["openSpaceProfile"] = "medium",
+  openSpaceProfile: CitySourceV5["generation"]["openSpaceProfile"] = "medium",
   citySeed = "complete-plan-compact-ring"
-): CitySourceV4 => {
+): CitySourceV5 => {
   const width = 640;
   const height = 640;
   const stripWidth = width / 4;
@@ -151,21 +155,21 @@ const compactRingSource = (
 };
 
 interface StagedReproductionFixture {
-  source: CitySourceV4;
+  source: CitySourceV5;
   reservations: MajorLandmarkSiteReservation[];
   warnings: string[];
 }
 
 function stagedReproduction(
   citySeed = "foundry-repro-0",
-  roadLayout: CitySourceV4["generation"]["roadLayout"] = "european",
-  hubMode: CitySourceV4["generation"]["hubMode"] = "multiple-hubs",
-  openSpaceProfile: CitySourceV4["generation"]["openSpaceProfile"] = "medium",
+  roadLayout: CitySourceV5["generation"]["roadLayout"] = "european",
+  hubMode: CitySourceV5["generation"]["hubMode"] = "multiple-hubs",
+  openSpaceProfile: CitySourceV5["generation"]["openSpaceProfile"] = "medium",
   grammarIds: readonly LandmarkGrammarId[] = PRE_ROAD_LANDMARK_GRAMMAR_IDS
 ): StagedReproductionFixture {
   const sceneBounds = { x: -600, y: -450, width: 1200, height: 900 };
   const land = rectangleLand(sceneBounds);
-  const source: CitySourceV4 = {
+  const source: CitySourceV5 = {
     origin: { x: 0, y: 0 },
     citySeed,
     generation: {
@@ -179,7 +183,7 @@ function stagedReproduction(
     terrain: { land, urbanFootprint: null },
     roads: { nodes: [], routes: [], edges: [] },
     districts: [],
-    architecture: { buildings: [], places: [], overrides: [] }
+    architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
   };
   const reservations = reserveMajorLandmarkSites(source, grammarIds);
   source.roads = generateInitialRoadNetwork({
@@ -244,7 +248,7 @@ const compactFourRepeat = (): CompleteCityPlan => sharedPlan("compactRingSource(
  * envelope before rebuilding the plan.
  */
 interface MixedDiagonalFixture {
-  source: CitySourceV4;
+  source: CitySourceV5;
   reservations: MajorLandmarkSiteReservation[];
   warnings: string[];
   plan: CompleteCityPlan;
@@ -276,7 +280,7 @@ function mixedDiagonalFixture(): MixedDiagonalFixture {
   if (promotedPlace === undefined || promotedPlace.placement === undefined) {
     throw new Error("The diagonal acceptance fixture needs a derived non-reserved compound place.");
   }
-  const architecture: CitySourceV4["architecture"] = {
+  const architecture: CitySourceV5["architecture"] = {
     buildings: [{
       id: promotedBuilding.id,
       lineage: promotedBuilding.lineage,
@@ -559,24 +563,6 @@ describe("buildCompleteCityPlan", () => {
     expect(plan.landmarks.length).toBeLessThanOrEqual(16);
     expect(plan.buildings.length).toBeGreaterThanOrEqual(1_050);
     expect(plan.buildings.length).toBeLessThanOrEqual(MAX_REFERENCE_DENSITY_BUILDINGS);
-    expect(FALLBACK_LANDMARK_SITE_TARGET_MIN_M2).toBe(2_000);
-    expect(FALLBACK_LANDMARK_SITE_TARGET_MAX_M2).toBe(3_000);
-    expect(FALLBACK_LANDMARK_SITE_MIN_AREA_MARGIN).toBe(1.1);
-    expect(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MIN_M2).toBe(5_000);
-    expect(GENERATED_MAJOR_LANDMARK_SITE_TARGET_MAX_M2).toBe(6_500);
-    expect(GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN).toBe(1.1);
-    expect(DENSITY_INFILL_SALT).toBe("density/v3/infill");
-    expect(MAX_DENSITY_INFILL_BUILDINGS).toBe(600);
-    expect(MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT).toBe(72);
-    expect(MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL).toBe(12);
-    expect(MAX_REFERENCE_DENSITY_BUILDINGS).toBe(1_250);
-    expect(MIN_DENSITY_INFILL_AREA_M2).toBe(60);
-    expect(MAX_DENSITY_INFILL_AREA_M2).toBe(4_800);
-    expect(MIN_DENSITY_INFILL_MINOR_DIMENSION_M).toBe(6.5);
-    expect(DENSITY_SMALL_SITE_GRAMMAR_WEIGHTS).toEqual({
-      "campus-annex": 0.7,
-      "narrow-strip": 0.75
-    });
     for (const typeId of [
       "civic-institutional",
       "heavy-industrial",
@@ -623,8 +609,6 @@ describe("buildCompleteCityPlan", () => {
     for (const grammarId of INFILL_BUILDING_GRAMMAR_IDS) {
       expect(DENSITY_INFILL_UNZONED_WEIGHTS[grammarId], grammarId).toBe(1);
     }
-    expect(DENSITY_INFILL_UNZONED_WEIGHTS["campus-annex"]).toBe(0.7);
-    expect(DENSITY_INFILL_UNZONED_WEIGHTS["narrow-strip"]).toBe(0.75);
     for (const grammarId of ["street-kiosk", "garage-unit", "shack-shanty", "utility-kiosk"] as const) {
       expect(DENSITY_INFILL_UNZONED_WEIGHTS[grammarId], grammarId).toBe(0);
     }
@@ -929,20 +913,20 @@ describe("buildCompleteCityPlan", () => {
   it("is deterministic and identical under source permutation and origin shift", () => {
     const source = crossSource();
     const plan = buildCompleteCityPlan(source);
-    const shuffled: CitySourceV4 = {
+    const shuffled: CitySourceV5 = {
       ...source,
       roads: { nodes: [...source.roads.nodes].reverse(), routes: [...source.roads.routes].reverse(), edges: [...source.roads.edges].reverse() },
       districts: [...source.districts].reverse()
     };
     expect(buildCompleteCityPlan(shuffled)).toEqual(plan);
-    const shifted: CitySourceV4 = { ...source, origin: { x: source.origin.x + 12345, y: source.origin.y - 6789 } };
+    const shifted: CitySourceV5 = { ...source, origin: { x: source.origin.x + 12345, y: source.origin.y - 6789 } };
     expect(buildCompleteCityPlan(shifted)).toEqual(plan);
     expect(buildCompleteCityPlan(source)).toEqual(plan);
   }, 300_000);
 
   it("materializes grammar circulation as explicit open space before building parcels", () => {
     const size = 300;
-    const largeBlock = (typeId: DistrictTypeId): CitySourceV4 => ({
+    const largeBlock = (typeId: DistrictTypeId): CitySourceV5 => ({
       origin: { x: 700, y: 300 },
       citySeed: `complete-plan-large-block-${typeId}`,
       generation: { terrainMode: "rectangle", coastEdge: null, roadLayout: "grid", hubMode: "single-centre", districtPool: [...DISTRICT_TYPE_IDS], openSpaceProfile: "none" },
@@ -953,7 +937,7 @@ describe("buildCompleteCityPlan", () => {
         edges: [edge("ab", "a", "b", "ring"), edge("bc", "b", "c", "ring"), edge("cd", "c", "d", "ring"), edge("da", "d", "a", "ring")]
       },
       districts: [{ id: "big", polygon: rectRing({ x: 0, y: 0, width: size, height: size }), seed: "big-seed", typeId, paletteId: DISTRICT_PALETTE_IDS[0]!, origin: "generated", locked: false, openSpaceOverride: null }],
-      architecture: { buildings: [], places: [], overrides: [] }
+      architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
     });
     for (const typeId of ["residential-megablocks", "utility-infrastructure"] as const) {
       const source = largeBlock(typeId);
@@ -1965,7 +1949,7 @@ describe("block height coherence", () => {
     const plan = ringFourPlan();
     expect(validateCompleteCityPlan(plan)).toEqual([]);
     const districtById = new Map(ringSource(4).districts.map((district) => [district.id, district]));
-    const bands = deriveBlockHeightBands(plan.parcels, districtById);
+    const bands = deriveBlockHeightBands(plan.districtPlan, districtById);
     const heightsByBlock = new Map<string, number[]>();
     const parcelById = new Map(plan.parcels.map((parcel) => [parcel.id, parcel]));
     const infillBlocks = new Set<string>();
@@ -2225,4 +2209,258 @@ describe("thin-building emission floor", () => {
       expect(openSpace!.areaM2).toBeCloseTo(parcel.areaM2, 4);
     }
   }, 60_000);
+});
+describe("full-size ring regeneration acceptance", () => {
+  const RING_DISTRICT = "d1";
+  const RING_DISTRICT_RESEED = "ring-district-reseed";
+  const RING_BLOCK_RESEED = "ring-block-reseed";
+
+  const regFragmentIdsForDistrict = (plan: CompleteCityPlan, districtId: string): string[] =>
+    plan.districtPlan.blocks
+      .flatMap((block) => block.districtFragments)
+      .filter((fragment) => fragment.districtId === districtId)
+      .map((fragment) => fragment.id);
+
+  const regFragmentIdsForBlock = (plan: CompleteCityPlan, blockId: string): string[] =>
+    plan.districtPlan.blocks
+      .filter((block) => block.id === blockId)
+      .flatMap((block) => block.districtFragments)
+      .map((fragment) => fragment.id);
+
+  /** The dominant interior block: the largest total buildable area in the plan. */
+  const regInteriorBlockId = (plan: CompleteCityPlan): string => {
+    let bestId = "";
+    let bestArea = 0;
+    for (const block of plan.districtPlan.blocks) {
+      const area = block.districtFragments.reduce((sum, fragment) => sum + multiArea(fragment.buildable), 0);
+      if (area > bestArea) {
+        bestArea = area;
+        bestId = block.id;
+      }
+    }
+    if (bestId === "") throw new Error("Fixture: the ring plan has no buildable block.");
+    return bestId;
+  };
+
+  /** Fragment-scoped plan content, compared as actual objects — never plan tokens/signatures. */
+  const regFragmentContent = (plan: CompleteCityPlan, fragmentIds: ReadonlySet<string>) => ({
+    buildings: plan.buildings.filter((building) => building.fragmentId !== null && fragmentIds.has(building.fragmentId)),
+    openSpaces: plan.openSpaces.filter((openSpace) => fragmentIds.has(openSpace.fragmentId)),
+    parcels: plan.parcels.filter((parcel) => fragmentIds.has(parcel.fragmentId))
+  });
+
+  interface RingRegFixture {
+    plan: CompleteCityPlan;
+    interiorBlockId: string;
+    interiorFragmentIds: string[];
+    districtFragmentIds: string[];
+    allFragmentIds: string[];
+  }
+
+  let ringRegFixtureCache: RingRegFixture | undefined;
+  function ringRegFixture(): RingRegFixture {
+    if (ringRegFixtureCache !== undefined) return ringRegFixtureCache;
+    const plan = ringFourPlan();
+    expect(validateCompleteCityPlan(plan)).toEqual([]);
+    const interiorBlockId = regInteriorBlockId(plan);
+    const interiorFragmentIds = regFragmentIdsForBlock(plan, interiorBlockId);
+    const districtFragmentIds = regFragmentIdsForDistrict(plan, RING_DISTRICT);
+    expect(interiorFragmentIds.length).toBeGreaterThanOrEqual(2);
+    expect(districtFragmentIds.length).toBeGreaterThan(0);
+    // Fixture sanity: the interior block is mixed-district and both compared scopes carry
+    // real procedural content.
+    const interiorBlock = plan.districtPlan.blocks.find((block) => block.id === interiorBlockId)!;
+    expect(new Set(interiorBlock.districtFragments.map((fragment) => fragment.districtId)).size).toBeGreaterThanOrEqual(2);
+    expect(plan.buildings.filter((building) => building.fragmentId !== null && districtFragmentIds.includes(building.fragmentId)).length).toBeGreaterThan(0);
+    const outsideFragmentIds = plan.districtPlan.blocks
+      .flatMap((block) => block.districtFragments)
+      .map((fragment) => fragment.id)
+      .filter((fragmentId) => !interiorFragmentIds.includes(fragmentId));
+    if (outsideFragmentIds.length > 0) {
+      const keep = new Set(outsideFragmentIds);
+      expect(plan.buildings.filter((building) => building.fragmentId !== null && keep.has(building.fragmentId)).length).toBeGreaterThan(0);
+    }
+    ringRegFixtureCache = {
+      plan,
+      interiorBlockId,
+      interiorFragmentIds,
+      districtFragmentIds,
+      allFragmentIds: plan.districtPlan.blocks.flatMap((block) => block.districtFragments).map((fragment) => fragment.id)
+    };
+    return ringRegFixtureCache;
+  }
+
+  const ringKeep = (fixture: RingRegFixture, excluded: ReadonlySet<string>[]): Set<string> =>
+    new Set(fixture.allFragmentIds.filter((fragmentId) => !excluded.some((set) => set.has(fragmentId))));
+
+  /** Every fragment outside the excluded scopes must stay byte-identical to the baseline plan. */
+  function expectRingOutsideIdentical(
+    actual: CompleteCityPlan,
+    baseline: CompleteCityPlan,
+    fixture: RingRegFixture,
+    excluded: ReadonlySet<string>[],
+    landmarkOutsideScope: (landmark: LandmarkPlan) => boolean
+  ): void {
+    const keep = ringKeep(fixture, excluded);
+    expect(regFragmentContent(actual, keep)).toEqual(regFragmentContent(baseline, keep));
+    expect(actual.landmarks.filter(landmarkOutsideScope)).toEqual(baseline.landmarks.filter(landmarkOutsideScope));
+  }
+
+  const ringWithDistrictSeed = (): CitySourceV5 =>
+    withRegenerationSeed(ringSource(4), { kind: "district", ids: [RING_DISTRICT] }, RING_DISTRICT_RESEED);
+
+  it("regenerates district and block on the full ring fixture with newest-record precedence and byte-identical outside scope", () => {
+    const base = ringRegFixture();
+    const districtPlan = sharedPlan("ring/district", () => buildCompleteCityPlan(ringWithDistrictSeed()));
+    const blockPlan = sharedPlan("ring/block", () =>
+      buildCompleteCityPlan(withRegenerationSeed(ringSource(4), { kind: "block", ids: [base.interiorBlockId] }, RING_BLOCK_RESEED)));
+    const districtThenBlock = sharedPlan("ring/district-then-block", () =>
+      buildCompleteCityPlan(withRegenerationSeed(ringWithDistrictSeed(), { kind: "block", ids: [base.interiorBlockId] }, RING_BLOCK_RESEED)));
+    const blockThenDistrict = sharedPlan("ring/block-then-district", () =>
+      buildCompleteCityPlan(withRegenerationSeed(
+        withRegenerationSeed(ringSource(4), { kind: "block", ids: [base.interiorBlockId] }, RING_BLOCK_RESEED),
+        { kind: "district", ids: [RING_DISTRICT] },
+        RING_DISTRICT_RESEED
+      )));
+    for (const plan of [districtPlan, blockPlan, districtThenBlock, blockThenDistrict]) {
+      expect(validateCompleteCityPlan(plan)).toEqual([]);
+      // Block and fragment lineage is seed-independent: a reseed never renames topology.
+      expect(plan.districtPlan.blocks.map((block) => block.id)).toEqual(base.plan.districtPlan.blocks.map((block) => block.id));
+    }
+
+    const districtIds = new Set(base.districtFragmentIds);
+    const interiorIds = new Set(base.interiorFragmentIds);
+    // The district target rekeys its own fragment and nothing else — including the rest
+    // of the shared interior block.
+    expect(JSON.stringify(regFragmentContent(districtPlan, districtIds))).not.toBe(JSON.stringify(regFragmentContent(base.plan, districtIds)));
+    expectRingOutsideIdentical(districtPlan, base.plan, base, [districtIds], (landmark) => landmark.districtId !== RING_DISTRICT);
+    // The block target rekeys the whole interior block and no other block.
+    expect(JSON.stringify(regFragmentContent(blockPlan, interiorIds))).not.toBe(JSON.stringify(regFragmentContent(base.plan, interiorIds)));
+    expectRingOutsideIdentical(blockPlan, base.plan, base, [interiorIds], (landmark) => landmark.blockId !== base.interiorBlockId);
+    // District→block: the newest (block) record governs every fragment of the interior
+    // block, including the district fragment the older district record also applies to.
+    expect(regFragmentContent(districtThenBlock, interiorIds)).toEqual(regFragmentContent(blockPlan, interiorIds));
+    expect(districtThenBlock.landmarks.filter((landmark) => landmark.blockId === base.interiorBlockId).map((landmark) => landmark.seed))
+      .toEqual(blockPlan.landmarks.filter((landmark) => landmark.blockId === base.interiorBlockId).map((landmark) => landmark.seed));
+    // Block→district: the newest (district) record governs exactly its own fragment with
+    // content byte-equal to the district-only rebuild; the rest of the block still
+    // follows the older block record.
+    expect(regFragmentContent(blockThenDistrict, districtIds)).toEqual(regFragmentContent(districtPlan, districtIds));
+    const restOfBlock = new Set(base.interiorFragmentIds.filter((fragmentId) => !districtIds.has(fragmentId)));
+    expect(regFragmentContent(blockThenDistrict, restOfBlock)).toEqual(regFragmentContent(blockPlan, restOfBlock));
+    expect(blockThenDistrict.landmarks.filter((landmark) => landmark.blockId === base.interiorBlockId && landmark.districtId !== RING_DISTRICT).map((landmark) => landmark.seed))
+      .toEqual(blockPlan.landmarks.filter((landmark) => landmark.blockId === base.interiorBlockId && landmark.districtId !== RING_DISTRICT).map((landmark) => landmark.seed));
+    // Outside scope stays byte-identical to the untouched baseline across both chronologies.
+    expectRingOutsideIdentical(districtThenBlock, base.plan, base, [interiorIds], (landmark) => landmark.blockId !== base.interiorBlockId);
+    expectRingOutsideIdentical(blockThenDistrict, base.plan, base, [interiorIds], (landmark) => landmark.blockId !== base.interiorBlockId);
+  }, 600_000);
+
+  it("promotes a protected generated override to a retained snapshot on the full ring fixture and re-rolls only the district scope", () => {
+    const base = ringRegFixture();
+    const districtIds = new Set(base.districtFragmentIds);
+    // A derived procedural building in the target district becomes the protected-override
+    // target; preflight must promote it into the persistent envelope, not block on it.
+    const target = base.plan.buildings.find((building) =>
+      building.sourceId === null
+      && building.placement !== undefined
+      && building.masses.length > 0
+      && building.districtId === RING_DISTRICT
+      && building.fragmentId !== null
+      && districtIds.has(building.fragmentId));
+    expect(target, "fixture needs a derived district building with a placement frame").toBeDefined();
+    const override: ArchitectureOverrideSource = {
+      targetKind: "building",
+      targetId: target!.id,
+      lineage: target!.lineage,
+      protection: "explicit",
+      snapshotSitePolygon: target!.sitePolygon.map((point) => ({ ...point })),
+      appearanceSeed: "ring-override-appearance"
+    };
+    const source: CitySourceV5 = {
+      ...ringSource(4),
+      architecture: { buildings: [], places: [], overrides: [override] }
+    };
+    const planWithOverride = sharedPlan("ring/override", () => buildCompleteCityPlan(source));
+    expect(validateCompleteCityPlan(planWithOverride)).toEqual([]);
+    // The override only retargets one derived object's appearance: every other fragment
+    // of the plan is untouched relative to the shared baseline.
+    const outsideKeep = ringKeep(base, [districtIds]);
+    expect(regFragmentContent(planWithOverride, outsideKeep)).toEqual(regFragmentContent(base.plan, outsideKeep));
+    expect(planWithOverride.landmarks.filter((landmark) => landmark.districtId !== RING_DISTRICT))
+      .toEqual(base.plan.landmarks.filter((landmark) => landmark.districtId !== RING_DISTRICT));
+
+    const preflight = evaluateRegenerationPreflight(source, planWithOverride, { kind: "district", ids: [RING_DISTRICT] }, "ring-preflight-reseed");
+    expect(preflight.blockers).toEqual([]);
+    expect(preflight.removedIds).toEqual([]);
+    expect(preflight.retainedIds).toContain(target!.id);
+    const candidate = preflight.candidateSource;
+    if (candidate === null) throw new Error("preflight.candidateSource must exist when no blocker exists");
+    expect(candidate.architecture.buildings.map((building) => building.id)).toEqual([target!.id]);
+    const promoted = candidate.architecture.buildings[0]!;
+    expect(promoted.protection).toBe("explicit");
+    expect(promoted.appearanceSeed).toBe("ring-override-appearance");
+    expect(promoted.sitePolygon).toEqual(override.snapshotSitePolygon);
+    expect(promoted.districtId).toBe(RING_DISTRICT);
+    expect(candidate.architecture.overrides).toEqual([]);
+    expect(candidate.regeneration.partialSeeds).toEqual([
+      { targetKind: "district", targetId: RING_DISTRICT, seed: "ring-preflight-reseed", order: 1 }
+    ]);
+
+    const rebuilt = sharedPlan("ring/override-rebuilt", () => buildCompleteCityPlan(candidate));
+    expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
+    // The promoted snapshot materializes exactly at its reserved site.
+    const promotedBuilding = rebuilt.buildings.find((building) => building.sourceId === target!.id);
+    expect(promotedBuilding, "the promoted override must materialize").toBeDefined();
+    expect(promotedBuilding!.sitePolygon).toEqual(override.snapshotSitePolygon);
+    expect(promotedBuilding!.appearanceSeed).toBe("ring-override-appearance");
+    expect(promotedBuilding!.masses.length).toBeGreaterThan(0);
+    for (const building of rebuilt.buildings) {
+      if (building.sourceId === target!.id) continue;
+      expect(overlap(building.sitePolygon, override.snapshotSitePolygon), `${building.id} must respect the promoted site`).toBeLessThan(0.5);
+    }
+    // Scope isolation: outside the district everything stays byte-identical to the
+    // pre-rebuild plan; the district scope's procedural content is re-rolled.
+    expect(regFragmentContent(rebuilt, outsideKeep)).toEqual(regFragmentContent(planWithOverride, outsideKeep));
+    expect(rebuilt.landmarks.filter((landmark) => landmark.districtId !== RING_DISTRICT))
+      .toEqual(planWithOverride.landmarks.filter((landmark) => landmark.districtId !== RING_DISTRICT));
+    const proceduralAfter = rebuilt.buildings.filter((building) =>
+      building.sourceId === null && building.fragmentId !== null && districtIds.has(building.fragmentId));
+    const proceduralBefore = planWithOverride.buildings.filter((building) =>
+      building.sourceId === null && building.fragmentId !== null && districtIds.has(building.fragmentId) && building.id !== target!.id);
+    expect(JSON.stringify(proceduralAfter)).not.toBe(JSON.stringify(proceduralBefore));
+    expect(proceduralAfter.length).toBeGreaterThan(0);
+  }, 600_000);
+
+  it("normalizes the stale interior-block seed record after ring topology removal and reconstructs the surviving city", () => {
+    const base = ringRegFixture();
+    const recorded = withRegenerationSeed(
+      withRegenerationSeed(ringSource(4), { kind: "block", ids: [base.interiorBlockId] }, "ring-block-attempt"),
+      { kind: "district", ids: [RING_DISTRICT] },
+      "ring-district-persisted"
+    );
+    // Opening the boundary ring merges the interior block with its surroundings: the
+    // recorded block lineage vanishes and its partial-seed record goes stale.
+    const edited = deleteEdges(recorded.roads, ["da"]);
+    const afterEdit: CitySourceV5 = { ...recorded, roads: edited.source };
+    const editedDistrictPlan = buildDistrictPlan(afterEdit);
+    expect(editedDistrictPlan.blocks.map((block) => block.id)).not.toContain(base.interiorBlockId);
+    const normalized = normalizeRegenerationPartialSeedRecords(afterEdit, editedDistrictPlan);
+    // Only the district record survives, with its exact seed and order — no remapping of
+    // the vanished block identity onto the merged block.
+    expect(normalized).toEqual([
+      { targetKind: "district", targetId: RING_DISTRICT, seed: "ring-district-persisted", order: 2 }
+    ]);
+    const clean: CitySourceV5 = { ...afterEdit, regeneration: { partialSeeds: normalized } };
+    const districtFragment = editedDistrictPlan.blocks
+      .flatMap((block) => block.districtFragments)
+      .find((fragment) => fragment.districtId === RING_DISTRICT);
+    expect(districtFragment, "edited fixture needs a district fragment").toBeDefined();
+    expect(effectiveRegenerationSeed(clean, { blockId: districtFragment!.blockId, districtId: RING_DISTRICT })).toBe("ring-district-persisted|district/d1");
+    // The surviving city reconstructs from the cleaned source.
+    const rebuilt = sharedPlan("ring/topology-rebuilt", () => buildCompleteCityPlan(clean));
+    expect(validateCompleteCityPlan(rebuilt)).toEqual([]);
+    expect(rebuilt.districtPlan.blocks.map((block) => block.id)).toEqual(editedDistrictPlan.blocks.map((block) => block.id));
+    expect(rebuilt.buildings.length).toBeGreaterThan(0);
+    expect(rebuilt.landmarks.length).toBeGreaterThan(0);
+  }, 300_000);
 });

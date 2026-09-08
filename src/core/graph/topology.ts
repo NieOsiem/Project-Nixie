@@ -1,4 +1,5 @@
-import type { Vec2 } from "../geom/types.js";
+import { intersection as polygonIntersection, ringAsMulti, union } from "../geom/boolean.js";
+import { ringArea, type MultiPolygon, type Vec2 } from "../geom/types.js";
 import {
   allocateManualId,
   ROUTE_CLASS_REGISTRY,
@@ -10,7 +11,17 @@ import {
   type RouteClassId,
   type RoadCurvePreset
 } from "../gen/city.js";
-import { compileRouteNetwork, CONNECTION_TOLERANCE_M, TOPOLOGY_EPSILON_M, type CompiledRouteNetwork } from "./compiler.js";
+import {
+  compileRouteNetwork,
+  CONNECTION_TOLERANCE_M,
+  corridorDisc,
+  corridorQuad,
+  TOPOLOGY_EPSILON_M,
+  spanCorridorHalfWidthM,
+  type CompiledJunction,
+  type CompiledRouteNetwork,
+  type CompiledSpan
+} from "./compiler.js";
 
 export interface TopologyValidation {
   ok: boolean;
@@ -380,4 +391,481 @@ export function deleteEdges(source: RoadSource, edgeIds: readonly string[]): { s
 
 export function appendRoute(source: RoadSource, points: readonly Vec2[], options: ConnectRoadOptions): RoadSource {
   return connectRoadPoints(source, points, options);
+}
+
+export interface RouteBlockedInterval {
+  startM: number;
+  endM: number;
+}
+
+export interface RouteConflict {
+  edgeId: string;
+  kind: "road";
+  reason: string;
+  /** Arc-length ranges from the edge start whose corridor intersects the occupied geometry. */
+  blockedArcM: RouteBlockedInterval[];
+  /** True when the edge compiles to its straight chord, so outside fragments can be trimmed in place. */
+  processable: boolean;
+}
+
+export interface RouteSurgeryBlocker {
+  id: string;
+  kind: "road";
+  reason: string;
+}
+
+export interface RouteSurgeryResult {
+  source: RoadSource;
+  conflicts: RouteConflict[];
+  trimmedEdgeIds: string[];
+  removedEdgeIds: string[];
+  disconnectedVehicleNetwork: boolean;
+}
+
+export class RouteSurgeryError extends Error {
+  readonly blockers: RouteSurgeryBlocker[];
+
+  constructor(blockers: RouteSurgeryBlocker[], message?: string) {
+    super(message ?? `Route surgery rejected: ${blockers.map((blocker) => blocker.reason).join(" ")}`);
+    this.name = "RouteSurgeryError";
+    this.blockers = blockers;
+  }
+}
+
+const CONFLICT_AREA_FLOOR_M2 = 1e-5;
+const TRIM_CLEARANCE_M = 0.01;
+const MIN_FRAGMENT_M = 0.05;
+const MAX_SURGERY_PASSES = 24;
+
+const multiArea = (multi: MultiPolygon): number =>
+  multi.reduce((sum, polygon) => sum + polygon.reduce((area, ring, index) => area + (index === 0 ? 1 : -1) * Math.abs(ringArea(ring)), 0), 0);
+
+
+function mergeIntervals(intervals: RouteBlockedInterval[]): RouteBlockedInterval[] {
+  const sorted = [...intervals].filter((interval) => interval.endM - interval.startM > TOPOLOGY_EPSILON_M).sort((a, b) => a.startM - b.startM || a.endM - b.endM);
+  const merged: RouteBlockedInterval[] = [];
+  for (const interval of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && interval.startM <= previous.endM + TOPOLOGY_EPSILON_M) previous.endM = Math.max(previous.endM, interval.endM);
+    else merged.push({ ...interval });
+  }
+  return merged;
+}
+
+/**
+ * Axis ranges where a disc of the given radius centred on the axis line touches occupied
+ * geometry: the union over occupied segments of the capsule (segment + disc) crossing the
+ * axis. Exact for the polygonal occupied geometry the pipeline produces.
+ */
+function discBlockedRange(origin: Vec2, dir: Vec2, radius: number, occupied: MultiPolygon): RouteBlockedInterval[] {
+  const intervals: RouteBlockedInterval[] = [];
+  const frame = (point: Vec2): { x: number; y: number } => {
+    const ox = point.x - origin.x;
+    const oy = point.y - origin.y;
+    return { x: ox * dir.x + oy * dir.y, y: ox * dir.y - oy * dir.x };
+  };
+  const range = (first: Vec2, second: Vec2): void => {
+    const a = frame(first);
+    const b = frame(second);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    // Extremes of x(t) + sigma*sqrt(R^2 - y(t)^2) sit at segment endpoints or where
+    // y(t)^2 = dx^2 R^2 / (dx^2 + dy^2) (from differentiating; sign condition filters roots).
+    const criticalYs: number[] = [];
+    if (Math.abs(dx) > TOPOLOGY_EPSILON_M) {
+      const magnitude = (radius * Math.abs(dx)) / Math.sqrt(dx * dx + dy * dy);
+      criticalYs.push(magnitude, -magnitude);
+    } else if (Math.abs(dy) > TOPOLOGY_EPSILON_M) {
+      criticalYs.push(0);
+    }
+    const value = (t: number, sigma: number): number => {
+      const y = a.y + dy * t;
+      if (Math.abs(y) >= radius) return Number.NaN;
+      return a.x + dx * t + sigma * Math.sqrt(radius * radius - y * y);
+    };
+    let low = Number.POSITIVE_INFINITY;
+    let high = Number.NEGATIVE_INFINITY;
+    for (const sigma of [1, -1] as const) {
+      for (const raw of [value(0, sigma), value(1, sigma), ...criticalYs.map((y) => (Math.abs(y) >= radius || sigma * y * dy * dx < 0 ? Number.NaN : value((y - a.y) / dy, sigma)))]) {
+        if (Number.isNaN(raw)) continue;
+        low = Math.min(low, raw);
+        high = Math.max(high, raw);
+      }
+    }
+    if (high - low > TOPOLOGY_EPSILON_M) intervals.push({ startM: low, endM: high });
+  };
+  for (const polygon of occupied) for (const ring of polygon) for (let i = 0; i < ring.length; i++) range(ring[i]!, ring[(i + 1) % ring.length]!);
+  return intervals;
+}
+
+/**
+ * Shared chord geometry for one conflicting edge: the straight source chord from nodeA to
+ * nodeB, its axis direction, and the along-chord extents of the occupied-over-corridor
+ * overlap across every compiled span of the edge. Straight multi-edge routes compile to
+ * several collinear spans that may overhang the chord past a shared node, so the extents
+ * are clamped back onto the chord the source trim will actually cut.
+ */
+interface ChordBlocking {
+  length: number;
+  dir: Vec2;
+  quadExtents: RouteBlockedInterval[];
+}
+
+function chordBlocking(chordA: Vec2, chordB: Vec2, spans: CompiledSpan[], occupied: MultiPolygon): ChordBlocking {
+  const length = dist(chordA, chordB);
+  const dir = { x: (chordB.x - chordA.x) / length, y: (chordB.y - chordA.y) / length };
+  const along = (point: Vec2): number => (point.x - chordA.x) * dir.x + (point.y - chordA.y) * dir.y;
+  const halfWidth = spanCorridorHalfWidthM(spans[0]!);
+  const quadExtents: RouteBlockedInterval[] = [];
+  for (const span of spans) {
+    const quadOverlap = polygonIntersection(occupied, ringAsMulti(corridorQuad(span.a, span.b, halfWidth)));
+    for (const polygon of quadOverlap) {
+      let min = Number.POSITIVE_INFINITY;
+      let max = Number.NEGATIVE_INFINITY;
+      for (const ring of polygon) for (const point of ring) {
+        const s = along(point);
+        min = Math.min(min, s);
+        max = Math.max(max, s);
+      }
+      if (max - min > TOPOLOGY_EPSILON_M) quadExtents.push({ startM: Math.max(0, min), endM: Math.min(length, max) });
+    }
+  }
+  return { length, dir, quadExtents };
+}
+
+/**
+ * Reported blocked arc ranges for an edge chord: axis projections of the occupied-over-
+ * corridor overlap, plus an anchor component when the junction disc at a chord end already
+ * overlaps occupied geometry and the end cap must retreat back to the last touching
+ * position. Both end-cap sliding ranges are evaluated in the chord-start frame.
+ */
+function blockedIntervalsForEdge(
+  chordA: Vec2,
+  chordB: Vec2,
+  blocking: ChordBlocking,
+  occupied: MultiPolygon,
+  radiusA: number,
+  radiusB: number
+): RouteBlockedInterval[] {
+  const { length, dir, quadExtents } = blocking;
+  const endpointComponent = (anchorPoint: Vec2, radius: number, fromStart: boolean): RouteBlockedInterval | null => {
+    if (radius <= TOPOLOGY_EPSILON_M) return null;
+    const discOverlap = polygonIntersection(occupied, ringAsMulti(corridorDisc(anchorPoint, radius)));
+    if (discOverlap.length === 0 || multiArea(discOverlap) <= CONFLICT_AREA_FLOOR_M2) return null;
+    // WHY: The end-cap disc must be able to retreat past ANY occupied wall facing the road, not
+    // just past vertices — use the exact segment-plus-disc capsule crossing of the edge axis.
+    const anchor = fromStart ? 0 : length;
+    const hit = mergeIntervals([...quadExtents, ...discBlockedRange(chordA, dir, radius, occupied)]).find(
+      (interval) => interval.startM <= anchor + TOPOLOGY_EPSILON_M && interval.endM >= anchor - TOPOLOGY_EPSILON_M
+    );
+    if (!hit) return null;
+    return fromStart ? { startM: 0, endM: Math.min(length, hit.endM + TRIM_CLEARANCE_M) } : { startM: Math.max(0, hit.startM - TRIM_CLEARANCE_M), endM: length };
+  };
+  const startComponent = endpointComponent(chordA, radiusA, true);
+  const endComponent = endpointComponent(chordB, radiusB, false);
+  return mergeIntervals([
+    ...quadExtents.map((interval) => ({ startM: Math.max(0, interval.startM - TRIM_CLEARANCE_M), endM: Math.min(length, interval.endM + TRIM_CLEARANCE_M) })),
+    ...(startComponent ? [startComponent] : []),
+    ...(endComponent ? [endComponent] : [])
+  ]);
+}
+
+/**
+ * Trim planning extends the reported ranges with the moving end-cap-disc ranges: a cut is
+ * only safe where a junction disc of the node's canonical radius sliding along the chord no
+ * longer touches occupied geometry, otherwise the trimmed edge would re-conflict on the
+ * next pass. Sliding ranges are clamped onto the chord before merging.
+ */
+function trimIntervalsForEdge(chordA: Vec2, blocking: ChordBlocking, occupied: MultiPolygon, radiusA: number, radiusB: number, blockedArcM: RouteBlockedInterval[]): RouteBlockedInterval[] {
+  const sliding = (radius: number): RouteBlockedInterval[] =>
+    radius <= TOPOLOGY_EPSILON_M
+      ? []
+      : discBlockedRange(chordA, blocking.dir, radius, occupied)
+          .map((interval) => ({ startM: Math.max(0, interval.startM - TRIM_CLEARANCE_M), endM: Math.min(blocking.length, interval.endM + TRIM_CLEARANCE_M) }))
+          .filter((interval) => interval.endM - interval.startM > TOPOLOGY_EPSILON_M);
+  return mergeIntervals([...blockedArcM, ...sliding(radiusA), ...sliding(radiusB)]);
+}
+
+/**
+ * An edge can be trimmed in place only when its compiled corridor is the straight chord:
+ * every span of the edge must lie on the chord line, and so must every same-route span that
+ * covers part of the chord interior within the corridor width. Straight multi-edge routes
+ * keep collinear smoothing extensions past their shared nodes, while a fillet through a
+ * neighbouring junction bends the compiled corridor off the chord and makes outside
+ * fragments non source-representable.
+ */
+function isChordRepresentable(network: CompiledRouteNetwork, edgeId: string, spans: CompiledSpan[], nodeA: RoadNodeSource, nodeB: RoadNodeSource): boolean {
+  const length = dist(nodeA, nodeB);
+  if (spans.length === 0 || length <= TOPOLOGY_EPSILON_M) return false;
+  const dir = { x: (nodeB.x - nodeA.x) / length, y: (nodeB.y - nodeA.y) / length };
+  const lateral = (point: Vec2): number => (point.x - nodeA.x) * -dir.y + (point.y - nodeA.y) * dir.x;
+  const onChordLine = (point: Vec2): boolean => Math.abs(lateral(point)) <= TOPOLOGY_EPSILON_M;
+  for (const span of spans) if (!onChordLine(span.a) || !onChordLine(span.b)) return false;
+  const routeId = spans[0]!.routeId;
+  const halfWidth = spanCorridorHalfWidthM(spans[0]!);
+  for (const span of network.spans) {
+    if (span.routeId !== routeId || span.edgeId === edgeId) continue;
+    const startLateral = lateral(span.a);
+    const endLateral = lateral(span.b);
+    const distance = startLateral * endLateral <= 0 ? 0 : Math.min(Math.abs(startLateral), Math.abs(endLateral));
+    if (distance > halfWidth + TOPOLOGY_EPSILON_M) continue;
+    const startAlong = (span.a.x - nodeA.x) * dir.x + (span.a.y - nodeA.y) * dir.y;
+    const endAlong = (span.b.x - nodeA.x) * dir.x + (span.b.y - nodeA.y) * dir.y;
+    // Spans that merely touch a chord end (perpendicular junction arms) never cover the interior.
+    const overlap = Math.min(length, Math.max(startAlong, endAlong)) - Math.max(0, Math.min(startAlong, endAlong));
+    if (overlap > TOPOLOGY_EPSILON_M && (!onChordLine(span.a) || !onChordLine(span.b))) return false;
+  }
+  return true;
+}
+
+interface RouteConflictAnalysis {
+  conflicts: RouteConflict[];
+  /** Per conflicting edgeId: reported blocked ranges extended with the end-cap disc sliding retreat for trim planning. */
+  trimArcs: Map<string, RouteBlockedInterval[]>;
+}
+
+function analyzeRouteConflictsDetailed(roads: RoadSource, occupied: MultiPolygon): RouteConflictAnalysis {
+  if (occupied.length === 0) return { conflicts: [], trimArcs: new Map() };
+  const network = compileRouteNetwork(roads);
+  const nodeById = new Map(roads.nodes.map((node) => [node.id, node]));
+  // WHY: Same radius rule as compiledRouteOccupancy — a node disc takes the widest incident half width.
+  const nodeRadius = new Map<string, number>();
+  for (const span of network.spans) {
+    const halfWidth = spanCorridorHalfWidthM(span);
+    for (const nodeId of [span.aNodeId, span.bNodeId]) {
+      const key = `${span.vehicle ? "v" : "n"}:${nodeId}`;
+      nodeRadius.set(key, Math.max(nodeRadius.get(key) ?? 0, halfWidth));
+    }
+  }
+  const spansByEdge = new Map<string, CompiledSpan[]>();
+  for (const span of network.spans) {
+    const list = spansByEdge.get(span.edgeId) ?? [];
+    list.push(span);
+    spansByEdge.set(span.edgeId, list);
+  }
+  const conflicts: RouteConflict[] = [];
+  const trimArcs = new Map<string, RouteBlockedInterval[]>();
+  for (const edge of [...roads.edges].sort((a, b) => a.id.localeCompare(b.id))) {
+    const spans = spansByEdge.get(edge.id);
+    const nodeA = nodeById.get(edge.a);
+    const nodeB = nodeById.get(edge.b);
+    if (!spans || spans.length === 0 || !nodeA || !nodeB) continue;
+    const pieces: MultiPolygon[] = spans.map((span) => ringAsMulti(corridorQuad(span.a, span.b, spanCorridorHalfWidthM(span))));
+    const radiusA = nodeRadius.get(`${spans[0]!.vehicle ? "v" : "n"}:${nodeA.id}`) ?? 0;
+    const radiusB = nodeRadius.get(`${spans[spans.length - 1]!.vehicle ? "v" : "n"}:${nodeB.id}`) ?? 0;
+    for (const [node, radius] of [[nodeA, radiusA], [nodeB, radiusB]] as const) if (radius > TOPOLOGY_EPSILON_M) pieces.push(ringAsMulti(corridorDisc(node, radius)));
+    const overlap = polygonIntersection(occupied, union(pieces));
+    if (overlap.length === 0 || multiArea(overlap) <= CONFLICT_AREA_FLOOR_M2) continue;
+    const processable = isChordRepresentable(network, edge.id, spans, nodeA, nodeB);
+    let blockedArcM: RouteBlockedInterval[] = [];
+    if (processable) {
+      const blocking = chordBlocking(nodeA, nodeB, spans, occupied);
+      blockedArcM = blockedIntervalsForEdge(nodeA, nodeB, blocking, occupied, radiusA, radiusB);
+      trimArcs.set(edge.id, trimIntervalsForEdge(nodeA, blocking, occupied, radiusA, radiusB, blockedArcM));
+    }
+    const blockedLength = blockedArcM.reduce((sum, interval) => sum + (interval.endM - interval.startM), 0);
+    conflicts.push({
+      edgeId: edge.id,
+      kind: "road",
+      reason: `Road edge "${edge.id}" corridor intersects occupied building footprint over ${blockedLength.toFixed(2)}m of ${dist(nodeA, nodeB).toFixed(2)}m.`,
+      blockedArcM,
+      processable
+    });
+  }
+  return { conflicts, trimArcs };
+}
+
+export function analyzeRouteConflicts(roads: RoadSource, occupied: MultiPolygon): RouteConflict[] {
+  return analyzeRouteConflictsDetailed(roads, occupied).conflicts;
+}
+
+interface TrimPlan {
+  cuts: number[];
+  freeRanges: RouteBlockedInterval[];
+}
+
+function trimPlan(blockedArcM: readonly RouteBlockedInterval[], length: number): TrimPlan {
+  const blocked = mergeIntervals(
+    blockedArcM.map((interval) => ({ startM: Math.max(0, interval.startM - TRIM_CLEARANCE_M), endM: Math.min(length, interval.endM + TRIM_CLEARANCE_M) }))
+  ).filter((interval) => interval.endM - interval.startM > TOPOLOGY_EPSILON_M);
+  const freeRanges: RouteBlockedInterval[] = [];
+  let cursor = 0;
+  for (const range of blocked) {
+    if (range.startM - cursor > MIN_FRAGMENT_M) freeRanges.push({ startM: cursor, endM: range.startM });
+    cursor = Math.max(cursor, range.endM);
+  }
+  if (length - cursor > MIN_FRAGMENT_M) freeRanges.push({ startM: cursor, endM: length });
+  const cuts = new Set<number>();
+  for (const free of freeRanges) for (const bound of [free.startM, free.endM]) if (bound > TOPOLOGY_EPSILON_M && bound < length - TOPOLOGY_EPSILON_M) cuts.add(bound);
+  return { cuts: [...cuts].sort((a, b) => a - b), freeRanges };
+}
+
+function spansDiffer(before: CompiledSpan, after: CompiledSpan): boolean {
+  return (
+    before.routeId !== after.routeId ||
+    before.classId !== after.classId ||
+    dist(before.a, after.a) > TOPOLOGY_EPSILON_M ||
+    dist(before.b, after.b) > TOPOLOGY_EPSILON_M ||
+    Math.abs(before.endArcM - before.startArcM - (after.endArcM - after.startArcM)) > TOPOLOGY_EPSILON_M
+  );
+}
+
+function junctionsDiffer(before: CompiledJunction | undefined, after: CompiledJunction | undefined): boolean {
+  if (!before || !after) return before !== after;
+  if (before.id !== after.id || before.arms.length !== after.arms.length || dist(before.point, after.point) > TOPOLOGY_EPSILON_M) return true;
+  return before.arms.some((arm, index) => {
+    const other = after.arms[index]!;
+    return (
+      arm.edgeId !== other.edgeId ||
+      arm.nodeId !== other.nodeId ||
+      arm.routeId !== other.routeId ||
+      arm.widthM !== other.widthM ||
+      arm.clearanceM !== other.clearanceM ||
+      dist(arm.direction, other.direction) > TOPOLOGY_EPSILON_M
+    );
+  });
+}
+
+function changedLockedEdgeIds(before: RoadSource, after: RoadSource): string[] {
+  const beforeNetwork = compileRouteNetwork(before);
+  const afterNetwork = compileRouteNetwork(after);
+  const changed: string[] = [];
+  for (const edge of before.edges) {
+    if (!edge.locked) continue;
+    const beforeSpans = beforeNetwork.spans.filter((span) => span.edgeId === edge.id);
+    const afterSpans = afterNetwork.spans.filter((span) => span.edgeId === edge.id);
+    if (beforeSpans.length !== afterSpans.length || beforeSpans.some((span, index) => spansDiffer(span, afterSpans[index]!))) {
+      changed.push(edge.id);
+      continue;
+    }
+    const junctionChanged = [edge.a, edge.b].some((nodeId) => {
+      const pick = (network: CompiledRouteNetwork) => network.junctions.find((junction) => junction.id === nodeId && junction.arms.some((arm) => arm.edgeId === edge.id));
+      return junctionsDiffer(pick(beforeNetwork), pick(afterNetwork));
+    });
+    if (junctionChanged) changed.push(edge.id);
+  }
+  return changed;
+}
+
+export function applyBuildingRouteSurgery(roads: RoadSource, occupied: MultiPolygon, options: RoadEditOptions = {}): RouteSurgeryResult {
+  const original = cloneSource(roads);
+  if (occupied.length === 0 || original.edges.length === 0) {
+    return { source: original, conflicts: [], trimmedEdgeIds: [], removedEdgeIds: [], disconnectedVehicleNetwork: false };
+  }
+  let work = cloneSource(original);
+  const lineage = new Map<string, string>();
+  for (const edge of original.edges) lineage.set(edge.id, edge.id);
+  const touched = new Set<string>();
+  const diagnostics = new Map<string, RouteConflict>();
+  let stable = false;
+  let sequence = options.sequence ?? 0;
+  for (let pass = 0; pass < MAX_SURGERY_PASSES; pass++) {
+    const analysis = analyzeRouteConflictsDetailed(work, occupied);
+    const conflicts = analysis.conflicts;
+    for (const conflict of conflicts) diagnostics.set(`${conflict.edgeId}\0${conflict.reason}`, conflict);
+    if (conflicts.length === 0) {
+      stable = true;
+      break;
+    }
+    const edgeById = new Map(work.edges.map((edge) => [edge.id, edge]));
+    const blockers: RouteSurgeryBlocker[] = conflicts
+      .filter((conflict) => edgeById.get(conflict.edgeId)?.locked)
+      .map((conflict) => ({ id: conflict.edgeId, kind: "road", reason: conflict.reason }));
+    if (blockers.length > 0) throw new RouteSurgeryError(blockers);
+    const deletions = new Set<string>();
+    let splitCount = 0;
+    for (const conflict of [...conflicts].sort((a, b) => a.edgeId.localeCompare(b.edgeId))) {
+      const edge = edgeById.get(conflict.edgeId)!;
+      const nodeA = work.nodes.find((node) => node.id === edge.a);
+      const nodeB = work.nodes.find((node) => node.id === edge.b);
+      if (!nodeA || !nodeB) continue;
+      if (!conflict.processable) {
+        deletions.add(edge.id);
+        continue;
+      }
+      const length = dist(nodeA, nodeB);
+      const plan = trimPlan(analysis.trimArcs.get(conflict.edgeId) ?? [], length);
+      if (plan.freeRanges.length === 0) {
+        deletions.add(edge.id);
+        continue;
+      }
+      if (plan.cuts.length === 0) continue;
+      const dir = { x: (nodeB.x - nodeA.x) / length, y: (nodeB.y - nodeA.y) / length };
+      let current = work;
+      let currentId = edge.id;
+      let start = 0;
+      const pieces: { id: string; startM: number; endM: number }[] = [];
+      for (const cut of plan.cuts) {
+        const before = new Set(current.edges.map((candidate) => candidate.id));
+        const split = splitEdgeAtPoint(current, currentId, { x: nodeA.x + dir.x * cut, y: nodeA.y + dir.y * cut }, { revision: options.revision, sequence });
+        sequence += 2;
+        current = split.source;
+        const child = current.edges.find((candidate) => !before.has(candidate.id));
+        if (!child) throw new RouteSurgeryError([{ id: edge.id, kind: "road", reason: `Route surgery failed to split road edge "${edge.id}".` }]);
+        pieces.push({ id: currentId, startM: start, endM: cut });
+        lineage.set(child.id, lineage.get(currentId) ?? currentId);
+        currentId = child.id;
+        start = cut;
+        splitCount++;
+      }
+      pieces.push({ id: currentId, startM: start, endM: length });
+      for (const piece of pieces) {
+        const kept = plan.freeRanges.some((free) => piece.startM >= free.startM - TOPOLOGY_EPSILON_M && piece.endM <= free.endM + TOPOLOGY_EPSILON_M);
+        if (!kept) deletions.add(piece.id);
+      }
+      work = current;
+    }
+    if (deletions.size > 0) {
+      for (const pieceId of deletions) {
+        const origin = lineage.get(pieceId);
+        if (origin) touched.add(origin);
+      }
+      try {
+        work = deleteEdges(work, [...deletions]).source;
+      } catch (error) {
+        throw new RouteSurgeryError(
+          conflicts.map((conflict) => ({ id: conflict.edgeId, kind: "road" as const, reason: `Route surgery could not apply trim on "${conflict.edgeId}": ${String(error)}` }))
+        );
+      }
+    } else if (splitCount === 0) {
+      throw new RouteSurgeryError(
+        conflicts.map((conflict) => ({ id: conflict.edgeId, kind: "road" as const, reason: `Route surgery cannot resolve conflict on road edge "${conflict.edgeId}" with deterministic progress.` }))
+      );
+    }
+  }
+  if (!stable) {
+    throw new RouteSurgeryError(
+      [...diagnostics.values()].map((conflict) => ({ id: conflict.edgeId, kind: "road" as const, reason: `Route surgery did not stabilize within ${MAX_SURGERY_PASSES} passes on road edge "${conflict.edgeId}".` }))
+    );
+  }
+  const protectedChanged = changedLockedEdgeIds(original, work);
+  if (protectedChanged.length > 0) {
+    throw new RouteSurgeryError(
+      protectedChanged.map((id) => ({ id, kind: "road" as const, reason: `Route surgery would alter the compiled geometry of locked road edge "${id}".` }))
+    );
+  }
+  const validation = validateRouteTopology(work);
+  if (!validation.ok) {
+    throw new RouteSurgeryError(validation.problems.map((problem) => ({ id: "roads", kind: "road" as const, reason: problem })));
+  }
+  const surviving = new Map<string, number>();
+  for (const edge of work.edges) {
+    const origin = lineage.get(edge.id);
+    if (origin) surviving.set(origin, (surviving.get(origin) ?? 0) + 1);
+  }
+  const trimmedEdgeIds: string[] = [];
+  const removedEdgeIds: string[] = [];
+  for (const edge of original.edges) {
+    const count = surviving.get(edge.id) ?? 0;
+    if (count === 0) removedEdgeIds.push(edge.id);
+    else if (touched.has(edge.id)) trimmedEdgeIds.push(edge.id);
+  }
+  const final = deleteEdges(work, []);
+  return {
+    source: final.source,
+    conflicts: [...diagnostics.values()].sort((a, b) => a.edgeId.localeCompare(b.edgeId) || a.reason.localeCompare(b.reason)),
+    trimmedEdgeIds: trimmedEdgeIds.sort((a, b) => a.localeCompare(b)),
+    removedEdgeIds: removedEdgeIds.sort((a, b) => a.localeCompare(b)),
+    disconnectedVehicleNetwork: final.disconnectedVehicleNetwork
+  };
 }

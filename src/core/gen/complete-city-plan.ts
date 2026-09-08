@@ -3,11 +3,12 @@ import { difference, intersectMultiWithRing, intersection, isSnapNoise, ringAsMu
 import { rectRing, rectsIntersect, ringArea, ringBounds, ringCentroid, type MultiPolygon, type Rect, type Ring, type Vec2 } from "../geom/types.js";
 import { compileRouteNetwork, type CompiledRouteNetwork } from "../graph/compiler.js";
 import { BASE_BANK, BANK_COUNT, DISTRICT_SLOT, FIRST_ZONE_BANK, MATERIAL, materialIndex } from "../palette.js";
-import { isRecord, ROUTE_CLASS_REGISTRY, type ArchitectureOrigin, type ArchitectureOverrideSource, type ArchitectureProtection, type CitySourceV4, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type PersistentBuildingSource, type PersistentPlaceSource, type PlacementFrame, type RouteClassId } from "./city.js";
+import { isRecord, ROUTE_CLASS_REGISTRY, type ArchitectureOrigin, type ArchitectureOverrideSource, type ArchitectureProtection, type CitySourceV5, type DistrictOpenSpaceProfile, type DistrictSource, type OpenSpaceCategory, type OpenSpaceSize, type PersistentBuildingSource, type PersistentPlaceSource, type PlacementFrame, type RouteClassId } from "./city.js";
 import { buildDistrictPlan, canonicalHoleFreePieces, compiledRouteOccupancy, DEVELOPMENT_SPACE_CATEGORIES, districtStructuralInputSignature, type DevelopmentCellPlan, type DevelopmentSpaceRole, type DistrictBlockFragment, type DistrictPlan, type RouteOccupancy, type StructuralInputSignature } from "./district-plan.js";
 import { DISTRICT_PALETTE_IDS, DISTRICT_TYPE_REGISTRY, type DistrictTypeDefinition, type DistrictTypeId, type HeightBand } from "./district-registry.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, INFILL_BUILDING_GRAMMAR_IDS, MICRO_BUILDING_GRAMMAR_IDS, UNZONED_BUILDING_GRAMMAR_WEIGHTS, isTowerGrammar, type BuildingGrammarDefinition, type BuildingGrammarId, type BuildingUseId, type FootprintArchetypeId, type WeightPair, type WeightTriple } from "./building-registry.js";
 import { LANDMARK_GRAMMAR_IDS, LANDMARK_GRAMMAR_REGISTRY, PRE_ROAD_LANDMARK_GRAMMAR_IDS, type LandmarkGrammarDefinition, type LandmarkGrammarId, type LandmarkMassTemplate } from "./landmark-registry.js";
+import { effectiveRegenerationSeed } from "./regeneration.js";
 import { normalizeRing, validateRing } from "./terrain.js";
 
 const GEOMETRY_EPSILON = 1e-6;
@@ -644,7 +645,7 @@ export function derivePaletteBanks(): PaletteBankEntry[] {
     .map((paletteId, index) => ({ paletteId, bank: FIRST_ZONE_BANK + index }));
 }
 
-export function completeCityStructuralInput(source: CitySourceV4): StructuralInputSignature {
+export function completeCityStructuralInput(source: CitySourceV5): StructuralInputSignature {
   const base = districtStructuralInputSignature(source);
   const palettes = [...source.districts]
     .sort((a, b) => a.id.localeCompare(b.id))
@@ -675,7 +676,7 @@ export const GENERATED_MAJOR_LANDMARK_SITE_MIN_AREA_MARGIN = 1.1;
  * passes the resulting polygons verbatim through road generation and city planning.
  */
 export function reserveMajorLandmarkSites(
-  source: CitySourceV4,
+  source: CitySourceV5,
   grammarIds: readonly LandmarkGrammarId[] = PRE_ROAD_LANDMARK_GRAMMAR_IDS
 ): MajorLandmarkSiteReservation[] {
   const seenGrammarIds = new Set<LandmarkGrammarId>();
@@ -1472,21 +1473,32 @@ function assertPersistentSite(
   label: string,
   site: Ring,
   placement: PlacementFrame,
-  source: CitySourceV4,
+  source: CitySourceV5,
   districtPlan: DistrictPlan,
   districtId: string | null,
   blockId: string | null,
   occupancyAll: MultiPolygon,
-  peerSites: readonly Ring[]
+  peerSites: readonly Ring[],
+  routeFree: "site" | "masses"
 ): void {
   if (!validRing(site)) throw new Error(`${label} sitePolygon is invalid.`);
   const land = source.terrain.land;
   const urban = source.terrain.urbanFootprint ?? land;
   if (!ringCountsAsContained(site, ringAsMulti(land))) throw new Error(`${label} sitePolygon must be contained in land.`);
   if (!ringCountsAsContained(site, ringAsMulti(urban))) throw new Error(`${label} sitePolygon must be contained in the urban footprint.`);
-  if (siteOverlapsOccupancy(site, occupancyAll)) throw new Error(`${label} sitePolygon overlaps road occupancy.`);
   if (!hasValidPlacementFrame(placement)) throw new Error(`${label} placement frame is invalid.`);
   const frame = placementRing(placement);
+  if (routeFree === "site" && siteOverlapsOccupancy(site, occupancyAll)) {
+    // Places stay road-free: the whole reservation must clear the compiled occupancy.
+    throw new Error(`${label} sitePolygon overlaps road occupancy.`);
+  }
+  // Buildings (routeFree "masses") never gate on the site or frame here: the frame is a
+  // massing container, not occupied geometry — its courtyard/setback empty area may
+  // legally cross a route the GM's surgery trims, so a frame/reservation crossing never
+  // authorizes deletion or a false rejection. Route legality is decided on the actual
+  // materialized mass footprints after materialization (validateCompleteCityPlan checks
+  // every persistent mass against the compiled occupancy) and exposed for surgery by
+  // occupiedPersistentBuildingGeometry.
   if (!ringCountsAsContained(frame, ringAsMulti(site))) throw new Error(`${label} placement frame exceeds sitePolygon.`);
   if (districtId !== null && !districtPlan.blocks.some((block) => block.districtFragments.some((fragment) => fragment.districtId === districtId))) {
     throw new Error(`${label} references unknown district "${districtId}".`);
@@ -1514,13 +1526,14 @@ function materializePersistentBuilding(
   }
   const frameRing = placementRing(source.placement);
   const frameAreaM2 = source.placement.widthM * source.placement.depthM;
-  // Generated provenance: the grammar fit was proven at planning time against the
-  // parcel that became this building's sitePolygon, using the same frontage angle the
-  // persisted frame carries. On a concave site the persisted promotion frame is the
-  // smaller mass-envelope fitted inside the site (placementFrameForRing's concave
-  // path), so re-checking declared limits against the frame alone would reject an
-  // unchanged, already-valid derived building. Re-run the identical check against the
-  // site parcel for generated origins; authored placements and genuinely changed
+  // Generated provenance: planning massed this building against the placement frame the
+  // promotion persists, drawing setback and mass layout from the record seed's historical
+  // streams ("<seed>/setback" and "<seed>/geometry"), so re-running the identical massing
+  // below replays a faithfully promoted derived building exactly. On a concave site the
+  // persisted frame is the smaller massing container fitted inside the site, so
+  // re-checking declared limits against the frame alone would reject an unchanged,
+  // already-valid derived building; generated origins re-run the identical fit check
+  // against the site parcel instead. Authored placements and genuinely changed
   // geometry (the frame and site are transformed together) keep the strict gate.
   const generatedSiteFits = source.origin === "generated"
     && grammarFitsParcel(grammar, {
@@ -1538,6 +1551,11 @@ function materializePersistentBuilding(
     throw new Error(`Persistent building "${source.id}" placement frame does not fit grammar "${source.grammarId}".`);
   }
   const setbackM = range(`${source.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
+  // Historical materialization stream: the V4→V5 migration preserves record seeds, and
+  // every pre-existing record was massed on "<seed>/geometry" — keying the layout on the
+  // bare record seed would silently reroll authored/protected buildings during migration.
+  // planParcelBuilding draws from the same "<plan.seed>/geometry" stream so a fresh
+  // promotion replays this recipe exactly.
   const geometrySeed = `${source.seed}/geometry`;
   const rawMasses = archetypeMasses(
     { polygon: frameRing, frontageAngleRad: source.placement.rotationRad },
@@ -1649,8 +1667,45 @@ function landmarkFitsDistrict(grammar: LandmarkGrammarDefinition, tags: Readonly
   return grammar.compatibilityTags.some((tag) => tags.has(tag));
 }
 
+/**
+ * Target-owned landmark presentation rekey (§16.5). A generated landmark whose
+ * explicit block/district association falls inside a scope carrying a partial-seed
+ * record derives its materialization seed — and therefore its masses, required
+ * open-space carve, and appearance — from that scope's effective regeneration seed,
+ * so a regeneration replaces the compound presentation as one unit. Site selection,
+ * landmark identity, placement, and lineage stay untouched, and scopes without an
+ * applicable record (every non-target landmark, and all landmarks in record-free
+ * sources) keep the legacy citySeed-derived seed byte-for-byte, so pre-regeneration
+ * cities and non-target content replay identically.
+ */
+function landmarkMaterializationSeed(
+  source: CitySourceV5,
+  scope: { blockId: string | null; districtId: string | null },
+  identity: string,
+  legacySeed: string
+): string {
+  if (scope.blockId === null && scope.districtId === null) return legacySeed;
+  const hasApplicableRecord = source.regeneration.partialSeeds.some((record) =>
+    (record.targetKind === "block" && record.targetId === scope.blockId) ||
+    (record.targetKind === "district" && scope.districtId !== null && record.targetId === scope.districtId)
+  );
+  if (!hasApplicableRecord) return legacySeed;
+  const effective = effectiveRegenerationSeed(source, { blockId: scope.blockId ?? "", districtId: scope.districtId });
+  return stableId("seed", `${effective}/landmarks/v3/materialized/${identity}`);
+}
+/**
+ * Site selection is regeneration-stable by construction: every site input — city seed,
+ * block ids and lineage geometry, fragment buildable areas, district type ids,
+ * reservation polygons — is independent of partial-regeneration seeds, and the
+ * usedBlocks/sitesByBlock walk is order-deterministic over id-sorted blocks. Materialization
+ * presentation is scoped: after the explicit district/block association is resolved, a
+ * landmark whose scope carries a partial-seed record rekeys its seed/appearance through
+ * `landmarkMaterializationSeed` (the regenerated compound replaces as one unit), while
+ * every non-target landmark — and all landmarks in record-free sources — keeps the
+ * legacy citySeed-derived streams byte-identical.
+ */
 function planLandmarks(
-  source: CitySourceV4,
+  source: CitySourceV5,
   districtPlan: DistrictPlan,
   reserved: readonly MajorLandmarkSiteReservation[],
   districtById: Map<string, DistrictSource>,
@@ -1701,6 +1756,12 @@ function planLandmarks(
       // Internal reservations may drop here; the fallback pass reselects them.
       continue;
     }
+    const materializationSeed = landmarkMaterializationSeed(
+      source,
+      { blockId, districtId },
+      `${reservation.grammarId}|major|${reservation.lineage}`,
+      reservation.seed
+    );
     const landmarkId = stableId("landmark", `${reservation.grammarId}|${reservation.lineage}|${pointKey(reservation.sitePolygon[0]!)}`);
     landmarks.push({
       id: landmarkId,
@@ -1714,8 +1775,8 @@ function planLandmarks(
       sitePolygon: reservation.sitePolygon,
       placement: placementFrameForRing(reservation.sitePolygon),
       placementLineage: reservation.lineage,
-      seed: reservation.seed,
-      appearanceSeed: `${reservation.seed}/appearance`,
+      seed: materializationSeed,
+      appearanceSeed: `${materializationSeed}/appearance`,
       paletteId: districtId === null ? null : districtById.get(districtId)?.paletteId ?? null,
       masses: [],
       openSpaceIds: [],
@@ -1776,6 +1837,14 @@ function planLandmarks(
         .sort((a, b) => a.id.localeCompare(b.id));
       const compatible = fragments.find((fragment) => landmarkFitsDistrict(definition, districtCompatibilityTags(fragment.districtId, districtById)));
       if (!compatible) continue;
+      // Site selection above stays keyed to the citySeed-derived blockSeed; only the
+      // materialization presentation rekeys for record-bearing target scopes.
+      const materializationSeed = landmarkMaterializationSeed(
+        source,
+        { blockId: block.id, districtId: compatible.districtId },
+        `${grammarId}|fallback|${block.id}`,
+        blockSeed
+      );
       const lineage = `fallback:${grammarId}:${block.id}`;
       landmarks.push({
         id: stableId("landmark", `${grammarId}|fallback|${block.id}|${pointKey(site[0]!)}`),
@@ -1789,8 +1858,8 @@ function planLandmarks(
         sitePolygon: site,
         placement: placementFrameForRing(site),
         placementLineage: lineage,
-        seed: blockSeed,
-        appearanceSeed: `${blockSeed}/appearance`,
+        seed: materializationSeed,
+        appearanceSeed: `${materializationSeed}/appearance`,
         paletteId: compatible.districtId === null ? null : districtById.get(compatible.districtId)?.paletteId ?? null,
         masses: [],
         openSpaceIds: [],
@@ -1886,29 +1955,6 @@ function planFragments(
   const parcels: ParcelPlan[] = [];
   const openSpaces: OpenSpacePlan[] = [];
   const warnings: string[] = [];
-  // One or two plot-sized courts in sufficiently fine-grained blocks produce a dense /
-  // breathe rhythm without surrendering broad development bands. Selection is stable
-  // under encounter order and isolated from all established grammar streams.
-  const densityPocketCellIds = new Set<string>();
-  for (const block of districtPlan.blocks) {
-    const eligible = block.districtFragments
-      .flatMap((fragment) => cellsByFragment.get(fragment.id) ?? [])
-      .filter((cell) => {
-        const areaM2 = Math.abs(ringArea(cell.polygon));
-        return cell.classification === "building"
-          && areaM2 >= MIN_DENSITY_POCKET_AREA_M2
-          && areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2;
-      })
-      .sort((a, b) => {
-        const aScore = fnv1a(`${block.id}/density/v1/pocket/${a.id}`);
-        const bScore = fnv1a(`${block.id}/density/v1/pocket/${b.id}`);
-        return aScore - bScore || a.id.localeCompare(b.id);
-      });
-    const target = eligible.length < 6
-      ? 0
-      : 1 + (eligible.length >= 18 && hashUnit(`${block.id}/density/v1/pocket-count`) < 0.55 ? 1 : 0);
-    for (const cell of eligible.slice(0, target)) densityPocketCellIds.add(cell.id);
-  }
   for (const block of districtPlan.blocks) {
     for (const fragment of block.districtFragments) {
       let available = fragment.buildable;
@@ -1985,7 +2031,28 @@ function planFragments(
         warnings.push(`Fragment "${fragment.id}" open-space intent could not carve final geometry.`);
       }
 
+      // One or two plot-sized courts in sufficiently fine-grained blocks produce a dense /
+      // breathe rhythm without surrendering broad development bands. Selection is scoped to
+      // ONE fragment: eligibility, target count, and scoring never see sibling fragments'
+      // cells, so regenerating one district's fragment cannot reshuffle another fragment's
+      // pockets. Scoring keeps the stable block identity for stream compatibility.
       const cells = (cellsByFragment.get(fragment.id) ?? []).sort((a, b) => a.id.localeCompare(b.id));
+      const pocketEligible = cells
+        .filter((cell) => {
+          const areaM2 = Math.abs(ringArea(cell.polygon));
+          return cell.classification === "building"
+            && areaM2 >= MIN_DENSITY_POCKET_AREA_M2
+            && areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2;
+        })
+        .sort((a, b) => {
+          const aScore = fnv1a(`${block.id}/density/v1/pocket/${a.id}`);
+          const bScore = fnv1a(`${block.id}/density/v1/pocket/${b.id}`);
+          return aScore - bScore || a.id.localeCompare(b.id);
+        });
+      const pocketTarget = pocketEligible.length < 6
+        ? 0
+        : 1 + (pocketEligible.length >= 18 && hashUnit(`${block.id}/density/v1/pocket-count`) < 0.55 ? 1 : 0);
+      const densityPocketCellIds = new Set(pocketEligible.slice(0, pocketTarget).map((cell) => cell.id));
       for (const cell of cells) {
         const densityPocket = densityPocketCellIds.has(cell.id);
         if (cell.classification === "building" && !densityPocket) continue;
@@ -2153,21 +2220,27 @@ export function shapeBuildingHeight(grammar: BuildingGrammarDefinition, band: He
 
 /**
  * Deterministic block → height-band map for production planning. Mixed blocks blend
- * their fragments' district bands by parcel area, so every building in a block draws
- * from ONE band no matter how many districts the block contains; unzoned parcels
- * contribute the UNZONED_HEIGHT_BAND fallback.
+ * their fragments' district bands by area, so every building in a block draws from ONE
+ * band no matter how many districts the block contains; unzoned fragments contribute
+ * the UNZONED_HEIGHT_BAND fallback. The blend weights are the fragments' buildable
+ * areas — seed-independent geometry fixed by roads, terrain, and district polygons —
+ * so regenerating any target fragment re-rolls only its own content and can never
+ * shift another fragment's band (the former parcel-area blend leaked exactly there).
  */
-export function deriveBlockHeightBands(sourceParcels: readonly ParcelPlan[], districtById: Map<string, DistrictSource>): Map<string, HeightBand> {
+export function deriveBlockHeightBands(districtPlan: DistrictPlan, districtById: Map<string, DistrictSource>): Map<string, HeightBand> {
   const totals = new Map<string, { areaM2: number; minM: number; maxM: number }>();
-  for (const parcel of sourceParcels) {
-    const district = parcel.districtId ? districtById.get(parcel.districtId) : undefined;
-    const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
-    const band = definition ? definition.heightBand : UNZONED_HEIGHT_BAND;
-    const entry = totals.get(parcel.blockId) ?? { areaM2: 0, minM: 0, maxM: 0 };
-    entry.areaM2 += parcel.areaM2;
-    entry.minM += band.minM * parcel.areaM2;
-    entry.maxM += band.maxM * parcel.areaM2;
-    totals.set(parcel.blockId, entry);
+  for (const block of districtPlan.blocks) {
+    for (const fragment of block.districtFragments) {
+      const district = fragment.districtId ? districtById.get(fragment.districtId) : undefined;
+      const definition = district ? DISTRICT_TYPE_REGISTRY.get(district.typeId) : undefined;
+      const band = definition ? definition.heightBand : UNZONED_HEIGHT_BAND;
+      const areaM2 = multiArea(fragment.buildable);
+      const entry = totals.get(block.id) ?? { areaM2: 0, minM: 0, maxM: 0 };
+      entry.areaM2 += areaM2;
+      entry.minM += band.minM * areaM2;
+      entry.maxM += band.maxM * areaM2;
+      totals.set(block.id, entry);
+    }
   }
   const bands = new Map<string, HeightBand>();
   for (const [blockId, total] of totals) {
@@ -2691,8 +2764,20 @@ export function planParcelBuilding(
   frontage: FrontageSide | null = null,
   heightBand: HeightBand | null = null
 ): BuildingPlan | null {
+  // The parcel seed persists verbatim as the persistent record's seed, and every draw
+  // the materializer replays keys on the historical streams below it — setback on
+  // "<seed>/setback", mass layout on "<seed>/geometry" (see materializePersistentBuilding)
+  // — so a promoted derived building re-materializes with the exact draws planning used.
+  const massingAngle = frontage?.angleRad ?? parcel.frontageAngleRad;
+  const massingPlacement = placementFrameForRing(parcel.polygon, massingAngle);
+  const geometrySeed = `${parcel.seed}/geometry`;
   const active = BUILDING_GRAMMAR_IDS.filter((id) => (weights[id] ?? 0) > 0);
-  const fitting = active.filter((id) => grammarFitsParcel(BUILDING_GRAMMAR_REGISTRY.get(id)!, parcel));
+  // The fit gate must run the exact inputs materialization re-checks for a promoted
+  // record: the record seed and the persisted frame's rotation.
+  const fitting = active.filter((id) => grammarFitsParcel(
+    BUILDING_GRAMMAR_REGISTRY.get(id)!,
+    { ...parcel, frontageAngleRad: massingAngle }
+  ));
   if (fitting.length === 0) return null;
   const primary = selectBuildingGrammar(weights, `${parcel.seed}/grammar`);
   let grammarId: BuildingGrammarId;
@@ -2711,7 +2796,6 @@ export function planParcelBuilding(
     BUILDING_USE_IDS.map((use) => [use, grammar.compatibleUses.includes(use) ? (useWeights[use] ?? 0) : 0])
   ) as Record<BuildingUseId, number>;
   const visualUse = supportedUses.length > 0 ? weightedChoice(compatibleWeights, supportedUses, `${parcel.seed}/use`) : grammar.compatibleUses[0]!;
-  const geometrySeed = `${parcel.seed}/geometry`;
   const appearanceSeed = appearanceSeedOverride ?? `${parcel.seed}/appearance`;
   // Deterministic [0,1] roll fraction; skylineBias pushes it toward the top of whatever
   // band the parcel draws from (identical distribution to the old min..max roll).
@@ -2726,8 +2810,20 @@ export function planParcelBuilding(
   const heightM = shaped
     ? shapeBuildingHeight(grammar, band, heightRoll)
     : grammar.height.minM + heightRoll * (grammar.height.maxM - grammar.height.minM);
+  // Drawn from the record seed's historical setback stream so materialization's
+  // `range(`${record.seed}/setback`, …)` replay draws the identical value.
   const setbackM = range(`${parcel.seed}/setback`, grammar.footprint.setbackMin, grammar.footprint.setbackMax);
-  const rawMasses = archetypeMasses(parcel, grammar, geometrySeed, heightM, setbackM, frontage);
+  // Massing runs against the placement frame the plan persists: the frame is the
+  // road-cleared massing container, so the record a promotion carries (frame, seed,
+  // height) re-derives these masses exactly in materializePersistentBuilding.
+  const rawMasses = archetypeMasses(
+    { polygon: placementRing(massingPlacement), frontageAngleRad: parcel.frontageAngleRad },
+    grammar,
+    geometrySeed,
+    heightM,
+    setbackM,
+    frontage
+  );
   if (rawMasses.length === 0) return null;
   // Thin-building floor: ordinary masses must present an oriented minor dimension of at
   // least MIN_MASS_MINOR_DIMENSION_M. Micro grammars fill slivers intentionally and are
@@ -2798,13 +2894,13 @@ export function planParcelBuilding(
     grammarId,
     visualUse,
     archetype: grammar.archetype,
-    seed: geometrySeed,
+    seed: parcel.seed,
     appearanceSeed,
     paletteId: district?.paletteId ?? null,
     setbackM,
     heightM: Math.max(...masses.map((mass) => mass.elevationM + mass.heightM)),
     sitePolygon: parcel.polygon,
-    placement: placementFrameForRing(parcel.polygon, parcel.frontageAngleRad, masses.map((mass) => mass.footprint)),
+    placement: massingPlacement,
     masses,
     areaM2: masses.reduce((sum, mass) => sum + Math.abs(ringArea(mass.footprint)), 0)
   };
@@ -3172,6 +3268,7 @@ interface PendingBuildingParcel {
 
 function planBuildings(
   sourceParcels: ParcelPlan[],
+  districtPlan: DistrictPlan,
   districtById: Map<string, DistrictSource>,
   banks: Map<string, number>,
   occupancy: MultiPolygon,
@@ -3184,9 +3281,30 @@ function planBuildings(
   let refinedCount = 0;
   let densityInfillCount = 0;
   const densityInfillCountByFragment = new Map<string, number>();
+  const buildingsCountByFragment = new Map<string, number>();
   let unbuiltCount = 0;
   const occBoxes = occupancyBoxes(occupancy);
-  const heightBands = deriveBlockHeightBands(sourceParcels, districtById);
+  const heightBands = deriveBlockHeightBands(districtPlan, districtById);
+  // Per-fragment budget allocation replaces the former cross-fragment budget
+  // consumption: the global density-infill and reference-density allowances are split
+  // deterministically over the fragments by their buildable area — seed-independent
+  // geometry fixed by roads, terrain, and district polygons — so one fragment's
+  // consumption can never change another fragment's capacity. Regenerating any target
+  // therefore leaves every non-target fragment's build/unbuilt/density outcome
+  // identical while the per-parcel (12) and per-fragment (72) guardrails stand.
+  const fragmentAreas = new Map<string, number>();
+  for (const block of districtPlan.blocks) {
+    for (const fragment of block.districtFragments) fragmentAreas.set(fragment.id, multiArea(fragment.buildable));
+  }
+  let totalFragmentArea = 0;
+  for (const areaM2 of fragmentAreas.values()) totalFragmentArea += areaM2;
+  const infillBudgetByFragment = new Map<string, number>();
+  const referenceBudgetByFragment = new Map<string, number>();
+  for (const [fragmentId, areaM2] of fragmentAreas) {
+    const share = totalFragmentArea > 0 ? areaM2 / totalFragmentArea : 0;
+    infillBudgetByFragment.set(fragmentId, Math.floor(MAX_DENSITY_INFILL_BUILDINGS * share));
+    referenceBudgetByFragment.set(fragmentId, Math.floor(MAX_REFERENCE_DENSITY_BUILDINGS * share));
+  }
   const pending: PendingBuildingParcel[] = sourceParcels.map((parcel) => ({
     parcel,
     residualDepth: 0,
@@ -3245,8 +3363,8 @@ function planBuildings(
       ? Math.min(
         MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL,
         MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT - (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0),
-        MAX_DENSITY_INFILL_BUILDINGS - densityInfillCount,
-        MAX_REFERENCE_DENSITY_BUILDINGS - buildings.length
+        (infillBudgetByFragment.get(parcel.fragmentId) ?? 0) - (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0),
+        (referenceBudgetByFragment.get(parcel.fragmentId) ?? 0) - (buildingsCountByFragment.get(parcel.fragmentId) ?? 0)
       )
       : Number.POSITIVE_INFINITY;
     if (densityCapacity <= 0) {
@@ -3268,6 +3386,7 @@ function planBuildings(
     if (building !== null) {
       parcels.push(parcel);
       buildings.push(building);
+      buildingsCountByFragment.set(parcel.fragmentId, (buildingsCountByFragment.get(parcel.fragmentId) ?? 0) + 1);
       if (densityInfill) {
         densityInfillCount++;
         densityInfillCountByFragment.set(parcel.fragmentId, (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0) + 1);
@@ -3289,6 +3408,10 @@ function planBuildings(
       const residual = residualParcelPlans(parcel, refined);
       parcels.push(...refined.parcels);
       buildings.push(...refined.buildings);
+      buildingsCountByFragment.set(
+        parcel.fragmentId,
+        (buildingsCountByFragment.get(parcel.fragmentId) ?? 0) + refined.buildings.length
+      );
       if (densityInfill) {
         densityInfillCount += refined.buildings.length;
         densityInfillCountByFragment.set(
@@ -3494,7 +3617,7 @@ function refreshLandmarkAppearance(landmark: LandmarkPlan, districtById: Map<str
  */
 export function restyleCompleteCityPlanObjectPalette(
   plan: CompleteCityPlan,
-  source: CitySourceV4,
+  source: CitySourceV5,
   kind: "building" | "place",
   id: string,
   paletteId: string | null
@@ -3527,7 +3650,7 @@ export function restyleCompleteCityPlanObjectPalette(
  */
 export function patchCompleteCityPlanPersistentBuilding(
   plan: CompleteCityPlan,
-  source: CitySourceV4,
+  source: CitySourceV5,
   id: string
 ): CompleteCityPlan {
   const record = source.architecture.buildings.find((building) => building.id === id);
@@ -3545,7 +3668,8 @@ export function patchCompleteCityPlanPersistentBuilding(
     record.districtId,
     record.blockId,
     plan.routeOccupancy.all,
-    peerSites
+    peerSites,
+    "masses"
   );
   const paletteEntries = derivePaletteBanks();
   const banks = new Map(paletteEntries.map((entry) => [entry.paletteId, entry.bank]));
@@ -3591,7 +3715,7 @@ export function patchCompleteCityPlanPersistentBuilding(
 }
 
 function applyArchitectureOverrides(
-  source: CitySourceV4,
+  source: CitySourceV5,
   buildings: BuildingPlan[],
   landmarks: LandmarkPlan[],
   districtById: Map<string, DistrictSource>,
@@ -3636,7 +3760,7 @@ function applyArchitectureOverrides(
 
 
 export function buildCompleteCityPlan(
-  source: CitySourceV4,
+  source: CitySourceV5,
   revision = 1,
   epoch = 0,
   reservedSites?: readonly MajorLandmarkSiteReservation[]
@@ -3674,7 +3798,8 @@ export function buildCompleteCityPlan(
       building.districtId,
       building.blockId,
       occupancy.all,
-      peerSites
+      peerSites,
+      "masses"
     );
     peerSites.push(building.sitePolygon);
   }
@@ -3688,7 +3813,8 @@ export function buildCompleteCityPlan(
       place.districtId,
       place.blockId,
       occupancy.all,
-      peerSites
+      peerSites,
+      "site"
     );
     peerSites.push(place.sitePolygon);
   }
@@ -3787,6 +3913,7 @@ export function buildCompleteCityPlan(
   const { parcels: planningParcels, openSpaces, warnings } = planFragments(districtPlan, architectureSites, districtById, banks);
   const procedural = planBuildings(
     planningParcels,
+    districtPlan,
     districtById,
     banks,
     occupancy.all,
@@ -3858,6 +3985,30 @@ export function buildCompleteCityPlan(
     diagnostics
   };
 }
+
+/**
+ * Pure candidate occupancy probe for route-conflict analysis (§25.2): materializes ONE
+ * candidate persistent building through the production registry path
+ * (`materializePersistentBuilding`, with palette banks and district context built from
+ * the CitySourceV5) and returns the union of its mass footprints — the actual occupied
+ * ground route surgery must treat as building presence. The reservation sitePolygon is
+ * deliberately NOT part of this: a reservation may legally cross a route while the
+ * materialized masses may not, and adapter/UI consumers need the real mass geometry,
+ * never the site alone. Consumes no planning state and runs no route validation, so a
+ * candidate crossing roads can be analyzed BEFORE the full planner accepts or rejects
+ * it. Throws on an invalid candidate (unknown grammar, unfit frame, mass escaping its
+ * site polygon) — callers probing uncertain candidates catch that as rejection
+ * evidence. Candidates are not mutated and no plan is built.
+ */
+export function occupiedPersistentBuildingGeometry(
+  building: PersistentBuildingSource,
+  source: CitySourceV5
+): MultiPolygon {
+  const banks = new Map(derivePaletteBanks().map((entry) => [entry.paletteId, entry.bank]));
+  const districtById = new Map(source.districts.map((district) => [district.id, district]));
+  return union(materializePersistentBuilding(building, districtById, banks).masses.map((mass) => ringAsMulti(mass.footprint)));
+}
+
 
 function finiteRing(ring: unknown): ring is Ring {
   return Array.isArray(ring) && ring.length >= 3 && ring.every((point) => isRecord(point) && typeof point.x === "number" && Number.isFinite(point.x) && typeof point.y === "number" && Number.isFinite(point.y));
@@ -4045,7 +4196,11 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
     if (!Array.isArray(building.masses) || building.masses.length === 0) problems.push(`Building "${building.id}" has no masses.`);
     const parcel = building.parcelId === null ? undefined : parcels.find((candidate) => candidate.id === building.parcelId);
     const grammar = BUILDING_GRAMMAR_REGISTRY.get(building.grammarId);
-    if (grammar && parcel && !grammarFitsParcel(grammar, parcel)) {
+    if (grammar && parcel && !grammarFitsParcel(grammar, {
+      ...parcel,
+      seed: parcel.seed,
+      frontageAngleRad: building.placement?.rotationRad ?? parcel.frontageAngleRad
+    })) {
       problems.push(`Building "${building.id}" grammar "${building.grammarId}" does not fit its parcel "${parcel.id}".`);
     }
     if (grammar && Array.isArray(building.masses) && !(building.masses.length >= grammar.massing.minMasses && building.masses.length <= grammar.massing.maxMasses)) {
@@ -4155,8 +4310,14 @@ export function validateCompleteCityPlan(plan: unknown): string[] {
     }
   }
   for (const building of buildings) {
-    if (typeof building.sourceId !== "string" || !validRing(building.sitePolygon) || occupancyAll === null) continue;
-    if (siteOverlapsOccupancy(building.sitePolygon, occupancyAll)) problems.push(`Persistent building "${building.id}" site overlaps road occupancy; the site is not legal.`);
+    if (typeof building.sourceId !== "string" || occupancyAll === null) continue;
+    // Building site legality is mass-level: the reservation may legally cross a route
+    // (the GM's route surgery trims it), so only the materialized mass footprints must
+    // be route-free. Places keep the whole-site rule above.
+    for (const mass of building.masses) {
+      if (!validRing(mass.footprint)) continue;
+      if (siteOverlapsOccupancy(mass.footprint, occupancyAll)) problems.push(`Persistent building "${building.id}" mass ${mass.index} overlaps road occupancy; materialized masses must be route-free.`);
+    }
   }
   for (const openSpace of openSpaces) {
     if (openSpace.landmarkId === null) continue;

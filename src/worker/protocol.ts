@@ -13,13 +13,14 @@ import type { Rect, Vec2 } from "../core/geom/types.js";
 import type { CitySourceV2 } from "../core/gen/terrain.js";
 import { coastalLand, normalizeCitySeed, rectangleLand, type CoastEdge } from "../core/gen/terrain.js";
 import type { CitySourceV2 as CitySourceV2Roads, RoadLayout, HubMode, RoadSource } from "../core/gen/city.js";
-import type { CitySourceV4, DistrictOpenSpaceProfile, DistrictSource } from "../core/gen/city.js";
-import { validateCitySourceV4 } from "../core/gen/city.js";
+import type { CitySourceV5, DistrictOpenSpaceProfile, DistrictSource, RegenerationPartialSeedRecord } from "../core/gen/city.js";
+import { validateCitySourceV5 } from "../core/gen/city.js";
 import type { DistrictTypeId } from "../core/gen/district-registry.js";
-import { buildDistrictPlan, type DistrictPlan } from "../core/gen/district-plan.js";
+import { buildDistrictPlan, districtStructuralInputSignature, type DistrictPlan } from "../core/gen/district-plan.js";
 import { assignLandmarkCompatibleDistrictTypes, generateInitialDistricts } from "../core/gen/district-generator.js";
 import {
   buildCompleteCityPlan,
+  completeCityStructuralInput,
   reserveMajorLandmarkSites,
   validateCompleteCityPlan,
   type CompleteCityPlan
@@ -30,6 +31,7 @@ import {
   type CompleteChunkBatch,
   type CompleteChunkBuild
 } from "../core/gen/complete-city-chunk.js";
+import { normalizeRegenerationPartialSeedRecords } from "../core/gen/regeneration.js";
 
 export interface PingRequest {
   id: number;
@@ -71,7 +73,7 @@ export interface GenerateInitialRoadNetworkRequest {
 export interface BuildDistrictPlanRequest {
   id: number;
   type: "buildDistrictPlan";
-  source: CitySourceV4;
+  source: CitySourceV5;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -80,7 +82,7 @@ export interface BuildDistrictPlanRequest {
 export interface GenerateInitialDistrictsRequest {
   id: number;
   type: "generateInitialDistricts";
-  source: CitySourceV4;
+  source: CitySourceV5;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -117,7 +119,7 @@ export interface GenerateCompleteCityPlanRequest {
 export interface BuildCompleteCityPlanRequest {
   id: number;
   type: "buildCompleteCityPlan";
-  source: CitySourceV4;
+  source: CitySourceV5;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -127,7 +129,7 @@ export interface BuildCompleteCityPlanRequest {
 export interface BuildCompleteCityChunksRequest {
   id: number;
   type: "buildCompleteCityChunks";
-  source: CitySourceV4;
+  source: CitySourceV5;
   sourceRevision: number;
   actionToken: number | string;
   buildToken: number | string;
@@ -215,7 +217,7 @@ export interface GenerateCompleteCityPlanResult {
   actionToken: number | string;
   buildToken: number | string;
   epoch: number;
-  candidate: CitySourceV4;
+  candidate: CitySourceV5;
   plan: CompleteCityPlan;
   counts: CompleteCityPlanCounts;
   validation: string[];
@@ -227,6 +229,12 @@ export interface BuildCompleteCityPlanResult {
   buildToken: number | string;
   epoch: number;
   plan: CompleteCityPlan;
+  /**
+   * The request source's partial-seed records after Worker-side normalization: records
+   * whose district ID or block lineage no longer exists are dropped (never remapped).
+   * The adapter merges these into the candidate source inside the same atomic commit.
+   */
+  normalizedPartialSeeds: RegenerationPartialSeedRecord[];
   validation: string[];
 }
 
@@ -456,7 +464,7 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           staging.terrainMode === "coastal"
             ? coastalLand(staging.sceneBoundsM, citySeed, staging.coastEdge!)
             : rectangleLand(staging.sceneBoundsM);
-        const source: CitySourceV4 = {
+        const source: CitySourceV5 = {
           origin: staging.origin,
           citySeed,
           generation: {
@@ -470,7 +478,7 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
           terrain: { land, urbanFootprint: null },
           roads: { nodes: [], routes: [], edges: [] },
           districts: [],
-          architecture: { buildings: [], places: [], overrides: [] }
+          architecture: { buildings: [], places: [], overrides: [] }, regeneration: { partialSeeds: [] }
         };
         // Major landmark sites are reserved before local roads so ordinary road occupancy
         // never claims them; the same reservations feed the plan verbatim.
@@ -517,19 +525,39 @@ export function handleRequest(request: WorkerRequest): WorkerResponse {
             massCount: plan.diagnostics.massCount,
             landmarkCount: plan.diagnostics.landmarkCount
           },
-          validation: [...validateCitySourceV4(source), ...validateCompleteCityPlan(plan)]
+          validation: [...validateCitySourceV5(source), ...validateCompleteCityPlan(plan)]
         };
         return { id: request.id, ok: true, result };
       }
       case "buildCompleteCityPlan": {
         const plan = buildCompleteCityPlan(request.source, request.sourceRevision, request.epoch);
+        // Normalize partial-seed records against the built district plan: records whose
+        // district ID or block lineage vanished are dropped, never remapped. A dropped
+        // record could never match a live kind+ID during fragment planning, so the plan's
+        // geometry is provably unchanged and only the structural identity needs restamping
+        // to represent the normalized source.
+        const sourceSeeds = request.source.regeneration.partialSeeds;
+        let normalizedPartialSeeds = sourceSeeds;
+        let stamped = plan;
+        if (sourceSeeds.length > 0) {
+          normalizedPartialSeeds = normalizeRegenerationPartialSeedRecords(request.source, plan.districtPlan);
+          if (normalizedPartialSeeds.length !== sourceSeeds.length) {
+            const normalizedSource: CitySourceV5 = { ...request.source, regeneration: { partialSeeds: normalizedPartialSeeds } };
+            stamped = {
+              ...plan,
+              structuralInput: completeCityStructuralInput(normalizedSource),
+              districtPlan: { ...plan.districtPlan, revisionInputs: districtStructuralInputSignature(normalizedSource) }
+            };
+          }
+        }
         const result: BuildCompleteCityPlanResult = {
           sourceRevision: request.sourceRevision,
           actionToken: request.actionToken,
           buildToken: request.buildToken,
           epoch: request.epoch,
-          plan,
-          validation: validateCompleteCityPlan(plan)
+          plan: stamped,
+          normalizedPartialSeeds,
+          validation: validateCompleteCityPlan(stamped)
         };
         return { id: request.id, ok: true, result };
       }

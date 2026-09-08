@@ -1,13 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
+  REGENERATION_TARGET_KINDS,
   ROUTE_CLASSES,
   allocateManualId,
   allocateManualLineage,
   validateCityStateV3,
   validateCityStateV4,
+  validateCityStateV5,
+  validateRegenerationPartialSeedRecords,
   validateRoadSource,
   type CityStateV3,
-  type CityStateV4
+  type CityStateV4,
+  type CityStateV5,
+  type RegenerationPartialSeedRecord,
+  type RegenerationTargetKind
 } from "./city.js";
 import { DISTRICT_TYPE_IDS } from "./district-registry.js";
 import { rectangleLand } from "./terrain.js";
@@ -503,6 +509,102 @@ describe("City Generator 2.0 generator-12 model", () => {
 
   it("rejects broken references and malformed fields", () => {
     expect(validateRoadSource({ nodes: [{ id: "a", x: 0, y: 0 }], routes: [{ id: "r", curvePreset: "standard" }], edges: [{ id: "e", a: "a", b: "b", routeId: "r", classId: "street", name: 1, locked: false, origin: "authored" }] })).toEqual(expect.arrayContaining([expect.stringContaining("unknown node"), expect.stringContaining("name")]));
+  });
+});
+
+describe("City Generator 2.0 generator-13 model", () => {
+  function stateV5(generatorVersion: number, revision = 1): CityStateV5 {
+    return {
+      kind: "city-generator-2",
+      schemaVersion: 5,
+      generatorVersion: generatorVersion as CityStateV5["generatorVersion"],
+      revision,
+      source: { ...state(12).source, regeneration: { partialSeeds: [] } }
+    };
+  }
+
+  function partialSeed(order: number, overrides: Partial<RegenerationPartialSeedRecord> = {}): RegenerationPartialSeedRecord {
+    return { targetKind: "district", targetId: `district-${order}`, seed: `seed/district-${order}`, order, ...overrides };
+  }
+
+  const invalidRegenerationCases = [
+    { name: "an unknown target kind", seeds: [partialSeed(1, { targetKind: "scene" as RegenerationTargetKind })], expected: "target kind must be one of" },
+    { name: "an empty target id", seeds: [partialSeed(1, { targetId: "" })], expected: "target id must be non-empty trimmed text." },
+    { name: "an untrimmed target id", seeds: [partialSeed(1, { targetId: " district-1 " })], expected: "target id must be non-empty trimmed text." },
+    { name: "an empty seed", seeds: [partialSeed(1, { seed: "" })], expected: "seed must be non-empty trimmed text." },
+    { name: "an untrimmed seed", seeds: [partialSeed(1, { seed: " seed/district-1 " })], expected: "seed must be non-empty trimmed text." },
+    { name: "a zero order", seeds: [partialSeed(0)], expected: "order must be a positive safe integer." },
+    { name: "a negative order", seeds: [partialSeed(-2)], expected: "order must be a positive safe integer." },
+    { name: "a fractional order", seeds: [partialSeed(1.5)], expected: "order must be a positive safe integer." },
+    { name: "an unsafe order", seeds: [partialSeed(Number.MAX_SAFE_INTEGER + 1)], expected: "order must be a positive safe integer." },
+    { name: "a non-numeric order", seeds: [partialSeed("2" as unknown as number)], expected: "order must be a positive safe integer." },
+    { name: "a duplicate district target", seeds: [partialSeed(1), partialSeed(2, { targetId: "district-1" })], expected: 'Duplicate regeneration target "district/district-1".' },
+    { name: "a repeated equal order", seeds: [partialSeed(3), partialSeed(3, { targetId: "district-9" })], expected: "must strictly increase after 3." },
+    { name: "a decreasing order", seeds: [partialSeed(5), partialSeed(4, { targetId: "district-9" })], expected: "must strictly increase after 5." }
+  ] satisfies ReadonlyArray<{ name: string; seeds: RegenerationPartialSeedRecord[]; expected: string }>;
+
+  it("accepts a valid empty regeneration envelope in schema 5", () => {
+    const current = stateV5(13);
+    expect(current.schemaVersion).toBe(5);
+    expect(current.generatorVersion).toBe(13);
+    expect(REGENERATION_TARGET_KINDS).toEqual(["district", "block"]);
+    expect(validateCityStateV5(current)).toEqual([]);
+  });
+
+  it("keeps geometry inputs identical to the schema-4 envelope apart from the regeneration branch", () => {
+    const { regeneration: _regeneration, ...geometrySource } = stateV5(13).source;
+    expect(geometrySource).toEqual(state(12).source);
+  });
+
+  it("rejects the historical schema-4 envelope and obsolete/future generator versions", () => {
+    expect(validateCityStateV5(state(12))).toEqual([
+      "Unsupported city schema version.",
+      "Unsupported city generator version.",
+      "City regeneration branch is required for schema 5."
+    ]);
+    expect(validateCityStateV5(stateV5(12))).toEqual(["Unsupported city generator version."]);
+    expect(validateCityStateV5(stateV5(14))).toEqual(["Unsupported city generator version."]);
+    expect(validateCityStateV4(stateV5(13))).toEqual([
+      "Unsupported city schema version.",
+      "Unsupported city generator version."
+    ]);
+  });
+
+  it("requires an object regeneration branch carrying a partialSeeds array", () => {
+    const base = stateV5(13);
+    const { regeneration: _regeneration, ...sourceWithoutBranch } = base.source;
+    expect(validateCityStateV5({ ...base, source: sourceWithoutBranch })).toEqual([
+      "City regeneration branch is required for schema 5."
+    ]);
+    expect(validateCityStateV5({ ...base, source: { ...base.source, regeneration: [] } })).toEqual([
+      "City regeneration branch must be an object."
+    ]);
+    const { partialSeeds: _partialSeeds, ...branchWithoutSeeds } = base.source.regeneration;
+    expect(validateCityStateV5({ ...base, source: { ...base.source, regeneration: branchWithoutSeeds } })).toEqual([
+      "Regeneration partial seeds are required for schema 5."
+    ]);
+    expect(validateCityStateV5({ ...base, source: { ...base.source, regeneration: { partialSeeds: "none" } } })).toEqual([
+      "Regeneration partial seeds must be an array."
+    ]);
+  });
+
+  it.each(invalidRegenerationCases)("$name", ({ seeds, expected }) => {
+    expect(validateRegenerationPartialSeedRecords(seeds)).toEqual(expect.arrayContaining([expect.stringContaining(expected)]));
+    const current = stateV5(13);
+    current.source.regeneration.partialSeeds = [...seeds];
+    expect(validateCityStateV5(current)).toEqual(expect.arrayContaining([expect.stringContaining(expected)]));
+  });
+
+  it("rejects non-object records and allows the same id across distinct target kinds", () => {
+    expect(validateRegenerationPartialSeedRecords(["district-1"])).toEqual(["Regeneration partial seed record must be an object."]);
+    const seeds = [
+      partialSeed(1, { targetKind: "block" }),
+      partialSeed(2, { targetKind: "district", targetId: "district-1" })
+    ];
+    expect(validateRegenerationPartialSeedRecords(seeds)).toEqual([]);
+    const current = stateV5(13);
+    current.source.regeneration.partialSeeds = seeds;
+    expect(validateCityStateV5(current)).toEqual([]);
   });
 });
 
