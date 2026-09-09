@@ -478,6 +478,24 @@ describe("Phase 6 route surgery through adapter actions", () => {
     return [a!, b!];
   }
 
+  it("does not report route surgery as committed when the Scene save rejects", async () => {
+    fixture = await mountPhase6Fixture(routeSource(straightRoads(), []));
+    const before = structuredClone(stored());
+    fixture.scene.setFlag.mockRejectedValueOnce(new Error("Scene write denied"));
+
+    await expect(placeBuilding({
+      grammarId: "infill-rowhouse",
+      visualUse: "residential",
+      heightM: 18,
+      paletteId: null,
+      placement: frameAt(0, 0, 40, 24),
+      sitePolygon: rectAt(0, 0, 40, 24)
+    })).rejects.toThrow("Scene write denied");
+
+    expect(stored()).toEqual(before);
+    expect(getRouteEditStatus()).toBeNull();
+  }, 120_000);
+
   it("trims an unlocked straight road into outside fragments when a placed building crosses it, warning about the disconnected network", async () => {
     fixture = await mountPhase6Fixture(routeSource(straightRoads(), []));
     const before = structuredClone(stored().source.roads);

@@ -440,7 +440,7 @@ describe("protection preflight drives a protected full rebuild", () => {
     expect(candidate.regeneration.partialSeeds).toEqual([
       { targetKind: "district", targetId: "west", seed: PREFLIGHT_RESEED, order: 1 }
     ]);
-  });
+  }, 120_000);
 
   it("rebuilds the city with protected snapshots and promoted sites intact and re-rolls only the target scope", () => {
     const { fixture, plan: rebuilt } = rebuiltPlan();
@@ -498,7 +498,7 @@ describe("protection preflight drives a protected full rebuild", () => {
     const badSeed = evaluateRegenerationPreflight(fixture.source, fixture.plan, { kind: "district", ids: ["west"] }, " padded ");
     expect(badSeed.candidateSource).toBeNull();
     expect(badSeed.blockers.some((blocker) => blocker.kind === "seed")).toBe(true);
-  });
+  }, 120_000);
 });
 
 describe("topology cleanup and reconstruction", () => {

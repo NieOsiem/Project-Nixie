@@ -1,5 +1,5 @@
 import type { Vec2 } from "../geom/types.js";
-import { intersection, isSnapNoise, ringAsMulti } from "../geom/boolean.js";
+import { difference, intersection, isSnapNoise, ringAsMulti } from "../geom/boolean.js";
 import { ringArea, type Ring } from "../geom/types.js";
 import { validateTerrain, validateRing, type TerrainGeneration, type TerrainSource } from "./terrain.js";
 import { BUILDING_GRAMMAR_IDS, BUILDING_GRAMMAR_REGISTRY, BUILDING_USE_IDS, type BuildingGrammarId, type BuildingUseId } from "./building-registry.js";
@@ -356,15 +356,17 @@ function placementContainedBySite(frame: PlacementFrame, sitePolygon: Ring): boo
   const footprintArea = frame.widthM * frame.depthM;
   if (!Number.isFinite(footprintArea) || footprintArea <= 0) return false;
   try {
-    const overlap = intersection(ringAsMulti(footprint), ringAsMulti(sitePolygon));
-    let overlapArea = 0;
-    for (const polygon of overlap) {
+    // Compare geometry on the same Boolean grid, not snapped overlap area against
+    // an unsnapped frame area: that comparison rejects valid translated frames.
+    const outside = difference(ringAsMulti(footprint), [ringAsMulti(sitePolygon)]);
+    let outsideArea = 0;
+    for (const polygon of outside) {
       if (polygon.length === 0) continue;
-      overlapArea += Math.abs(ringArea(polygon[0]!));
-      for (const hole of polygon.slice(1)) overlapArea -= Math.abs(ringArea(hole));
+      outsideArea += Math.abs(ringArea(polygon[0]!));
+      for (const hole of polygon.slice(1)) outsideArea -= Math.abs(ringArea(hole));
     }
     const tolerance = Math.max(1e-4, footprintArea * 1e-6);
-    return overlapArea + tolerance >= footprintArea;
+    return outsideArea <= tolerance;
   } catch {
     return false;
   }

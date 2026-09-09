@@ -503,6 +503,37 @@ describe("Objects workspace bulk editing", () => {
     expect(html).not.toContain("Drag-box");
   });
 
+  it("offers no height edit for disjoint grammar ranges until a shared preset is staged", () => {
+    adapterMocks.getArchitectureSource.mockReturnValue({
+      ...architecture,
+      buildings: architecture.buildings.map((building) => ({
+        ...building,
+        grammarId: building.id === "building-a" ? "corporate-chamfered-tower" : "street-kiosk"
+      }))
+    });
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    const module = objectsWorkspace();
+    expect(module.renderTray()).not.toContain('data-field="object-height"');
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-grammar"]', "garage-unit");
+    expect(module.renderTray()).toContain('data-field="object-height"');
+  });
+
+  it("discards staged bulk edits on Reset without committing them", () => {
+    objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
+    const module = objectsWorkspace();
+    const { root, controls } = fakeInspectorRoot();
+    const ctx = fakeContext();
+    module.onRender(root, ctx);
+    triggerControl(controls, '[data-field="object-height"]', "40");
+    module.onAction("object-reset", {} as HTMLElement, ctx);
+    module.onAction("object-apply", {} as HTMLElement, ctx);
+    expect(adapterMocks.bulkEditObjects).not.toHaveBeenCalled();
+    expect(module.renderTray()).toContain(">Multiple</output>");
+  });
+
   it("applies only explicitly staged shared fields with the captured revision in one bulk call", () => {
     objectLayerMocks.getObjectSelection.mockReturnValue({ ...mixedSelection });
     const module = objectsWorkspace();

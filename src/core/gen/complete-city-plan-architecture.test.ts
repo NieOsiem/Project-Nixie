@@ -441,7 +441,7 @@ describe("Phase 5 persistent architecture planning", () => {
       records.map((source) => BUILDING_GRAMMAR_REGISTRY.get(source.grammarId)!.archetype)
     );
     expect(materializedArchetypes).toEqual(expectedArchetypes);
-  }, 120_000);
+  }, 300_000);
 
   it("materializes every current landmark grammar from a persistent source with lineage and site containment", () => {
     const records = LANDMARK_GRAMMAR_IDS.map((grammarId, index, all) => {

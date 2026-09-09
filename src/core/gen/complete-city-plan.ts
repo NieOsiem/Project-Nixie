@@ -31,6 +31,8 @@ export const MIN_DENSITY_INFILL_AREA_M2 = 60;
 export const MAX_DENSITY_INFILL_AREA_M2 = 4_800;
 export const MIN_DENSITY_INFILL_MINOR_DIMENSION_M = 6.5;
 const MIN_DENSITY_POCKET_AREA_M2 = 100;
+/** A block courts plot-sized pockets only when its primary fragment can choose from a credible field. */
+const MIN_POCKET_ELIGIBLE_CELLS = 6;
 export const MAX_ANONYMOUS_OPEN_SPACE_AREA_M2 = 1_200;
 /** Large grammar-authored courts become plot-sized pockets; their remainder stays developable. */
 export const MAX_SEMANTIC_CELL_OPEN_SPACE_AREA_M2 = 1_600;
@@ -178,38 +180,49 @@ function hasValidPlacementFrame(frame: unknown): frame is PlacementFrame {
     && frame.depthM > 0;
 }
 /**
- * Source validation uses the overlap-area tolerance below. Keep derived frame fitting
- * on the same strict gate instead of accepting a frame solely because the boolean
- * difference was classified as snap noise.
+ * Containment is decided by the Boolean difference's OUTSIDE area against the strict
+ * tolerance — never by comparing snapped overlap area against the unsnapped
+ * width*depth product (that rejects valid translated/rotated frames on quantization
+ * noise alone and collapses the fitting ladder far below the site's real extent) and
+ * never by the mean-thickness snap-noise heuristic alone (a frame poking out of a
+ * jagged parcel leaves long thin ribbons that the heuristic forgives at any length).
  */
+
+/**
+ * Last containment verdict per fitted frame. The fitting ladder already paid for the
+ * Boolean difference; planParcelBuilding reuses the verdict to skip its per-mass
+ * containment re-check whenever the accepted frame is strictly inside the parcel.
+ */
+const frameContainmentMemo = new WeakMap<PlacementFrame, { site: Ring; outsideArea: number }>();
+
 function placementFrameContainedBySite(frame: PlacementFrame, site: Ring): boolean {
   const footprintArea = frame.widthM * frame.depthM;
   if (!Number.isFinite(footprintArea) || footprintArea <= 0) return false;
   try {
-    const overlap = intersection(ringAsMulti(placementRing(frame)), ringAsMulti(site));
-    let overlapArea = 0;
-    for (const polygon of overlap) {
+    const outside = difference(ringAsMulti(placementRing(frame)), [ringAsMulti(site)]);
+    let outsideArea = 0;
+    for (const polygon of outside) {
       if (polygon.length === 0) continue;
-      overlapArea += Math.abs(ringArea(polygon[0]!));
-      for (const hole of polygon.slice(1)) overlapArea -= Math.abs(ringArea(hole));
+      outsideArea += Math.abs(ringArea(polygon[0]!));
+      for (const hole of polygon.slice(1)) outsideArea -= Math.abs(ringArea(hole));
     }
-    return overlapArea + Math.max(1e-4, footprintArea * 1e-6) >= footprintArea;
+    frameContainmentMemo.set(frame, { site, outsideArea });
+    // Both verdicts the frame must survive downstream: the strict absolute outside
+    // area (the area tolerance alone forgives compact pokes that the plan validator's
+    // snap-noise heuristic still rejects, which is what made locked generated frames
+    // throw "placement frame exceeds sitePolygon") and the snap-noise heuristic (the
+    // area bound alone forgives jagged-parcel ribbons of unbounded length).
+    return outsideArea <= Math.max(1e-4, footprintArea * 1e-6) && isSnapNoise(outside);
   } catch {
     return false;
   }
 }
-
-/**
- * Stable frame metadata for derived plans; persistent plans copy their source frame
- * verbatim. The first candidate deliberately preserves the established rectangular
- * output. For concave sites, the candidate is replaced with an envelope of the
- * actual derived footprints and then deterministically fitted inside the site.
- */
 function placementFrameForRing(
   ring: Ring,
   rotationRad = longestEdgeAngle(ring),
-  actualFootprints: readonly Ring[] = []
-): PlacementFrame {
+  actualFootprints: readonly Ring[] = [],
+  frameFilter: ((frame: PlacementFrame) => boolean) | null = null
+): PlacementFrame | null {
   const centre = ringCentroid(ring);
   const cosine = Math.cos(rotationRad);
   const sine = Math.sin(rotationRad);
@@ -245,13 +258,24 @@ function placementFrameForRing(
     widthM: Math.max(GEOMETRY_EPSILON, bounds.maxX - bounds.minX),
     depthM: Math.max(GEOMETRY_EPSILON, bounds.maxY - bounds.minY)
   });
+  // An optional frameFilter lets massing callers require grammar-legal containers;
+  // candidates must pass BOTH the filter and containment, so a filtered search may
+  // legitimately return null (no legal container exists). The filter runs FIRST — it
+  // is pure limit arithmetic, so size/aspect-rejected candidates never pay for a
+  // Boolean clip; the two predicates are conjunctive, so the order is semantics-free.
+  const FIT_LADDER_ATTEMPTS = 8;
   const contains = (frame: PlacementFrame, includeFootprints: boolean): boolean => {
-    const frameRing = placementRing(frame);
     if (!placementFrameContainedBySite(frame, ring)) return false;
-    return !includeFootprints || actualFootprints.every((footprint) => ringCountsAsContained(footprint, ringAsMulti(frameRing)));
+    if (!includeFootprints) return true;
+    const frameRing = placementRing(frame);
+    return actualFootprints.every((footprint) => ringCountsAsContained(footprint, ringAsMulti(frameRing)));
+  };
+  const accept = (frame: PlacementFrame): boolean => {
+    if (frameFilter !== null && !frameFilter(frame)) return false;
+    return contains(frame, false);
   };
   const fitInside = (frame: PlacementFrame, anchor: Vec2): PlacementFrame | null => {
-    for (let attempt = 0; attempt < 48; attempt++) {
+    for (let attempt = 0; attempt < FIT_LADDER_ATTEMPTS; attempt++) {
       const scale = attempt === 0 ? 1 : Math.pow(0.82, attempt);
       const candidate: PlacementFrame = {
         centre: anchor,
@@ -259,16 +283,46 @@ function placementFrameForRing(
         widthM: Math.max(GEOMETRY_EPSILON, frame.widthM * scale),
         depthM: Math.max(GEOMETRY_EPSILON, frame.depthM * scale)
       };
-      if (contains(candidate, false)) return candidate;
+      if (accept(candidate)) return candidate;
     }
     return null;
+  };
+  // Isotropic shrinkage collapses a tapering or L-shaped site's frame to a fraction of
+  // its long axis, and a frame-derived massing pass then emits sliver masses on a
+  // parcel that has plenty of usable width. Shrinking ONE axis at a time keeps the
+  // other axis at full site extent, so the fitted container tracks the site's real
+  // proportions; the largest-area candidate wins with a deterministic tie-break.
+  const fitAxisPreserving = (frame: PlacementFrame, anchor: Vec2, keep: "width" | "depth"): PlacementFrame | null => {
+    for (let attempt = 0; attempt < FIT_LADDER_ATTEMPTS; attempt++) {
+      const scale = attempt === 0 ? 1 : Math.pow(0.82, attempt);
+      const candidate: PlacementFrame = {
+        centre: anchor,
+        rotationRad,
+        widthM: keep === "width" ? frame.widthM : Math.max(GEOMETRY_EPSILON, frame.widthM * scale),
+        depthM: keep === "depth" ? frame.depthM : Math.max(GEOMETRY_EPSILON, frame.depthM * scale)
+      };
+      if (accept(candidate)) return candidate;
+    }
+    return null;
+  };
+  const largestFrame = (candidates: readonly (PlacementFrame | null)[]): PlacementFrame | null => {
+    let best: PlacementFrame | null = null;
+    for (const candidate of candidates) {
+      if (candidate === null) continue;
+      if (
+        best === null
+        || candidate.widthM * candidate.depthM > best.widthM * best.depthM + GEOMETRY_EPSILON
+        || (Math.abs(candidate.widthM * candidate.depthM - best.widthM * best.depthM) <= GEOMETRY_EPSILON && (candidate.widthM > best.widthM + GEOMETRY_EPSILON || (Math.abs(candidate.widthM - best.widthM) <= GEOMETRY_EPSILON && candidate.depthM > best.depthM + GEOMETRY_EPSILON)))
+      ) best = candidate;
+    }
+    return best;
   };
 
   const siteBounds = boundsFor([ring]);
   // Keep the established frame centre for ordinary rectangular sites. Concave
   // sites fall through to the actual-footprint envelope below.
   const siteFrame = frameFromBounds(siteBounds, centre);
-  if (contains(siteFrame, true)) return siteFrame;
+  if (accept(siteFrame) && contains(siteFrame, true)) return siteFrame;
 
   if (actualFootprints.length > 0) {
     const footprintFrame = frameFromBounds(boundsFor(actualFootprints));
@@ -281,13 +335,22 @@ function placementFrameForRing(
       const fitted = fitInside(footprintFrame, anchor);
       if (fitted !== null) return fitted;
     }
+    if (frameFilter !== null) return null;
   }
-
-  // This path is only reached before a generated landmark's masses are
-  // materialized. Keep a valid, deterministic metadata frame; the materializer
-  // replaces it with the actual-footprint frame before the plan is returned.
+  // This path is reached before a generated landmark's masses are materialized and by
+  // parcel massing (planParcelBuilding masses run against the persisted frame). The
+  // unfiltered search keeps a valid, deterministic metadata frame preserving as much
+  // site extent as containment allows (the landmark materializer replaces it with the
+  // actual-footprint frame); a filtered search returns null when no candidate — axis
+  // preserving first, then isotropic — satisfies the caller's frame predicate.
+  const axisFitted = largestFrame([
+    fitAxisPreserving(siteFrame, centre, "width"),
+    fitAxisPreserving(siteFrame, centre, "depth")
+  ]);
+  if (axisFitted !== null) return axisFitted;
   const fittedSite = fitInside(siteFrame, centre);
   if (fittedSite !== null) return fittedSite;
+  if (frameFilter !== null) return null;
   return {
     centre,
     rotationRad,
@@ -1717,7 +1780,7 @@ function planLandmarks(
   const skipped: string[] = [];
   const failures: string[] = [];
   const warnings: string[] = [];
-  const placedGrammars = new Set<LandmarkGrammarId>(occupiedGrammars);
+  const placedGrammars = new Set<LandmarkGrammarId>();
   const usedBlocks = new Set<string>();
   const sitesByBlock = new Map<string, Ring[]>();
   const reservedLandmarkIds = new Set<string>();
@@ -1762,7 +1825,14 @@ function planLandmarks(
       `${reservation.grammarId}|major|${reservation.lineage}`,
       reservation.seed
     );
+    // The unfiltered fitting always yields a container (half-size terminal fallback);
+    // the null branch is unreachable but kept explicit for the nullable search signature.
+    const reservationFrame = placementFrameForRing(reservation.sitePolygon);
+    if (reservationFrame === null) throw new Error("Major reservation frame fitting failed.");
     const landmarkId = stableId("landmark", `${reservation.grammarId}|${reservation.lineage}|${pointKey(reservation.sitePolygon[0]!)}`);
+    const superseded = occupiedGrammars.has(reservation.grammarId);
+    const obstructed = occupiedSites.some(site => ringOverlaps(reservation.sitePolygon, site));
+    if (!superseded && !obstructed) {
     landmarks.push({
       id: landmarkId,
       sourceId: null,
@@ -1770,10 +1840,10 @@ function planLandmarks(
       origin: "generated",
       protection: "none",
       landmarkGrammarId: reservation.grammarId,
+      sitePolygon: reservation.sitePolygon,
       districtId,
       blockId,
-      sitePolygon: reservation.sitePolygon,
-      placement: placementFrameForRing(reservation.sitePolygon),
+      placement: reservationFrame,
       placementLineage: reservation.lineage,
       seed: materializationSeed,
       appearanceSeed: `${materializationSeed}/appearance`,
@@ -1783,8 +1853,11 @@ function planLandmarks(
       areaM2: Math.abs(ringArea(reservation.sitePolygon)),
       rawMasses: []
     });
+    } else if (!superseded) {
+      skipped.push(reservation.grammarId);
+    }
     placedGrammars.add(reservation.grammarId);
-    reservedLandmarkIds.add(landmarkId);
+    if (!superseded && !obstructed) reservedLandmarkIds.add(landmarkId);
     if (blockId !== null) sitesByBlock.set(blockId, [...(sitesByBlock.get(blockId) ?? []), reservation.sitePolygon]);
   }
   for (const grammarId of LANDMARK_GRAMMAR_IDS) {
@@ -1809,8 +1882,9 @@ function planLandmarks(
         landmarkFitsDistrict(definition, districtCompatibilityTags(fragment.districtId, districtById))
       );
       const compatibleArea = union(compatibleFragments.map((fragment) => fragment.buildable));
-      const occupied = [...occupiedSites, ...existing];
-      const available = occupied.length > 0 ? difference(compatibleArea, [union(occupied.map((ring) => ringAsMulti(ring)))]) : compatibleArea;
+      // Persistent edits must not move another scope's landmark slots. Allocate the
+      // canonical sites first, then suppress occupied slots without relocating them.
+      const available = existing.length > 0 ? difference(compatibleArea, [union(existing.map((ring) => ringAsMulti(ring)))]) : compatibleArea;
       if (multiArea(available) < definition.minSiteAreaM2) continue;
       const blockSeed = stableId("seed", `${source.citySeed}/landmarks/v3/fallback/${grammarId}/${block.id}`);
       const compactSite = compactFallbackLandmarkSite(available, definition, blockSeed);
@@ -1846,6 +1920,13 @@ function planLandmarks(
         blockSeed
       );
       const lineage = `fallback:${grammarId}:${block.id}`;
+    // Unfiltered fitting always yields a container (half-size terminal fallback); the
+    // null branch is unreachable but explicit for the nullable search signature.
+    const fallbackFrame = placementFrameForRing(site);
+    if (fallbackFrame === null) throw new Error("Fallback landmark frame fitting failed.");
+      const superseded = occupiedGrammars.has(grammarId);
+      const obstructed = occupiedSites.some(occupied => ringOverlaps(site, occupied));
+      if (!superseded && !obstructed) {
       landmarks.push({
         id: stableId("landmark", `${grammarId}|fallback|${block.id}|${pointKey(site[0]!)}`),
         sourceId: null,
@@ -1856,7 +1937,7 @@ function planLandmarks(
         districtId: compatible.districtId,
         blockId: block.id,
         sitePolygon: site,
-        placement: placementFrameForRing(site),
+        placement: fallbackFrame,
         placementLineage: lineage,
         seed: materializationSeed,
         appearanceSeed: `${materializationSeed}/appearance`,
@@ -1866,6 +1947,9 @@ function planLandmarks(
         areaM2: Math.abs(ringArea(site)),
         rawMasses: []
       });
+      } else if (!superseded) {
+        skipped.push(grammarId);
+      }
       usedBlocks.add(block.id);
       sitesByBlock.set(block.id, [...existing, site]);
       placed = true;
@@ -1956,6 +2040,33 @@ function planFragments(
   const openSpaces: OpenSpacePlan[] = [];
   const warnings: string[] = [];
   for (const block of districtPlan.blocks) {
+    // One or two plot-sized courts per block produce a dense / breathe rhythm. The
+    // block's allowance is granted to its PRIMARY fragment — ranked purely by
+    // seed-independent geometry (buildable area, then district and fragment identity) —
+    // and the granted count reads only that fragment's own eligible cells plus the
+    // stable block hash stream. Regenerating any fragment therefore re-rolls only its
+    // own pockets and can never reshuffle a sibling's, while every pocket-holding
+    // block keeps one or two courts in total.
+    const pocketGrantByFragment = new Map<string, number>();
+    const primaryFragment = [...block.districtFragments].sort((a, b) =>
+      multiArea(b.buildable) - multiArea(a.buildable)
+      || (a.districtId ?? "").localeCompare(b.districtId ?? "")
+      || a.id.localeCompare(b.id)
+    )[0];
+    if (primaryFragment !== undefined) {
+      const primaryEligible = (cellsByFragment.get(primaryFragment.id) ?? []).filter((cell) => {
+        const areaM2 = Math.abs(ringArea(cell.polygon));
+        return cell.classification === "building"
+          && areaM2 >= MIN_DENSITY_POCKET_AREA_M2
+          && areaM2 <= MAX_ANONYMOUS_OPEN_SPACE_AREA_M2;
+      }).length;
+      if (primaryEligible >= MIN_POCKET_ELIGIBLE_CELLS) {
+        pocketGrantByFragment.set(
+          primaryFragment.id,
+          1 + (primaryEligible >= 18 && hashUnit(`${block.id}/density/v1/pocket-count`) < 0.55 ? 1 : 0)
+        );
+      }
+    }
     for (const fragment of block.districtFragments) {
       let available = fragment.buildable;
       for (const site of landmarkSites.values()) {
@@ -2031,11 +2142,10 @@ function planFragments(
         warnings.push(`Fragment "${fragment.id}" open-space intent could not carve final geometry.`);
       }
 
-      // One or two plot-sized courts in sufficiently fine-grained blocks produce a dense /
-      // breathe rhythm without surrendering broad development bands. Selection is scoped to
-      // ONE fragment: eligibility, target count, and scoring never see sibling fragments'
-      // cells, so regenerating one district's fragment cannot reshuffle another fragment's
-      // pockets. Scoring keeps the stable block identity for stream compatibility.
+      // Plot-sized courts read the pocket allowance the block already granted from
+      // geometry (primary-fragment grant above). Eligibility and scoring see only this
+      // fragment's cells, and scoring keeps the stable block identity for stream
+      // compatibility, so regenerating any fragment re-rolls solely its own courts.
       const cells = (cellsByFragment.get(fragment.id) ?? []).sort((a, b) => a.id.localeCompare(b.id));
       const pocketEligible = cells
         .filter((cell) => {
@@ -2049,9 +2159,10 @@ function planFragments(
           const bScore = fnv1a(`${block.id}/density/v1/pocket/${b.id}`);
           return aScore - bScore || a.id.localeCompare(b.id);
         });
-      const pocketTarget = pocketEligible.length < 6
-        ? 0
-        : 1 + (pocketEligible.length >= 18 && hashUnit(`${block.id}/density/v1/pocket-count`) < 0.55 ? 1 : 0);
+      // The block already allocated this fragment's pocket allowance from geometry
+      // (see the primary-fragment grant above); scoring stays per-fragment so a
+      // sibling's regeneration never reorders another fragment's candidates.
+      const pocketTarget = pocketGrantByFragment.get(fragment.id) ?? 0;
       const densityPocketCellIds = new Set(pocketEligible.slice(0, pocketTarget).map((cell) => cell.id));
       for (const cell of cells) {
         const densityPocket = densityPocketCellIds.has(cell.id);
@@ -2744,6 +2855,35 @@ export interface ParcelBuildingInput {
 }
 
 /**
+ * Fraction of the parcel's own-frame AABB a placement frame inscribes. Micro-grammar
+ * massing below this floor means the parcel is a massing-hostile wedge whose kiosk
+ * would read as an anonymous void with a building on it.
+ */
+const MIN_MICRO_FRAME_COVERAGE = 0.25;
+
+function microFrameCoverage(parcelPolygon: Ring, placement: PlacementFrame): number {
+  const centre = ringCentroid(parcelPolygon);
+  const cosine = Math.cos(placement.rotationRad);
+  const sine = Math.sin(placement.rotationRad);
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const point of parcelPolygon) {
+    const dx = point.x - centre.x;
+    const dy = point.y - centre.y;
+    const localX = dx * cosine + dy * sine;
+    const localY = -dx * sine + dy * cosine;
+    minX = Math.min(minX, localX);
+    maxX = Math.max(maxX, localX);
+    minY = Math.min(minY, localY);
+    maxY = Math.max(maxY, localY);
+  }
+  const siteArea = (maxX - minX) * (maxY - minY);
+  if (siteArea <= GEOMETRY_EPSILON) return 1;
+  return (placement.widthM * placement.depthM) / siteArea;
+}
+/**
  * Deterministically plan one parcel into a BuildingPlan or null. A null result means no
  * shipping grammar's declared limits genuinely fit the parcel, and the parcel must be
  * left as an explicitly classified unbuilt open parcel. The chosen grammar always fits
@@ -2769,7 +2909,6 @@ export function planParcelBuilding(
   // "<seed>/setback", mass layout on "<seed>/geometry" (see materializePersistentBuilding)
   // — so a promoted derived building re-materializes with the exact draws planning used.
   const massingAngle = frontage?.angleRad ?? parcel.frontageAngleRad;
-  const massingPlacement = placementFrameForRing(parcel.polygon, massingAngle);
   const geometrySeed = `${parcel.seed}/geometry`;
   const active = BUILDING_GRAMMAR_IDS.filter((id) => (weights[id] ?? 0) > 0);
   // The fit gate must run the exact inputs materialization re-checks for a promoted
@@ -2779,18 +2918,52 @@ export function planParcelBuilding(
     { ...parcel, frontageAngleRad: massingAngle }
   ));
   if (fitting.length === 0) return null;
+  // The persisted frame must satisfy the grammar-level site fit on its own: an
+  // authored-origin promotion carries no site-fit fallback at materialization, and a
+  // massing frame that keeps one axis at full parcel extent can exceed the grammar's
+  // declared width/aspect window even though the parcel's AABB fits it. Frame
+  // legality is therefore part of grammar viability: a grammar is usable only when
+  // the fitted search yields a contained, grammar-legal container. The fallback
+  // convention is unchanged — primary first, then the seeded weighted choice over
+  // the viable pool — and the frame search itself is memoized per grammar.
+  const frameByGrammar = new Map<BuildingGrammarId, PlacementFrame | null>();
+  const frameFor = (id: BuildingGrammarId): PlacementFrame | null => {
+    const cached = frameByGrammar.get(id);
+    if (cached !== undefined) return cached;
+    const frame = placementFrameForRing(parcel.polygon, massingAngle, [], (candidate) => grammarFitsParcel(
+      BUILDING_GRAMMAR_REGISTRY.get(id)!,
+      {
+        polygon: placementRing(candidate),
+        frontageAngleRad: candidate.rotationRad,
+        areaM2: candidate.widthM * candidate.depthM,
+        seed: parcel.seed
+      }
+    ));
+    frameByGrammar.set(id, frame);
+    return frame;
+  };
+  const viable = fitting.filter((id) => frameFor(id) !== null);
+  if (viable.length === 0) return null;
   const primary = selectBuildingGrammar(weights, `${parcel.seed}/grammar`);
   let grammarId: BuildingGrammarId;
-  if (fitting.includes(primary)) {
+  if (viable.includes(primary)) {
     grammarId = primary;
   } else {
     // Micro grammars fill slivers only: a parcel that fits any main grammar must get a
     // main grammar, or every mid-size parcel floods with kiosks/annexes.
-    const fittingMain = fitting.filter((id) => !MICRO_BUILDING_GRAMMAR_IDS.has(id));
-    const pool = fittingMain.length > 0 ? fittingMain : fitting;
+    const viableMain = viable.filter((id) => !MICRO_BUILDING_GRAMMAR_IDS.has(id));
+    const pool = viableMain.length > 0 ? viableMain : viable;
     grammarId = weightedChoice(weights, pool, `${parcel.seed}/grammar-fit`);
   }
   const grammar = BUILDING_GRAMMAR_REGISTRY.get(grammarId)!;
+  const massingPlacement = frameFor(grammarId)!;
+  // Micro grammars intentionally fill slivers, but a placement frame that inscribes
+  // only a fraction of the parcel's own-frame extent marks a massing-hostile wedge:
+  // its kiosk-scale masses span a sliver of the parcel and read as an anonymous void
+  // with a building on it. Leave such parcels to the unbuilt/residual accounting.
+  if (MICRO_BUILDING_GRAMMAR_IDS.has(grammarId) && microFrameCoverage(parcel.polygon, massingPlacement) < MIN_MICRO_FRAME_COVERAGE) {
+    return null;
+  }
   const supportedUses = grammar.compatibleUses.filter((use) => (useWeights[use] ?? 0) > 0);
   const compatibleWeights = Object.fromEntries(
     BUILDING_USE_IDS.map((use) => [use, grammar.compatibleUses.includes(use) ? (useWeights[use] ?? 0) : 0])
@@ -2831,6 +3004,17 @@ export function planParcelBuilding(
   // fitted rect to the parcel's true width) is rejected at the source rather than
   // emitted as a pathological bar.
   if (!MICRO_BUILDING_GRAMMAR_IDS.has(grammarId) && rawMasses.some((raw) => orientedMinorDimension(raw.footprint) < MIN_MASS_MINOR_DIMENSION_M)) {
+    return null;
+  }
+  // Masses are massed on the placement frame, and the frame only needs to sit inside
+  // the parcel to within fitting tolerance; a mass that still escapes the parcel (a
+  // frame edge hugging a jagged parcel boundary) must not reach the plan, where
+  // validation would reject it outright. The fitting ladder already computed the
+  // frame's outside area, so a strictly-inside verdict (outside area 0) makes the
+  // per-mass re-check redundant and free.
+  const containment = frameContainmentMemo.get(massingPlacement);
+  const frameStrictlyInside = containment !== undefined && containment.site === parcel.polygon && containment.outsideArea === 0;
+  if (!frameStrictlyInside && rawMasses.some((raw) => !ringCountsAsContained(raw.footprint, ringAsMulti(parcel.polygon)))) {
     return null;
   }
   const bank = parcelBank(district, banks);
@@ -3282,16 +3466,17 @@ function planBuildings(
   let densityInfillCount = 0;
   const densityInfillCountByFragment = new Map<string, number>();
   const buildingsCountByFragment = new Map<string, number>();
-  let unbuiltCount = 0;
   const occBoxes = occupancyBoxes(occupancy);
   const heightBands = deriveBlockHeightBands(districtPlan, districtById);
+  let unbuiltCount = 0;
   // Per-fragment budget allocation replaces the former cross-fragment budget
-  // consumption: the global density-infill and reference-density allowances are split
+  // consumption: the density-infill and reference-density allowances are split
   // deterministically over the fragments by their buildable area — seed-independent
   // geometry fixed by roads, terrain, and district polygons — so one fragment's
-  // consumption can never change another fragment's capacity. Regenerating any target
-  // therefore leaves every non-target fragment's build/unbuilt/density outcome
-  // identical while the per-parcel (12) and per-fragment (72) guardrails stand.
+  // consumption can never change another fragment's capacity. Regenerating any
+  // target therefore leaves every non-target fragment's build/unbuilt/density
+  // outcome identical while the per-parcel (12) and per-fragment (72) guardrails
+  // stand.
   const fragmentAreas = new Map<string, number>();
   for (const block of districtPlan.blocks) {
     for (const fragment of block.districtFragments) fragmentAreas.set(fragment.id, multiArea(fragment.buildable));
@@ -3359,12 +3544,21 @@ function planBuildings(
       openSpaces.push(...unbuiltOpenSpacePlans(parcel));
       continue;
     }
+    // The fragment's reference allowance is consumed by every building it produces
+    // (ordinary and infill alike), so the density pass can only spend the headroom a
+    // fragment's ordinary development left behind; the extra infill-specific caps
+    // only tighten it further. Ordinary massing itself is bounded by grammar fit,
+    // not by the budget. Capacity reads NO cross-fragment or plan-total state: a
+    // fragment over its allowance simply stops infilling without touching a sibling,
+    // so scope isolation holds at every total, including cities at the reference cap.
+    const referenceCapacity =
+      (referenceBudgetByFragment.get(parcel.fragmentId) ?? 0) - (buildingsCountByFragment.get(parcel.fragmentId) ?? 0);
     const densityCapacity = densityInfill
       ? Math.min(
         MAX_DENSITY_INFILL_BUILDINGS_PER_PARCEL,
         MAX_DENSITY_INFILL_BUILDINGS_PER_FRAGMENT - (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0),
         (infillBudgetByFragment.get(parcel.fragmentId) ?? 0) - (densityInfillCountByFragment.get(parcel.fragmentId) ?? 0),
-        (referenceBudgetByFragment.get(parcel.fragmentId) ?? 0) - (buildingsCountByFragment.get(parcel.fragmentId) ?? 0)
+        referenceCapacity
       )
       : Number.POSITIVE_INFINITY;
     if (densityCapacity <= 0) {
@@ -3544,11 +3738,13 @@ function materializeLandmarkMasses(
     });
     if (landmark.sourceId === null) {
       const rotationRad = landmark.placement?.rotationRad ?? longestEdgeAngle(landmark.sitePolygon);
-      landmark.placement = placementFrameForRing(
+      const envelopeFrame = placementFrameForRing(
         landmark.sitePolygon,
         rotationRad,
         landmark.rawMasses.map((mass) => mass.footprint)
       );
+      if (envelopeFrame === null) throw new Error(`Landmark "${landmark.id}" footprint frame fitting failed.`);
+      landmark.placement = envelopeFrame;
     }
   }
 }
@@ -3857,10 +4053,8 @@ export function buildCompleteCityPlan(
       droppedReservations.push(reservation.grammarId);
       continue;
     }
-    if (peerSites.some((peer) => ringOverlaps(reservation.sitePolygon, peer))) {
-      if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps persistent architecture.`);
-      droppedReservations.push(reservation.grammarId);
-      continue;
+    if (explicitReservations && peerSites.some((peer) => ringOverlaps(reservation.sitePolygon, peer))) {
+      throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps persistent architecture.`);
     }
     if (honored.some((peer) => ringOverlaps(reservation.sitePolygon, peer.sitePolygon))) {
       if (explicitReservations) throw new Error(`Explicit landmark reservation "${reservation.grammarId}" overlaps another landmark reservation.`);

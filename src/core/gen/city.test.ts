@@ -441,6 +441,26 @@ describe("City Generator 2.0 generator-12 model", () => {
     expect(validateCityStateV4(state(13))).toEqual(["Unsupported city generator version."]);
   });
 
+  it("keeps a frame contained when its matching site is translated off the Boolean grid", () => {
+    const current = architectureState();
+    const placement = {
+      centre: { x: -60.07213401287471, y: -168.48022794736502 },
+      rotationRad: -0.006904358096752716,
+      widthM: 11.477933729919096,
+      depthM: 6.2503328555135065
+    };
+    const c = Math.cos(placement.rotationRad);
+    const s = Math.sin(placement.rotationRad);
+    const sitePolygon = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => ({
+      x: placement.centre.x + sx! * placement.widthM / 2 * c - sy! * placement.depthM / 2 * s,
+      y: placement.centre.y + sx! * placement.widthM / 2 * s + sy! * placement.depthM / 2 * c
+    }));
+    current.source.architecture.buildings = [architectureBuilding({ placement, sitePolygon })];
+    expect(validateCityStateV4(current)).toEqual([]);
+    current.source.architecture.buildings[0]!.placement.widthM += 0.1;
+    expect(validateCityStateV4(current).length).toBeGreaterThan(0);
+  });
+
   it.each(invalidArchitectureCases)("$name", ({ mutate, expected }) => {
     const current = architectureState();
     mutate(current.source.architecture);

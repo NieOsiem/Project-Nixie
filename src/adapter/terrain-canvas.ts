@@ -2631,21 +2631,8 @@ function buildingRouteSurgery(city: CityStateV5, occupied: MultiPolygon): RouteS
     pushEditDiagnostic({ subsystem: "routes", message: `Building edit rejected by locked road edges: ${blockers.map((blocker) => `${blocker.id} — ${blocker.reason}`).join("; ")}` });
     throw new RouteSurgeryError(blockers);
   }
+  routeEditStatusState = null;
   const surgery = applyBuildingRouteSurgery(city.source.roads, occupied, { revision: city.revision, sequence: nextRoadSequence() });
-  routeEditStatusState = {
-    conflicts: structuredClone(surgery.conflicts),
-    blockers: [],
-    trimmedEdgeIds: [...surgery.trimmedEdgeIds],
-    removedEdgeIds: [...surgery.removedEdgeIds],
-    disconnectedVehicleNetwork: surgery.disconnectedVehicleNetwork
-  };
-  if (roadsChangedBySurgery(surgery)) {
-    pushEditDiagnostic({
-      subsystem: "routes",
-      message: `Route surgery trimmed [${surgery.trimmedEdgeIds.join(", ")}] and removed [${surgery.removedEdgeIds.join(", ")}]` +
-        (surgery.disconnectedVehicleNetwork ? "; vehicle network disconnected (warning permitted, commit proceeds)." : ".")
-    });
-  }
   return surgery;
 }
 
@@ -2938,6 +2925,20 @@ async function commitArchitectureWithRoads(
     })) keys.set(chunkId(key), key);
   }
   const result = await commitCandidate(candidate, { wallRelevant: true, changedChunkKeys: [...keys.values()] });
+  routeEditStatusState = {
+    conflicts: structuredClone(surgery.conflicts),
+    blockers: [],
+    trimmedEdgeIds: [...surgery.trimmedEdgeIds],
+    removedEdgeIds: [...surgery.removedEdgeIds],
+    disconnectedVehicleNetwork: surgery.disconnectedVehicleNetwork
+  };
+  if (roadsChangedBySurgery(surgery)) {
+    pushEditDiagnostic({
+      subsystem: "routes",
+      message: `Route surgery trimmed [${surgery.trimmedEdgeIds.join(", ")}] and removed [${surgery.removedEdgeIds.join(", ")}]` +
+        (surgery.disconnectedVehicleNetwork ? "; vehicle network disconnected (warning permitted, commit proceeds)." : ".")
+    });
+  }
   roadSelection = pruneRoadSelection(roadSelection, roads);
   return result;
 }

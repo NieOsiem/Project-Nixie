@@ -539,7 +539,8 @@
   margin: 8px 0 4px;
 }
 
-.nixie-context-tray .form-footer button {
+.nixie-context-tray .form-footer button,
+.nixie-regen button {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -552,12 +553,14 @@
   cursor: pointer;
 }
 
-.nixie-context-tray .form-footer button:hover:not(:disabled) {
+.nixie-context-tray .form-footer button:hover:not(:disabled),
+.nixie-regen button:hover:not(:disabled) {
   border-color: var(--nixie-border-strong);
   color: var(--nixie-text-bright);
 }
 
-.nixie-context-tray .form-footer button:disabled {
+.nixie-context-tray .form-footer button:disabled,
+.nixie-regen button:disabled {
   opacity: 0.45;
   cursor: default;
 }

@@ -476,7 +476,7 @@ function sharedUseOptions(members: readonly NormalizedObject[], grammarId: Build
 }
 
 /** Height range every affected grammar accepts: the highest floor and the lowest ceiling. */
-function sharedHeightBounds(members: readonly NormalizedObject[], grammarId: BuildingGrammarId | null): { min: number; max: number } {
+function sharedHeightBounds(members: readonly NormalizedObject[], grammarId: BuildingGrammarId | null): { min: number; max: number } | null {
   const definitions: BuildingGrammarDefinition[] = [];
   if (grammarId !== null) {
     const definition = BUILDING_GRAMMAR_REGISTRY.get(grammarId);
@@ -487,10 +487,10 @@ function sharedHeightBounds(members: readonly NormalizedObject[], grammarId: Bui
       if (definition !== undefined) definitions.push(definition);
     }
   }
-  if (definitions.length === 0) return { min: 1, max: 300 };
+  if (definitions.length === 0) return null;
   const min = Math.max(...definitions.map((definition) => definition.height.minM));
   const max = Math.min(...definitions.map((definition) => definition.height.maxM));
-  return min <= max ? { min, max } : { min: definitions[0]!.height.minM, max: definitions[0]!.height.maxM };
+  return min <= max ? { min, max } : null;
 }
 
 /** Multi selects prepend a disabled `Multiple` sentinel for mixed, untouched fields. */
@@ -614,7 +614,7 @@ function renderMultiInspector(current: ObjectsSelection, enabled: boolean): stri
   const fieldDisabled = editable ? "" : " disabled";
   const grammarField = `<div class="form-group"><label for="nixie-object-grammar">Shared preset</label><div class="form-fields"><select id="nixie-object-grammar" data-field="object-grammar"${fieldDisabled}>${grammarMixed ? mixedOption() : ""}${buildingOptions(sharedGrammarId ?? "", grammarOptions)}</select></div></div>`;
   const useField = `<div class="form-group"><label for="nixie-object-use">Shared use</label><div class="form-fields"><select id="nixie-object-use" data-field="object-use"${fieldDisabled}>${bulkUseOptions(sharedUse, useOptionIds, useMixed)}</select></div></div>`;
-  const heightField = `<div class="form-group"><label for="nixie-object-height">Shared height <output data-height-output>${heightNow === null ? "Multiple" : `${Math.round(heightNow)} m`}</output></label><div class="form-fields"><input id="nixie-object-height" type="range" min="${bounds.min}" max="${bounds.max}" step="1" value="${escapeHTML(String(staged?.heightM ?? bounds.min))}" data-field="object-height" aria-label="Shared height for all selected ${noun}"${fieldDisabled}></div></div>`;
+  const heightField = `<div class="form-group"><label for="nixie-object-height">Shared height <output data-height-output>${heightNow === null ? "Multiple" : `${Math.round(heightNow)} m`}</output></label><div class="form-fields">${bounds === null ? '<span class="nixie-note">No shared compatible height. Choose a shared preset first.</span>' : `<input id="nixie-object-height" type="range" min="${bounds.min}" max="${bounds.max}" step="1" value="${escapeHTML(String(staged?.heightM ?? heightShared ?? bounds.min))}" data-field="object-height" aria-label="Shared height for all selected ${noun}"${fieldDisabled}>`}</div></div>`;
   const landmarkField = `<div class="form-group"><label for="nixie-object-landmark">Shared preset</label><div class="form-fields"><select id="nixie-object-landmark" data-field="object-landmark"${fieldDisabled}>${landmarkMixed ? mixedOption() : ""}${placeOptions(sharedLandmarkId ?? "")}</select></div></div>`;
   const paletteField = `<div class="form-group"><label for="nixie-object-palette">Shared palette</label><div class="form-fields"><select id="nixie-object-palette" data-field="object-palette"${fieldDisabled}>${bulkPaletteOptions(paletteCurrent, paletteMixed)}</select></div></div>`;
   const fields = kind === "building" ? grammarField + useField + heightField + paletteField : landmarkField + paletteField;
@@ -819,6 +819,12 @@ export function objectsWorkspace(): WorkspaceModule {
         return;
       }
       if (action === "object-clear-selection") { clearObjectSelection(); return; }
+      if (action === "object-reset") {
+        stagedById.clear();
+        clearBulkStaging();
+        ctx.rerender();
+        return;
+      }
       // Same-type multi-selection: one bulk adapter call per action, expected
       // revision captured with the staging, exact blockers retained on rejection.
       const multi = selection();
@@ -908,7 +914,8 @@ export function objectsWorkspace(): WorkspaceModule {
           }
           if (stagedBulk.heightM !== undefined) {
             const bounds = sharedHeightBounds(members, value);
-            stagedBulk.heightM = Math.min(bounds.max, Math.max(bounds.min, stagedBulk.heightM));
+            if (bounds === null) delete stagedBulk.heightM;
+            else stagedBulk.heightM = Math.min(bounds.max, Math.max(bounds.min, stagedBulk.heightM));
           }
           syncInspectorButtons(root, multi.ids[0]!);
           ctx.rerender();
@@ -972,6 +979,7 @@ export function objectsWorkspace(): WorkspaceModule {
           const members = bulkMembers(multi);
           const grammarId = bulkStaging?.grammarId ?? (uniformValue(members.map((member) => member.grammarId)) as BuildingGrammarId | null);
           const bounds = sharedHeightBounds(members, grammarId);
+          if (bounds === null) return;
           const normalized = Math.min(bounds.max, Math.max(bounds.min, value));
           ensureBulkStaging("building", multi.ids).heightM = normalized;
           const output = root.querySelector<HTMLOutputElement>("[data-height-output]");
