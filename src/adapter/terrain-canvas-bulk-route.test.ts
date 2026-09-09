@@ -13,6 +13,7 @@ import { compileRouteNetwork } from "../core/graph/compiler.js";
 import { intersection, isSnapNoise, ringAsMulti } from "../core/geom/boolean.js";
 import { ringBounds, type MultiPolygon, type Ring, type Vec2 } from "../core/geom/types.js";
 import { mountPhase6Fixture, phase6Source, type Phase6Fixture } from "./phase6-test-fixture.js";
+import { objectInspector } from "../ui/objects-layer.js";
 import {
   bulkDeleteObjects,
   bulkEditObjects,
@@ -277,13 +278,11 @@ describe("Phase 6 bulk architecture actions", () => {
     await bulkSetObjectsLocked([derived.id], true);
 
     expect(stored().revision).toBe(revision + 1);
-    // Locking a derived object persists its protection across plan rebuilds: the
-    // commit materializes the explicit override into a record (override consumed) —
-    // either representation must carry the explicit protection.
     const lockedRecord = stored().source.architecture.buildings.find((building) => building.id === derived.id);
     const lockedOverride = stored().source.architecture.overrides.find((candidate) => candidate.targetId === derived.id);
     expect(lockedRecord !== undefined || lockedOverride !== undefined).toBe(true);
     expect(lockedRecord?.protection ?? lockedOverride?.protection).toBe("explicit");
+    expect(objectInspector([derived.id])?.locked).toBe(true);
 
     await bulkSetObjectsLocked([derived.id], false);
 
@@ -291,6 +290,7 @@ describe("Phase 6 bulk architecture actions", () => {
     const releasedOverride = stored().source.architecture.overrides.find((candidate) => candidate.targetId === derived.id);
     expect(releasedRecord !== undefined || releasedOverride !== undefined).toBe(true);
     expect(releasedRecord?.protection ?? releasedOverride?.protection).toBe("none");
+    expect(objectInspector([derived.id])?.locked).toBe(false);
   }, 120_000);
 
   it("promotes every substantially edited derived member in one bulk edit and one save", async () => {

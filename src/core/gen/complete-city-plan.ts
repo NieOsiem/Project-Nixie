@@ -3946,6 +3946,7 @@ function applyArchitectureOverrides(
       orphaned.push(override.targetId);
       continue;
     }
+    target!.protection = override.protection;
     if (override.appearanceSeed !== undefined) target!.appearanceSeed = override.appearanceSeed;
     if (Object.prototype.hasOwnProperty.call(override, "paletteId")) target!.paletteId = override.paletteId ?? null;
     if (target !== undefined && "grammarId" in target) refreshBuildingAppearance(target, districtById, banks);
